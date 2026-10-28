@@ -24,14 +24,12 @@ docs/           路线图、HLE 边界说明
 | M1 | 解包/装载 NSO，跑通 `.text` | ✅ 私有工作区 |
 | M2 | 启动链 HLE（nn::oe / fs / vi / nv / NVN 引导） | ✅ nn::init::Start 跑完 |
 | M2.5 | Horizon 线程 + IPC/CMIF 服务端（hid/sm/pctl） | 🟢 主循环已跑起来 |
-| M3 | NVN 设备/队列/窗口语义（真实 GPU 资源） | 🟢 录制循环在跑，未出画面 |
+| M3 | NVN 对象层 + 命令流录制（`m3_nvn.py`） | 🟢 对象/记录已就绪，draw=0（游戏还没提交几何） |
 | M4 | NVN → Metal 回放（管线/纹理/命令缓冲） | ⬜ |
 | M5 | 音频（nn::audio → AVAudioEngine）、输入 | ⬜ |
 | M6 | 真机性能与内存（6 GB 机型起步） | ⬜ |
-| M5 | 音频（nn::audio → AVAudioEngine）、输入 | ⬜ |
-| M6 | 真机性能与内存（6 GB 机型起步） | ⬜ |
 
-## M2 进展（最近一轮）
+## M2 进展
 
 本轮把 **IPC/CMIF 服务端**做出来了，游戏于是从"启动即 abort"变成**真的在跑主循环**：
 
@@ -42,7 +40,59 @@ docs/           路线图、HLE 边界说明
 * **hid 服务打通**：`CreateAppletResource` → `GetSharedMemoryHandle` → `svcMapSharedMemory(0x40000)`
   → `SetSupportedNpadStyleSet` / `SetSupportedNpadIdType` 等命令全部返回成功
 * 之后进入渲染主循环：每帧 `nvnCommandBufferBeginRecording … EndRecording` +
-  `nvnWindowSetPresentInterval` + 等 vsync，回归跑 45 秒可录到 **8000+ 帧**
+  `nvnWindowSetPresentInterval` + 等 vsync，回归跑 45 秒可录到 **13000+ 帧（≈295 fps）**
+
+## M3 进展（本轮）
+
+### NVN 对象层（`tools/m3_nvn.py`）
+
+照 D2R `dm/gfx/nvn/nvn_obj.h` 的三条原则实现，**不建指针表**：
+
+1. 对象就地存在**游戏自己分配**的 NVN 对象内存里（magic + 字段），
+   预留大小取自 `nvn.h`（device 0x3000 / pool 0x100 / buffer 0x30 / texture 0xC0 /
+   program 0xC0 / queue 0x2000 / window 0x180 / commandBuffer 0xA0 / sync 0x40）。
+2. 命令写进**游戏自己给的**命令内存：`nvnCommandBufferAddCommandMemory(cb, pool, off, size)`
+   的命令区 VA 是 `pool.storage + off`，句柄就是段首地址。记录格式 `{op,size}+payload`，8 字节对齐。
+3. **每个 NVN 入口都记一条**（含还没实现语义的），所以 dump 出来的是完整调用序列，
+   而不是"只有我们认识的调用"。
+
+本轮实测：对象层建立成功（4 个 memory pool、2 张 texture、sampler/texture pool、
+queue、window、command buffer、buffer 各 1），每帧写入 **10 条记录 / 416 字节**。
+
+### 关键结论：现在还没有 draw call
+
+```
+$ BOTW_NVN_VERBOSE=0 python tools/_m3a.py
+frame ops=10 bytes=416
+1  BEGIN
+2  nvnBufferGetAddress                     a=1080BE020 107EBD020 ...
+2  nvnCommandBufferReportCounter           a=107E8B3E0 10 ...
+2  nvnCommandBufferSetSamplerPool          a=107E8B3E0 106D8E0B8 ...
+2  nvnCommandBufferSetTexturePool          a=107E8B3E0 106D8E098 ...
+2  nvnCommandBufferSetShaderScratchMemory  a=107E8B3E0 107FBD040 ...
+2  nvnBufferGetAddress                     a=1080BE020 41254F70 ...
+2  nvnCommandBufferReportCounter           a=107E8B3E0 0 ...
+2  nvnCommandBufferEndRecording            a=107E8B3E0 ...
+0  END
+```
+
+也就是说：**渲染线程在提交"空帧"**（只设置 pool 与计数），没有 render target、
+没有 clear、没有 draw、也没有 present。`nvnQueuePresentTexture` 一次都没被调用。
+这不是 HLE 的 bug，是游戏还在资源加载阶段 —— 所以"移植到 iOS 能出画面"离现在仍有
+M4（管线/纹理/回放）+ 资源加载的距离。不要把它当成"差一点就能玩"。
+
+### 性能：把 1 MIPS 修回 ~100 MIPS
+
+之前跑 45 秒只能录到 8000 帧，看起来像"卡住"。定位到两个真问题：
+
+| 问题 | 症状 | 修法 |
+|---|---|---|
+| `emu_start(..., timeout=...)` | 一旦传 timeout，Unicorn 2.1.4 的 TCG 主循环退化，同一段 guest 代码慢 ~100 倍（present 循环 305 fps → 2 fps），而且 `count` 与块钩子几乎都不触发 | **永不传 timeout**，改成 `count=2M/20M` 分块，块之间看表 |
+| `find_svc` 依赖逐指令 ring | 快路径下 ring 为空，`pc` 落在**下一个** stub 的 `svc` 上 → 派发错函数（表现为 GetProcAddress 循环里反复调用同一个 API，最后跳到 0） | stub 槽改成 16 字节步长（`svc` 后 12 字节 0），`find_svc` 先试 `pc-4` 再试 `pc`，不依赖 ring |
+
+顺带：stub 区改为启动时**一次性预写**（原来每个 stub 现写 4 字节，写入可执行页会让
+翻译缓存失效）。现在 `m2_verify.py` 45 秒能跑 **13000+ 帧（≈295 fps）** 且
+`ipc missing` 为空。Unicorn 本身实测 ~100 MIPS（1M 条 guest 指令 7.6 ms）。
 * 当前一轮 IPC 命令表**零缺失**：`hid` 0/0x64/0x66/0x6D、`IAppletResource` 0、
   `pctl` 0/1/3 全部返回成功（家长控制统一回"无限制"）
 

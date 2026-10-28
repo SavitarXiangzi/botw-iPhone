@@ -40,8 +40,16 @@
 ## 已知技术债
 
 * **页别名**：Fiber 真正跑起来时需要（复制 + 回写，或自建页表）。当前是“假装成功”。
-* **线程调度**：目前只登记 `svcCreateThread`，尚未真正并发执行。
+* **线程调度**：协作式，只在 SVC 边界换上下文，没有抢占（也没有真时间片）。
 * **`AddressRegionManager` 基址**：当前拿到垃圾值（`0x2`），待补 `svcGetInfo` 其余 id。
+* **NVN 纹理存储大小**：`_tex_size()` 用"线性 pitch 64B 对齐"近似，真实 NVN 是
+  block-linear 布局；等 M4 接后端时要换成真布局，否则上传的数据是错的。
+* **命令内存用完**：`nvnCommandBufferSetMemoryCallback` 只记了回调地址，
+  没有真的回调 guest 申请新段；目前靠 0x30000/帧 够用（实测只用 416 字节）。
+* **present 未实现**：`nvnQueuePresentTexture` 一次都没被调用；即便被调用，现在也只记一条
+  `OP_PRESENT`，没有交换链。
+* **符号表两套地址**：`symbols.json` 里每个模块有两张重叠的表（shndx 1/2），
+  查符号要和 `valid_entry()` 一起用，否则会落到 `udf` 填充上。
 
 
 ## 已踩过的第 4 个坑：`svcGetInfo` 的值也要放 x1
@@ -146,3 +154,81 @@ nvnCommandBufferBeginRecording → nvnCommandBufferAddCommandMemory/AddControlMe
 
 也就是说 **SDK 层已经不再是瓶颈**，瓶颈变成 NVN 的语义（资源、管线、命令回放）——
 那是 M3/M4 的工作。
+
+## 执行器（Unicorn）的两个坑
+
+这两个坑都不是"游戏慢"，是**我们的 harness 慢**，而且症状极具误导性（表现为"卡住"）。
+
+### 千万不要给 `emu_start` 传 `timeout`
+
+Unicorn 2.1.4 里，只要 `uc_emu_start(..., timeout=X)` 带了非零 timeout，TCG 主循环的
+行为就退化了：同一段 guest 代码慢约 **100 倍**，而且 `count` 与 `UC_HOOK_BLOCK`
+几乎不再触发（看起来像"guest 卡在一个循环里"）。实测同一份 BOTW：
+
+| 调用方式 | present 循环帧率 |
+|---|---|
+| `count=20_000_000`，无 timeout | 305 fps |
+| `timeout=剩余秒数*1e6` | 2 fps |
+
+正确做法：**分块 + 自己看表**。`count` 用完就回 Python 一次（0.06 ms），
+块之间检查 `deadline`、采样 PC。块边界和"guest 真返回"用 `PC == END` 区分。
+
+顺带一个已测数据：Unicorn 本身跑 ARM64 约 **100 MIPS**（1M 条指令 7.6 ms），
+所以"每帧 0.29 秒"这种数字一定是 harness 的问题，不是 TCG 的极限。
+
+### `find_svc` 不能依赖逐指令 ring
+
+老实现用 `ring[-1]`（逐指令回调记录的 PC）定位出事的那条 `svc`。关掉逐指令回调后
+ring 是空的，回退到读 `PC` —— 而 Unicorn 报的是 `svc+4`，动态 stub 又是 4 字节紧排，
+于是**读到了下一个 stub 的 `svc`，派发到错的处理函数**。症状：`nvnDeviceGetProcAddress`
+循环里反复调用同一个 API（512 次），最后由一个 0 函数指针跳到 `pc=0`。
+
+修法两条一起用：
+
+1. stub 槽改成 **16 字节步长**：`svc #imm` + 12 字节 0。这样 `pc+4` 落在槽内填充区，
+   不会读到邻居的 `svc`。
+2. `find_svc` 依次试 `pc-4` → `pc` →（可选）`ring[-1]`，并对 stub 区校验
+   `(addr-STUB_BASE) % 16 == 0`、`imm` 必须已在 `hle_slots` 注册。
+
+另外 stub 区改成**启动时一次性预写**（`_prep_stubs`）：运行期不再写可执行页，
+避免翻译缓存反复失效。
+
+## M3：NVN 对象与命令流（`tools/m3_nvn.py`）
+
+### 对象就地存放
+
+对象写在**游戏分配**的 NVN 对象内存里，不另建指针表。预留大小直接取 `nvn.h`
+（这些数字要在 HLE 里当硬约束）：
+
+| 对象 | 大小 | 对象 | 大小 |
+|---|---|---|---|
+| `NVNdevice` | 0x3000 | `NVNmemoryPool` | 0x100 |
+| `NVNbuffer` | 0x30 | `NVNtexture` | 0xC0 |
+| `NVNsampler` | 0x30 | `NVNprogram` | 0xC0 |
+| `NVNtexturePool` | 0x20 | `NVNsamplerPool` | 0x20 |
+| `NVNqueue` | 0x2000 | `NVNwindow` | 0x180 |
+| `NVNcommandBuffer` | 0xA0 | `NVNsync` | 0x40 |
+
+### 命令内存的地址从哪来
+
+`nvnCommandBufferAddCommandMemory(cb, NVNmemoryPool, offset, size)` —— 第二个参数是
+**memory pool 对象**，不是裸指针；命令区 VA = `pool.storage + offset`。
+（之前按"裸地址"理解，记录区就写成 0，录制全落空。）
+
+### 记录格式
+
+```
+{op:u32, size:u32}  + payload      # size 含头，8 字节对齐
+OP_BEGIN / OP_END / OP_API / ...
+OP_API payload: name_idx:u32, caller:u32, a0..a3:u64
+```
+
+`OP_API` 的价值：**没实现语义的入口也照样记录**，所以 dump 是完整调用序列。
+`caller` 存 guest 返回地址，用来反查"是哪段游戏代码发的这条命令"。
+
+### 当前 BOTW 每帧只有 10 条记录，且没有 draw
+
+实测帧内容：`BEGIN`、`BufferGetAddress`×2、`ReportCounter`×2、
+`SetSamplerPool`、`SetTexturePool`、`SetShaderScratchMemory`、`EndRecording`、`END`。
+**没有 render target、没有 clear、没有 draw、没有 present**（`nvnQueuePresentTexture` 0 次）。
+渲染线程在提交空帧 = 游戏还在加载阶段，不是 HLE 丢了调用。
