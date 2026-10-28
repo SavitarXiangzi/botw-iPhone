@@ -43,6 +43,8 @@ docs/           路线图、HLE 边界说明
   → `SetSupportedNpadStyleSet` / `SetSupportedNpadIdType` 等命令全部返回成功
 * 之后进入渲染主循环：每帧 `nvnCommandBufferBeginRecording … EndRecording` +
   `nvnWindowSetPresentInterval` + 等 vsync，回归跑 45 秒可录到 **8000+ 帧**
+* 当前一轮 IPC 命令表**零缺失**：`hid` 0/0x64/0x66/0x6D、`IAppletResource` 0、
+  `pctl` 0/1/3 全部返回成功（家长控制统一回"无限制"）
 
 当前"跑起来"的含义要说明白：**游戏逻辑在跑，画面还什么都没有**。所有 `nvn*`
 仍是记账式桩（只记参数、返回假缓冲），下一阶段才是把它们翻译成 Metal。

@@ -127,6 +127,13 @@ ret
    建 `IAppletResource` 子会话，再 `GetSharedMemoryHandle` 拿 0x40000 的共享内存
    （手柄状态就在里面）。
 
+### 请求头的 CMIF 位置不固定
+
+`data_offset = 3 + pid + copy_handles + move_handles`（word），CMIF 在
+`align16(data_offset*4)`。实测出现过 **0x10 / 0x20 / 0x30** 三种；带 buffer 描述符
+（`ProcessRequestWithBuffer`）时更靠后。解析时从 0x10 起按 16 字节步进扫描 `'SFCI'`，
+不要写死两个位置。
+
 ## 进入主循环之后
 
 `nn::init::Start` 现在能跑完并返回；游戏线程在渲染循环里每帧：
