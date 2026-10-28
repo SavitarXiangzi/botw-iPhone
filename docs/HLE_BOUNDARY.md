@@ -276,3 +276,44 @@ _ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvmRKNS0_10ReadOptionE
 64 KiB 的线程栈槽 `uc.mem_map` 失败（`UC_ERR_MAP`）。现在按四段互不重叠的窗口
 提交，并记录已映射区间。
 
+
+## 实测补充：NVN 的"空实现"是静默陷阱（M3.6）
+
+`nvnDeviceGetProcAddress` 对不在表里的名字返回一个 **no-op 桩**（`return 0`，不写出参）。
+这比直接崩更危险：调用"成功"了，但游戏的状态没变。
+
+本轮就是这么丢掉纹理尺寸的：BOTW 建纹理走的是
+
+```
+nvnTextureBuilderSetDefaults -> SetTarget -> SetFormat -> SetLevels
+nvnTextureBuilderSetWidth / SetHeight     <- 我们表里没有，静默 no-op
+nvnTextureBuilderGetStorageSize           -> 0
+```
+
+于是 26 个格式的纹理尺寸全是 0，游戏跳过分配，随后拿 NULL 当基址写格式表，
+在 `main+0x12AFF34` 写地址 0 崩溃。
+
+现在 `botw_hle` 会把"被调用但只有空实现"的 NVN 入口按次数记进 `NVN_MISS`，
+每次长跑结束打印 top-N；补实现前先看这张表，不要靠猜。
+
+## 实测补充：memory pool builder 不给 storage 是合法的（M3.6）
+
+真机上 `nvnMemoryPoolInitialize` 的 builder `storage==0` 表示"由驱动分配"。
+宿主没有 NVN 驱动，必须自己补一块 guest 内存，否则
+`nvnMemoryPoolGetStorage` / `nvnMemoryPoolGetBufferAddress` 返回 0，
+游戏会把整块 pool（例如 120 MiB）当成地址 0 的资源区。
+现在 `nvnMemoryPoolInitialize` 在 `mem==0 && size>0` 时用 `Kernel.alloc()`
+给一块 2 MiB 对齐的 guest 存储。
+
+## 实测补充：动态 stub 区不能被当成数据（M3.6）
+
+`stub_for()` 把每个 HLE 入口写成 `STUB_BASE + i*16` 上的 `svc`。
+guest 会把这些地址存进自己的函数表并在运行期调用，所以这块内存**只读可执行**：
+
+* 任何 HLE 出参写落进 `[STUB_BASE, STUB_BASE+0x20000)` 都会把桩打烂，
+  下一次调用就跳进数据里，报成 `UC_ERR_EXCEPTION pc=stub+4`（极难定位）。
+  现在 `wr64/wr32/wmem` 统一拦截并打印是哪个 HLE 干的（实测抓到
+  `nvnBufferMap` 把 pool 地址写到 `0xA0008A0`）。
+* `find_svc()` 以前会**跳过**未登记的 stub 槽，导致"未登记"和"没有 svc"
+  两种情况表现一样。现在 `handle_svc` 对未登记槽单独记 `stub_unregistered`
+  并当作空实现返回，不再直接掉进 `udf`。

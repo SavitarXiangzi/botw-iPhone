@@ -45,9 +45,53 @@ nnMain → application case0 → app init
   → NVN 建立 4 个 memory pool（含 2×120 MiB）
 ```
 
-当前卡点：`main+0x12AFF34` 用空指针写纹理格式掩码数组（`x9=0`），
-前一步有一个 `nvnMemoryPoolBuilderSetStorage(mem=0, size=0x7300000)`。
-下一个 milestone 是让这条资源初始化走完，进而创建 `+0x100` 渲染器。
+（这一段的卡点已在 M3.6 解决，见下节。）
+
+### M3.6 资源初始化打通（本轮）
+
+上一轮停在 `main+0x12AFF34`：拿空指针当基址写"纹理格式掩码表"。
+本轮把它彻底查清并修掉，启动链又往前走了一大截。
+
+**根因链（全部实测，不是推测）**
+
+```
+nvnTextureBuilderSetDefaults/SetTarget/SetFormat/SetLevels
+nvnTextureBuilderSetWidth / SetHeight      <- 我们没有实现，静默 no-op
+nvnTextureBuilderGetStorageSize            -> 0
+main+0x12AFE5C: cbz w25 -> 跳过分配
+main+0x12AFE90: [x23+0x18] == NULL
+main+0x12AFF34: str w12,[x9,w10,uxtw #2]   x9 = 0 + 偏移 -> 写地址 0
+```
+
+配套发现：`nvnMemoryPoolInitialize` 的 builder 可以是 `storage==0`
+（真机上表示"驱动分配"），宿主必须自己补一块 guest 存储，否则
+`nvnMemoryPoolGetStorage` 返回 0，游戏会把 120 MiB 的 pool 当成地址 0。
+
+**本轮修掉的 3 个宿主层 bug**
+
+1. NVN 空实现静默失效：新增 `NVN_MISS` 计数（谁被调用过、几次），
+   并补 `nvnTextureBuilderSetWidth/SetHeight/SetDepth/SetSize1D/SetSize3D/SetStride`
+   与对应 getter、`nvnMemoryPoolGetFlags/GetBufferAddress/Map/MapVirtual`。
+2. pool 无 storage 时由宿主分配（2 MiB 对齐），`GetStorage` 返回真实地址。
+3. 动态 stub 区被当数据写：实测 `nvnBufferMap` 把 pool 地址写到 `0xA0008A0`
+   （正是某个 stub 桩的位置），下一次函数指针调用跳进数据 →
+   `UC_ERR_EXCEPTION pc=stub+4`。现在 `wr64/wr32/wmem` 统一拦截并打印肇事 HLE；
+   `handle_svc` 对未登记 stub 槽单独记账，不再掉进 `udf`。
+
+**现在的进度（长跑实测）**
+
+```
+nnMain -> app init -> 任务线程解包 RomFS -> NVN 建 30+ 个 memory pool
+  （含 0x211FE000 = 553 MiB 一块）-> 走到主循环 scene 状态机
+```
+
+新卡点：`main+0x1D3A90C` 读 `[x19+0x20]` 得到 `0x38`（应该是对象指针），
+`main+0x1D3A910` 解引用 `x21+0x38` → 读地址 0x70 崩溃。
+调用链 `0x4124EE48(呈现) -> 0x41251718(主循环) -> 0x40E3AA00(scene case1)
+-> 0x41835740 -> 0x41D3A8E0`，即标题场景的第一帧初始化。
+
+门禁：`m2_verify` / `m3_verify` 均为 PASS（17 帧、15 线程、`ipc missing={}`）。
+注意 `present=0 / draw=0` 仍未变——现在还在"能跑通初始化"阶段，不是"能出画面"。
 
 配套修复（都属于"宿主替身"层，不含任何游戏数据）：
 * `nn::fs::ReadFile` 补 `ReadOption` 重载，否则绕进真 SDK 把句柄当对象指针
