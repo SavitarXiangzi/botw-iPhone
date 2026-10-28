@@ -36,11 +36,14 @@ jobs:
         run: |
           xcodegen --version
           echo "objectVersion: $(grep -m1 objectVersion BotW.xcodeproj/project.pbxproj || echo missing)"
-          plutil -lint BotW.xcodeproj/project.pbxproj || true
-          if ! xcodebuild -list -project BotW.xcodeproj; then
-            echo "::error::generated project cannot be opened by xcodebuild"
+          ls -la BotW.xcodeproj
+          if ! out=$(xcodebuild -list -project BotW.xcodeproj 2>&1); then
+            echo "$out" | head -20 | while read -r line; do echo "::error::$line"; done
+            echo "::error::plutil: $(plutil -lint BotW.xcodeproj/project.pbxproj 2>&1 | head -3)"
+            head -12 BotW.xcodeproj/project.pbxproj | while read -r line; do echo "::error::pbxproj| $line"; done
             exit 1
           fi
+          echo "$out" | head -12
 
       - name: Build for iOS Simulator
         id: sim
