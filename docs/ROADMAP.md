@@ -93,6 +93,46 @@ nnMain -> app init -> 任务线程解包 RomFS -> NVN 建 30+ 个 memory pool
 门禁：`m2_verify` / `m3_verify` 均为 PASS（17 帧、15 线程、`ipc missing={}`）。
 注意 `present=0 / draw=0` 仍未变——现在还在"能跑通初始化"阶段，不是"能出画面"。
 
+### M3.7 资源重定位异常（进行中）
+
+卡点从 `main+0x1D3A90C` 继续下钻，先把调用链上的 thunk 全部翻译成符号：
+
+```
+0x421298E0 -> nn::util::BinaryFileHeader::IsRelocated() const
+0x421298F0 -> nn::util::BinaryFileHeader::SetRelocated(bool)
+0x42129900 -> nn::util::RelocationTable::Relocate()
+0x421286A0 -> nn::util::BinaryFileHeader::GetRelocationTable()
+```
+
+被测对象 `0x19B739000` 是**货真价实的 FSHA 资源**（头 16 字节
+`46 53 48 41 20 20 20 20 01 00 03 00 ff fe 0c 00`），53 MB 数据已全部写入
+（最后一个非零字节在 `obj+0x32B7FF4`），`IsRelocated()` 返回 false，
+所以 `Relocate()` 确实被调用了——问题是**它拿到的表是全零**。
+
+三个数对不上，这是本轮最关键的发现：
+
+| 来源 | 值 |
+|---|---|
+| 头部 `+0x18`（`GetRelocationTable()` 用的偏移） | `0x032B7000` |
+| 实际找到 `_RLT` 魔数的位置 | `obj + 0x317D398` |
+| 表自己 `+0x04` 记录的自身偏移 | `0x248B398` |
+
+而 `0x248B398 + 0xCF0000 == 0x317D398`，其中 `0xCF0000` 正好是头部
+`+0x10`（`0xCEEE1A`）按 64 KiB 向上对齐的值。也就是说：**这份资源的数据在
+运行期被整体搬动过约 13.5 MB**，表跟着搬了，但表内的自述偏移和头部偏移都没有跟着改。
+
+排除项（都实测过）：
+* 不是文件没读全：`fs::ReadFile` 的 4 次大读（Bootup/Graphics/Title/TitleBG）
+  `got == size`，只是请求比文件多 2~6 字节（对齐补齐）。
+* 不是 RomFS 缺文件：base 39768 / update 41052，只有 4 个文件只在 base 里；
+  已改成 **base 打底 + update 覆盖** 的分层挂载。
+* 不是 4 个 boot pack 的明文成员：在 `Bootup/Bootup_Graphics/Title/TitleBG` 里
+  搜 FSHA 魔数 0 命中 → 该资源来自压缩成员或别的 pack。
+
+下一步：盯住"谁把资源搬到 `obj+0xCF0000` 之后"——在 `obj` 与 `obj+0xCF0000`
+两段分别下写断点，抓解压/搬运代码；顺带确认 Yaz0 解压是否用了我们 HLE 掉的
+`memcpy/memset`。
+
 配套修复（都属于"宿主替身"层，不含任何游戏数据）：
 * `nn::fs::ReadFile` 补 `ReadOption` 重载，否则绕进真 SDK 把句柄当对象指针
 * HLE 写 guest 缓冲区前按需提交 lazy 页（BOTW 的 `.pack` 单次读上百 MB）
