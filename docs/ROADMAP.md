@@ -27,6 +27,35 @@ D2R 的做法是：把游戏二进制里对 SDK / 图形 API 的调用**在符�
 * NVN 对象布局照 `nvn_obj.h` 落地
 * 出口条件：创建出 swapchain 并提交第一帧（哪怕是空帧）
 
+### M3.5 真实启动流程（本轮突破，进行中）
+
+上一轮为止游戏只是"每帧提交一个空 pass"，`fs::OpenFile` 调用数为 0。本轮在
+协作式调度器里修掉一个**线程饿死**的 bug（`_pick_next()` 把已被标记 blocked 的
+当前线程当成轮转起点，永远回落到 `live[0]`），主线程之外的线程从此才真正被调度。
+
+修完之后启动链第一次跑通到：
+
+```
+nnMain → application case0 → app init
+  → account::Initialize / OpenPreselectedUser（HLE 直通）
+  → 全局 Application 指针 0x42CCFB50 被赋值
+  → 任务线程开始加载 RomFS：
+       RegionLangMask / ResourceSizeTable / Font_JP.sbfarc
+       Bootup*.pack / Title*.pack / Version.txt
+  → NVN 建立 4 个 memory pool（含 2×120 MiB）
+```
+
+当前卡点：`main+0x12AFF34` 用空指针写纹理格式掩码数组（`x9=0`），
+前一步有一个 `nvnMemoryPoolBuilderSetStorage(mem=0, size=0x7300000)`。
+下一个 milestone 是让这条资源初始化走完，进而创建 `+0x100` 渲染器。
+
+配套修复（都属于"宿主替身"层，不含任何游戏数据）：
+* `nn::fs::ReadFile` 补 `ReadOption` 重载，否则绕进真 SDK 把句柄当对象指针
+* HLE 写 guest 缓冲区前按需提交 lazy 页（BOTW 的 `.pack` 单次读上百 MB）
+* lazy 映射窗口改为互不重叠（堆窗口原来把线程栈窗口整个包住）
+* `nn::oe` 查询类 API 直接给值；`nn::account` 整体直通（只影响存档/UI）
+* `nn::settings` 的 `MakeLanguageCode` / `GetAvailableLanguageCodes2` 等按命令号实现
+
 ### M4 Metal 回放
 * NVN 命令流 → MTLCommandBuffer
 * 着色器：已有 5,099 个程序 / 20.07 MiB 唯一字节码，需要 NVN 的 GPR/SH 描述 → MSL 翻译

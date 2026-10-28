@@ -232,3 +232,47 @@ OP_API payload: name_idx:u32, caller:u32, a0..a3:u64
 `SetSamplerPool`、`SetTexturePool`、`SetShaderScratchMemory`、`EndRecording`、`END`。
 **没有 render target、没有 clear、没有 draw、没有 present**（`nvnQueuePresentTexture` 0 次）。
 渲染线程在提交空帧 = 游戏还在加载阶段，不是 HLE 丢了调用。
+
+---
+
+## 实测补充：同名 API 的**重载**是独立的符号（M3.5）
+
+BOTW 1.6.0 调的是带 `ReadOption` 的那个：
+
+```
+_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvmRKNS0_10ReadOptionE
+```
+
+只挂 `..._PmNS0_10FileHandleElPvm`（不带 Option）会**静默失效**：调用进入真 SDK，
+真 SDK 在自己的 handle→`FileAccessor` 表里找不到我们的假句柄（我们 HLE 了
+`OpenFile`），于是把句柄值 `0x11` 当成对象指针 → `ldr w8,[x0,#0x24]` 读 0x35 崩溃。
+
+结论：**HLE 名单要按 mangled name 逐条核对**，不能按"函数名"想当然。
+`nn::fs::ReadFile` 一共 4 个重载，`WriteFile` 又另有 `WriteOption` 版本。
+
+## 实测补充：CMIF 命令号要反查，不要猜（M3.5）
+
+`set`（`nn::settings`）我们一开始让未知命令走"回 0 + 空 payload"，
+结果 `MakeLanguageCode` 的 `LanguageCode`（8 字节 ASCII）读成垃圾，
+游戏把系统语言判成日语，于是去加载 `Font_JP.sbfarc` / `Bootup_JPja.pack`。
+
+定位方法：hook `svcSendSyncRequest` 的 HLE 入口，抓**调用栈**，再拿返回地址在
+`symbols.json` 里取最近的符号。例如：
+
+* `set` cmd 2 → `ISettingsServer::MakeLanguageCode`
+* `set` cmd 5 → `ISettingsServer::GetAvailableLanguageCodes2`
+* `aoc:u` cmd 3 → `IAddOnContentManager::ListAddOnContent`
+* `acc:u0` cmd 0x8C → `IAccountServiceForApplication::InitializeApplicationInfo`
+
+## 实测补充：宿主写 guest 内存要自己提交页（M3.5）
+
+`uc.mem_write` **不会**触发 `UC_HOOK_MEM_UNMAPPED`。BOTW 的 `.pack` 单次读 140 MB，
+目标缓冲区在 8 GiB 的 guest 堆窗口里、尚未 `mem_map`，直接写会
+`UC_ERR_WRITE_UNMAPPED`。所以 HLE 侧统一走 `Kernel.wmem()`（内部先
+`commit_range()` 再写）。
+
+另外 lazy 映射窗口**不能重叠**：原来堆窗口 `[0xB0000000,0x2B0000000)` 把线程栈
+窗口 `[0x100000000,0x180000000)` 整个包住，一次 64 MiB 的堆提交就会让后续
+64 KiB 的线程栈槽 `uc.mem_map` 失败（`UC_ERR_MAP`）。现在按四段互不重叠的窗口
+提交，并记录已映射区间。
+
