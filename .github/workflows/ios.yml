@@ -1,0 +1,60 @@
+name: ios-build
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  core-syntax:
+    # Fast gate: the C ABI must compile with a plain clang before we pay for a macOS runner.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile C++ core (host clang)
+        run: clang++ -std=c++20 -Wall -Wextra -Werror -c core/src/botw_core.cpp -Icore/include -o /tmp/botw_core.o
+
+  ios:
+    needs: core-syntax
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        working-directory: ios
+        run: xcodegen generate --spec project.yml
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Build for iOS Simulator
+        working-directory: ios
+        run: |
+          set -o pipefail
+          xcodebuild -project BotW.xcodeproj -scheme BotW \
+            -configuration Debug -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' \
+            CODE_SIGNING_ALLOWED=NO \
+            build | tail -80
+
+      - name: Build for device (unsigned)
+        working-directory: ios
+        run: |
+          set -o pipefail
+          xcodebuild -project BotW.xcodeproj -scheme BotW \
+            -configuration Release -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            build | tail -80
+
+      - name: Upload simulator app
+        uses: actions/upload-artifact@v4
+        with:
+          name: BotW-simulator-app
+          path: ios/build/Debug-iphonesimulator/BotW.app
+          if-no-files-found: warn
+          retention-days: 14

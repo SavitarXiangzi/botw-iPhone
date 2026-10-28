@@ -1,0 +1,36 @@
+name: BotW
+options:
+  bundleIdPrefix: dev.botw
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    CLANG_CXX_LANGUAGE_STANDARD: "c++20"
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+targets:
+  BotW:
+    type: application
+    platform: iOS
+    sources:
+      - path: BotW
+      - path: ../core/include
+        buildPhase: none
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.botw.app
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationLandscapeRight
+        INFOPLIST_KEY_UIRequiresFullScreen: YES
+        INFOPLIST_KEY_UIStatusBarHidden: YES
+        TARGETED_DEVICE_FAMILY: "1,2"
+        METAL_FAST_MATH: YES
+schemes:
+  BotW:
+    build:
+      targets:
+        BotW: all
+    run:
+      config: Debug

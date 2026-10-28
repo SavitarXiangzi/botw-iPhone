@@ -1,0 +1,17 @@
+# Xcode / macOS
+build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+ios/BotW.xcodeproj/
+
+# Never commit title-derived data
+*.xci
+*.nsp
+*.nca
+*.nso
+*.kdb
+*.keys
+prod.keys
+title.keys
+RomFS/
