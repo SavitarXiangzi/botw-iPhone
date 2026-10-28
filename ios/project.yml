@@ -15,8 +15,6 @@ targets:
     platform: iOS
     sources:
       - path: BotW
-      - path: ../core/include
-        buildPhase: none
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.botw.app
@@ -26,7 +24,7 @@ targets:
         INFOPLIST_KEY_UIRequiresFullScreen: YES
         INFOPLIST_KEY_UIStatusBarHidden: YES
         TARGETED_DEVICE_FAMILY: "1,2"
-        METAL_FAST_MATH: YES
+        PRODUCT_NAME: BotW
 schemes:
   BotW:
     build:

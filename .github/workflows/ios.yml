@@ -32,14 +32,26 @@ jobs:
         run: xcodebuild -version
 
       - name: Build for iOS Simulator
+        id: sim
         working-directory: ios
         run: |
           set -o pipefail
           xcodebuild -project BotW.xcodeproj -scheme BotW \
             -configuration Debug -sdk iphonesimulator \
             -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath build \
             CODE_SIGNING_ALLOWED=NO \
-            build | tail -80
+            build > build-sim.log 2>&1 || rc=$?
+          if [ -n "${rc:-}" ]; then
+            # surface the compiler errors as annotations so they are readable without log auth
+            grep -E "(error|fatal error):" build-sim.log | head -15 | while read -r line; do
+              echo "::error::$line"
+            done
+            echo "::error::xcodebuild exited with $rc"
+            tail -60 build-sim.log
+            exit "$rc"
+          fi
+          tail -20 build-sim.log
 
       - name: Build for device (unsigned)
         working-directory: ios
@@ -48,13 +60,22 @@ jobs:
           xcodebuild -project BotW.xcodeproj -scheme BotW \
             -configuration Release -sdk iphoneos \
             -destination 'generic/platform=iOS' \
+            -derivedDataPath build-device \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
-            build | tail -80
+            build > build-dev.log 2>&1 || rc=$?
+          if [ -n "${rc:-}" ]; then
+            grep -E "(error|fatal error):" build-dev.log | head -15 | while read -r line; do
+              echo "::error::$line"
+            done
+            tail -60 build-dev.log
+            exit "$rc"
+          fi
+          tail -20 build-dev.log
 
       - name: Upload simulator app
         uses: actions/upload-artifact@v4
         with:
           name: BotW-simulator-app
-          path: ios/build/Debug-iphonesimulator/BotW.app
+          path: ios/build/Build/Products/Debug-iphonesimulator/BotW.app
           if-no-files-found: warn
           retention-days: 14
