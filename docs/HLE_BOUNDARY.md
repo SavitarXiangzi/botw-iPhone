@@ -35,3 +35,34 @@
 * **页别名**：Fiber 真正跑起来时需要（复制 + 回写，或自建页表）。当前是“假装成功”。
 * **线程调度**：目前只登记 `svcCreateThread`，尚未真正并发执行。
 * **`AddressRegionManager` 基址**：当前拿到垃圾值（`0x2`），待补 `svcGetInfo` 其余 id。
+
+
+## 已踩过的第 4 个坑：`svcGetInfo` 的值也要放 x1
+
+SDK 的包装器长这样：
+
+```asm
+str x0,[sp,#-0x10]!
+svc #0x29
+ldr x2,[sp]
+str w1,[x2]        ; 把 x1 的低 32 位写回调用者的 out 指针
+ret
+```
+
+也就是说内核既要写 out 内存，**也要**把值放在 `x1`。只写内存的话，低 32 位会被残留的
+`x1` 覆盖——`nn::os::detail::VammManager` 就是因此拿到 `base=0x2`，
+进而 `AddressRegionManager` 用 2 当堆地址、`CreateUnitHeap` 写 `[0,8]` 直接 fault。
+
+同类需要“out 内存 + 返回值”双写的：
+
+| SVC | 说明 |
+|---|---|
+| 0x24 GetProcessId / 0x25 GetThreadId | out 是指针，返回 Result |
+| 0x29 GetInfo | `x0` 返回值，`x1` 也要带值 |
+| 0x08 CreateThread | 写句柄到 out |
+
+## 进入 nnMain 之后
+
+启动链跑通后到达 `nnMain`（`main+0xE53710`），当前停在 `main+0xE5454C`：
+`0x42127FB0(w0=[x26+0x648]+0x88)` 返回 0，随后 `ldr x20,[x0,#0xB0]` 读空指针。
+这里是**游戏自己的数据查找**，不再是 SDK 层，说明 HLE 边界已经越过 SDK。

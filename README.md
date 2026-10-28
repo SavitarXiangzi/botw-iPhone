@@ -22,11 +22,19 @@ docs/           路线图、HLE 边界说明
 |---|---|---|
 | M0 | iOS 壳 + Metal 渲染 + CI 编译 | ✅ 本仓库 |
 | M1 | 解包/装载 NSO，跑通 `.text` | ✅ 私有工作区 |
-| M2 | 启动链 HLE（nn::oe / fs / vi / nv / NVN 引导） | 🟡 进行中 |
+| M2 | 启动链 HLE（nn::oe / fs / vi / nv / NVN 引导） | 🟢 已进入 nnMain |
 | M3 | 线程模型 + NVN 设备/队列/窗口 | ⬜ |
 | M4 | NVN → Metal 回放（管线/纹理/命令缓冲） | ⬜ |
 | M5 | 音频（nn::audio → AVAudioEngine）、输入 | ⬜ |
 | M6 | 真机性能与内存（6 GB 机型起步） | ⬜ |
+
+## M2 进展（最近一轮）
+
+* NVN 引导打通：`nvnBootstrapLoader` → `nvnDeviceGetProcAddress` → **512 个入口全部解析**
+* 启动改走真实链路 `nn::init::Start(heap, arg, nninitStartup, nnMain)`
+* 游戏开始请求服务：`aoc:u`、`pctl`、`pctl:s/a/r`
+* 3.22 GiB 主堆（`AllocateMemoryBlock(0xC1000000)`）分配成功
+* **已进入 `nnMain`**，当前停在游戏自己的场景查找（返回空指针）
 
 ## 本地验证（不需要 Mac）
 
