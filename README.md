@@ -38,13 +38,14 @@ docs/           路线图、HLE 边界说明
 | M3.20 | `nvnProgramSetShadersExt` 返回 0 = false，游戏判定着色器没装上 → `+0xD0/+0xD8` 空表 → 空指针崩溃 | ✅ 崩溃已消失 |
 | M3.21 | `draws=0` 曾是假指标：`nvnDrawArrays` 一族未实现，全是静默 no-op | ✅ 已如实计数 |
 | M3.22 | 存档挂载 → 线程别名栈（pc=0）→ `nn::time` → applet 启动参数，四道门连续推平 | ✅ 300 s 无 FAULT |
+| M3.23 | 调度器只在 SVC 处让出 → 一个不含 SVC 的忙等会饿死全部工作线程；分块边界改成时片（2M 指令 ≈ 1.1 ms） | ✅ 178 → 199 帧 |
 | M4 | NVN → Metal 回放（管线/纹理/命令缓冲） | ⬜ |
 | M5 | 音频（nn::audio → AVAudioEngine）、输入 | ⬜ |
 | M6 | 真机性能与内存（6 GB 机型起步） | ⬜ |
 
-### 最新一段（M3.16 → M3.22）
+### 最新一段（M3.16 → M3.23）
 
-无钩子长跑现在的极限是 **175 帧 / API 895 / draws 0**，卡在资源系统：
+无钩子长跑现在的极限是 **199 帧 / API 1087 / draws 0**，卡在资源系统：
 
 * **M3.16** `nvnTextureBuilderGetStorageSize` 的 `BPP` 表错（RG8/RG16 记错、`DEPTH16`
   缺失、DXT/RGTC/BPTC/ASTC 全缺）→ 返回偏小 → 游戏按它开 pool → 法线图解码器写满就越界，
@@ -82,7 +83,20 @@ docs/           路线图、HLE 边界说明
   （SDK 内部调用，main 不导入）答"没有启动参数"。300 s 无钩子长跑：175 帧 → `time` 通过 →
   持续解包（chunks 2116→4945）、无 FAULT、`committed` 1151 MiB 持平。
 
-细节、地址与下一步实验都在 [`docs/ROADMAP.md`](docs/ROADMAP.md) 的 M3.16–M3.22。
+* **M3.23（本轮）** M3.22 之后的长跑出现新的"假卡死"：帧停在 178，PC 采样有 1544 次
+  落在 `0x41062388` 同一条指令上——那是资源管理器状态机里"在途请求计数 `[mgr+0x38]` 非零就
+  原地重试"的忙等。根因不在 guest：我们的调度器**只在 SVC 处切线程**，于是一个不含任何 SVC
+  的 `while` 就把所有 runnable 的工作线程永久饿死（真机是 1 ms 定时器抢占）。修法是把
+  `CHUNK`=2M 指令的分块边界当成时片（2M/1.8 GHz ≈ 1.1 ms），到点保存上下文并轮转。
+  效果：帧 178 → 199、API 895 → 1087、无 FAULT，FSLOG 里第一次看到完整的标题资源
+  （`Title.pack` 4.9 MB、`TitleBG.pack` 147 MB 全部读入）。但 **t≈220 s 之后整机静止**
+  （`frames`/`API`/`committed`/`chunks` 四个数 900 s 内一动不动），全线程栈显示任务系统的
+  入口都空转在 `ReceiveMessageQueue`/`AcquireSemaphore` 上——这是下一道墙，不是变慢。
+  顺带更正两个观测口径问题：
+  `chunks` 不是指令计数器（SVC 密集时它在 250 s 里一动不动，而主线程调了 80 万次
+  `GetSystemTick`），`0x4191F000` 那页也不是"任务树轮询"而是逐字节 LZ 解码器。
+
+细节、地址与下一步实验都在 [`docs/ROADMAP.md`](docs/ROADMAP.md) 的 M3.16–M3.23。
 
 ## M2 进展
 
@@ -91,7 +105,8 @@ docs/           路线图、HLE 边界说明
 * 启动改走真实链路 `nn::init::Start(heap, arg, nninitStartup, nnMain)`，**完整返回**
 * NVN 引导：`nvnBootstrapLoader` → `nvnDeviceGetProcAddress` → **512 个入口全部解析**
 * 3.22 GiB 主堆（`AllocateMemoryBlock(0xC1000000)`）分配成功
-* 4 个 guest 线程（协作式调度：SVC 边界换上下文，含 x0-x28/Q0-Q31/SP/PC/NZPCR/TLS）
+* 4 个 guest 线程（含 x0-x28/Q0-Q31/SP/PC/NZPCR/TLS 的完整上下文切换；
+  M3.23 起按 2M 指令时片抢占，不再只依赖 SVC 边界）
 * **hid 服务打通**：`CreateAppletResource` → `GetSharedMemoryHandle` → `svcMapSharedMemory(0x40000)`
   → `SetSupportedNpadStyleSet` / `SetSupportedNpadIdType` 等命令全部返回成功
 * 之后进入渲染主循环：每帧 `nvnCommandBufferBeginRecording … EndRecording` +

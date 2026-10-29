@@ -726,6 +726,152 @@ GetSpanBetween/ToCalendarTime`。原则同 M3.18：guest 看到的时间不能�
 `committed` 持平 1151 MiB。`draws` 仍为 0——现在这个 0 是**可信的**（见 M3.21），
 说明游戏还在加载，没有提交几何。
 
+### M3.23 抢占式调度：一个不含 SVC 的忙等会饿死所有工作线程（已修）
+
+M3.22 之后的长跑出现一种新的"假卡死"：`chunks` 继续涨到 2118，帧却停在 178，
+之后 100 s 里 `chunks` 一动不动。200 s 的全线程快照只有主线程活着。
+
+#### 1. 主线程在等"资源管理器在忙"
+
+采样窗口里 **1544 次**落在**同一条指令**上：
+
+```
+0x41062258  ldr   w8, [x26]          ; 状态机状态（0..0x1b，跳表 @0x42611E70）
+0x4106225C  cmp   w8, #0x1b
+0x41062260  b.hi  0x41062388
+0x41062388  ldr   w8, [x20, #0x38]   ; 管理器"在途请求"计数
+0x4106238C  tbz   w23, #0, 0x4106239C
+0x41062394  cbnz  w8, 0x41062258     ; 非零 → 回到分发，等于原地打转
+```
+
+`[mgr+0x38]` 就是"有请求在飞"。置 1 的两处：
+
+* `0x4165F898`：按名字查表（`[mgr+0xe00]` 的 count@+0x28 / array@+0x30，命中后逐字节比
+  `"caption.sav"` 之类），然后调 `[mgr+0x30]` 的 `vtable+0x18` 提交加载；
+* `0x4165FA24`：另一条入口，路径用 `"%s://%s"`（`0x426572F1`）拼出来再提交。
+
+清零的三处：`0x4165ADF8` / `0x4165B2EC` / `0x4165EA98`——都在**别的线程**上跑的完成回调里。
+运行时探针（`_probe_peek.py`，在分块边界读 guest 寄存器）拿到的现场：
+
+```
+pc=0x41062388 tid=0x100   state[x26]=6
+[x20+0x38]=0x400000001   [x20+0x3C]=0x400000004   线程数=38
+```
+
+同一时段的 `_probe_stall2.py` 现场：这个窗口里除主线程之外几乎没有线程被采样到——
+队列里明明有 runnable 的 worker，却一次都没拿到 CPU。
+
+#### 2. 根因：调度器只在 SVC 处让出
+
+`Kernel.run()` 的分块边界原来只是"回 Python 看一眼表，然后**继续跑同一个线程**"：
+
+```python
+p = mu.reg_read(UC_ARM64_REG_PC)
+if p != END:
+    self.chunks += 1
+    pc = p; continue          # ← 没有调度
+```
+
+真机是**定时器抢占**：Horizon 的时片 1 ms ≈ 180 万条指令。我们没有这一层，于是任何
+`while (!flag) {}` 都等于"进程停摆"——不是死锁，是其它线程**永远拿不到 CPU**，
+而那个唯一能把 `[mgr+0x38]` 清零的解压/IO 线程就在 runnable 队列里躺着。
+
+#### 3. 修法：分块边界就是时片
+
+```python
+def _tick(self, pc):
+    cur = self.cur
+    if cur is None or cur.state != 'run': return pc
+    if len([c for c in self.runnable if c.state == 'run']) < 2: return pc
+    self._save_ctx(cur, pc)
+    nxt = self._pick_next()
+    if nxt is None or nxt is cur: return pc
+    self._load_ctx(nxt)
+    return nxt.regs['pc']
+```
+
+`CHUNK`=2M 条指令，按 1.8 GHz 折算 ≈ **1.1 ms**，与真机 1 ms 时片同量级，所以不用改
+`CHUNK`。代价：每 2M 条指令一次上下文切换（20 次/秒量级），可忽略。
+
+#### 4. 效果（`LIM=300`，`BOTW_BARE=1`，无钩子）
+
+| | M3.22 | M3.23 |
+|---|---|---|
+| 帧 | 178 | **199** |
+| API 调用 | 895 | **1087** |
+| FAULT | 无 | 无 |
+| 标题资源 | 读不到 | `Title.pack` 4.9 MB、`TitleBG.pack` 147 MB 全部读入 |
+
+`m2_verify.py` / `m3_verify.py` 都仍然 PASS。首段帧时间线也变了：M3.22 是
+"21 帧 → 60 s 静默 → 175 帧"，现在是 "42 帧 → 立刻进资源加载 → 190 帧"。
+
+#### 5. 第二个假指标：`chunks` 不是指令计数器
+
+`chunks` 统计的是"`emu_start` 因 count 用完而返回"的次数。**SVC 密集的阶段永远到不了
+边界**：`LIM=250` 那次 `chunks` 从 2199 一动不动跑了 80 s，而这 80 s 里主线程调了
+**804,025 次 `os::GetSystemTick`**，线程 `0x121` 每 2.31 ms 一次 `svcSleepThread` 共
+16,074 次。所以"chunks 不涨"和 M3.21 的 "draws=0" 一样是**观测口径**问题。
+
+现在看进度至少三个数一起看：`k.chunks`（纯计算段）/ `sum(k.svcs.values())`（内核调用）/
+`k.hle_calls`（HLE 入口分布）。按 tid 统计的办法是先包一层 `Kernel.handle_svc`。
+
+#### 6. 顺带更正：`0x4191F000` 不是"任务树轮询"
+
+M3.22 的交接把它读成"加载任务树轮询"，反汇编 `0x4191F830` 起是一段**逐字节 LZ 解码器**：
+
+```
+[x19+0x100] 目标指针      [x19+0x108] 标志位缓冲    [x19+0x114] 模式（1/2 都是回引）
+[x19+0x118] 16 位距离     0x4191F948..0x4191F998  回引拷贝（8 字节一组展开）
+```
+
+同一 4 KiB 页里确实还有 `0x41C4B630`（"子任务是否全部完成"：遍历 `[obj+0x78]` 个条目，
+检查 `[entry+0xfc] & 8`），4 KiB 页粒度把两者混成了一页。
+
+#### 7. 新的墙：t≈220 s 之后整机静止（下一个目标）
+
+`LIM=900` 的裸跑证实这不是"加载慢"：从 t≈220 s 起 `frames`(199) / `API`(1087) /
+`committed`(1152 MiB) / `chunks`(2199) **四个数一起冻住**，一直冻到 900 s。
+"能跑但很慢"和"停了"必须分开判。
+
+在 SVC 边界（安全点）遍历各线程保存的 `x29` 帧链（`_probe_allstacks.py`）看到的现场：
+
+| 停在哪 | 线程 |
+|---|---|
+| `nn::os::ReceiveMessageQueue`（`sdk+0x32637C` ← `main+0x126DB3C` ← `main+0x126CF74`） | 约 20 个 |
+| `nn::os::AcquireSemaphore`（`sdk+0x327698` ← `main+0x1EE4E18`） | 0x114–0x119 共 6 个 |
+| `nn::os::TimedWaitEvent` | 0x110 |
+| `svcSleepThread` | 0x113、0x121（0x121 每 2.31 ms 醒一次，是唯一 runnable） |
+| `svcWaitProcessWideKeyAtomic` | 主线程 0x100 |
+
+也就是"任务系统的入口都在排队等活，而主线程在等一个永远不会来的完成信号"。
+条件变量侧（`_probe_cv.py`，`k.dbg_cv=True`）：2035 次 `SignalProcessWideKey` /
+677 次 `WaitProcessWideKeyAtomic`，其中 **1391 次 signal 到达时一个等待者都没有**。
+
+#### 8. 顺带修掉的两处（都不改语义，只改"能不能跑完/跑多快"）
+
+* **别名栈镜像改成按 `mem_regions()` 整段拷贝。** 原来是按 4 KiB 页逐页
+  `mem_read` + `wmem`，`os::MapAliasStack` 在 300 s 裸跑里占 **35.4 s（12%）**；
+  现在先枚举已映射区间、每段一次读写，降到 **0.22 s**（同一份脚本、同样 199 帧）。
+  记录实际镜像过的区间，`UnmapAliasStack` 只回拷这些区间。
+* **lazy 映射账本缺失导致的 `UC_ERR_MAP`。** 加速后长跑第一次撞上 Yaz0 往
+  `0x146244000` 写时的 `Invalid memory mapping`：这一页在 Unicorn 里其实**已经映射**
+  （`svcMapSharedMemory` 直接调了 `mem_map`，没写进 `self.ranges`），`_map_block`
+  折半到 4 KiB 仍报"已存在"于是返回失败。现在最后一层失败会先用 `mem_read` 探测，
+  已映射就补账本。修完 `LIM=320` 无 FAULT，指标回到 199 帧 / API 1087。
+
+#### 下一步（按顺序）
+
+1. 按 tid 记录 `(cond, mutex, tag)` 的完整配对，把"有 waiter、却永远没等到 signal"
+   的那一条挑出来——`SignalProcessWideKey` 在没有等待者时丢弃是内核语义，所以要么
+   signal 早于 waiter 到达，要么 signal 根本没人发。
+2. 重点怀疑 `nn::os::MessageQueue` / `Semaphore` 的唤醒计数：我们唤醒时把 mutex 字
+   直接写成 waiter 的 tid（等价于"内核替它拿到锁"），若一次唤醒多个，互斥就被破坏，
+   对象状态可能被写坏。
+3. 顺带确认 `os::MapAliasStack` 的逐页镜像已经换成按 `mem_regions()` 整段拷贝
+   （300 s 裸跑里原来占 **35 s = 12%**）。
+4. `0x4191F830`（本作 LZ）与 `0x421209C4`（Yaz0）的宿主侧解码 HLE **放到最后**：
+   它会改变观测，必须先确认墙不是"等信号"再动。
+
 ### M4 Metal 回放
 * NVN 命令流 → MTLCommandBuffer
 * 着色器：已有 5,099 个程序 / 20.07 MiB 唯一字节码，需要 NVN 的 GPR/SH 描述 → MSL 翻译
