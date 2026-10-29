@@ -483,6 +483,11 @@ return 0x100000000 + _TICK_CALLS[0] * TICK_STEP
 
 ### M3.19 当前卡点：资源类型表全是空的（`sysTextureSampler0` 查不到）
 
+> **M3.20 更正**：本节"注册点一次都没命中 / 378 个表"的结论作废一半。
+> `0x41D41038` 只属于 `A[0]&2==0` 那条子路径，而本作数据里 `A[0]` 恒为 2；
+> `378` 与 `151` 也来自两次不同 `LIM` 的统计。真正的根因见下一节 M3.20。
+> 本节其余部分（`mgr` 是新建的、分支看 `A[1]`、入口枚举在 `[A+0x20]==0` 处跳过）仍然成立。
+
 ```
 [mem] UNMAPPED access=19 addr=0x0 size=8 pc=0x41D41A10 main+0x1D41A10
    pc=0x41D41A10  insn=ldr x21, [x9, x8]      x8=0 x9=0
@@ -541,6 +546,97 @@ A[0..0x1F] = 02 00 00 00 00 00 00 00 <ptr> 01 00 00 00 00 00 00 00 00 ...
 
 在拿到这张表之前，不要用 `0x41D41A00 → 0x41D41DFC`（"当作资源不存在、返回 -1"）那种
 诊断补丁往下走：它能过这一步，但资源是空的，后面只会以更远的方式再崩。
+
+### M3.20 `nvnProgramSetShadersExt` 返回 0，等于告诉游戏"着色器没装上"
+
+```
+[mem] UNMAPPED access=19 addr=0x0 size=8 pc=0x41D41A10 main+0x1D41A10
+   pc=0x41D41A10  insn=ldr x21, [x9, x8]      x8=0 x9=0
+   x3=0x426C25B0 "sysTextureSampler0"
+```
+
+#### 怎么定位到 NVN 的
+
+崩溃点本身看不到 NVN，得从**写 `mgr+0xD0` 的那条路径**往回找。`0x41D40D30` 的
+`A[1]==0` 分支里，收集完 6 个 stage 之后有一句 `blr`：
+
+```
+0x41D41058  mov w22, wzr                      ; 记录条数
+0x41D41068  mov x0, x20 / mov w1, w21
+0x41D41070  bl  #0x41D41E30                   ; e = entry(i) = *(A + 8 + 8i)
+0x41D41074  cbz x0, #0x41D4112C               ; 该 stage 为空就跳过（不中断循环）
+0x41D41078  ldr x8, [x0]      ; rec[0]  = e[0]      （stage 枚举）
+0x41D41084  ldr x8, [x0, #8]  ; rec[8]  = e[8]      （shader 二进制）
+0x41D4108C  ldr x8, [x0,#0x30]; rec[0x10] = e[0x30]（大小）
+0x41D41138  adrp x8,#0x42c80000 ; ldr x8,[x8,#0x310]  ← GOT 0x42C80310
+0x41D41150  blr x8                             ; (**)
+0x41D41154  tst w0, #0xff
+0x41D41158  b.eq #0x41D41178                   ; 低字节 0 → mov w22,#3 → 直接返回
+0x41D41168  ldr x8,[x20,#0x78] / str x8,[x19,#0xd0]   ; 只有成功才写 mgr+0xD0
+```
+
+`(*)` 那个 `blr` 的目标不是游戏代码，也不是真实 SDK：
+
+```
+0x42C80310 -> 0x42D2F120 -> 0x0A0005C0
+0x0A0005C0 = 动态 stub 槽 #0x105C  ->  'nvnapi:nvnProgramSetShadersExt'
+```
+
+即 `nvnProgramSetShadersExt(program, 2, NVNshaderData[2])`。这条 `NVNboolean` 返回值的
+语义是"着色器装上没有"。`m3_nvn.py` 里当时**一个 program 入口都没有**，于是 `_nvn_getproc`
+把它登记成 `_nvn_miss` → 一律 `return 0` → 游戏判定失败 → 提前返回 → 两张表都不建
+→ 几十条资源之后在 `0x41D41A10` 空指针崩掉。
+
+实测（`LIM=150`，无钩子）：
+
+```
+0x41D41150 命中 150   w22=2（每条都是 2 个 stage）
+0x41D41154 命中 150   返回字节直方图 {0: 150}     ← 修复前：全失败
+0x41D41168 命中 0                              ← 修复前：mgr+0xD0 从未写入
+```
+
+#### 关于 `+0xD8`：它不是这条路建的
+
+`str [x19,#0xd8]` 在本函数里只有 `0x41D41474` 一处，位于 `A[1]==2` 分支建反射表的地方
+（`w0=0x190` 分配 → `+0x110` 拷反射 blob → 按 `blob+0x4c` 的条目数逐项解析）。
+本作数据里 `A` 的形状**只有 `(A[0],A[1]) = (2,0)` 一种**（150 次调用全同），所以那条分支
+从不进入；`0x41D41920` 会走 `0x41D41A00` 的兼容路径，用 `[mgr+0xD0]` 这张
+"6 个 stage 指针的数组"（表 `0x4271B848 = {0,8,0x10,0x18,0x20,0x28}`）做名字查找。
+换句话说：**`+0xD0` 一填上，兼容路径就能用**，`+0xD8` 不是必要条件。
+
+#### 修复
+
+`m3_nvn.py` 新增 program 层（14 个入口）：`Initialize/Finalize/SetDebugLabel/
+SetShadersExt/SetShaders/GetStageCount/GetUniformLocation(+ByName)/
+GetUniformBlockIndex(+ByName)/GetTextureIndex/GetSamplerIndex/AddShader/AddSeparateShader`。
+`SetShadersExt` 把 0x18 字节一条的 `NVNshaderData` 记进对象镜像并**返回 1**；
+`GetUniform*` 一律 `-1`（反射表整体替身）。
+
+修复后同一脚本：
+
+```
+0x41D41154 ret w0=0x1     × 150
+0x41D41168 mgr+0xD0 <= …  × 150
+STATUS budget frames 175 draws 0     （150 s，无 FAULT）
+```
+
+帧时间线（20 s 采样）：`21 帧` 之后 frames 不再增长，`chunks` 一路涨、热页 100% 在
+`main+0x191F000`（Yaz0 解压）——**游戏进资源加载了**，这正是要的结果。
+
+#### 同轮附带
+
+* `m2_nfp.py`：`nn::nfp`（amiibo）20 个入口整体替身成"已初始化、无设备"，
+  接进 `botw_hle.py`（原来 `Initialize` 走真 SDK → `sf::SharedPointer<ISystem>` 保持 NULL
+  → `ldr x8,[x0]` 在 `0x203003C4` 崩）。
+* `AttachActivateEvent` 的 mangled name 长度前缀写错（`_ZN2nn3nfp21…` 应为 `…19…`），
+  这种错**不会报错**，只会让那一条 HLE 静默失效。接线时拿 `inventory/imports.tsv`
+  逐条比对，别靠眼睛。
+
+#### 下一步
+
+资源加载期是纯 guest 的 Yaz0 解压，慢是预期的（无钩子约 2 MIPS）。要看的是
+**加载完之后能不能走到第一个 `nvnCommandBuffer` 里有 draw 的帧**。门禁仍要求
+`m2_verify` / `m3_verify` PASS（已复跑），目标仍是 `DRAWS != 0` 才进 M4。
 
 ### M4 Metal 回放
 * NVN 命令流 → MTLCommandBuffer

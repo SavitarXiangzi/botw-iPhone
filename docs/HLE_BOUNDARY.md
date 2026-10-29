@@ -347,3 +347,30 @@ memory）→ 之后每帧 `cmd=7` / `cmd=4`（Update / RequestUpdateAudioRendere
    真机上这一步是系统层的"选用户"，移植版只需造一个固定 UID 的已登录用户。
 
 同类判据：**如果补齐它需要实现一整套"帧间状态机"，而它不产出 draw / 不产出资源，就替身。**
+
+## 实测补充：返回 `NVNboolean` 的入口不能用"返回 0"兜底（M3.20）
+
+`_nvn_miss` 的 `return 0` 只对 `void` 入口安全。凡是返回值有语义的入口，0 就是**一个答案**，
+游戏会照它走失败分支。
+
+M3.19/M3.20 的实例：
+
+* `0x41D41150` 的 `blr` 走 `GOT 0x42C80310 → 0x42D2F120 → 0x0A0005C0`，
+  `0x0A0005C0` 是动态 stub 槽 `#0x105C`，反查回来是 `nvnapi:nvnProgramSetShadersExt`。
+* 它的真身签名是 `NVNboolean nvnProgramSetShadersExt(NVNprogram, int, const NVNshaderData*)`，
+  `0` = 失败。我们返回 0，游戏就把"program 建好了"的后续（写 `mgr+0xD0`/`+0xD8`）整段跳过，
+  **几十条资源之后**才在别处以空指针崩掉——崩溃点离根因隔着一整个资源循环，栈上看不出关系。
+
+判据与做法：
+
+1. 遇到 `blr` 到 `GOT → 0x0A000xxx` 的调用点，先反查符号：
+   `k.stub_by_desc`（desc → 地址）、`k.hle_slots[0x1000+((addr-0x0A000000)//0x10)]`。
+   不知道调的是谁，就别猜返回值。
+2. 返回值是 `NVNboolean`（1=成功）、指针、句柄的入口一律显式实现；
+   只有真正的 `void` 入口才可以交给 `_nvn_miss`。
+3. 同一类坑还有"`w0` 低字节被当布尔用"（`tst w0,#0xff`）和"返回 -1 表示找不到"：
+   这类入口的返回值是**协议**，不是随便填的整数。
+
+附带一条命名坑：mangled name 里的数字是**名字长度**，
+`_ZN2nn3nfp19AttachActivateEventE…` 写成 `…21AttachActivateEvent…` 不会报错，
+只会让那条 HLE 静默失效（`m2_nfp.py` 里真出现过）。接线后用导入表逐条比对。
