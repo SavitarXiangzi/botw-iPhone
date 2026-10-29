@@ -293,6 +293,10 @@ TryReceiveMessageQueue` 四个入口打点（每次记 tid / queue / msg），�
 时间几乎都花在把 140 MB 的 `TitleBG.pack` 拷进 guest 内存上，后面可用
 `mmap + 一次 memcpy`（或直接让 guest 读宿主映射）替掉逐块 `mem_write`。
 
+> 更正（M3.14）：上面那段「停在 21 帧」的观测全部是在 `UC_HOOK_BLOCK` 采样下做的（约 2 MIPS）。
+> 关掉钩子后有 19 MIPS，同一份资产预载 70 秒就跑完并进入标题画面（175 帧 / API 895），
+> 所以这里既不是死锁，也不只是「模拟器慢」，而是**采样本身把速度压了 50 倍**。
+
 ### M3.13 一次 `fs::ReadFile` 里的 2247 次 `uc.mem_map`（25.9 s）
 
 上一节结尾记的"性能债"是错的：那 26 s **不是**在拷 140 MB 数据。
