@@ -180,6 +180,28 @@ AT90C  obj=0x19B739000  p20=0x19B739038                             <- +0x20 已
 下一步：给 `pwkey/pwsig` 加按 condvar 地址的计数与等待者快照，找出“谁该 signal、
 为什么落空”；同时复核 `svcSignalProcessWideKey` 的 count 语义（`<=0` / 全唤醒）。
 
+**本轮复查结果**（已做的两处修正）：
+
+* `pwsig`（“落空信号记账”）是错的：真实内核在没有等待者时**丢弃** signal。
+  实测它堆出了 67 / 28 / 21 个幽灵令牌，制造伪唤醒。已删除，改为内核语义。
+* `svcWaitProcessWideKeyAtomic` 的 `timeout` 之前被忽略；现已支持
+  `timeout==0` → 立即 `0xEA01`，有限超时在全阻塞时按 `0xEA01` 放行。
+* `svcSignalProcessWideKey` 的 count：`-1` 全唤醒、`0` 不唤醒、其余按个数。
+
+修正后门禁仍 PASS，但 21 帧后依然停住。现场：
+
+```
+MAIN state=blocked pc=0x2037ec38 lr=0x20324ce8     <- 卡在 WaitLightEvent
+worker 0x101..0x10E: pc=0x2037eb40 (WaitProcessWideKeyAtomic)
+WAITERS: 11 个 condvar 各 1 个等待者，timeout 全是 -1
+```
+
+主线程等的 LightEvent `0x111bc37a0` 与 worker 的 condvar `0x111bc36a4/6a8`
+在同一块对象里，SVC 日志尾部是二者高频 ping-pong（每轮都成功 wake，但
+`BEGIN/END` 帧数不涨）。下一步应从 `0x4126CF74`（任务队列入口）和
+`0x4192xxxx`（主线程 LEvent 等待函数）两头对，确认是“队列永远有假任务”
+还是“主线程在等一个不会再来的完成事件”。
+
 ### M4 Metal 回放
 * NVN 命令流 → MTLCommandBuffer
 * 着色器：已有 5,099 个程序 / 20.07 MiB 唯一字节码，需要 NVN 的 GPR/SH 描述 → MSL 翻译
