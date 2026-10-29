@@ -26,14 +26,37 @@ docs/           路线图、HLE 边界说明
 | M2.5 | Horizon 线程 + IPC/CMIF 服务端（hid/sm/pctl） | 🟢 主循环已跑起来 |
 | M3 | NVN 对象层 + 命令流录制（`m3_nvn.py`） | 🟢 对象/记录已就绪，draw=0（游戏还没提交几何） |
 | M3.8 | LightEvent 同步（SVC 0x34/0x35），资源加载真正完成 | ✅ 53 MB FSHA 可完整落盘并重定位 |
-| M3.10 | `mrs CNTPCT_EL0` 恒为 0 → `GetSystemTick` HLE 到宿主时钟 | ✅ 定时/超时循环不再自旋 |
+| M3.10 | `mrs CNTPCT_EL0` 恒为 0 → `GetSystemTick` 改成 HLE（**宿主时钟那版已被 M3.18 取代**） | ✅ 定时/超时循环不再自旋 |
 | M3.11 | `svcSleepThread` 从"空让出"改为真按 ns 挂起 | ✅ 空闲轮询不再吃满 CPU |
 | M3.13 | `fs::ReadFile` 的 147 MB 缓冲区被逐 64 KiB 提交（2247 次 `mem_map`）→ HLE 时间 27.9 s 降到 0.27 s | ✅ |
 | M3.14 | `UC_HOOK_BLOCK` 53 倍代价：热页采样下 2 MIPS，无钩子 19 MIPS；长跑一律无钩子 | ✅ |
 | M3.15 | `nvnBufferMap` / `nvnMemoryPoolMap(MapVirtual)` 签名写错，往脏 `x1` 写 8 字节 | ✅ |
+| M3.16 | 纹理存储尺寸：`BPP` 表漏 `DEPTH16`、RG8/RG16 记错，块压缩格式全缺 → 解码器越界覆盖空闲块头 | ✅ |
+| M3.17 | `audren` 更新协议不可补，音频/账号客户端入口整体替身（`m2_audio.py` / `m2_account.py`） | ✅ |
+| M3.18 | 时间源虚拟化：`GetSystemTick` 接宿主时钟导致同一份脚本跑出 21 帧 / 8 帧两种结果 | ✅ |
 | M4 | NVN → Metal 回放（管线/纹理/命令缓冲） | ⬜ |
 | M5 | 音频（nn::audio → AVAudioEngine）、输入 | ⬜ |
 | M6 | 真机性能与内存（6 GB 机型起步） | ⬜ |
+
+### 最新一段（M3.16 → M3.19）
+
+无钩子长跑现在的极限是 **175 帧 / API 895 / draws 0**，卡在资源系统：
+
+* **M3.16** `nvnTextureBuilderGetStorageSize` 的 `BPP` 表错（RG8/RG16 记错、`DEPTH16`
+  缺失、DXT/RGTC/BPTC/ASTC 全缺）→ 返回偏小 → 游戏按它开 pool → 法线图解码器写满就越界，
+  覆盖了分配器的空闲块头。修完这个 FAULT 消失。
+* **M3.17** 音频 `audren:u` 的更新协议等价于重写一遍 yuzu 的 audren 服务端，而它对"第一帧
+  Draw"毫无贡献 → 把碰 IPC 的客户端入口整体替身（18 个），纯计算的 config/voice 仍让 guest
+  真跑。顺带修掉 `GetMemoryPoolState` 的 5 ms 轮询死等，以及 `nn::account` 的 NULL 全局。
+* **M3.18** `nn::os::GetSystemTick` 原来接宿主单调时钟 → guest 的超时按宿主时间算，宿主被
+  抢占就"更慢"，同一份脚本 60 s 能到 21 帧、被占满时 200 s 只到 8 帧。改为每次调用前进固定
+  tick（`BOTW_TICK_STEP`），换回确定性。
+* **M3.19（当前卡点）** 走到"解析 `sysTextureSampler0`"这一步时，设备资源类型表
+  `[mgr+0xD0]`/`[mgr+0xD8]` 是空的；`mgr` 是刚由 `0x41D40D30` 新建的（写入监视证明不是被
+  Yaz0 覆盖），而它的"模式"字节来自 `A[0] == 2`，那条分支什么都不注册就返回成功。
+  `fs` 侧 21 次 open 全部成功、没有 MISSING。
+
+细节、地址与下一步实验都在 [`docs/ROADMAP.md`](docs/ROADMAP.md) 的 M3.16–M3.19。
 
 ## M2 进展
 

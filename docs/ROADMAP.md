@@ -382,29 +382,151 @@ Python 看表）后，真实吞吐约 **19 MIPS**，同一台机器的同一份�
 
 修完这三处，同一无钩子跑法从 160 帧推进到 **175 帧 / API 895**。
 
-### M3.16 当前卡点：空闲链表里的块被纹理解码覆盖
+### M3.16 纹素解码越界：`BPP` 表漏了 DEPTH16、RG8/RG16 记错（已修）
 
-无钩子跑到 175 帧后停在 `main+0x125B1D4`（`str x13, [x15, #8]`，
-`x15=0x32577E6E6871858B`）。`x19=0x19F190170` 是游戏自己的分配器，
-`x8=0x1A026D000` 是它从最佳适配链表里挑出的块。对 `0x1A026D000` 这一页做写入
-监视，时间线非常干净：
+上一轮把 `0x1A026D000` 的写入时间线拍下来以后，结论是"一块还在空闲链表里的内存被法线
+图解码器整块覆盖"。顺着"缓冲区比游戏以为的小"这条线查 `nvnTextureBuilderGetStorageSize`，
+根因在 `tools/m3_nvn.py` 的 `BPP` 表：
 
-| 时刻 | 写入者 | 动作 |
+| 格式 | 旧值 | 真值 |
 |---|---|---|
-| t=82.0 s | `main+0x125B0D0` | 分配器在 `0x1A026D000` 写**空闲块头**（size `0x26B1AFE0`，flag `0xFFFF`） |
-| t=82.1 s | `main+0x125B2E0` | 把该块**链入**空闲链表（`prev=next=0x19F190250` 表头） |
-| t=96.6 s | `main+0x181D9E4` | **纹理解码器**（`fcvt`+`strb` 逐字节，浮点 clamp 到 [0,1]，典型法线图解码）把整块覆盖成像素数据 |
-| t=111 s | `main+0x125B1A8/1D4` | 分配器再次扫描空闲链表、挑中这个块，取 `[x8]`/`[x8+8]` 当 prev/next 去摘链 → 野指针 → FAULT |
+| RG8 | 4 | 2 |
+| RG16 | 4 | 4 |
+| DEPTH16 | 缺项（退回 4） | 2 |
+| DXT1/3/5、RGTC1/2、BPTC、ASTC | 未列，按 4 B/像素 | 按 4x4 块计 |
 
-也就是说：**一块还在空闲链表里的内存，被一个已经拿到的纹理缓冲区覆盖了**。
-两种可能，下一步二分：
+返回值偏小 → 游戏按这个值开 NVN pool → 法线图解码器按真实纹素尺寸写满，越界覆盖
+`0x1A026D000` 的空闲块头 → 分配器摘链时拿到野指针（`main+0x125B1D4`）。
 
-1. 更早的空闲链表中被插入过重复块 / 尺寸错乱（分配器元数据先行损坏）
-2. 解码器的目标指针（`main+0x181DCA8` 的返回值链 `0x4180C49C` → `0x418357F4`
-   → `0x40E3AA00`）来自我们某个 HLE 返回的错误指针，落进了空闲块里
+修法（`m3_nvn.py`，备份 `m3_nvn.py.bak_texsize`）：
 
-验证手段已经就位：`_probe_watch4.py` 那一套"只监视某 64 字节 + 打时间戳和 PC"，
-把监视窗口挪到解码器缓冲区的起点，就能看到它到底是从哪次分配拿到的。
+* `BPP` 按 `nvn.h` 的 `NVNformat` 枚举重写，补上 `DEPTH16`
+* 新增 `BLOCK`：DXT1/3/5、RGTC1/2、BPTC、ASTC（含 SRGB 变体）
+* `_surface_size(fmt,w,h,depth)` / `_tex_size(fmt,w,h,levels,layers,depth)`，按 mip/array/depth 累加
+* 所有调用点补 `b.get('d',1)`（3D 纹理的 depth）
+
+验证：`fmt=0x1 w=32 h=32 levels=6` 的存储需求从 `0x1000` 变成 `0x16000`（6 级 mip 累加），
+分配器那个 FAULT 不再出现。
+
+### M3.17 audren 更新协议不可补：音频/账号的客户端入口整体替身
+
+修掉纹素池后，无钩子跑到 175 帧进入音频初始化，停在 `svcBreak`：
+
+```
+[ipc] audren:u cmd=1 args=0000BB80 000000F0 0000001E 00000001 00000060 00000001   ×4
+[ipc] audren:u cmd=0 ...（带 transfer memory 0xA0E75000）
+[ipc] ?        cmd=7     ← 未知句柄
+[ipc] ?        cmd=4
+===== svcBreak =====  sdk+0x1801E8 diag::detail::Abort
+   Abort(Result*): 0x00000000      ← 纯断言，不是 Result 码
+```
+
+`OpenAudioRenderer` 没有返回会话句柄，后面的 `UpdateAudioRenderer` /
+`RequestUpdateAudioRenderer` 落在未知句柄上，我们回空 payload，客户端读栈上垃圾 →
+`NN_ASSERT` → `Abort(0)`。
+
+补齐 audren 的更新协议（voice / mix / sink / memory-pool 的 in/out 参数块）等于把 yuzu 的
+audren 服务端重写一遍，而这一层对"第一帧 NVN Draw"毫无贡献。按 M2 的边界原则：**碰 IPC /
+设备的入口整体替身，纯计算的留在 guest 真跑**。
+
+新增 `tools/m2_audio.py`（18 个入口）：
+
+| 类别 | 入口 | 行为 |
+|---|---|---|
+| 工作区 | `GetAudioRendererWorkBufferSize` / `...ConfigWorkBufferSize` | 4 MiB |
+| 生命周期 | `Open`/`Start`/`Stop`/`Close`AudioRenderer | 写假句柄 `0x41444F0000000001`，不开服务 |
+| 每帧 | `RequestUpdateAudioRenderer` | 直接 0（先不出声，M5 补 mixer） |
+| 内存池 | `GetMemoryPoolState` / `IsMemoryPoolAttached` | **恒 1（Attached）** |
+| 设备 | `GetActiveChannelCount` / `ListAudioDeviceName` / `SetAudioDeviceOutputVolume` | 2 声道 / 1 个 `DeviceOut` |
+
+保留原生：`InitializeAudioRendererParameter` / `InitializeAudioRendererConfig` /
+`AcquireVoiceSlot` / `SetVoiceXxx` / `AddDeviceSink` —— 它们只改 guest 内存里的 config。
+
+**`GetMemoryPoolState` 必须直接返回 1。** 渲染器整个替身掉以后，真机那条
+`RequestAttach → 下一帧服务端把状态翻成 Attached` 永远不会发生，音频线程就卡在
+`main+0x1CF9698` 的 5 ms 轮询里（实测 16370 次/10 s，主线程 61% 的采样落在
+`nn::os::GetSystemTick`）。直接回答"已挂载"后恢复推进。
+
+修完 audren 之后撞上 `nn::account::ListAllUsers`（`pc=0x2003B710 ldr x8,[x0]`，`x0=0`）：
+`nn::account::Initialize` 走的是真实 IPC，我们伪造的空服务让它静默失败、SDK 全局保持
+NULL，`ListAllUsers` 于是解引用 0。真机这一步是"选用户"，是系统层的事。新增
+`tools/m2_account.py`（4 个入口）造一个固定 UID（`0x0000B07A00000001`）的已登录用户：
+`Initialize` / `ListAllUsers`（回 1 个用户）/ `OpenPreselectedUser` / `GetUserId`。
+
+### M3.18 时间源必须虚拟化：宿主时钟让同一份脚本跑出两种结果（已修）
+
+这一轮最值钱的一条观测，是在改任何东西之前先做对照：
+
+| 条件 | 同一份 `_probe_obj.py`，60 s |
+|---|---|
+| 机器空闲 | 21 帧 / 797 MiB / 1416 块 |
+| 机器被别的 python 占满 | 200 s 只到 **8 帧 / 340 MiB** |
+
+根因是 M3.10 那个修法本身：`nn::os::GetSystemTick` 被接到了宿主 `time.monotonic()`。
+guest 里所有 `while (now - t0 < T)` 的超时于是**按宿主时间算**——宿主被抢占，guest 就
+"更慢"，同一份二进制在不同负载下走不同分支。此前"175 帧 vs 21 帧"的分歧有一部分就是它。
+
+改成**每次读 tick 前进固定量**（`BOTW_TICK_STEP`，默认 4096 tick ≈ 213 µs）：
+
+```python
+_TICK_CALLS[0] += 1
+return 0x100000000 + _TICK_CALLS[0] * TICK_STEP
+```
+
+* 确定性：与宿主负载无关
+* 任何忙等最多 STEP 次调用就超时
+* 代价：guest 侧"每帧多少毫秒"不再真实。帧节流 / 物理 dt 要等 M4 有真 present 环再重做
+  ——Unicorn 在无钩子模式下不给逐条指令计数（`self.instr` 只在带 trace 钩子时累加），
+  暂时拿不到"按指令数走"的时钟。
+
+改完复测：无钩子仍然 175 帧、仍然撞同一个资源 FAULT —— 它没有掩盖问题。
+
+### M3.19 当前卡点：设备资源类型表是空的（`sysTextureSampler0` 查不到）
+
+```
+[mem] UNMAPPED access=19 addr=0x0 size=8 pc=0x41D41A10 main+0x1D41A10
+   pc=0x41D41A10  insn=ldr x21, [x9, x8]      x8=0 x9=0
+   x3=0x426C25B0 "sysTextureSampler0"
+```
+
+调用链（下面这几层都是精确 PC，不是栈扫描猜的）：
+
+| 地址 | 作用 |
+|---|---|
+| `0x41D6A89C` | 遍历 `*(ctx+0x20)` 里的 0x40 字节条目：条目 `+0x00` = `B`，`+0x10` = `A` |
+| `0x41D6A8CC` | `0x41D40D30([A+0x68], dev, A)` —— 按需要建/初始化"设备资源表" |
+| `0x41D6A924` | `0x41D6AFF0(slot, entry, state)` → `slot+8 = [[entry+0x10]+0x68]` |
+| `0x41D6B020` | `LoadResult` 构造：依次解析 `sysEmtMat2Buff` / `sysTextureSampler0/1` / `sysFrameBufferTexture` |
+| `0x41D41920` | 按名字查表：`x22=[mgr+0xD8]` 为 0 时走 `0x41D41A00` 兼容路径，`[mgr+0xD0]` 也是 0 → 空指针 |
+
+实测 `entry=0x142E720C0`、`A=0x142E8B400`、`[A+0x68]=mgr=0x143239918`。对
+`0x143239880..0x143239B00`（含 `mgr` 上下 0x280 字节）挂写入监视，645 次写里
+**639 次是 Yaz0 按字节解压**（这块内存原来是解压缓冲），紧接着 4 次是 `0x41D40D30`
+自己在建对象：
+
+```
+#643 W pc=0x41D40D58 addr=0x143239920 val=0x143239928   ; mgr+0x08 = mgr+0x10（内联缓冲）
+#644 W pc=0x41D40D60 addr=0x143239919 val=0x02          ; mgr+0x01 = [A] = 2（模式）
+```
+
+**对象是新建的，不是被覆盖**：建完之后 `mgr+0xD0`/`mgr+0xD8`（6 类 × 6 模式的类型表）
+仍然是 0。而 `0x41D40D30` 里 `mgr+1` 是从 `A[0]` 拷过来的，值为 2 时走 `0x41D41050`
+这条分支——`mov w22,#1; b 尾`，**什么都不注册、直接返回成功**。
+
+同一时刻 `fs` 侧没有异常：`BOTW_FSLOG=1` 打出的 21 次 open 全部成功，包括
+`System/Resource/ResourceSizeTable.product.srsizetable`、`Actor/ActorInfo.product.sbyml`、
+四个 `Pack/*.pack`、`Sound/DummySound.bfsar`，没有一次 MISSING。
+
+下一步是弄清 `A[0]==2` 是谁写进去的、"模式 2"到底表示什么：
+
+* `A` 是 `*(ctx+0x20)` 里第 i 个 0x40 条目的 `+0x10`；同一条目 `+0x00` 是 `B`，本次跑里
+  `B == 0`，于是 `0x41D6A8D0` 的 `cmp/ccmp` 落到 `w22=0`（"没有备用表"）。
+* 要在**第一次**进 `0x41D40D30` 时 dump `A`/`B`、`[A+0]` 的字节，以及 `mgr+0xD0` 指向的
+  6 项类别表（`0x4271B848` = `{0,8,0x10,0x18,0x20,0x28}`，模式表在 `0x4271B878` /
+  `0x4271B8A8`），跟真值对比。
+
+在拿到这张表之前，不要用 `0x41D41A00 → 0x41D41DFC`（"当作资源不存在、返回 -1"）那种
+诊断补丁往下走：它能过这一步，但资源是空的，后面只会以更远的方式再崩。
 
 ### M4 Metal 回放
 * NVN 命令流 → MTLCommandBuffer

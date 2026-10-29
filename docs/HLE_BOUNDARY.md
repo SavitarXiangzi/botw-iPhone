@@ -317,3 +317,33 @@ guest 会把这些地址存进自己的函数表并在运行期调用，所以�
 * `find_svc()` 以前会**跳过**未登记的 stub 槽，导致"未登记"和"没有 svc"
   两种情况表现一样。现在 `handle_svc` 对未登记槽单独记 `stub_unregistered`
   并当作空实现返回，不再直接掉进 `udf`。
+
+## 实测补充：服务端协议不必补全，客户端入口可以整体替身（M3.17）
+
+边界原则里最容易走偏的一条是"游戏调了 IPC，就去把那个服务实现出来"。音频给出了反例。
+
+`audren:u` 的调用序列是 `cmd=1`（问工作区大小）×4 → `cmd=0`（OpenAudioRenderer，带 transfer
+memory）→ 之后每帧 `cmd=7` / `cmd=4`（Update / RequestUpdateAudioRenderer）。这两条命令的
+出参是一整套 `AudioRendererUpdateDataHeader`（voices / mixes / sinks / memory pools 的 in/out
+参数块）。我们回了空 payload，客户端读到栈上垃圾 → `NN_ASSERT` → `Abort(0)`
+（注意 `Abort(Result*)` 的参数是 0，是纯断言，不是 Result 码——不要按错误码去查）。
+
+正面补齐这套协议 = 把 yuzu 的 audren 服务端重写一遍，而它对"第一帧 NVN Draw"毫无贡献。
+正确的切法是**按客户端入口切，而不是按服务端命令切**：
+
+* 碰 IPC / 设备的那几个入口整体替身（`Open/Start/Stop/Close AudioRenderer`、
+  `RequestUpdateAudioRenderer`、`GetMemoryPoolState`、`ListAudioDeviceName` …）
+* 只改 guest 内存的纯计算入口继续让 guest 真跑
+  （`InitializeAudioRendererParameter`、`InitializeAudioRendererConfig`、
+  `AcquireVoiceSlot`、`SetVoiceXxx`、`AddDeviceSink`）
+
+替身以后有两个必须自己回答的状态机，否则游戏会安静地卡死：
+
+1. `RequestAttachMemoryPool` 之后服务端本该在下一帧把状态翻成 `Attached`。替身掉的渲染器
+   永远不会翻，音频线程就卡在 `main+0x1CF9698` 的 5 ms 轮询里（实测 16370 次/10 s）。
+   → `GetMemoryPoolState` 直接返回 1。
+2. `nn::account::Initialize` 走真实 IPC 时会被我们伪造的空服务"成功"骗过去，SDK 全局保持
+   NULL，后面的 `ListAllUsers` 解引用 0（`pc=0x2003B710 ldr x8,[x0]`，`x0=0`）。
+   真机上这一步是系统层的"选用户"，移植版只需造一个固定 UID 的已登录用户。
+
+同类判据：**如果补齐它需要实现一整套"帧间状态机"，而它不产出 draw / 不产出资源，就替身。**
