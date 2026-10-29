@@ -36,11 +36,13 @@ docs/           路线图、HLE 边界说明
 | M3.18 | 时间源虚拟化：`GetSystemTick` 接宿主时钟导致同一份脚本跑出 21 帧 / 8 帧两种结果 | ✅ |
 | M3.19 | 资源表是**新建的空表**而不是被覆盖；分支看 `A[1]`（结论已按 M3.20 更正） | ✅ |
 | M3.20 | `nvnProgramSetShadersExt` 返回 0 = false，游戏判定着色器没装上 → `+0xD0/+0xD8` 空表 → 空指针崩溃 | ✅ 崩溃已消失 |
+| M3.21 | `draws=0` 曾是假指标：`nvnDrawArrays` 一族未实现，全是静默 no-op | ✅ 已如实计数 |
+| M3.22 | 存档挂载 → 线程别名栈（pc=0）→ `nn::time` → applet 启动参数，四道门连续推平 | ✅ 300 s 无 FAULT |
 | M4 | NVN → Metal 回放（管线/纹理/命令缓冲） | ⬜ |
 | M5 | 音频（nn::audio → AVAudioEngine）、输入 | ⬜ |
 | M6 | 真机性能与内存（6 GB 机型起步） | ⬜ |
 
-### 最新一段（M3.16 → M3.20）
+### 最新一段（M3.16 → M3.22）
 
 无钩子长跑现在的极限是 **175 帧 / API 895 / draws 0**，卡在资源系统：
 
@@ -67,7 +69,20 @@ docs/           路线图、HLE 边界说明
   同一轮还接上了 `nn::nfp` 的 20 个入口（`m2_nfp.py`，"已初始化、无设备"），并修掉
   `AttachActivateEvent` 的 mangled name 长度前缀（`21`→`19`）——差一个字符整条 HLE 就不生效。
 
-细节、地址与下一步实验都在 [`docs/ROADMAP.md`](docs/ROADMAP.md) 的 M3.16–M3.20。
+* **M3.21** `m3_nvn.py` 里 `OP_DRAW`/`OP_DRAW_IDX`/`OP_DISPATCH` 只存在于名字表里，
+  `nvnDrawArrays` 一族**一个都没实现**，全落进 `_nvn_miss` 静默丢——所以那之前的
+  `draws=0` 是结构性假象，不能当成"游戏没画"。现在补了 8 个入口（含实例化/multi/dispatch）
+  并如实计数，`DRAWS != 0` 才是可信的 M4 判据。
+* **M3.22（本轮）** 资源系统通了之后连续四道门：① `nn::fs::MountSaveData` 缺失 →
+  `Abort(0x1A80A)`（fs 模块），改成把 `save:` 映射到私有宿主目录，存档是真文件但不入库；
+  ② 线程启动 `pc=0` FAULT —— `MapAliasStack` 的参数被解读错（`x0` 是 this、`x1` 才是别名、
+  `x2` 源栈、`x3` size），别名区永远是零页，`*(stack_top-0x20)` 取到的入口是 0，改成按 4 KiB
+  页镜像主栈（源栈懒提交，必须逐页容错）；③ `nn::time` 7 个入口要求 `time:u` 的共享内存 →
+  改为固定时钟（2020-01-01T12:00:00Z）；④ `applet::TryPopFromApplicationParameterChannel`
+  （SDK 内部调用，main 不导入）答"没有启动参数"。300 s 无钩子长跑：175 帧 → `time` 通过 →
+  持续解包（chunks 2116→4945）、无 FAULT、`committed` 1151 MiB 持平。
+
+细节、地址与下一步实验都在 [`docs/ROADMAP.md`](docs/ROADMAP.md) 的 M3.16–M3.22。
 
 ## M2 进展
 

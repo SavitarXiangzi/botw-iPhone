@@ -374,3 +374,31 @@ M3.19/M3.20 的实例：
 附带一条命名坑：mangled name 里的数字是**名字长度**，
 `_ZN2nn3nfp19AttachActivateEventE…` 写成 `…21AttachActivateEvent…` 不会报错，
 只会让那条 HLE 静默失效（`m2_nfp.py` 里真出现过）。接线后用导入表逐条比对。
+
+## 实测补充：别名映射不可"接受但不做"（M3.22）
+
+Horizon 给每个线程栈映射**两次**：宿主地址一份、别名地址一份（别名在
+`0x80000000..0xA0000000` 那块 arena 里），线程实际跑在别名那份上。Unicorn 没有
+"两段虚拟地址指向同一组物理页"这种能力，早期实现就"接受映射、什么都不做"。
+
+代价在几十秒后才出现，而且现场完全看不出跟线程栈有关：
+
+```
+[mem] UNMAPPED addr=0x0 size=4 pc=0x0      ; 新线程跳到空函数指针
+   lr=0x2032E294 ThreadManagerImplByHorizon::CreateThread
+```
+
+因为 SDK 的 trampoline 是这么取入口的：`*(stack_top - 0x20)`。创建时入口确实被写进了
+主栈，但 `MapAliasStack` 之后 `ThreadType+0x50` 被改写成别名基址，别名区又是全新零页
+→ 读到 0。
+
+两个必须记住的点：
+
+1. **参数顺序不要猜**。`MapAliasStack(this, alias, src, size)`：`x0` 是
+   `ThreadManagerImplByHorizon` 单例（`0x20CA5BB8`），不是源地址。按 (src,dst,size)
+   解读会得到"看起来跑了、其实没做"的实现——最糟的一种 bug。
+2. 镜像要**按页**做：源栈是懒提交的，`mem_read` 整块会 `UC_ERR_READ_UNMAPPED`；
+   逐 4 KiB 页拷贝、遇到未映射页跳过，就够了（一个线程栈最多几 MB）。
+
+真正的修复是把内容拷过去（映射时 主→别名，卸载时 别名→主）。完整别名语义要等换掉
+Unicorn 才有，但那属于 M6 的事；现在这一层只要保证"trampoline 能取到入口、线程能跑"。

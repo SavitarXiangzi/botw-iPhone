@@ -638,6 +638,94 @@ STATUS budget frames 175 draws 0     （150 s，无 FAULT）
 **加载完之后能不能走到第一个 `nvnCommandBuffer` 里有 draw 的帧**。门禁仍要求
 `m2_verify` / `m3_verify` PASS（已复跑），目标仍是 `DRAWS != 0` 才进 M4。
 
+### M3.21 `draws=0` 之前是个假指标：`nvnDrawArrays` 一族根本没实现
+
+`m3_nvn.py` 里 `OP_DRAW / OP_DRAW_IDX / OP_DISPATCH` 只出现在 `OPNAME` 字典里，
+**没有任何入口会 emit 它们**：`nvnDrawArrays` / `nvnDrawElements` /
+`...Instanced` / `nvnMultiDraw*` / `nvnDispatchCompute*` 一个都没登记，全落进
+`_nvn_miss` 变成静默 no-op。于是 `DRAWS[0]` 是**结构性**的 0——"游戏还没提交几何"
+这个结论当时并没有证据支撑。
+
+补上 8 个入口（含实例化/multi/dispatch），如实计数并把参数记进命令流。从现在起
+`DRAWS != 0` 才可以作为进 M4 的判据。
+
+### M3.22 一口气过四道门：存档挂载 → 线程别名栈 → nn::time → applet 启动参数
+
+M3.20 之后资源系统不再崩，长跑停在 175 帧。这一节是"顺着 Abort/FAULT 一路往下推"
+的四步，每一步都有确定的现场。
+
+#### 1. `nn::fs::MountSaveData`（Abort 0x1A80A）
+
+```
+svcBreak pc=0x2037EBA4  Abort(Result*): 0x0001A80A  module=10 description=212
+stack: nn::fs::MountSaveData(char const*, nn::account::Uid)
+```
+
+module 10 = `fs`。BOTW 在进标题之前要挂存档，我们没这个入口 → 真 SDK 去连
+`fsp-srv` 的存档会话 → 失败断言。移植版把 `save:` 映射到私有宿主目录
+（`BOTW_SAVE_ROOT`，默认 `tools/save`），补 `CommitSaveData` / `CreateFile` / `DeleteFile`。
+存档是**真文件**：可复现，也能直接删掉重来，但不进版本库。
+
+#### 2. 线程别名栈：`MapAliasStack` 的参数全解读错了（pc=0 FAULT）
+
+```
+[mem] UNMAPPED addr=0x0 size=4 pc=0x0
+   lr=0x2032E294 ThreadManagerImplByHorizon::CreateThread   sp=0x815D9FC0
+```
+
+`pc=0` 是新线程启动时**跳到空函数指针**。SDK 的 trampoline（`0x2032E240`）这样取入口：
+
+```
+0x2032E280  ldp x8, x9, [x19, #0x50]     ; ThreadType+0x50 = 栈基址字段, +0x58 = size
+0x2032E284  add x8, x9, x8
+0x2032E288  ldur x8, [x8, #-0x20]        ; *(stack_top - 0x20) = 入口
+0x2032E290  blr x8
+```
+
+创建时 SDK 确实把入口写到了 `*(stack_top-0x20)`（`0x2032E0B4`），但随后
+`MapAliasStack` 把 `ThreadType+0x50` **改写成了别名地址**，而线程跑在别名那份上：
+
+```
+[CT] tt=0x1AB168020 +50=0x9F0C8000 base=0x9F1C8000  entry written @0x9F1C7FE0
+[TR] tt=0x1AB168020 +50=0x1AB068000 read @0x1AB167FE0 = 0x0     <- 别名是全新零页
+```
+
+原实现的三个参数全错了：`x0` 是 `this`（`ThreadManagerImplByHorizon` 单例
+`0x20CA5BB8`）、`x1` 才是别名地址、`x2` 是源栈、`x3` 是 size——被当成
+(src, dst, size) 用，于是"接受映射但什么都不做"。Unicorn 不能真让两段虚拟地址
+指向同一组物理页，所以改成**按 4 KiB 页把主栈镜像到别名区**（源栈是懒提交的，
+整块读会 `UC_ERR_READ_UNMAPPED`，必须逐页容错），卸载时再拷回去。
+
+#### 3. `nn::time`（`Abort(Result*=0)`，纯断言）
+
+`nn::time::Initialize` 向 `time:u` 要标准用户时钟/稳态时钟的共享内存，我们回空
+payload → `g_SharedMemoryClient` 保持 NULL → 断言。移植版给**固定时间**
+（2020-01-01 12:00:00Z），7 个入口全部替身：`Initialize/Finalize/IsInitialized/
+StandardUserSystemClock::GetCurrentTime/StandardSteadyClock::GetCurrentTimePoint/
+GetSpanBetween/ToCalendarTime`。原则同 M3.18：guest 看到的时间不能依赖宿主。
+
+#### 4. `nn::applet::TryPopFromApplicationParameterChannel`
+
+`nn::time` 之后解引用 NULL 的是它。注意这个入口 **main 不导入**，是 SDK 自己调的
+（导出符号在 sdk 里），所以按符号名接管；答案固定为"没有启动参数"（返回 false，出参清零）。
+
+顺带踩到本轮的**第二个** mangled name 坑：符号真实名字末尾还有一个 `E`
+（`…LaunchParameterKindE`），少写就静默不生效。为此 `m1_kern._install_hle` 现在装完
+会打一行汇总：
+
+```
+[hle] 126 entries installed, 4 missing  <- os::FreeMemoryBlock, account::CloseUser, ...
+```
+
+（那 4 条是历史遗留的防御性重载，本 SDK 里没有对应符号，无害但会一直列出来。）
+
+#### 当前状态
+
+`LIM=300`、无钩子：175 帧在 ~80 s 到；`[time] Initialize` 在 ~190 s 通过；
+之后到 300 s **没有 FAULT**，`chunks` 从 2116 稳定涨到 4945（资源解包），
+`committed` 持平 1151 MiB。`draws` 仍为 0——现在这个 0 是**可信的**（见 M3.21），
+说明游戏还在加载，没有提交几何。
+
 ### M4 Metal 回放
 * NVN 命令流 → MTLCommandBuffer
 * 着色器：已有 5,099 个程序 / 20.07 MiB 唯一字节码，需要 NVN 的 GPR/SH 描述 → MSL 翻译
