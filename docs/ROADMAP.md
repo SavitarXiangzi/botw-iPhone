@@ -202,6 +202,97 @@ WAITERS: 11 个 condvar 各 1 个等待者，timeout 全是 -1
 `0x4192xxxx`（主线程 LEvent 等待函数）两头对，确认是“队列永远有假任务”
 还是“主线程在等一个不会再来的完成事件”。
 
+### M3.10 `mrs CNTPCT_EL0` 恒为 0：guest 里所有"按时间等待"都永不超时
+
+追这一轮卡点时先做的是**量化**：每 10 秒采一次 `BEGIN/API/END` 和块级热页直方图。
+结果是第 21 帧之后 **99% 的块采样都落在 `main+0x191F000` 一个页里**，其它线程寸步难行。
+
+那个页里的循环（`main+0x1F0F0` 起）：
+
+```
+TryPeekMessageQueue(&msg, &queue)   // 没消息就退
+now = GetSystemTick()
+if (now - t0 > 1s)  -> 处理/清理分支
+else                -> SleepThread(ConvertToTimeSpan(timeout/N)); 再看一次队列
+```
+
+`x25`（超时阈值）在运行期读出来是 `0x124F800` = 19,200,000，正好是 1 秒。
+也就是说这是一个**带 1 秒超时的空闲轮询**。它之所以不退出，是因为时间不走：
+
+* `nn::os::GetSystemTick`（sdk+0x327FD0）就是两条指令：`mrs x0, cntpct_el0; ret`
+* `nn::os::GetSystemTickFrequency`（sdk+0x327FE0）返回 `0x124F800`
+* Unicorn 2.1.4 不实现 / 不推进 `CNTPCT_EL0`，读出来恒为 0 → `now - t0` 永远是 0
+
+修复：用 HLE 接管这两个函数入口，把 tick 映射到宿主 `time.monotonic()`（19.2 MHz，
+起点 `0x100000000`，避开"0 表示未初始化"的 SDK 判断）。
+
+**注意**：`svc #0x1E (GetSystemTick)` 的调用计数一直是 **0** —— SDK 是直接读系统寄存器的，
+不经过 SVC，所以只有改**函数入口**（HLE 打桩）才有效，改 SVC 表无效。
+
+### M3.11 `svcSleepThread` 之前是"立即让出"
+
+M3.12 的同一份采样显示：45 秒里 `svc #0x0B` 只有 13 次，可那个轮询却吃掉了 99% 的 CPU。
+原因是最初的 `SleepThread` 实现直接 `_yield()`，等于"睡 0 纳秒"，于是
+`while (!timeout) { SleepThread(1ms); }` 退化成 100% 空转。
+
+现在按真实语义处理：`svcSleepThread(ns)` 把线程挂起到宿主墙钟上的
+`monotonic() + min(ns/1e9, 0.25s)`，`run()` 的分块边界统一唤醒到点的线程；
+如果全体都在睡，宿主 `sleep` ≤ 5 ms 再继续。
+
+### M3.12 卡点复测（240 s）：停在 21 帧，不是丢消息
+
+两处修复后门禁仍是 `m2_verify PASS`（48.5 s / 15 帧 / `ipc missing={}`）、
+`m3_verify PASS`（`draw=0 overflow=0`）。240 秒长跑：
+
+```
+[t= 15s] BEGIN=9   [t=30s]  BEGIN=16  [t=60s] BEGIN=21
+[t=240s] BEGIN=21  API=168  END=21     块采样 main+0x191F000 = 2,081,534
+```
+
+在 `nn::os::SendMessageQueue / TrySendMessageQueue / ReceiveMessageQueue /
+TryReceiveMessageQueue` 四个入口打点（每次记 tid / queue / msg），得到的事实：
+
+* 主线程**每帧**往队列 `0x111BC3668` 发 1 条消息（21 帧 = 21 条），消费者是 worker `0x109`
+* 停住前的最后两条：`tid=0x100 Send(q=0x111BC3668, msg=1)` → `tid=0x109 Recv(...)` →
+  `tid=0x100 Send(q=0x111BC3668, msg=2)`，之后 `0x109` 再没取过
+* 结束时所有队列都是 `count=0`（全部取空）→ **不是"队列里堆了消息没人取"**
+
+`MessageQueueType` 布局（反汇编 sdk+0x25DC0 `SendMessageQueue` / sdk+0x26340
+`ReceiveMessageQueue` 得到，对以后接其它 SDK 版本也有用）：
+
+| 偏移 | 字段 |
+|---|---|
+| +0x00 / +0x08 / +0x10 | 三个链表头（等待者节点） |
+| +0x20 | `u64 *buffer` |
+| +0x28 | `u32 capacity` |
+| +0x2c | `u32 count` |
+| +0x30 | `u32 read_pos` |
+| +0x38 | `u32 mutex`（InternalCriticalSection） |
+| +0x3c | `u32 condvar`（InternalConditionVariable） |
+| +0x40 | light event |
+
+配套的 SDK 侧语义（同样是这一轮反汇编核对的）：
+
+* `InternalConditionVariableImpl::Wait`（sdk+0x32F1A0）：先断言
+  `(*mutex & 0xBFFFFFFF) == 当前线程 tid`，再
+  `svcWaitProcessWideKeyAtomic(mutex, cv, tag=tid, timeout=-1)`
+* `InternalCriticalSectionImpl::Enter`（sdk+0x32F7A0）：快路径 CAS `0 -> tid`；
+  否则把 mutex 的 bit30（"有竞争者"）置上，再 `svcArbitrateLock(owner, &mutex, me)`
+* `LightEvent`（sdk+0x324A80/AC0/C20/C50）：`state` 0=closed、1=有等待者、2=已 signal；
+  `Wait` = `svcWaitForAddress(&state, 2, 1, -1)`，`Signal` = CAS `0->2` 或
+  `svcSignalToAddress(&state, 2, 1)`
+
+结论：主线程在队列 `0x111BC3668` 上等"任务完成"，worker `0x109` 能收到消息，
+但**任务体没有把完成标志写回去**，于是主线程的信号量状态机原地打转
+（每轮都 wake，但 `BEGIN/END` 不涨）。下一步要对读两处游戏代码：
+
+1. `main+0x1F0F0`：`TryPeekMessageQueue` 成功后的处理分支（它才是真正"跑任务"的地方）
+2. `main+0x126DB10`：任务组的完成计数循环（`[obj+0xc8]` vs 读到的值，`[obj+0xc0]` 判断继续）
+
+顺带记一条性能债：`m2_verify` 里 `hle_calls=1949 / hle_time=26.32s`（整轮 48.5s），
+时间几乎都花在把 140 MB 的 `TitleBG.pack` 拷进 guest 内存上，后面可用
+`mmap + 一次 memcpy`（或直接让 guest 读宿主映射）替掉逐块 `mem_write`。
+
 ### M4 Metal 回放
 * NVN 命令流 → MTLCommandBuffer
 * 着色器：已有 5,099 个程序 / 20.07 MiB 唯一字节码，需要 NVN 的 GPR/SH 描述 → MSL 翻译
