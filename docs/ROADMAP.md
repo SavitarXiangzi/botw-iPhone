@@ -1162,6 +1162,228 @@ tid=0x121  run      pc 在 main+0x126CF74：`while(...) SleepThread(250us);` 的
    ② 该 signal 由一个工作线程发，而那个线程卡在 CV 上（本轮已经能确认 32 条 CV 的位置）；
    ③ 该事件本来就该由 GPU fence 回读触发，M4 之前不可能来。
 
+## M3.29–M3.32：从"等一个没人 signal 的事件"到 14952 帧仍在加载
+
+这四轮的形状是一样的：上一轮的结论被证据推翻，换成更底层的解释，然后往前走一层。
+每一轮都记录"怎么证伪的"，因为下一次遇到同类现象时，最快的就是复用这条证据链。
+
+### M3.29 先证伪 M3.28：`svc 0x34/0x35` 的参数签名读错了
+
+M3.28 的结论是"主线程在无限等一个 LightEvent"。`_probe_stall_m3.py` 的
+`addrwait` 表把它推翻了：
+
+```
+ev=0x10B628500 val=1 n=1 [('0x100', 2, 976927)]
+```
+
+第三个字段是**超时值 976927 ns ≈ 1 ms**，不是 -1。真正的死锁是这样产生的：
+
+1. 主线程用 1 ms 超时等 `0x10B628500`；
+2. 旧内核只在"没有可运行线程"时才让带超时的等待者超时返回；
+3. 而 tid `0x121` 是一条 `SleepThread(250 µs)` 的轮询线程，永远可运行 ——
+   于是**那个 1 ms 永远不到期**。
+
+两处修复（`m1_kern.py`）：
+
+* `_vtick_now()/_deadline_ticks()/_expire_waiters()`：等待项改成
+  `[ctx, tag, timeout, deadline_tick]`，按 19.2 MHz 虚拟 tick 到期
+  （和 `GetSystemTick` 同一时钟），在 `_bump_tick` / `_pick_next` 里检查。
+* `svc 0x34/0x35` 按 Atmosphere 语义整体重写（之前把 `w1` 当 tag、`w2` 当超时，
+  等于**把 type 字段直接写进了事件字**）：
+
+```
+0x34 WaitForAddress(x0 addr, w1 TYPE, x2 VALUE, x3 timeout)
+     type 0: *addr <  value 时等       type 1: *addr <  value 时先减一再等
+     type 2: *addr == value 时等       type 3: 64 位相等时等
+     条件不成立 → 0xFA01（SDK 当"重试"）  超时 → 0xEA01   成功 → 0
+0x35 SignalToAddress(x0 addr, w1 TYPE, w2 VALUE, w3 count)
+     type 0: 只唤醒                   type 1: *addr == value 时 +1（manual-reset）
+     type 2: autoClear，按等待者数改字；count<=0 唤醒全部
+```
+
+证据：`_ev.txt` 里 `0x10B628500` 全程只有 5 次 guest 写
+（`InitializeLightEvent` ×2、`SignalLightEventImpl 0→2`、`ClearLightEvent 2→0`、
+`TimedWaitLightEventImpl 0→1`），而 `_sig.txt` 里 `SVC35 exit` 连续 300+ 次
+读回 `val=1/2`、`state==1` 命中 0 次 —— 事件字被我们自己写回了"等待中"。
+
+效果：`wait_to['addr']` 归零，帧 178 → **192**，NVN API 919 → **998**。
+
+### M3.30 三堵"空服务指针"墙：pl VR / oe / applet
+
+死锁消失后，init 一路往前，连续撞到三处同一类崩溃：**服务对象指针是 NULL**，
+`ldr x8,[x0]` 直接读 0 号地址。
+
+| 顺序 | 崩溃点 | 为什么是 NULL | 处理 |
+|---|---|---|---|
+| 1 | `sdk+0x337DB0 nn::pl::EndVrMode` | `pl::detail::GetService()` 拿缓存对象，pl 从没初始化 | `pl::BeginVrMode/EndVrMode/IsVrMode → 0`（iOS 没有 VR，语义就是恒 false） |
+| 2 | `sdk+0x23650 nn::oe::EnableRecording` | `oe::Initialize` 是空实现 | 把 main 导入的 20 条 `oe::` 全量替身 |
+| 3 | `sdk+0x7BD94 applet::StartLibraryAppletImmediately` | 游戏调 `hid::ShowControllerSupport` 弹"请握持手柄"的库小程序 | 见下 |
+
+`oe` 这一组里带出参/返回值的不能一律给 0：
+`GetOperationMode → 0`（Handheld）、`GetPerformanceMode → 0`、`GetDesiredLanguage → 1`
+（AmericanEnglish）、`GetCurrentFocusState → 1`、`GetExpectedVolumeBalance(float*,float*)`
+写入 `0.5f`、`TryPopNotificationMessage → false`。
+
+第三堵墙的调用链是 main 自己的状态机：
+
+```
+main+0x15D2E0C  bl 0x42128CE0 (hid::ShowControllerSupport)
+main+0x15D2C28  if (++counter < 3) return;          ← 连续 3 帧"没有手柄"才弹
+```
+
+也就是说：**我们的 hid 一直报"没有连接的手柄"**，游戏就弹 applet。先按 M5 的口径
+在 `m2_hid.py` 里做了虚拟 Pro Controller（布局取自 nxnative `dm/host/hle_hid.c`）：
+
+```
+NpadFullKeyState / Handheld / JoyDual / JoyLeft / JoyRight 共用 0x28
+    int64 sampling; uint64 key; int32 lx, ly, rx, ry; uint32 attributes, pad
+    attributes bit0 = 已连接（Pro Controller 0x15，Handheld 0x3F）
+GetNpadStates 写满 n 条（新→旧，sampling 连续递减）并返回 n
+SixAxisSensorState 0x60：静止平放 acc=(0,0,-1)、方向=单位矩阵、attributes=1
+SevenSixAxisSensor（机身陀螺仪）：初始化成功、GetStates 返回 0 条（和 nxnative 一致）
+```
+
+实测游戏确实在用它：`GetNpadStyleSet` 555 次、`GetNpadStates<FullKey>` 412 次、
+`GetNpadStates<Handheld>` 143 次、`GetSixAxisSensorStates` 698 次，查询直方图里
+`('states', 1, 0, 16, 16)` / `('states', 2, 32, 16, 16)` 全是"连着的 16 条"。
+
+这一层修完：192 → **2722** → **2998** 帧，NVN API **10024**。
+
+### M3.31 互斥失效：`ThreadType+0x1B0` 的 tag 是**死线程的句柄**
+
+2998 帧之后整机静止。全量快照显示两把 CriticalSection 互等：
+
+```
+cs=0x1AAFB6540 word=0x40000220 n=3 [0x127, 0x123, 0x124]   ← owner = 0x125
+cs=0x1AB066CD8 word=0x40000228 n=2 [0x100(main), 0x125]    ← owner = 0x127
+```
+
+看似 guest 真的 ABBA。但 SDK 的 `InternalCriticalSectionImplByHorizon::Enter`
+（`sdk+0x32F780`）是这样写的：
+
+```
+w20 = [[tpidrro_el0+0x1F8]+0x1B0]        ; 本线程的 tag
+loop: w8 = ldaxr [mutex]
+      w8 == 0 → stlxr w20（拿到）
+      否则 → 置 bit30、ArbitrateLock(w8&0xBFFFFFFF, mutex, w20)
+             返回后重新读：(word & 0xBFFFFFFF) == w20 才算拿到
+Leave: 读 tag；word == tag → 写 0；word 带 bit30 → ArbitrateUnlock
+```
+
+**tag 就是 ThreadType 里的 +0x1B0。** 打开 `BOTW_LOCKLOG=1` 把每把锁的事件史打出来：
+
+```
+== cs=0x1AAFB6540 (owner 0x220 = tid 0x125)
+   tid=0x127  L  a=0x40000220  b=0x0        ← 0x127 传给内核的 tag 是 0
+== cs=0x1AB066CD8 (owner 0x228 = tid 0x127)
+   tid=0x127  H0 ...                        ← 0x127 在 CondVar::Wait 里释放过
+```
+
+`b=0x0` 说明 0x127 的 tag 是 0 —— 而 tag=0 在 guest 的判据里等于"空闲"：
+交接后 `(word & 0xBFFFFFFF) == 0` 成立，它**自以为拿到了锁**，互斥就此失效，
+后面看到的 ABBA 是失效之后的产物。
+
+tag 日志给出了根因：
+
+```
+[tag] tid=0x127 tt=0x1A1EE7020 +0x1B0=0x248 handle=0x228     ← 0x248 是已退出的 0x12F
+[tag] tid=0x128 tt=0x1A1EE7020 +0x1B0=0x0   handle=0x22C
+[tag] tid=0x12F tt=0x1A1EE7020 +0x1B0=0x0   handle=0x248
+```
+
+`0x127..0x12F` **共用同一个 ThreadType**（BOTW 的线程池复用线程对象），
+而我们的 `_new_thread` 用 `idx = len(self.ctxs)` 分配 TLS 槽位 —— `ctxs` 以
+**线程对象地址**为键，复用同一个对象时 `len()` 不增长：
+
+```python
+idx = len(self.ctxs)                 # 旧：0x127 和 0x128 拿到同一个 idx
+tls = TLS_WIN + idx * TLS_STRIDE     #  → 同一个 TLS 块
+self.ctxs[arg] = c                   #  → 后创建的覆盖前一个
+```
+
+于是两条活着的线程共用一个 TLS 块，后启动的那条在启动代码里把
+`[tpidrro+0x1F8]` 写成**自己的** ThreadType —— 0x127 的 TLS 从此指向别人的
+（很快退出的）ThreadType：锁 tag 变成死线程的句柄，`GetTlsValue` 读回 0。
+
+修复：
+
+* `self.tls_next` 单调递增分配 TLS 槽位（TLS 窗口同时从 0x40000 扩到 0x100000，
+  即 255 条线程）；
+* 线程切换时把 `[tpidrro+0x1F8]+0x1B0` 校正成本线程句柄（`_tag_fix`），
+  防止复用同一个 ThreadType 的**顺序**线程沿用上一条的 tag。
+
+效果：2998 帧的静止彻底消失，同一份镜像跑到 **14952 帧 / 1265 MiB**。
+
+另有一处同源崩溃，正好可以当对照：`main+0x1C80F9C ldr w8,[x0,#0xd0]`，x0=0，
+调用点是 `nn::os::GetTlsValue(nn::os::TlsSlot)`：
+
+```
+sdk+0x327F80  mrs x8, tpidrro_el0
+              ldr x8, [x8, #0x1f8]
+              add x8, x8, w0, uxtw #3
+              ldr x0, [x8, #0x80]        ← TLS 值挂在 ThreadType+0x80+slot*8
+sdk+0x327FA0  ... str x1, [x8, #0x80]    ← SetTlsValue 写同一处
+```
+
+也就是说 **TLS 值和锁 tag 住在同一个对象（ThreadType）里**：TLS 块一复用，
+两样一起坏。修 TLS 分配之后再没出现。
+
+### M3.32 共享字体：BOTW 的 UI 文字来自固件，不在 RomFS 里
+
+（本轮先补上，尚未被调用）真机上 `fontll::ScalableFontEngine::LoadFont` 的入参来自
+`nn::pl` 的共享字体。BOTW 导入的四条：
+
+```
+pl::RequestSharedFontLoad(type)     pl::GetSharedFontLoadState(type)
+pl::GetSharedFontAddress(type)      pl::GetSharedFontSize(type)
+```
+
+`m2_font.py` 按 nxnative `dm/host/hle_sdk16.c` 的做法给一份 BFTTF：
+
+```
+u32 magic = 0x18029A7F                       ; "已解码"标记
+u32 len   = bswap32(size ^ 0x49621806)
+后面紧跟原始 TTF
+```
+
+`ScalableFontEngineHelper::Decode` 看到 magic 就直接返回 `addr+8`（不改数据），
+所以 BFTTF 头 + 宿主系统 TTF 就能让 SDK 自己的 FreeType 解析通过；
+解析与错误处理仍在 SDK 里，我们只负责"地址和长度是真的"。字体文件不进仓库。
+
+### 当前状态（M3.32）
+
+```
+BOTW_BARE=1, LIM=340 s：frames 14952  API 55211  draws 0  presents 565  MiB 1265
+```
+
+`op 统计 {'BEGIN': 14952, 'API': 55211, 'END': 14952, 'PRESENT': 565}`，
+**一条 DRAW / CLEAR_COLOR / SET_RT 都没有**。把最近一帧的命令序列导出来看：
+
+```
+BEGIN
+  nvnBufferGetAddress              caller=0x4124EBDC
+  nvnCommandBufferReportCounter    caller=0x4124EBF4
+  nvnCommandBufferSetSamplerPool   caller=0x4124EC0C
+  nvnCommandBufferSetTexturePool   caller=0x4124EC24
+  nvnCommandBufferSetShaderScratchMemory  caller=0x4124EC40
+  nvnCommandBufferInitialize / AddControlMemory(2 MiB) / AddCommandMemory(4 MiB)
+  nvnCommandBufferEndRecording
+END
+```
+
+每帧都是"新开一个 command buffer → 设置池和 scratch → 结束"，**没有任何渲染目标**。
+同期堆还在长（1151 → 1265 MiB），Yaz0 解压页（`main+0x191F000`）在采样里仍占大头，
+说明它还在**首启加载**：BOTW 这一段是黑屏（所以 0 draw 是正常的），
+不是卡死。
+
+### 下一步
+
+1. 继续把加载跑完（单次 15–30 min），盯 **draws 是否从 0 变成非 0**；
+   同时看 `chunks` 是否还在涨（涨 = 加载；长时间不涨且 frames 涨 = 新的空转）。
+2. 若加载完成后仍 0 draw，就按 `caller` 反查 0x4124EBDC / 0x412BE964 这两条
+   路径到底属于哪个子系统（更像"GPU 作业队列"而不是主渲染）。
+3. M3 的出口条件不变：**创建出 swapchain 并提交第一帧带几何的画面**。
+
 ### M4 Metal 回放
 * NVN 命令流 → MTLCommandBuffer
 * 着色器：已有 5,099 个程序 / 20.07 MiB 唯一字节码，需要 NVN 的 GPR/SH 描述 → MSL 翻译
@@ -1175,3 +1397,140 @@ tid=0x121  run      pc 在 main+0x126CF74：`while(...) SleepThread(250us);` 的
 ### M6 性能
 * 主堆 3.22 GiB（`AllocateMemoryBlock(0xC1000000)`）是硬指标
 * 目标是 iPhone 6 GB 机型 30 fps 起步
+
+
+## M3.33–M3.60：把「首启加载」从 15 分钟压到 30 秒，然后撞上字节序墙
+
+这一段的形状和前面几轮不同：前几轮是「卡死 → 找到缺失的 HLE → 打通」，
+这一段是「**太慢，慢到看起来像卡死**」。判据只有一个：`draws` 是否从 0 变成非 0。
+
+### M3.33–M3.52 Yaz0 / 填充循环的宿主快路径
+
+首启加载的热点从块采样里可以直接读出来：
+
+| 地址 | 是什么 | 代价 | 处理 |
+|---|---|---|---|
+| `main+0x191F000` | 游戏内**增量** Yaz0 解压状态机（`main+0x191F770`） | 长期占 90% 采样 | `m2_yaz0.py`：按同样的调用契约在宿主解压 |
+| `main+0x150F4E0` | 编译器内联的 `0xBEEF2929BEEF2929` 16 字节填充（清 24 MiB 图形缓冲） | 单次约 40 s | `m2_fastfill.py`：宿主 memset |
+| `main+0x12E52C0` | 16 字节节点链的**逐字翻转**（`rev` × 4，步长 = 节点首字） | — | `m2_fastparse.py`（见 M3.58 的坑） |
+
+Yaz0 的调用契约（实测）：
+
+```
+x0 = 解压器/作业对象      x1 = 1..N 当前块序号
+[x0+0x180] 压缩流基址     [x0+0x188] 压缩总长
+[x0+0x18c] 块步长 0x80000 [x0+0x100] 输出游标
+```
+
+宿主按「已提交的压缩字节」解析完整的 Huffman/回溯组，把读不全的组回滚到下一块；
+流结束时写回整块输出并跳进游戏自己的收尾代码（两条 LightEvent signal 仍由 guest 发）。
+
+### M3.53 `m2_fastparse` 的坑：寄存器是对的，数据是错的
+
+第一版 `m2_fastparse` 报：
+
+```
+[parse] bswap loop error at n=148897792 p=0x15AB80958: UC_ERR_READ_UNMAPPED
+```
+
+看着像钩子读错了寄存器。**不是。** 现场寄存器（`_probe_walk.py`）：
+
+```
+pc=0x412E52DC x10=0x18EB80958 x11=0x18EB80950 x12=0x8CB13AF x13=0x15AB80958
+```
+
+`x10 == x11 + 8`、`x13` 已经从基址**倒走 0x3400000（54 MiB）**，所以
+`x12/x13` 正是这段循环的 count/pointer。钩子没错，是**它忠实地执行了一条
+本不该存在的 1.5 亿次遍历**。教训：先看循环体，再怀疑钩子。
+
+### M3.54 Yaz0 的产物是对的（先证伪自己）
+
+`m2_yaz0` 写出的两块输出（8.1 MiB / 11.0 MiB）落在 `C:\botw-work\tmp`，按
+BOTW 自己的约定（**LE 字段 + `BOM = 0xFEFF`**）解析：
+
+```
+yaz0_7B91C4.out  hl=14 bom=FEFF fsz=7B91C4(real 7B91C4) doff=1000 ver=100
+                 SFAT hl=C nodes=6 hash=00000065  node0 attr=01000000 start=0 end=61A8
+                 SFNT 同一节点数
+```
+
+`fileSize` 与实际长度逐字节吻合、`SFAT/SFNT` 名字表可读。
+对照磁盘上的 `Pack/TitleBG.pack`（`53415243 1400 fffe fa11c6 08 34530000`）：
+`fileSize` 也只有按 LE 读才是 147,198,458。**BOTW 的 SARC 包就是 LE 的，
+`FF FE` 只是标记，不是「大端」的意思。** 所以 HLE 解码不是污染源。
+
+### M3.55 裸跑对照：这堵墙只在加载变快之后才摸得到
+
+```
+BARE 150 s：hits(0x412E52C0)=0   MiB 541 → 733 → 797（120 s 后不再涨）   frames 14
++ Yaz0 HLE ：hits 从 ~40 s 起持续增长，主线程 pc 停在 0x412E52DC
+```
+
+也就是说：裸跑那 15 分钟全部花在 guest 自己的 Yaz0 状态机上，
+`main+0x412E52C0` **一次都没进**。Yaz0 HLE 把加载压到 30 s 内，
+才第一次露出后面这堵墙。这不是新引入的回归，是**下一层**。
+
+### M3.56 墙的结构：`0x412E5000` 决定「要不要翻字节序」
+
+调用者 `main+0x12C33D0`（返回地址 `0x412C33D4`，与 fp 链一致）以
+`x0=作业对象 x1=资源数据 x2=0 w3=4 x4=…` 调 `0x412E5000`：
+
+```
+0x412E5020  ldrh w8,[x0,#0x7a]          作业标志
+0x412E502C  tst  w3,#4
+0x412E5038  str  x1,[x0,#0x28]          作业->资源
+0x412E5050  ldr  w19,[x1,#0xc]          ← 关键字段
+0x412E5054  tbnz w19,#0,skip            bit0 = 1 → 已翻过，跳过
+0x412E5058  （否则把 x1 起 0x150 字节按 dword 逐个 rev）
+0x412E51A8  tbz  w19,#0,0x412E5234      同一个判据，决定节点链要不要翻
+```
+
+实测唯一一次调用：
+
+```
+CALL #1 x0=0x1901E2838 x1=0x18EB7D000 x2=0x0 w3=0x4 x4=0x18F7DC308 lr=0x412C33D4
+  [blk+0xc]=0x270  [blk+0x14]=0x3800  [blk+0x18]=0x27D  [blk+0x1c]=0
+```
+
+`0x270 & 1 == 0` → 游戏认为「这份数据是**大端**，要翻」。翻完之后
+`0x412E5234` 走到 `x9 = x1 + 0x150 + [x1+0x14] = 0x18EB80950`，也就是
+M3.53 里那条链的基址，于是：
+
+```
+节点链基址处的 8 字节（guest 已经把前两个 dword 翻过一遍）：
+  [x11]   = 0x00000000         next = 0
+  [x11+4] = 0x08E00000         ← 循环用的 count = 149,946,368
+翻之前它的原始 LE 值是 0x0000E008 = 57,352，才是一个合理的节点数。
+```
+
+**同一个 4 字节，LE 读 57,352（合理），按 BE 翻完是 1.5 亿（荒谬）。**
+所以「要不要翻」这个判据在这份数据上给出了错误答案 —— 要么数据本该是 BE
+却以 LE 到达，要么 `[blk+0xc]` 的 bit0 本来就该是 1（已经翻过）而某处把它清了。
+
+### 现在的状态（M3.60）
+
+```
+m2_verify  PASS   13 帧 / 15 线程 / ipc missing={} / hid 查询 18 类
+m3_verify  PASS   draw=0 overflow=0 api_entries=56
++ Yaz0 快路径：14 帧后停在 main+0x412E52DC（0x412E5000 内的节点链）
+裸跑        ：14 帧后停在加载，797 MiB 后堆不再增长
+```
+
+**M3 出口条件（建出 swapchain 并提交第一帧带几何的画面）仍未达成**，
+但卡点已经从「加载太慢看不清」变成「一个可定位的判据」。
+
+### 下一步（按优先级）
+
+1. **确认 `[blk+0xc]` bit0 的来源**：按 `blk` 头 32 字节在 RomFS 里反查文件，
+   对磁盘原文件读同一个字段；若原文件本来就是 LE，则判据被我们自己写坏，
+   去查 `0x412E5000` 之前谁改了 `[blk+0xc]` / `[blk+0x28]`。
+2. 若确认原文件真是 BE（判据没错），就把 `0x412E52C0` 那条链做成**语义等价**的
+   宿主快路径（`m2_fastparse`），并加保护：`count > 4M` 时不接管、只记账。
+3. `m2_verify` 的 hid 检查已从「hid IPC 日志」改成「`m2_hid` 查询直方图」——
+   M3.30 起 hid 是进程内 HLE，IPC 日志永远不会再出现，旧判据是过期而非回归。
+
+### 环境备注
+
+`unicorn` / `capstone` 曾从 `C:\Python314` 里消失，重新
+`pip install unicorn capstone`（走本地 wheel 缓存，2.1.4 / 5.0.9）即可；
+门禁与探针都必须用 `C:\Python314\python.exe` 跑。
