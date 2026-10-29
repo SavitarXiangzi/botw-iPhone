@@ -171,6 +171,15 @@ AT90C  obj=0x19B739000  p20=0x19B739038                             <- +0x20 已
 门禁：`m2_verify` PASS（52.1s / 15 帧 / `ipc missing={}`）、`m3_verify` PASS
 （`draw=0 overflow=0`）。`draw=0` 仍未变：现在只是“资源能完整加载并解析”。
 
+### M3.9 当前卡点：条件变量死锁（待办）
+
+900 秒 / 3e9 指令长跑：不再崩，`DRAWS=0`，`OPSTATS={BEGIN:21, API:168, END:21}`。
+结束时 11 个 worker 的 PC 都停在 `sdk+0x37EB40`（`svc #0x1C` 的返回地址，
+即 `WaitProcessWideKeyAtomic`），只有 0x10B 可运行 —— 典型的**丢唤醒**。
+
+下一步：给 `pwkey/pwsig` 加按 condvar 地址的计数与等待者快照，找出“谁该 signal、
+为什么落空”；同时复核 `svcSignalProcessWideKey` 的 count 语义（`<=0` / 全唤醒）。
+
 ### M4 Metal 回放
 * NVN 命令流 → MTLCommandBuffer
 * 着色器：已有 5,099 个程序 / 20.07 MiB 唯一字节码，需要 NVN 的 GPR/SH 描述 → MSL 翻译
