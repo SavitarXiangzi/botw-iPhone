@@ -140,6 +140,37 @@ nnMain -> app init -> 任务线程解包 RomFS -> NVN 建 30+ 个 memory pool
 * `nn::oe` 查询类 API 直接给值；`nn::account` 整体直通（只影响存档/UI）
 * `nn::settings` 的 `MakeLanguageCode` / `GetAvailableLanguageCodes2` 等按命令号实现
 
+### M3.8 加载同步打通（LightEvent）
+
+M3.7 的“重定位表全是零”不是文件问题，也不是重定位算法问题，而是**时序问题**：
+
+* 磁盘上的 `uking_mat.sbfsha` 尾部 `+0x32B7000` 就是一张合法的 `_RLT`（2 项）；
+  小资源（`+0x18=0x45000`）在同一套代码里本来就能正常重定位。
+* 崩溃时 `obj+0x32B7000` 的 16 字节**全为零** —— 53 MB 的解压只差最后约 0xE8631 字节。
+* 解压是异步分块任务：多个 worker（0x101..0x10B）从队列取块执行，主线程 0x100 通过
+  `nn::os::LightEvent` 等“加载完成”。
+* 宿主里 **SVC 0x34/0x35（WaitForAddress / SignalToAddress）没有实现**，落到默认分支
+  直接返回 0 —— `WaitLightEvent` 于是立即“成功”，主线程在数据还没写完时就去解析 FSHA。
+
+补上真正的阻塞语义后，同一次运行里：
+
+```
+SCENE  obj=0x19B739000  tblHead=5f 52 4c 54 00 70 2b 03 02 00 00 00   <- _RLT 在
+AT90C  obj=0x19B739000  p20=0x19B739038                             <- +0x20 已重定位
+```
+
+原来的 `main+0x1D3A910` 崩溃消失，启动链继续往下建立 NVN pool，直到指令预算用尽。
+
+实测语义（按 SDK 反汇编核对）：
+
+* `svcWaitForAddress(addr, tag, ..., timeout)`：`*addr != tag` 时阻塞；等于 tag 返回 0；
+  值已变化时返回 `0xFA01` 让调用方重试；超时返回 `0xEA01`。
+* `svcSignalToAddress(addr, tag, count)`：`*addr = tag` 并唤醒至多 count 个等待者；
+  **x0 是 Result（0=成功），唤醒数在 x1**（返回唤醒数会被 SDK 当错误并 abort）。
+
+门禁：`m2_verify` PASS（52.1s / 15 帧 / `ipc missing={}`）、`m3_verify` PASS
+（`draw=0 overflow=0`）。`draw=0` 仍未变：现在只是“资源能完整加载并解析”。
+
 ### M4 Metal 回放
 * NVN 命令流 → MTLCommandBuffer
 * 着色器：已有 5,099 个程序 / 20.07 MiB 唯一字节码，需要 NVN 的 GPR/SH 描述 → MSL 翻译

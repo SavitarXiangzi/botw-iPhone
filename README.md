@@ -25,6 +25,7 @@ docs/           路线图、HLE 边界说明
 | M2 | 启动链 HLE（nn::oe / fs / vi / nv / NVN 引导） | ✅ nn::init::Start 跑完 |
 | M2.5 | Horizon 线程 + IPC/CMIF 服务端（hid/sm/pctl） | 🟢 主循环已跑起来 |
 | M3 | NVN 对象层 + 命令流录制（`m3_nvn.py`） | 🟢 对象/记录已就绪，draw=0（游戏还没提交几何） |
+| M3.8 | LightEvent 同步（SVC 0x34/0x35），资源加载真正完成 | ✅ 53 MB FSHA 可完整落盘并重定位 |
 | M4 | NVN → Metal 回放（管线/纹理/命令缓冲） | ⬜ |
 | M5 | 音频（nn::audio → AVAudioEngine）、输入 | ⬜ |
 | M6 | 真机性能与内存（6 GB 机型起步） | ⬜ |
