@@ -872,6 +872,53 @@ M3.22 的交接把它读成"加载任务树轮询"，反汇编 `0x4191F830` 起�
 4. `0x4191F830`（本作 LZ）与 `0x421209C4`（Yaz0）的宿主侧解码 HLE **放到最后**：
    它会改变观测，必须先确认墙不是"等信号"再动。
 
+### M3.24 mutex 的 `WAITERS_BIT`：M3.23 的墙其实是"解锁走了用户态快路径"（已修）
+
+对标 `nxnative` 的 `dm/host/hle_thread.c`（详见 `docs/NXNATIVE_BOTW_NOTES.md`）时发现，
+我们把 Horizon 的互斥字只当"owner 句柄"用，忽略了 **bit 31 = 有等待者**。
+
+* `svcArbitrateLock`（0x1A）加锁失败时**从不置这个位**；
+* SDK 的 `nn::os::Mutex::Unlock()` 在**用户态**读这个位：没置位就只写 0、
+  **不发 `svc 0x1B`**；
+* 于是我们影子表里的等待者永远等不到人交接。
+
+改法（`m1_kern.py`）：0x1A 置位后再 `_block`；0x1B 交给队列第一个，
+后面还有人就把位留着（`me | (0x80000000 if rest else 0)`）。
+
+| 观测 | 改前 | 改后 |
+|---|---|---|
+| `m2_verify` 45 s | 20 帧 | 11,374 帧（253 fps） |
+| `m3_verify` 30 s | 通过 | 7,089 帧（236 fps） |
+| 裸跑 `LIM=320` `frames` | 199 | 115,686 |
+| 裸跑 `API` | 1,087 | 925,488 |
+| 裸跑 `committed` | 1,151 MiB | 335 MiB |
+| 裸跑 `fs` 读取次数 | 多次（含 `TitleBG.pack` 147 MB） | 1 |
+
+**最后两行说明这不是"修好了"，是换了一堵墙**：帧泵活了，资源加载退回去了。
+
+#### 新墙（t=45 s 全线程栈，已定位）
+
+* 主线程 `0x101`：`run`，持有消息队列 mutex `0x1080BE140`（字面值 `0x40000108`）；
+* `0x10B` / `0x10C`：`TryPeekMessageQueue` → `svcArbitrateLock`，
+  `owner=0x108`（即 0x101），`nwait=0`；
+* 其余 10 个线程：`ReceiveMessageQueue` 的 `WaitProcessWideKeyAtomic`。
+
+即"主线程拿着队列锁忙等，两个 worker 在等这把锁"，与 M3.23 同族。
+
+#### 两个被数据否定的假设
+
+1. `*cv_key` 没记账**不是**这堵墙的原因：给 cvlog 加上 key 字面值后发现
+   2035 次 signal / 677 次 wait 的 key **全是 0**（1.6.0 的 `Signal` 不读它）。
+   补上记账后帧数量级不变（3,815 vs 4,363）。
+2. 把 0x1D 改成"只有第一个等待者拿到锁、其余退回 lockwait"（内核语义）后，
+   游戏 **3 帧后从 `nn::init::Start` 正常返回**（主动退出）。先不改，等新墙拆完再看。
+
+#### 下一步
+
+1. 静态确认 1.6.0 `main` 是否有 `DT_RELR` 且我们的 loader 已正确应用。
+2. 拆新墙：主线程为什么持 `0x1080BE140` 忙等、在哪忙等、为什么不解锁。
+3. `dbg_cv` 的 cvlog 长期保留 `(cond, mutex, tag, key)` 四元组。
+
 ### M4 Metal 回放
 * NVN 命令流 → MTLCommandBuffer
 * 着色器：已有 5,099 个程序 / 20.07 MiB 唯一字节码，需要 NVN 的 GPR/SH 描述 → MSL 翻译
