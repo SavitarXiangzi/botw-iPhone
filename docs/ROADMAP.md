@@ -1113,6 +1113,55 @@ M3.26 之后仍有 30 s 的死窗口（`chunks` 不动、帧不动）。这一�
 178 帧之后堆再次走平（t=160..180 只涨 0）。继续用同一套指纹（`chunks` 冻结 + 
 `handle_svc` / `emu_start` 记账）找下一个死窗口；`draws` 仍然是 0，M4 的前提没变。
 
+### M3.28 终局指纹：178 帧之后，主线程等一个永远不会来的 LightEvent
+
+M3.27 把 tick 往返修好之后，30 s 死窗口没了，但 178 帧 / 1151 MiB 之后整机还是静止。
+这一轮把"静止"拍成了全量快照。
+
+#### 1. 静止时的指纹
+
+| 观测（`BOTW_BARE=1`，300 s） | t=165 s | t=180 s … t=300 s |
+|---|---|---|
+| 帧 / 堆 | 178 / 1151 MiB | 178 / 1151 MiB（不动） |
+| `chunks` | +128 | **+0** |
+| 最热 `emu_start` 入口 | — | **`0x2037EA70`，2.4 万次 / 15 s** |
+
+`0x2037EA6C` 是 `svc #0x0b`（`svcSleepThread`）的 trampoline，所以那段"热"就是
+**一个 250 µs 的轮询睡眠循环**（`x0=0x3D090`）。
+
+#### 2. 全量快照（t=200 s）
+
+```
+MAIN   pc=0x2037EC38  svcWaitForAddress  (svc 0x34，LightEvent，timeout = -1 无限等)
+       #0 main+0x13A0440  #1 main+0x1506C58  #2 main+0x1251718
+       #3..#5 main+0x1251730（递归三帧）  #6 main+0x124EE48
+       #7 main+0x1614C60  #8 main+0x1614950  #9 main+0x1250B2C
+tid=0x121  run      pc 在 main+0x126CF74：`while(...) SleepThread(250us);` 的轮询循环
+其余 32 个线程        全部 blocked，各自 idle 在自己那条 condvar 上
+```
+
+也就是说：**主线程在等一个事件，唯一的"活人"是个每 250 µs 醒一次的空转 worker，
+没有任何人会 signal 那个 LightEvent。** 这不是死锁（没有互相持有），是**缺一个完成通知**。
+
+#### 3. 顺手修的一处：`svcSleepThread` 也要推进虚拟时钟
+
+虚拟 tick 是"读一次才走一步"的（M3.18/M3.27），于是任何
+`while (!done) SleepThread(1ms);` 形态的等待在虚拟时间里永远不前进。现在
+`svcSleepThread(ns)` 会按 `ns×19.2 MHz` 补进计数器（`_bump_tick`）。
+
+效果：终局形态不变（178 帧 / 1151 MiB），但这属于**语义补齐**——它让"只靠睡眠等待"
+的循环至少能在超时语义上正常工作；真正的完成通知仍然缺。
+
+#### 4. 下一步（精确）
+
+1. 在 `main+0x1506C58` / `main+0x13A0440` 处取出 `svcWaitForAddress` 的 `x0`（LightEvent
+   地址），并在 `nn::os::LightEventInitialize` 的调用点反查它属于哪个对象。
+2. 顺着该对象的创建点（大概率在 1151 MiB 那批 pack 的加载路径上，紧邻
+   `ShaderArchives` / `Graphics`）找出"谁应该 signal 它"。
+3. 三种常见结局要先区分：① 该 signal 在我们 HLE 掉的服务里（fs/nvn/ssl…）被吞了；
+   ② 该 signal 由一个工作线程发，而那个线程卡在 CV 上（本轮已经能确认 32 条 CV 的位置）；
+   ③ 该事件本来就该由 GPU fence 回读触发，M4 之前不可能来。
+
 ### M4 Metal 回放
 * NVN 命令流 → MTLCommandBuffer
 * 着色器：已有 5,099 个程序 / 20.07 MiB 唯一字节码，需要 NVN 的 GPR/SH 描述 → MSL 翻译
