@@ -15,3 +15,5 @@ ios/BotW.xcodeproj/
 prod.keys
 title.keys
 RomFS/
+_doc_*.py
+_patch_*.py

@@ -293,6 +293,45 @@ TryReceiveMessageQueue` 四个入口打点（每次记 tid / queue / msg），�
 时间几乎都花在把 140 MB 的 `TitleBG.pack` 拷进 guest 内存上，后面可用
 `mmap + 一次 memcpy`（或直接让 guest 读宿主映射）替掉逐块 `mem_write`。
 
+### M3.13 一次 `fs::ReadFile` 里的 2247 次 `uc.mem_map`（25.9 s）
+
+上一节结尾记的"性能债"是错的：那 26 s **不是**在拷 140 MB 数据。
+
+用 `BOTW_HLE_SLOW=0.3`（`m1_kern.py` 里新加的 HLE 打点）逐次打印慢调用：
+
+| 调用 | 缓冲区 | 大小 | 墙钟 |
+|---|---|---|---|
+| `fs::ReadFile(option)` | `0x15FD33280` | 31.5 MB (`Bootup.pack`) | 0.956 s |
+| `fs::ReadFile(option)` | `0x15E986B00` | 20.6 MB (`Bootup_Graphics.pack`) | 0.275 s |
+| `fs::ReadFile(option)` | `0x1621C1F00` | **147.2 MB** (`TitleBG.pack`) | **25.912 s** |
+
+耗时与大小完全不成比例，而独立基准（同一文件）是：`open().read()` 0.09 s +
+`uc.mem_write(147 MB)` 0.07 s（2.1 GB/s）。所以瓶颈既不在磁盘也不在 Unicorn 的
+批量写，而在**我们自己提交页的那段代码**：
+
+* `commit_range` 是按"匹配窗口的 chunk"步进提交的
+* `0x1621C1F00` 落在**线程栈窗口** `[0x100000000,0x180000000)`（`chunk=0x10000`），
+  因为 BOTW 的大块资源缓冲区是从 `ThreadManager` 的那个 allocator 里要的
+* 于是 147 MB / 64 KiB = **2247 次 `uc.mem_map`**；更早的失败路径还会退化成逐
+  4 KiB 重试（3.5 万次），这也是 M2 阶段就开始记的那笔"26 s 性能债"的真身
+
+修复（`m1_kern.py`，备份 `m1_kern.py.bak_map`）：
+
+1. `commit_range` 改成按 64 MiB 步进，不再跟着窗口 chunk 走
+2. `_map_safe` 先**减掉已映射区间**，只补真正的空洞
+3. `_map_block` 整块 `uc.mem_map`，与已映射页冲突时**折半重试**（最细 4 KiB），
+   代价从 O(pages) 降到 O(log)
+
+效果（同一台机器、同样的门禁脚本）：
+
+```
+修复前: boot 45 s  blocks=17,749,963  frames=15  hle_time=27.93 s  (hle_calls=1949)
+修复后: boot 45 s  blocks=37,553,920  frames=20  hle_time= 0.27 s  (hle_calls=2072)
+```
+
+`hle_time` 降了两个数量级，同样墙钟下 guest 多跑 2.1 倍的块。`m2_verify` / `m3_verify`
+仍然 PASS（`ipc missing={}`、`draw=0 overflow=0`）。
+
 ### M4 Metal 回放
 * NVN 命令流 → MTLCommandBuffer
 * 着色器：已有 5,099 个程序 / 20.07 MiB 唯一字节码，需要 NVN 的 GPR/SH 描述 → MSL 翻译
