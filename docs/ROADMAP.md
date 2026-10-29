@@ -332,6 +332,76 @@ TryReceiveMessageQueue` 四个入口打点（每次记 tid / queue / msg），�
 `hle_time` 降了两个数量级，同样墙钟下 guest 多跑 2.1 倍的块。`m2_verify` / `m3_verify`
 仍然 PASS（`ipc missing={}`、`draw=0 overflow=0`）。
 
+### M3.14 块钩子要 53 倍代价：所谓"21 帧卡死"主要是采样本身
+
+先把"模拟器到底多快"量出来（同机、同一个 20 M 条指令的循环）：
+
+```
+无钩子                       107 MIPS
+装 UC_HOOK_BLOCK              2 MIPS   (10,000,001 次 Python 回调)
+uc.ctl_set_tcg_buffer_size   113 MIPS
+```
+
+`UC_HOOK_BLOCK` 是**每个翻译块**一次 Python 回调，于是热页直方图把整台模拟器按到
+~2 MIPS。之前所有"长跑 240 s / 300 s 仍停在 21 帧"的结论，都是在 2 MIPS 下测的：
+那段 210 MB 的 pack 预载 + Yaz0 解码并没有死循环，只是被采样拖慢了 50 倍。
+
+改成 `BOTW_BARE=1`（不装任何 Python 钩子，靠 `emu_start(count=...)` 分块，块边界回
+Python 看表）后，真实吞吐约 **19 MIPS**，同一台机器的同一份门禁：
+
+```
+钩子模式   90 s  → BEGIN=21  API=168  draws=0   （91% 的块在 main+0x191F000）
+无钩子     70 s  → BEGIN=175 API=895  draws=0   （已经越过资源预载、进到标题画面）
+```
+
+结论：**热页采样必须只用于短诊断跑**，长跑一律无钩子。为了还保留"卡在哪"的能力，
+`_on_block` 里新增 `pcx`：在 1/64 采样中对**非 `YAZ0_PAGE`（main+0x191F000）**的块
+记录**精确地址**并带上 tid，代价可以忽略，却足够定位卡点循环。
+
+### M3.15 三个 NVN 入口签名写错：往野指针里写 8 字节
+
+权威签名在 d2r 那边的 `dm/gfx/nvn/include/nvn.h`：
+
+| 入口 | 真实签名 | 旧实现 |
+|---|---|---|
+| `nvnBufferMap` | `void* (const NVNbuffer*)` | 往 `x1` 写 out、`return 1` |
+| `nvnMemoryPoolMap` | `void* (const NVNmemoryPool*)` | 往 `x1` 写 out、`return mem` |
+| `nvnMemoryPoolMapVirtual` | `NVNboolean (NVNmemoryPool*, int, const NVNmappingRequest*)` | 往 `x1` 写 out、`return mem` |
+
+三个都没有 out 参数，`x1` 是**上一次调用残留的脏值**。两个后果：
+
+* `nvnBufferMap` 的情况被日志抓了个正着：`wmem` 的守卫打出
+  `HLE out-param write into stub arena 0xA0008A0 dropped`，而游戏拿到返回值 `1`
+  当指针用，下一条就是 `memcpy(dst=1, src=0x19EB81DD8, n=0x1B0)`
+  → `UC_ERR_WRITE_UNMAPPED @ sdk+0x4CB9D0 (memcpy)`
+* 另外两个更危险：脏 `x1` 恰好是个可写地址时，8 字节会**静默**写进 guest 内存
+
+修完这三处，同一无钩子跑法从 160 帧推进到 **175 帧 / API 895**。
+
+### M3.16 当前卡点：空闲链表里的块被纹理解码覆盖
+
+无钩子跑到 175 帧后停在 `main+0x125B1D4`（`str x13, [x15, #8]`，
+`x15=0x32577E6E6871858B`）。`x19=0x19F190170` 是游戏自己的分配器，
+`x8=0x1A026D000` 是它从最佳适配链表里挑出的块。对 `0x1A026D000` 这一页做写入
+监视，时间线非常干净：
+
+| 时刻 | 写入者 | 动作 |
+|---|---|---|
+| t=82.0 s | `main+0x125B0D0` | 分配器在 `0x1A026D000` 写**空闲块头**（size `0x26B1AFE0`，flag `0xFFFF`） |
+| t=82.1 s | `main+0x125B2E0` | 把该块**链入**空闲链表（`prev=next=0x19F190250` 表头） |
+| t=96.6 s | `main+0x181D9E4` | **纹理解码器**（`fcvt`+`strb` 逐字节，浮点 clamp 到 [0,1]，典型法线图解码）把整块覆盖成像素数据 |
+| t=111 s | `main+0x125B1A8/1D4` | 分配器再次扫描空闲链表、挑中这个块，取 `[x8]`/`[x8+8]` 当 prev/next 去摘链 → 野指针 → FAULT |
+
+也就是说：**一块还在空闲链表里的内存，被一个已经拿到的纹理缓冲区覆盖了**。
+两种可能，下一步二分：
+
+1. 更早的空闲链表中被插入过重复块 / 尺寸错乱（分配器元数据先行损坏）
+2. 解码器的目标指针（`main+0x181DCA8` 的返回值链 `0x4180C49C` → `0x418357F4`
+   → `0x40E3AA00`）来自我们某个 HLE 返回的错误指针，落进了空闲块里
+
+验证手段已经就位：`_probe_watch4.py` 那一套"只监视某 64 字节 + 打时间戳和 PC"，
+把监视窗口挪到解码器缓冲区的起点，就能看到它到底是从哪次分配拿到的。
+
 ### M4 Metal 回放
 * NVN 命令流 → MTLCommandBuffer
 * 着色器：已有 5,099 个程序 / 20.07 MiB 唯一字节码，需要 NVN 的 GPR/SH 描述 → MSL 翻译

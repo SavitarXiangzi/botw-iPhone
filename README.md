@@ -29,6 +29,8 @@ docs/           路线图、HLE 边界说明
 | M3.10 | `mrs CNTPCT_EL0` 恒为 0 → `GetSystemTick` HLE 到宿主时钟 | ✅ 定时/超时循环不再自旋 |
 | M3.11 | `svcSleepThread` 从"空让出"改为真按 ns 挂起 | ✅ 空闲轮询不再吃满 CPU |
 | M3.13 | `fs::ReadFile` 的 147 MB 缓冲区被逐 64 KiB 提交（2247 次 `mem_map`）→ HLE 时间 27.9 s 降到 0.27 s | ✅ |
+| M3.14 | `UC_HOOK_BLOCK` 53 倍代价：热页采样下 2 MIPS，无钩子 19 MIPS；长跑一律无钩子 | ✅ |
+| M3.15 | `nvnBufferMap` / `nvnMemoryPoolMap(MapVirtual)` 签名写错，往脏 `x1` 写 8 字节 | ✅ |
 | M4 | NVN → Metal 回放（管线/纹理/命令缓冲） | ⬜ |
 | M5 | 音频（nn::audio → AVAudioEngine）、输入 | ⬜ |
 | M6 | 真机性能与内存（6 GB 机型起步） | ⬜ |
