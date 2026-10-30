@@ -3562,6 +3562,7 @@ extern "C" int nvngfx_metal_selftest(void) {
                              static_cast<unsigned long long>(words[0]),
                              static_cast<unsigned long long>(words[1]),
                              static_cast<unsigned long long>(words[2]));
+                std::fflush(stderr);
             }
             if (!b5 || !b5->last || b5->encoded != 1) {
                 std::fprintf(stderr,

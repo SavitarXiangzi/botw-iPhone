@@ -190,7 +190,7 @@ jobs:
               | while IFS= read -r l; do echo "::error::selftest| $l"; done
             # Keep every selftest diagnostic.  The app's Metal validation
             # output can push the failing pixel line out of a short tail.
-            grep -E '\[selftest\]|BOTW_SELFTEST|nvnCommandBufferDraw|nvnProgram\.pipeline' /tmp/selftest-console.log 2>/dev/null \
+            grep -E '\[selftest\]|BOTW_SELFTEST' /tmp/selftest-console.log 2>/dev/null \
               | tail -80 | while IFS= read -r l; do echo "::error::console| $l"; done
             ls -la "$DATA/Documents" 2>/dev/null | while IFS= read -r l; do echo "::error::$l"; done
             xcrun simctl spawn "$UDID" log show --style compact --last 2m \
