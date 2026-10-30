@@ -2322,7 +2322,8 @@ id<MTLBuffer> argument_buffer(Ctx* c, CmdBuf* b) {
                 return nil;
             }
             slots[e.id] = static_cast<uint64_t>([src gpuAddress]) + off;
-            [b->enc useResource:src usage:MTLResourceUsageRead];
+            [b->enc useResource:src usage:MTLResourceUsageRead
+                           stages:MTLRenderStageFragment];
         } else if (e.kind == 1) {
             const uint64_t h = b->texHandle[e.slot] ? b->texHandle[e.slot]
                                                    : b->sepTexHandle[e.slot];
@@ -2332,7 +2333,8 @@ id<MTLBuffer> argument_buffer(Ctx* c, CmdBuf* b) {
                 return nil;
             }
             slots[e.id] = static_cast<uint64_t>(t->mtl.gpuResourceID._impl);
-            [b->enc useResource:t->mtl usage:MTLResourceUsageRead];
+            [b->enc useResource:t->mtl usage:MTLResourceUsageRead
+                           stages:MTLRenderStageFragment];
         } else {
             const PooledSampler* s = bound_sampler(b, b->texHandle[e.slot] ? b->texHandle[e.slot]
                                                                             : b->sepSampHandle[e.slot]);

@@ -46,6 +46,12 @@ enum {
     MTLResourceUsageWrite = 1u << 1,
     MTLResourceUsageSample = 1u << 2,
 };
+typedef NSUInteger MTLRenderStages;
+enum {
+    MTLRenderStageVertex = 1u << 0,
+    MTLRenderStageFragment = 1u << 1,
+    MTLRenderStageTile = 1u << 2,
+};
 @protocol MTLResource
 @end
 
@@ -353,7 +359,7 @@ destinationBytesPerImage:(NSUInteger)bpi;
 - (void)setFragmentBuffer:(id<MTLBuffer>)buffer
                    offset:(NSUInteger)offset
                   atIndex:(NSUInteger)index;
-- (void)useResource:(id<MTLResource>)resource usage:(MTLResourceUsage)usage;
+- (void)useResource:(id<MTLResource>)resource usage:(MTLResourceUsage)usage stages:(MTLRenderStages)stages;
 @end
 
 @class MTLRenderPassDescriptor;
