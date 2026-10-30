@@ -168,42 +168,60 @@ jobs:
           xcrun simctl boot "$UDID" 2>/dev/null || true
           xcrun simctl bootstatus "$UDID" -b
           APP=build/Build/Products/Debug-iphonesimulator/BotW.app
-          xcrun simctl install "$UDID" "$APP"
-          # stdout is attached after launch and the hook exits immediately, so
-          # the result is written to Documents/selftest.txt as well.
-          # --console attaches the app's stdout/stderr, which is where the
-          # [nvn] diagnostics go.  Without it a failed pixel check says
-          # only "rc=2048" and the reason is lost with the process.
-          set +e
-          xcrun simctl launch --console --terminate-running-process \
-            "$UDID" dev.botw.app --selftest > /tmp/selftest-console.log 2>&1 &
-          LAUNCH_PID=$!
-          # A hung GPU command buffer used to leave the workflow blocked until
-          # the job timeout, with the diagnostics still inside the simulator.
-          # Kill the launch after two minutes so the log dump below always runs.
-          for _ in $(seq 1 120); do
-            if ! kill -0 "$LAUNCH_PID" 2>/dev/null; then break; fi
+          ATTEMPT=1
+          while :; do
+            xcrun simctl install "$UDID" "$APP"
+            DATA=$(xcrun simctl get_app_container "$UDID" dev.botw.app data)
+            echo "container: $DATA (attempt $ATTEMPT)"
+            rm -f "$DATA/Documents/selftest.txt" 2>/dev/null || true
+            # stdout is attached after launch and the hook exits immediately, so
+            # the result is written to Documents/selftest.txt as well.
+            # --console attaches the app's stdout/stderr, which is where the
+            # [nvn] diagnostics go.  Without it a failed pixel check says
+            # only "rc=2048" and the reason is lost with the process.
+            set +e
+            xcrun simctl launch --console --terminate-running-process \
+              "$UDID" dev.botw.app --selftest > "/tmp/selftest-console.$ATTEMPT.log" 2>&1 &
+            LAUNCH_PID=$!
+            # A hung GPU command buffer used to leave the workflow blocked until
+            # the job timeout, with the diagnostics still inside the simulator.
+            # Kill the launch after 150 s so the log dump below always runs.
+            for _ in $(seq 1 150); do
+              if ! kill -0 "$LAUNCH_PID" 2>/dev/null; then break; fi
+              sleep 1
+            done
+            if kill -0 "$LAUNCH_PID" 2>/dev/null; then
+              echo "::warning::self-test did not finish within 150 s (attempt $ATTEMPT)"
+              kill "$LAUNCH_PID" 2>/dev/null || true
+              xcrun simctl terminate "$UDID" dev.botw.app 2>/dev/null || true
+              wait "$LAUNCH_PID" 2>/dev/null
+              LAUNCH_RC=124
+            else
+              wait "$LAUNCH_PID"
+              LAUNCH_RC=$?
+            fi
             sleep 1
+            set -e
+            # A crash inside the app can still leave simctl with status 0, so
+            # this number is context only: the rc marker in selftest.txt is what
+            # decides pass/fail.
+            echo "launch exit status: $LAUNCH_RC (not authoritative, attempt $ATTEMPT)"
+            tail -20 "/tmp/selftest-console.$ATTEMPT.log" 2>/dev/null || true
+            if [ -f "$DATA/Documents/selftest.txt" ] && \
+               grep -q "BOTW_SELFTEST rc=" "$DATA/Documents/selftest.txt"; then
+              break
+            fi
+            if [ "$ATTEMPT" -ge 2 ]; then break; fi
+            # The first launch after a fresh boot occasionally never reaches
+            # main(): no stdout, no selftest.txt, and simctl just sits there.
+            # That is the simulator, not the replay layer -- a real hang
+            # reproduces on the second attempt too.
+            echo "::warning::the app wrote no selftest.txt on attempt $ATTEMPT; reinstalling and retrying"
+            ATTEMPT=$((ATTEMPT + 1))
+            xcrun simctl uninstall "$UDID" dev.botw.app 2>/dev/null || true
+            sleep 3
           done
-          if kill -0 "$LAUNCH_PID" 2>/dev/null; then
-            echo "::error::self-test did not finish within 120 s"
-            kill "$LAUNCH_PID" 2>/dev/null || true
-            xcrun simctl terminate "$UDID" dev.botw.app 2>/dev/null || true
-            wait "$LAUNCH_PID" 2>/dev/null
-            LAUNCH_RC=124
-          else
-            wait "$LAUNCH_PID"
-            LAUNCH_RC=$?
-          fi
-          sleep 1
-          set -e
-          # A crash inside the app can still leave simctl with status 0, so
-          # this number is context only: the rc marker in selftest.txt is what
-          # decides pass/fail.
-          echo "launch exit status: $LAUNCH_RC (not authoritative)"
-          tail -20 /tmp/selftest-console.log 2>/dev/null || true
-          DATA=$(xcrun simctl get_app_container "$UDID" dev.botw.app data)
-          echo "container: $DATA"
+          cp "/tmp/selftest-console.$ATTEMPT.log" /tmp/selftest-console.log 2>/dev/null || true
           cat "$DATA/Documents/selftest.txt" 2>/dev/null || echo "(no selftest.txt)"
           if ! grep -q "BOTW_SELFTEST rc=0" "$DATA/Documents/selftest.txt" 2>/dev/null; then
             echo "::error::self-test did not report rc=0"
@@ -216,6 +234,13 @@ jobs:
             grep -E '\[selftest\]|BOTW_SELFTEST' /tmp/selftest-console.log 2>/dev/null \
               | tail -80 | while IFS= read -r l; do echo "::error::console| $l"; done
             ls -la "$DATA/Documents" 2>/dev/null | while IFS= read -r l; do echo "::error::$l"; done
+            # "No selftest.txt at all" is a different failure from a wrong
+            # pixel: it means the process never reached main().  These two
+            # lines say whether the simulator even has the app running.
+            ps -Ao pid,etime,command 2>/dev/null | grep -i botw | grep -v grep | head -5 \
+              | while IFS= read -r l; do echo "::error::ps| $l"; done
+            xcrun simctl spawn "$UDID" launchctl list 2>/dev/null | grep -i botw | head -5 \
+              | while IFS= read -r l; do echo "::error::launchd| $l"; done
             xcrun simctl spawn "$UDID" log show --style compact --last 2m \
               --predicate 'process == "BotW"' 2>/dev/null | tail -40 \
               | while IFS= read -r l; do echo "::error::log| $l"; done
