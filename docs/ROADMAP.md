@@ -3492,15 +3492,20 @@ BOTW_SELFTEST rc=16401
 `layers` 是对的，错在我给自检写的 `size <= 1024` 预算。`nvngfx_tex_layout()`
 把每层对齐到 block 边界，2×2 RGBA8 的一层仍是 **512 字节**，cube 6 层 =
 3072，cube array 12 层 = 6144；原来的 16 KiB guest pool 也装不下
-12288 + 3072 / 13824 + 6144 两组纹理。于是：
+12288 + 3072 与 13824 + 6144 两组纹理。于是：
 
-- guest pool 从 16 KiB 提到 64 KiB（仍按同一个常量分配、memset、建 builder）；
-- 预算检查改成 `size == 512 * layers`，并把 cube array 挪到 offset 16384；
+- 预算检查改成 `size == 512 * layers`；
+- 两个 cube 自检改用**第二块 16 KiB 页**和独立的 NVN memory pool（`0x7300`），
+  cube 在 offset 0、cube array 在 offset 4096；
 - `tests/nvn_texlayout_test.cpp` 加一条 2×2 的可移植断言
   （`layer_size = 512`、cube `size = 3072`、cube array `size = 6144`），
   免得再靠模拟器才发现。
 
-这轮自检的价值就在这里：它不是“跑通就行”，而是把布局算术和池预算一起钉住。
+第一版改法是把原来的 pool 直接扩到 64 KiB。下一次 run 41075224028 里 App
+在 draw 1 之后、建完这块 pool 的下一帧就退出了（两次 attempt 都一样，
+没有崩溃报告，`selftest.txt` 只剩 `BOTW_SELFTEST start`），原因没查清。
+`newBufferWithBytesNoCopy` 对 64 KiB 应该没有意见，但既有的 16 KiB 页是
+**跑通过**的尺寸，于是退回“多一块小页”，而不是在同一块页上赌。
 
 ### 本地证据
 
@@ -3521,9 +3526,58 @@ verify_ios: ok
 
 | 缺口 | 后果 |
 |---|---|
-| cube / cube array 的真实 draw 自检 | 目前只验证布局与 Metal 描述，端到端只跑 2D array |
-| LINEAR 存储 | `nvngfx_tex_deswizzle()` 仍拒绝；线性纹理上传会丢 draw |
 | 连续更新 | 首次采样后 guest 再改内存不会重传 |
 | BCn 转码 | Apple GPU 无对应格式时仍无法建立可用纹理 |
 | 暂存内存 | 分层纹理需要完整 CPU 副本，大纹理可能超出 iOS 内存预算 |
 | 真机 | 没有真机运行记录 |
+
+## M3.93 LINEAR 存储：布局、mip 偏移与逐行拷贝
+
+覆盖仍是 **131 / 513（25.5%）**。这一轮补的是纹理路径里被直接拒绝的那一类：
+`NVNtextureFlags_LINEAR` / `LINEAR_RENDER_TARGET`（`flags & 0x50`）。
+
+### 三个错
+
+1. **尺寸只算了一层一级。** 旧代码 `size = stride * height`：mip 链的其余级
+   和数组的其余层都没有算进去，`nvnTextureGetStorageSize` 会偏小，按它开池
+   的客体就会越界（和 M3.16 是同一类错误，只是换了个 flag）。
+2. **两级 pitch 混用。** 线性纹理的 guest 存储行距来自
+   `nvnTextureBuilderSetStride`，而调用方的缓冲区行距是另一回事。拷贝必须
+   同时知道两者，否则“去 padding”变成“读错行”。
+3. **`nvngfx_tex_level_geometry()` 直接 `return -1`。** 上传路径因此整条
+   跳过线性纹理，`tex_upload()` 只留下一条 `deswizzle` 的日志。
+
+### 实现
+
+- `linear_pitch()`：`stride > 0` 用 guest 给的值，否则按 32 字节（线性渲染
+  目标 128 字节）对齐一行；`stride` 比一行还窄时 `nvngfx_tex_layout()` 返回 -1。
+- 布局：一级之后按对齐接下一级，`layer_size` 是整条 mip 链，
+  `size = layer_size * layers`（1D array 的 `height` 仍是层数）。
+- `nvngfx_tex_level_offset()` 对线性也给出真实偏移（0 / 128 / 192 …），
+  不再恒为 0。
+- `nvngfx_tex_level_geometry()` 接受线性纹理，`tile_h/tile_d` 报 0。
+- 拷贝（`nvngfx_tex_swizzle` / `deswizzle`）走一条逐行 `memcpy`：源行距是
+  存储 pitch，目标行距是调用方 pitch，padding 既不读也不写。
+
+### 可移植测试
+
+`tests/nvn_texlayout_test.cpp` 新增 `test_linear()`：
+
+- 4×4 RGBA8、`stride = 32`：`layer_size = 128`；
+- 三级 mip：`layer_size = 224`，级偏移 0 / 128 / 192；
+- 2D array 两层：`size = 256`（旧代码会报 128）；
+- `stride = 16`（正好一行）可用，`stride = 8` 被拒；
+- 往返：把带 `0xEE` padding 的存储解成紧凑图像、再写回去，逐行比对，
+  并确认 padding 一个字节都没被写过。
+
+```
+nvn_texlayout_test: ok (block shapes, sizes, offsets, round trip, linear, refusals)
+```
+
+### 还没有的
+
+- 端到端：还没有一条从 guest pool 取 LINEAR 纹理、采样、回读的自检 draw；
+  `tex_upload()` 只是**不该**再拒绝它，模拟器上还没跑过。
+- 每级独立 pitch（有的标题会给 mip 小级换更小的 pitch）没有建模，现在一条
+  链共用一个 pitch。
+- 3D 线性纹理、线性渲染目标（`0x40`）都只有布局算术，没有真实使用场景。

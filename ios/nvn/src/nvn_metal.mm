@@ -883,7 +883,19 @@ void tex_initialize(nvngfx_ctx* ctx, uint64_t* x) {
         t->uploaded = false;
         t->rendered = false;
         t->uploadedLevels = 0;
-        t->mtl = [c->device newTextureWithDescriptor:td];
+        /* A descriptor Metal rejects throws an NSException rather than
+         * returning nil; uncaught, that aborts the process with no clue in
+         * the self-test log (which is exactly how draw 13 died).  Turn it
+         * into a logged failure and let the caller drop the draw. */
+        @try {
+            t->mtl = [c->device newTextureWithDescriptor:td];
+        } @catch (NSException* e) {
+            std::fprintf(stderr,
+                         "[nvn] texture create threw for target %d: %s\n",
+                         d.target,
+                         [e reason] ? [[e reason] UTF8String] : "?");
+            t->mtl = nil;
+        }
         x[0] = t->mtl ? 1u : 0u;
     }
 }
@@ -5617,6 +5629,8 @@ extern "C" int nvngfx_metal_selftest(void) {
             const uint64_t kB13 =
                 reinterpret_cast<uint64_t>(guestCubeArrayBuilder);
             const unsigned kCubeArrayOffset = 4096;
+            std::fprintf(stderr, "[selftest] trace: draw 13 start\n");
+            std::fflush(stderr);
             unsigned char* vpool13 = nullptr;
             if (!poolRaw2) {
                 std::fprintf(stderr,
@@ -5669,6 +5683,8 @@ extern "C" int nvngfx_metal_selftest(void) {
                     goto done;
                 }
             }
+            std::fprintf(stderr, "[selftest] trace: draw 13 guest bytes ready\n");
+            std::fflush(stderr);
             {
                 x[0] = kB13;
                 tex_builder_set_defaults(ctx, x);
@@ -5692,6 +5708,19 @@ extern "C" int nvngfx_metal_selftest(void) {
             std::fprintf(stderr, "[selftest] trace: draw 13 texture initialized\n");
             std::fflush(stderr);
             Tex* cubeArrayTex = find<Tex>(kTexGuestCubeArray);
+            std::fprintf(stderr,
+                         "[selftest] trace: draw 13 texture type=%lu "
+                         "array=%lu layers=%u\n",
+                         cubeArrayTex
+                             ? static_cast<unsigned long>(
+                                   cubeArrayTex->mtl.textureType)
+                             : 0ul,
+                         cubeArrayTex
+                             ? static_cast<unsigned long>(
+                                   cubeArrayTex->mtl.arrayLength)
+                             : 0ul,
+                         cubeArrayTex ? cubeArrayTex->layers : 0u);
+            std::fflush(stderr);
             if (x[0] != 1 || !cubeArrayTex || !cubeArrayTex->mtl ||
                 cubeArrayTex->mtl.textureType != MTLTextureTypeCubeArray ||
                 cubeArrayTex->mtl.arrayLength != 2 ||
@@ -5764,6 +5793,8 @@ extern "C" int nvngfx_metal_selftest(void) {
             x[0] = kCb13;
             cmdbuf_end_recording(ctx, x);
 
+            std::fprintf(stderr, "[selftest] trace: draw 13 recorded\n");
+            std::fflush(stderr);
             CmdBuf* b13 = find<CmdBuf>(kCb13);
             if (!b13 || !b13->last) {
                 std::fprintf(stderr,

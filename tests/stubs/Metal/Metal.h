@@ -44,6 +44,12 @@ __attribute__((objc_root_class))
 - (NSString*)localizedDescription;
 @end
 
+/* Metal validation throws instead of returning nil, and the self-test turns
+ * that into a log line.  Only `reason` is needed. */
+@interface NSException : NSObject
+- (NSString*)reason;
+@end
+
 /* iOS 16+: resource and sampler-table entries in an argument buffer are
  * 64-bit MTLResourceID values.  The public struct's only field is the
  * implementation handle, which is exactly what the table stores. */

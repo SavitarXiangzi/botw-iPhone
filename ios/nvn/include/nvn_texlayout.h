@@ -78,8 +78,10 @@ unsigned long long nvngfx_tex_bl_offset(unsigned x, unsigned y, unsigned z,
 
 /* Copies one level/layer from whole-texture storage into a linear image.
  * `pitch` is bytes per row and must be at least the level's row_bytes.
- * Returns 0, or -1 for a texture this path does not handle: multisampled,
- * the LINEAR / LINEAR_RENDER_TARGET flags (already linear), or BUFFER. */
+ * Block-linear storage goes through the GOB arithmetic; a texture with the
+ * LINEAR / LINEAR_RENDER_TARGET flag is copied row by row at the descriptor's
+ * own stride.  Returns 0, or -1 for a texture this path does not handle:
+ * multisampled, BUFFER, or a stride narrower than one row. */
 int nvngfx_tex_deswizzle(const nvngfx_texdesc* d, unsigned level,
                          unsigned layer, const void* storage, void* linear,
                          size_t pitch);

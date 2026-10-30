@@ -97,6 +97,18 @@ static unsigned adj_tile(unsigned shift, unsigned unit, unsigned dim) {
     return shift;
 }
 
+/* Byte pitch of a linear (non-tiled) texture.  NVN carries it in
+ * NVNtextureBuilderSetStride; a zero stride means the guest let the driver
+ * pick, which pads the row to the layout alignment (32 bytes, or 128 for the
+ * linear render-target flag). */
+static unsigned linear_pitch(const nvngfx_texdesc* d) {
+    const fmt_t t = fmt_of(d->format);
+    const unsigned align = (d->flags & 0x40) ? 128u : 32u;
+    const unsigned row = blk((unsigned)d->width, t.bw) * t.bpb;
+    if (d->stride > 0) return (unsigned)d->stride;
+    return (row + align - 1u) / align * align;
+}
+
 static void samples_xy(int s, unsigned* sx, unsigned* sy) {
     *sx = *sy = 1;
     if (s == 2) *sx = 2;
@@ -241,12 +253,28 @@ int nvngfx_tex_layout(const nvngfx_texdesc* d, nvngfx_texlayout* o) {
         return 0;
     }
     if (d->flags & 0x50) {                     /* LINEAR / LINEAR_RENDER_TARGET */
-        unsigned stride;
+        /* Linear storage is row-major at a byte pitch: no GOBs, no tiles.
+         * One pitch serves the whole chain, mip levels follow one another
+         * (each starting on the layout alignment) and every layer repeats
+         * the chain.  The old code returned stride * height, which is one
+         * layer of one level -- too small for a mip chain or an array. */
+        const unsigned pitch = linear_pitch(d);
+        const unsigned nl = d->levels ? (unsigned)d->levels : 1u;
+        unsigned long long total = 0;
+        unsigned l;
         o->alignment = (d->flags & 0x40) ? 128u : 32u;
-        stride = d->stride ? (unsigned)d->stride
-                           : (t.bpb * blk(w, t.bw) + o->alignment - 1u) &
-                                 ~(o->alignment - 1u);
-        o->layer_size = o->size = (unsigned long long)stride * h;
+        o->tile_h = 0;
+        o->tile_d = 0;
+        if ((unsigned long long)pitch <
+            (unsigned long long)blk(w, t.bw) * t.bpb)
+            return -1;                          /* stride narrower than a row */
+        for (l = 0; l < nl; ++l) {
+            const unsigned rows_l = dpl >= 2 ? mip(h, l) : 1u;
+            total = (total + o->alignment - 1ull) / o->alignment * o->alignment;
+            total += (unsigned long long)pitch * rows_l;
+        }
+        o->layer_size = total;
+        o->size = layered ? total * z : total;
         return 0;
     }
     if (d->pkg_block_h) {
@@ -295,8 +323,19 @@ unsigned long long nvngfx_tex_level_offset(const nvngfx_texdesc* d,
     if (!d) return 0;
     t = fmt_of(d->format);
     shape(d, &dpl, &layered, &w, &h, &z);
-    if (!t.bpb || (d->flags & 0x50) || d->target == 10) return 0;
+    if (!t.bpb || d->target == 10) return 0;
     if (nvngfx_tex_layout(d, &L) != 0) return 0;
+    if (d->flags & 0x50) {
+        const unsigned pitch = linear_pitch(d);
+        unsigned long long off = 0;
+        unsigned l;
+        for (l = 0; l < level; ++l) {
+            const unsigned rows_l = dpl >= 2 ? mip(h, l) : 1u;
+            off = (off + L.alignment - 1ull) / L.alignment * L.alignment;
+            off += (unsigned long long)pitch * rows_l;
+        }
+        return (off + L.alignment - 1ull) / L.alignment * L.alignment;
+    }
     return level_offset(d, level, dpl, w, h, z, L.tile_h, L.tile_d, t);
 }
 
@@ -337,7 +376,7 @@ int nvngfx_tex_level_geometry(const nvngfx_texdesc* d, unsigned level,
     nvngfx_texlayout L;
     if (!d) return -1;
     if (d->target == 5 || d->target == 6 || d->target == 10 ||
-        (d->flags & 0x50) || d->samples > 1)
+        d->samples > 1)
         return -1;
     t = fmt_of(d->format);
     if (!t.bpb || level >= (d->levels ? (unsigned)d->levels : 1u)) return -1;
@@ -355,7 +394,8 @@ int nvngfx_tex_level_geometry(const nvngfx_texdesc* d, unsigned level,
                       nvngfx_tex_level_offset(d, level);
     if (tile_h || tile_d) {
         unsigned th = 0, td = 0;
-        level_tiles(L.tile_h, L.tile_d, d, level, dpl, h, z, t, &th, &td);
+        if (!(d->flags & 0x50))
+            level_tiles(L.tile_h, L.tile_d, d, level, dpl, h, z, t, &th, &td);
         if (tile_h) *tile_h = th;
         if (tile_d) *tile_d = td;
     }
@@ -392,6 +432,25 @@ static int move(const nvngfx_texdesc* d, unsigned level, unsigned layer,
         return -1;
     if (pitch < row_bytes) return -1;
     bl += base;
+    if (d->flags & 0x50) {
+        /* Already row-major on the guest side: copy row by row, honouring
+         * both pitches.  `storage_pitch` comes from the descriptor, `pitch`
+         * from the caller's buffer. */
+        const size_t storage_pitch = linear_pitch(d);
+        unsigned z, y;
+        if (storage_pitch < row_bytes) return -1;
+        for (z = 0; z < slices; ++z) {
+            for (y = 0; y < rows; ++y) {
+                unsigned char* const lin_row =
+                    lin + ((size_t)z * rows + y) * pitch;
+                unsigned char* const bl_row =
+                    bl + ((size_t)z * rows + y) * storage_pitch;
+                if (to_linear) memcpy(lin_row, bl_row, row_bytes);
+                else memcpy(bl_row, lin_row, row_bytes);
+            }
+        }
+        return 0;
+    }
     {
         unsigned long long lb =
             (unsigned long long)nvngfx_tex_level_gobs(d, level) * 64ull;

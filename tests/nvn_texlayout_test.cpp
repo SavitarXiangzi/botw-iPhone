@@ -252,13 +252,99 @@ static void test_round_trip() {
     round_trip("rgba8 1D array layer 3", oneD, 0, 256, 1, 3);
 }
 
+/* Linear storage: rows at a byte pitch, a mip chain after them, and every
+ * layer repeating the chain.  The old code computed stride * height, which
+ * under-sized a mip chain and every array. */
+static void test_linear() {
+    nvngfx_texlayout L;
+    {
+        nvngfx_texdesc d = make_desc(0x25, 4, 4, 1);
+        d.flags = 0x10;                  /* LINEAR */
+        d.stride = 32;                   /* 16 real row bytes + 16 padding */
+        CHECK(nvngfx_tex_layout(&d, &L) == 0);
+        CHECK(L.alignment == 32);
+        CHECK(L.layer_size == 128);
+        CHECK(L.size == 128);
+        CHECK(nvngfx_tex_level_geometry(&d, 0, 0, nullptr, nullptr, nullptr,
+                                        nullptr, nullptr, nullptr) == 0);
+
+        d.levels = 3;
+        CHECK(nvngfx_tex_layout(&d, &L) == 0);
+        CHECK(L.layer_size == 224);      /* 128 + 64 + 32, each 32-aligned */
+        CHECK(L.size == 224);
+        CHECK(nvngfx_tex_level_offset(&d, 0) == 0);
+        CHECK(nvngfx_tex_level_offset(&d, 1) == 128);
+        CHECK(nvngfx_tex_level_offset(&d, 2) == 192);
+
+        d.target = 4;                    /* 2D array */
+        d.depth = 2;
+        d.levels = 1;
+        CHECK(nvngfx_tex_layout(&d, &L) == 0);
+        CHECK(L.layers == 2);
+        CHECK(L.layer_size == 128);
+        CHECK(L.size == 256);            /* the old code said 128 */
+
+        d.target = 0;
+        d.depth = 1;
+        d.stride = 16;                   /* exactly one row */
+        CHECK(nvngfx_tex_layout(&d, &L) == 0);
+        CHECK(L.layer_size == 64);
+        d.stride = 8;                    /* narrower than a row */
+        CHECK(nvngfx_tex_layout(&d, &L) != 0);
+    }
+    {
+        /* Copy in and out: the padding must be skipped, not sampled. */
+        nvngfx_texdesc d = make_desc(0x25, 4, 4, 1);
+        d.flags = 0x10;
+        d.stride = 32;
+        std::vector<unsigned char> storage(128, 0xEE);
+        std::vector<unsigned char> packed(64, 0);
+        for (unsigned y = 0; y < 4; ++y)
+            for (unsigned x = 0; x < 4; ++x) {
+                unsigned char* const p = storage.data() + y * 32 + x * 4;
+                p[0] = static_cast<unsigned char>(y * 16 + x * 4);
+                p[1] = 7;
+                p[2] = 9;
+                p[3] = 255;
+            }
+        CHECK(nvngfx_tex_deswizzle(&d, 0, 0, storage.data(), packed.data(),
+                                   16) == 0);
+        {
+            bool ok = true;
+            for (unsigned y = 0; y < 4; ++y)
+                for (unsigned x = 0; x < 4; ++x) {
+                    const unsigned char* const p =
+                        packed.data() + y * 16 + x * 4;
+                    ok = ok && p[0] == static_cast<unsigned char>(y * 16 + x * 4) &&
+                         p[1] == 7 && p[2] == 9 && p[3] == 255;
+                }
+            CHECK(ok);
+        }
+        {
+            std::vector<unsigned char> back(128, 0);
+            CHECK(nvngfx_tex_swizzle(&d, 0, 0, packed.data(), 16,
+                                     back.data()) == 0);
+            bool same = true;
+            for (unsigned y = 0; y < 4; ++y)
+                same = same &&
+                       std::memcmp(back.data() + y * 32,
+                                   storage.data() + y * 32, 16) == 0;
+            CHECK(same);
+            CHECK(back[16] == 0 && back[31] == 0);   /* padding untouched */
+        }
+    }
+}
+
 static void test_refusals() {
     nvngfx_texdesc d = make_desc(0x25, 64, 64, 1);
     std::vector<unsigned char> a(16384), b(16384);
     d.samples = 4;
     CHECK(nvngfx_tex_deswizzle(&d, 0, 0, a.data(), b.data(), 256) == -1);
+    /* Linear is supported (see test_linear); a stride narrower than one row
+     * is the refusal, and the copy must not guess a pitch. */
     d = make_desc(0x25, 64, 64, 1);
     d.flags = 0x10;
+    d.stride = 128;
     CHECK(nvngfx_tex_deswizzle(&d, 0, 0, a.data(), b.data(), 256) == -1);
     d = make_desc(0x25, 64, 64, 1);
     d.target = 10;   /* BUFFER */
@@ -281,12 +367,13 @@ int main() {
     test_sizes();
     test_bl_offset();
     test_round_trip();
+    test_linear();
     test_refusals();
     if (g_failures) {
         std::printf("nvn_texlayout_test: %d failure(s)\n", g_failures);
         return 1;
     }
     std::printf("nvn_texlayout_test: ok (block shapes, sizes, offsets, "
-                "round trip, refusals)\n");
+                "round trip, linear, refusals)\n");
     return 0;
 }
