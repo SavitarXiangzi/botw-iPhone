@@ -3342,6 +3342,17 @@ extern "C" int nvngfx_metal_selftest(void) {
                 rc = 8193;  /* draw 4: no command buffer */
                 goto done;
             }
+            if (b4->encoded != 1) {
+                Program* p4 = find<Program>(kProg4);
+                std::fprintf(stderr,
+                             "[selftest] draw 4 not encoded: pso=%d argbuf=%d "
+                             "hasArgBuffer=%d argEnc=%d argLen=%lu ubo0=0x%llx\n",
+                             b4->pso ? 1 : 0, b4->argbuf ? 1 : 0,
+                             p4 && p4->hasArgBuffer ? 1 : 0,
+                             p4 && p4->argEnc ? 1 : 0,
+                             p4 ? static_cast<unsigned long>(p4->argLen) : 0ul,
+                             static_cast<unsigned long long>(b4->ubo[0]));
+            }
             [b4->last waitUntilCompleted];
             if (b4->last.status == MTLCommandBufferStatusError) {
                 std::fprintf(stderr, "[selftest] draw 4 command buffer error: %s\n",
