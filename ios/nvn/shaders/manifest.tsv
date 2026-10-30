@@ -1,0 +1,4 @@
+# nvngfx offline MSL bundle -- SYNTHETIC fixture, not title data.
+# key	stage	msl	c1	args
+e01e5955f6f39e29	vs	bundle-vs.msl	-	-
+e01e5955f6f39e29	ps	bundle-fs.msl	-	-

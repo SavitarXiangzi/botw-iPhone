@@ -29,7 +29,15 @@ __attribute__((objc_root_class))
 
 @interface NSString : NSObject
 - (const char*)UTF8String;
+- (const char*)fileSystemRepresentation;
+- (NSString*)stringByAppendingPathComponent:(NSString*)component;
 + (instancetype)stringWithUTF8String:(const char*)utf8;
+@end
+
+/* Only the two calls nvn_metal.mm makes to find <app>/shaders. */
+@interface NSBundle : NSObject
++ (NSBundle*)mainBundle;
+- (NSString*)resourcePath;
 @end
 
 @interface NSError : NSObject

@@ -1,3 +1,9 @@
+/* The MSVC CRT marks getenv() deprecated; the portable spelling is what this
+ * translation unit uses, and Apple's clang ignores this define. */
+#if defined(_MSC_VER)
+#define _CRT_SECURE_NO_WARNINGS 1
+#endif
+
 /*
  * nvn_metal.mm -- NVN -> Metal host backend (Apple platforms only).
  *
@@ -4915,6 +4921,133 @@ extern "C" int nvngfx_metal_selftest(void) {
             }
         }
 
+        {
+            /* --- Draw 10: MSL that came from a file ----------------------
+             * Every draw so far used MSL compiled into this binary.  This one
+             * follows the path a translated title shader will use: the
+             * control+code of a "guest" shader hash to a key, that key names a
+             * blob loaded from <app>/shaders/manifest.tsv, and the blob's MSL
+             * builds the pipeline.  The fixture is synthetic (ios/nvn/shaders),
+             * so no title data is involved. */
+            if (nvngfx_shader_bundle_count() == 0) {
+                std::fprintf(stderr,
+                             "[selftest] draw 10 skipped: no MSL bundle installed\n");
+            } else {
+                alignas(16) unsigned char ctl10[0x880] = {};
+                unsigned char code10[0x40];
+                const uint32_t own10 = 0x880, ncode10 = 0x40;
+                const uint64_t kProg10 = 0x6700;
+                const uint64_t kCb10 = 0x6800;
+                char key10[17] = {0};
+                for (unsigned i = 0; i < sizeof code10; ++i)
+                    code10[i] = static_cast<unsigned char>(i);
+                std::memcpy(ctl10 + 0x20, &own10, sizeof own10);
+                std::memcpy(ctl10 + 0x704, &ncode10, sizeof ncode10);
+                if (nvngfx_shader_key_from_guest(ctl10, code10, key10) != 0) {
+                    std::fprintf(stderr,
+                                 "[selftest] draw 10: key computation failed\n");
+                    rc = 16397;
+                    goto done;
+                }
+                {
+                    const char* why10 = nullptr;
+                    if (!nvngfx_shader_lookup_blob(key10, NVNGFX_STAGE_VERTEX,
+                                                   &why10) ||
+                        !nvngfx_shader_lookup_blob(key10, NVNGFX_STAGE_FRAGMENT,
+                                                   &why10)) {
+                        std::fprintf(stderr,
+                                     "[selftest] draw 10: no bundle blob for key "
+                                     "%s (%s)\n",
+                                     key10, why10 ? why10 : "?");
+                        rc = 16397;
+                        goto done;
+                    }
+                }
+                struct { uint64_t data; uint64_t control; } sd10[2];
+                sd10[0].data = reinterpret_cast<uint64_t>(code10);
+                sd10[0].control = reinterpret_cast<uint64_t>(ctl10);
+                sd10[1] = sd10[0];
+                x[0] = kProg10; x[1] = 0;
+                prog_initialize(ctx, x);
+                x[0] = kProg10; x[1] = 2;
+                x[2] = reinterpret_cast<uint64_t>(&sd10[0]);
+                prog_set_shaders(ctx, x);
+                if (x[0] != 1) {
+                    std::fprintf(stderr, "[selftest] draw 10: SetShaders failed\n");
+                    rc = 16397;
+                    goto done;
+                }
+                {
+                    Program* p10 = find<Program>(kProg10);
+                    if (!p10 || std::strcmp(p10->key[0], key10) != 0 ||
+                        std::strcmp(p10->key[1], key10) != 0) {
+                        std::fprintf(stderr,
+                                     "[selftest] draw 10: program key is not the "
+                                     "guest key %s\n",
+                                     key10);
+                        rc = 16397;
+                        goto done;
+                    }
+                }
+                {
+                    const uint64_t target10 = kTex;
+                    const float clear10[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+                    x[0] = kCb10;
+                    cmdbuf_begin_recording(ctx, x);
+                    x[0] = kCb10; x[1] = 1;
+                    x[2] = reinterpret_cast<uint64_t>(&target10);
+                    x[3] = 0; x[4] = 0; x[5] = 0;
+                    cmdbuf_set_render_targets(ctx, x);
+                    x[0] = kCb10; x[1] = 0;
+                    x[2] = reinterpret_cast<uint64_t>(clear10);
+                    x[3] = 0xF;
+                    cmdbuf_clear_color(ctx, x);
+                    x[0] = kCb10; x[1] = kProg10; x[2] = 0;
+                    cmdbuf_bind_program(ctx, x);
+                    x[0] = kCb10; x[1] = 0; x[2] = 0; x[3] = 3;
+                    cmdbuf_draw_arrays(ctx, x);
+                    x[0] = kCb10;
+                    cmdbuf_end_recording(ctx, x);
+                }
+                CmdBuf* b10 = find<CmdBuf>(kCb10);
+                if (!b10 || !b10->last) {
+                    std::fprintf(stderr,
+                                 "[selftest] draw 10: nothing was committed\n");
+                    rc = 16398;
+                    goto done;
+                }
+                [b10->last waitUntilCompleted];
+                if (b10->last.status == MTLCommandBufferStatusError) {
+                    std::fprintf(stderr,
+                                 "[selftest] draw 10 command buffer error: %s\n",
+                                 b10->last.error
+                                     ? [[b10->last.error localizedDescription]
+                                           UTF8String]
+                                     : "(no description)");
+                    rc = 16398;
+                    goto done;
+                }
+                {
+                    unsigned char px[4] = {0, 0, 0, 0};
+                    const int wantOrange[4] = {255, 128, 0, 255};
+                    if (!read_center_pixel(dev, c->queue, t->mtl, kSide, px) ||
+                        !pixels_near(px, wantOrange, 2)) {
+                        std::fprintf(stderr,
+                                     "[selftest] draw 10 centre pixel is "
+                                     "(%u,%u,%u,%u), want (%d,%d,%d,%d); the "
+                                     "bundle MSL never reached the GPU\n",
+                                     px[0], px[1], px[2], px[3], wantOrange[0],
+                                     wantOrange[1], wantOrange[2], wantOrange[3]);
+                        rc = 16398;
+                        goto done;
+                    }
+                    std::fprintf(stderr,
+                                 "[selftest] draw 10: MSL loaded from the bundle "
+                                 "drew key %s\n",
+                                 key10);
+                }
+            }
+        }
     done:
         nvngfx_shader_set_msl_passthrough(0);
         forget<CmdBuf>(kCb);
@@ -4956,12 +5089,41 @@ extern "C" const nvngfx_backend* nvngfx_metal_backend(void) {
     return &k_metal;
 }
 
+/* Offline MSL as files: <app>/shaders/manifest.tsv, or NVNGFX_SHADER_DIR.
+ *
+ * The generated C table is for a handful of shaders; a translated title is
+ * thousands of files, and those must be replaceable without a rebuild.  A
+ * missing directory is the normal state of this repository (the committed
+ * table is empty), so this logs and continues rather than failing the device.
+ * The fixture under ios/nvn/shaders is what the self-test's tenth draw uses. */
+static void install_shader_bundle(void) {
+    char why[256] = {0};
+    const char* env = std::getenv("NVNGFX_SHADER_DIR");
+    NSString* dir = nil;
+    if (env && env[0]) {
+        dir = [NSString stringWithUTF8String:env];
+    } else {
+        NSString* res = [[NSBundle mainBundle] resourcePath];
+        if (res) dir = [res stringByAppendingPathComponent:@"shaders"];
+    }
+    if (!dir) return;
+    const char* path = [dir fileSystemRepresentation];
+    if (nvngfx_shader_load_bundle(path, why, sizeof why) == 0) {
+        std::fprintf(stderr, "[nvn] shader bundle: %zu blob(s) from %s\n",
+                     nvngfx_shader_bundle_count(), path);
+    } else {
+        std::fprintf(stderr, "[nvn] shader bundle: %s (%s)\n", path, why);
+    }
+    std::fflush(stderr);
+}
+
 /* Lifetime is owned by the app: create once, install, destroy at exit. */
 extern "C" nvngfx_ctx* nvngfx_metal_create(void) {
     /* The offline chain's output, if this build has any: the table lives in
      * nvn_shader_blobs.gen.c and is empty in the committed tree.  Installing
      * it here means a program's key finds its MSL without any further setup. */
     nvngfx_shader_install_offline_blobs();
+    install_shader_bundle();
     return reinterpret_cast<nvngfx_ctx*>(new Ctx());
 }
 

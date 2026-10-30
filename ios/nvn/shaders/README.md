@@ -1,4 +1,19 @@
-# shader/ -- 离线着色器产物放这里（当前为空）
+## 现在这里有一个合成 fixture（不是游戏数据）
+
+`manifest.tsv` / `bundle-vs.msl` / `bundle-fs.msl` 是**本仓库自己写的**
+最小 bundle，用来验证“文件 -> blob 表 -> 按 key 建管线”这条路：
+
+```
+key              stage  file            c1  args
+e01e5955f6f39e29  vs    bundle-vs.msl   -   -
+e01e5955f6f39e29  ps    bundle-fs.msl   -   -
+```
+
+- `key` 是那对合成 control+code 的 SHA-256 前 8 字节（规则见
+  `docs/SHADER_CHAIN.md` §4），自检第十条 draw 现场算出来再查。
+- 运行时 `nvngfx_shader_load_bundle()` 读这个目录；App 里默认找
+  `<app>/shaders`，`NVNGFX_SHADER_DIR` 可以覆盖。
+- 真实翻译产物（几千个 `.msl` + `.c1`）同样按这个格式放，**不要入库**。
 
 这个目录现在**没有可用的着色器**，只放说明。原因是 NVN 和 Metal 在这一点上
 没有可自动翻译的公共层：

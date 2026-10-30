@@ -23,10 +23,10 @@ try {
     if (-not (Test-Path $VcVars)) {
         Write-Error "vcvars64.bat not found at '$VcVars'. Pass -VcVars <path>."
     }
-    New-Item -ItemType Directory -Force -Path build\nvn\abi, build\nvn\core, build\nvn\tex, build\nvn\shd, build\nvn\vtx, build\nvn\smp, build\nvn\pool, build\nvn\txl | Out-Null
+    New-Item -ItemType Directory -Force -Path build\nvn\abi, build\nvn\core, build\nvn\tex, build\nvn\shd, build\nvn\vtx, build\nvn\smp, build\nvn\pool, build\nvn\txl, build\nvn\bnd | Out-Null
 
     $inc = "/I core\include /I ios\nvn\include"
-    $lib = "ios\nvn\src\nvn_dispatch.cpp ios\nvn\src\nvn_null.cpp ios\nvn\src\nvn_pool.c ios\nvn\src\nvn_sampler.c ios\nvn\src\nvn_texture.c ios\nvn\src\nvn_shader.c ios\nvn\src\nvn_shader_key.c ios\nvn\src\nvn_shader_blobs.gen.c ios\nvn\src\nvn_texlayout.c ios\nvn\src\nvn_vertex.c core\src\botw_core.cpp"
+    $lib = "ios\nvn\src\nvn_dispatch.cpp ios\nvn\src\nvn_null.cpp ios\nvn\src\nvn_pool.c ios\nvn\src\nvn_sampler.c ios\nvn\src\nvn_texture.c ios\nvn\src\nvn_shader.c ios\nvn\src\nvn_shader_key.c ios\nvn\src\nvn_shader_bundle.c ios\nvn\src\nvn_shader_blobs.gen.c ios\nvn\src\nvn_texlayout.c ios\nvn\src\nvn_vertex.c core\src\botw_core.cpp"
     $flags = "/nologo /std:c++20 /EHsc /W4 /WX"
 
     $jobs = @(
@@ -38,6 +38,7 @@ try {
         @{ name = "nvn_sampler_test"; src = "tests\nvn_sampler_test.cpp"; obj = "build\nvn\smp\" },
         @{ name = "nvn_pool_test";    src = "tests\nvn_pool_test.cpp";    obj = "build\nvn\pool\" }
         @{ name = "nvn_texlayout_test"; src = "tests\nvn_texlayout_test.cpp"; obj = "build\nvn\txl\" }
+        @{ name = "nvn_shader_bundle_test"; src = "tests\nvn_shader_bundle_test.cpp"; obj = "build\nvn\bnd\" }
     )
 
     foreach ($j in $jobs) {

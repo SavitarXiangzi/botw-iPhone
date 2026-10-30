@@ -178,6 +178,28 @@ const nvngfx_shader_blob* nvngfx_shader_lookup_blob(const char* key,
                                                     nvngfx_stage stage,
                                                     const char** why);
 
+/* ---------------------------------------------------------------------------
+ * Offline MSL bundles
+ *
+ * The generated table is a C array; a title's few thousand shaders are better
+ * shipped as files.  A bundle is a directory holding manifest.tsv plus one
+ * .msl per stage and optional .c1 sidecars (format: ios/nvn/src/nvn_shader_bundle.c).
+ *
+ * Loading validates every entry first, then installs generated + bundle as one
+ * table, so a build may ship both.  On failure nothing changes and `why` names
+ * the first problem, including the manifest line number.
+ *
+ * On Apple platforms nvn_metal.mm looks in <app>/shaders; NVNGFX_SHADER_DIR
+ * overrides that, which is how a freshly translated set is tried without
+ * rebuilding the app.
+ */
+int nvngfx_shader_load_bundle(const char* dir, char* why, size_t why_size);
+
+/* Entries the loaded bundle contributed (0 when none is installed). */
+size_t nvngfx_shader_bundle_count(void);
+
+/* Drops the bundle and reinstalls the generated table. */
+void nvngfx_shader_unload_bundle(void);
 /* The installed table and its length (NULL/0 when empty).  A caller that has
  * to swap the table out for a moment -- the Metal self-test does -- can put
  * the previous one back with nvngfx_shader_set_blobs(). */

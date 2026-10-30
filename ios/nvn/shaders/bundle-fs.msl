@@ -1,0 +1,8 @@
+#include <metal_stdlib>
+using namespace metal;
+
+/* Orange on purpose: no other self-test draw produces it, so a pixel readback
+ * says whether this MSL -- which arrived as a file -- reached the GPU. */
+fragment float4 nvngfx_main_fs() {
+    return float4(1.0, 0.5, 0.0, 1.0);
+}
