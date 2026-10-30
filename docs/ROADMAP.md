@@ -2830,11 +2830,99 @@ texture/sampler 条目——那需要 `gpuResourceID != 0` 的硬件，GitHub �
 |---|---|
 | guest 纹理上传 | 自检的像素是宿主 blit；BOTW 放进池里的像素还读不到 |
 | tiled / block-linear 布局 | 即使上传，未解块的纹理仍是花屏 |
-| 真实 shader 的 `[[id(k)]]` 侧车 | 只有内置 MSL 有布局；翻译产物还不能采样 |
+| 真实 shader 的 `[[id(k)]]` 侧车 | M3.84 已补：真实 MSL 的参数布局已进 blob；真实 shader 仍不能采样，因为 c1、bindless、guest 纹理上传都没接 |
 | Metal 3 的 argument-buffer 纹理条目 | 只有 UBO 条目在 CI 里真正走过；纹理/采样器条目只在直连路径上验证过 |
 | MRT / depth attachment | 只有单 color attachment，深度/模板未接 |
 | 非 pixel stage 的绑定 | 顶点/几何/计算的纹理绑定只记日志 |
 | `nvnTexturePoolGetMemoryPool` / `SamplerPoolGetMemoryPool` | 不在 470 个已测形状里，未绑 |
 | `nvnCommandBufferBindImage(s)` | compute 图像路径未接 |
 | 真实 shader 的 draw | 仍是 0 条；五条自检 draw 都用内置 MSL |
+| 真机 | **没有真机运行记录** |
+
+## M3.84 真实 shader 的 `[[id(k)]]` 侧车（本轮）
+
+覆盖仍是 **131 / 513（25.5%）**：本轮没有新增 NVN 入口，改的是"参数从哪来"。
+
+### 8 项上限不够：真实 shader 有 42 项
+
+本地 `Bootup_Graphics` 的两个真实 shader（数据不入库）：
+
+| stage | `[[id(k)]]` 成员 | 最高 id | 分类 |
+|---|---|---|---|
+| `d756ff62a57fc508_vs` | 7 | 6 | 3 UBO + 2 纹理 + 2 采样器 |
+| `029de06ee5b5d21b_ps` | 42 | 41 | 5 UBO + 18 纹理 + 18 采样器 + 1 c1 |
+
+`Program::args` 因此从 8 项改成 `NVNGFX_MAX_ARGS`（64）；参数表按最高 id
+分配（42 项 = 336 字节），不再固定 16 个字。纹理槽位扩到 NVN 的 32 个
+（c2 `0x20..0x120`），采样器 32 个。
+
+### 名字就是映射：`gen_blobs.py` 解 `spvDescriptorSetBuffer0`
+
+| MSL 成员名 | 含义 | 侧车 kind / slot |
+|---|---|---|
+| `fp_c3` / `vp_c5` | 常量段 N -> 统一缓冲槽 N−3 | `UBO` 0 / 2 |
+| `fp_t_tcb_1C` | 合并纹理（c2 句柄表） | `TEXTURE` 10 |
+| `fp_t_tcb_1CSmplr` | 同一个句柄里的采样器 | `SAMPLER_OF_TEXTURE` 10 |
+| `fp_t_tcb_5A` | c2 `0x168` 起的独立纹理 | `SEPARATE_TEXTURE` 0 |
+| `fp_t_cb2_1C` | c2 驱动表，按普通纹理解 | `TEXTURE` |
+| `fp_t_cb7_2A` | 句柄写在统一缓冲里（bindless） | `UNSUPPORTED` |
+| `fp_c1` | c1 常量段 | `UNSUPPORTED` |
+| `fp_i_*` / `fp_s3` | image / storage buffer | `UNSUPPORTED` |
+
+`decode_tex` 与 nxnative 的 `dmsh_build.py` 同源（MIT），数字来自 §6 的驱动段
+布局。生成器把布局写进 `kArgs_<key>_<stage>[]`，和 MSL 一起下发；id ≥ 64、
+槽位越界或 id 重复时**构建失败**，不会产出一张运行时会拒绝的表。
+
+两个真实 shader 一共解出 49 项：8 UBO、20 纹理、20 采样器、1 个 unsupported
+（就是 `fp_c1`）。
+
+### 运行时：MSL 与布局来自同一个 blob
+
+`prog_set_shaders()` 算完 key 后用 `nvngfx_shader_lookup_blob()` 取回 blob，
+`nvngfx_shader_copy_args()` 拷进 `Program::args`。`argument_buffer()` 按 kind 填：
+
+- `UBO` -> `gpuAddress + off`；没绑就丢 draw（零指针会 fault，不是"可选"）
+- `TEXTURE` / `SEPARATE_TEXTURE` -> `gpuResourceID`
+- `SAMPLER_OF_TEXTURE` -> 同一合并句柄里的采样器
+- `SEPARATE_SAMPLER` -> 独立采样器槽
+- `UNSUPPORTED` -> 丢 draw，记 `nvnCommandBufferDraw.argUnsupported`
+
+顶点阶段的布局**记录但不消费**：本后端 `buffer(0)` 是第一条顶点流，顶点参数
+缓冲区要先有槽位偏移约定（§6），这是下一块工作。
+
+### 自检：侧车路径每台设备都跑
+
+第五条 draw 现在装一张临时 blob（key `00000000000000a5`，id **5 / 9 / 12**），
+`lookup_blob` + `copy_args` 校验后打印，再恢复真正的表：
+
+```
+[selftest] blob layout: key=00000000000000a5 numArgs=3 ids=5/9/12
+```
+
+非直连设备把布局应用到程序；模拟器走直连时 `numArgs=0` 是预期的（直连不看
+id）。Metal 3 真机的 fragment 用 variant 5（`[[id(5)]]`/`[[id(9)]]`/`[[id(12)]]`），
+回读四角顺带证明表的步长与空洞。
+
+### 证据（CI）
+
+run `41037369546`（HEAD `09b0327`）：portable `124001430324`、ios
+`124001563704`，都 success；`BOTW_SELFTEST rc=0`，release gate 仍拒绝编译。
+
+本地 `test_gen_blobs.py`（合成 MSL，无游戏内容）钉住：合并纹理 10、独立纹理
+128→0、bindless/c1/image/sbuf 的 unsupported、空洞，以及 `[[id(64)]]` 必须让
+生成器失败。第一次推送（`c1b6500`）在 portable 上被 clang 的
+`-Wmissing-field-initializers` 拦下——旧的三字段 blob 初始化在 MSVC 下不报，
+CI 用 `-Wextra` 就报；`09b0327` 补全。
+
+### 仍然没有的
+
+| 缺口 | 后果 |
+|---|---|
+| c1 常量段 | fragment 里唯一解不出的一项；当前链不产出 c1 内容，不能填零假装正确 |
+| bindless（句柄在统一缓冲里） | `fp_t_cb7_*` 要运行时读统一缓冲再解句柄 |
+| image / typed buffer | compute 与部分像素路径 |
+| 顶点阶段的参数缓冲区 | 与顶点流 0 号槽冲突，偏移约定未定 |
+| guest 纹理上传 / tiled 布局 | 侧车只解决"填哪一格"，不解决"格子里是什么" |
+| 真实 shader 的 draw | 仍是 0 条；本地 shader 的 c1 未解，CI 也不含标题数据 |
+| blob 表查找 | 线性表；19,592 条时每次 SetShaders 是 O(n)，量起来要换哈希 |
 | 真机 | **没有真机运行记录** |

@@ -159,8 +159,9 @@ C:\Python314\python.exe scripts\shader_chain\gen_blobs.py --msl build\shader-cha
    sampler pool 给出稳定句柄，`BindTexture` / `BindSeparateSampler` 记录句柄，
    draw 前按 `[[id(k)]]` 写一张每项 8 字节的参数表：buffer 写
    `gpuAddress + offset`，texture / sampler 写 `gpuResourceID`。
-   **仍然缺的**是每个真实 shader 的 `[[id(k)]]` ↔ NVN 槽位映射：它只能来自
-   翻译侧车（SPIR-V 描述符顺序），内置 MSL 里是手工声明的。
+   **真实 shader 的槽位映射也已接上**（M3.84，见 §5.5.1）：`gen_blobs.py`
+   从 `spvDescriptorSetBuffer0` 的成员名解出布局，和 MSL 一起写进同一个 blob；
+   `prog_set_shaders()` 查找 blob、把布局拷进 `Program::args`，运行时不再猜。
 
    为什么不用 `MTLArgumentEncoder`：模拟器返回的对象 `encodedLength == 0`，
    而模拟器的纹理 `gpuResourceID` 又是 0——"让 Metal 自己算布局"这条路在那里
@@ -168,8 +169,9 @@ C:\Python314\python.exe scripts\shader_chain\gen_blobs.py --msl build\shader-cha
 3. 几何路径：`DrawArrays` 与 `DrawElements`（16/32 位索引）都已编码，
    顶点与索引都按 pool 零拷贝绑定（M3.79 / M3.80）。也就是说**画什么形状
    已经不缺了**；常量、纹理、sampler 三条绑定都通了（模拟器上纹理/sampler
-   走直连，见 §5.5），缺的是真实 shader 的槽位映射，所以仍然没有一条
-   **真实** shader 在 Metal 里执行过。
+   走直连，见 §5.5），真实 shader 的槽位映射也已由 M3.84 侧车补上；但 c1、
+   bindless、guest 纹理上传仍未解，所以仍然没有一条**真实** shader 在 Metal
+   里执行过。
 
 ### 5.4 Sampler 状态对象（M3.82）
 
@@ -207,6 +209,42 @@ M3.83 之后这**已经**是资源绑定的一部分：`nvnSamplerPoolInitialize
 `BindSeparateSampler(s)` 只消费 pixel stage；其他 stage 记一次日志后忽略，
 因为当前后端只建 fragment 的参数缓冲区。
 
+#### 5.5.1 真实 shader 的参数布局（M3.84）
+
+`gen_blobs.py` 不只收起 MSL：它同时解析 `--msl-argument-buffers` 产物里的
+`struct spvDescriptorSetBuffer0`，把每个成员翻译成 NVN 资源槽位，并生成
+`kArgs_<key>_<stage>[]`。生成器按成员名分类，不靠描述符出现顺序猜：
+
+| MSL 成员名 | 含义 | 侧车 kind / slot |
+|---|---|---|
+| `fp_c3` / `vp_c5` | 常量段 N -> 统一缓冲槽 N−3 | `UBO` 0 / 2 |
+| `fp_t_tcb_1C` | c2 合并纹理句柄 | `TEXTURE` 10 |
+| `fp_t_tcb_1CSmplr` | 同一合并句柄中的采样器 | `SAMPLER_OF_TEXTURE` 10 |
+| `fp_t_tcb_5A` | 独立纹理 | `SEPARATE_TEXTURE` 0 |
+| `fp_t_cb2_1C` | c2 驱动表纹理 | `TEXTURE` |
+| `fp_t_cb7_2A` | bindless，句柄在统一缓冲里 | `UNSUPPORTED` |
+| `fp_c1` | c1 常量段 | `UNSUPPORTED` |
+| `fp_i_*` / `fp_s3` | image / storage buffer | `UNSUPPORTED` |
+
+本地 `Bootup_Graphics` 的两个真实 shader（数据不入库）暴露了尺寸问题：
+
+| stage | `[[id(k)]]` 成员 | 最高 id | 分类 |
+|---|---:|---:|---|
+| `d756ff62a57fc508_vs` | 7 | 6 | 3 UBO + 2 纹理 + 2 采样器 |
+| `029de06ee5b5d21b_ps` | 42 | 41 | 5 UBO + 18 纹理 + 18 采样器 + 1 c1 |
+
+两项合计 49 项：8 UBO、20 纹理、20 采样器、1 个 unsupported（`fp_c1`）。
+`Program::args` 因此扩到 `NVNGFX_MAX_ARGS`（64），参数表按最高 id 分配；
+纹理和采样器槽位各 32 个。布局随 blob 下发，`nvngfx_shader_lookup_blob()` /
+`nvngfx_shader_copy_args()` 在 `prog_set_shaders()` 里取同一份记录，避免 MSL 与
+布局来自不同版本。
+
+`UNSUPPORTED` 不会被静默填零：`argument_buffer()` 直接丢 draw，并记
+`nvnCommandBufferDraw.argUnsupported`；缺 UBO 同理。生成器对 id ≥ 64、
+重复 id、非法 kind 和越界槽位**直接让构建失败**。顶点阶段的布局会保存，
+但当前不消费——`buffer(0)` 还是第一条顶点流，顶点参数缓冲区的槽位偏移
+约定未定。
+
 ### 模拟器上走直连，Metal 3 上走参数缓冲区
 
 自检打印了真实 ID：模拟器 `apple7=0 metal3=0 unifiedMemory=0`，
@@ -223,7 +261,8 @@ M3.83 之后这**已经**是资源绑定的一部分：`nvnSamplerPoolInitialize
 - 纹理注册只保存客体地址；`nvnTextureFinalize` 后再采样会解析失败并丢 draw。
 - `nvnTexturePoolGetMemoryPool` / `nvnSamplerPoolGetMemoryPool` 不在
   `signatures.json` 的 470 个形状里，未绑。
-- 真实 shader 的 `[[id(k)]]` 顺序仍缺侧车。
+- 真实 shader 的 `[[id(k)]]` 顺序已由 M3.84 侧车解出；c1、bindless、image /
+  storage buffer 仍标为 `UNSUPPORTED`。
 - 参数缓冲区的 texture / sampler 条目要写 `gpuResourceID`。iOS 模拟器
   （`apple7=0 metal3=0`）的纹理 ID 恒为 0，所以那里只能走直连绑定；
   该条目本身**只在 Metal 3 硬件上有意义，尚未验证**。
@@ -257,10 +296,12 @@ M3.83 之后这**已经**是资源绑定的一部分：`nvnSamplerPoolInitialize
 | compute / geometry shader | 未做（`extract` 目前跳过 cs） |
 | 运行时按 key 取 MSL | **已接线**（M3.78，见 §5.1） |
 | 顶点描述符 | **已接**（M3.79） |
-| argument buffer（UBO / 纹理 / sampler） | UBO 已接（M3.81）；texture/sampler 条目按固定 8 字节 ABI 写入（M3.83）；模拟器因 `gpuResourceID == 0` 改走直连绑定，参数缓冲区的纹理条目未在 Metal 3 硬件上验证 |
+| argument buffer（UBO / 纹理 / sampler） | UBO 已接（M3.81）；texture/sampler 条目按固定 8 字节 ABI 写入（M3.83）；真实 shader 的 `[[id(k)]]` 布局侧车已接（M3.84），但 c1 / bindless / 顶点参数缓冲区仍未解 |
+| Metal 3 参数缓冲区的纹理条目 | 未验证；模拟器 `gpuResourceID == 0` 改走直连绑定，需原生 macOS Metal 离屏测试或真机 |
 
 一句话：**链的前 2/3 在 Windows 上真的通了，后 1/3（`xcrun metal`）要在 CI 的
 macOS 上补；运行时按 key 取 MSL 已接线（M3.78），顶点与索引都已接（M3.79 / M3.80），
 UBO 已进 argument buffer（M3.81），sampler 状态对象已能创建（M3.82），
-texture/sampler 条目也已接（M3.83，模拟器走直连绑定），但还没有任何一条真实
-shader 在 Metal 里执行过。**
+texture/sampler 条目也已接（M3.83，模拟器走直连绑定），真实 shader 的
+`[[id(k)]]` 布局侧车已接（M3.84）；c1、bindless、顶点参数缓冲区仍未解，
+所以还没有任何一条真实 shader 在 Metal 里执行过。**
