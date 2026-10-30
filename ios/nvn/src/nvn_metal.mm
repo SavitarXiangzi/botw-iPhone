@@ -3427,6 +3427,14 @@ extern "C" int nvngfx_metal_selftest(void) {
     const NSUInteger kSide = 64;
     /* Backing store for the second draw's memory pool; freed at `done`. */
     void* poolRaw = nullptr;
+    /* The cube draws need 3072 + 6144 bytes of block-aligned layers, more
+     * than the last 4 KiB of the first page, so they get their own page and
+     * their own NVN memory pool (0x7300).  Growing the first pool to 64 KiB
+     * instead made the simulator app exit on the next draw (cause not
+     * established); two 16 KiB pages keep every no-copy buffer at the size
+     * that already worked. */
+    void* poolRaw2 = nullptr;
+    const uint64_t kCubePool = 0x7300;
 
     @autoreleasepool {
         id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
@@ -3686,11 +3694,8 @@ extern "C" int nvngfx_metal_selftest(void) {
              * (allocation, memset, builder) must agree.  Using
              * sizeof(vertexPool) here was a bug: vertexPool is a
              * pointer, so the pool was 8 bytes and every span check
-             * rejected the 24-byte vertex range.  The pool is 64 KiB so the
-             * cube and cube-array draws below fit: each layer is block
-             * aligned, so a 2x2 face still costs 512 bytes and a two-cube
-             * array costs 12 * 512. */
-            const size_t kPoolSize = 65536;
+             * rejected the 24-byte vertex range. */
+            const size_t kPoolSize = 16384;
             poolRaw = std::malloc(kPoolSize + kPoolSize);
             if (!poolRaw) {
                 std::fprintf(stderr, "[selftest] could not allocate the pool page\n");
@@ -5354,9 +5359,9 @@ extern "C" int nvngfx_metal_selftest(void) {
             const uint64_t kCb12 = 0x6E00;
             const uint64_t kB12 =
                 reinterpret_cast<uint64_t>(guestCubeBuilder);
-            const unsigned kCubeOffset = 13312;
+            const unsigned kCubeOffset = 0;
             unsigned char* const vpool12 = reinterpret_cast<unsigned char*>(
-                (reinterpret_cast<uintptr_t>(poolRaw) + 16383u) &
+                (reinterpret_cast<uintptr_t>(poolRaw2) + 16383u) &
                 ~static_cast<uintptr_t>(16383u));
 
             nvngfx_texdesc cd;
@@ -5368,7 +5373,36 @@ extern "C" int nvngfx_metal_selftest(void) {
             cd.depth = 1;
             cd.levels = 1;
             cd.samples = 1;
-            cd.pool = 0x5400;
+            poolRaw2 = std::malloc(16384 + 16384);
+            if (!poolRaw2) {
+                std::fprintf(stderr,
+                             "[selftest] draw 12: could not allocate the "
+                             "cube pool page\n");
+                rc = 16401;
+                goto done;
+            }
+            std::memset(vpool12, 0, 16384);
+            {
+                alignas(16) unsigned char cubePoolBuilder[0x40] = {};
+                const uint64_t kCubePoolB =
+                    reinterpret_cast<uint64_t>(cubePoolBuilder);
+                x[0] = kCubePoolB;
+                pool_builder_set_defaults(ctx, x);
+                x[0] = kCubePoolB;
+                x[1] = reinterpret_cast<uint64_t>(vpool12);
+                x[2] = 16384;
+                pool_builder_set_storage(ctx, x);
+                x[0] = kCubePool;
+                x[1] = kCubePoolB;
+                pool_initialize(ctx, x);
+                if (x[0] != 1) {
+                    std::fprintf(stderr,
+                                 "[selftest] draw 12: cube pool init failed\n");
+                    rc = 16401;
+                    goto done;
+                }
+            }
+            cd.pool = kCubePool;
             cd.offset = kCubeOffset;
             {
                 const unsigned char red[16] = {
@@ -5416,7 +5450,7 @@ extern "C" int nvngfx_metal_selftest(void) {
                 tex_builder_set_levels(ctx, x);
                 x[0] = kB12; x[1] = 1;
                 tex_builder_set_samples(ctx, x);
-                x[0] = kB12; x[1] = 0x5400; x[2] = kCubeOffset;
+                x[0] = kB12; x[1] = kCubePool; x[2] = kCubeOffset;
                 tex_builder_set_storage(ctx, x);
                 x[0] = kTexGuestCube; x[1] = kB12;
                 tex_initialize(ctx, x);
@@ -5566,9 +5600,9 @@ extern "C" int nvngfx_metal_selftest(void) {
             const uint64_t kCb13 = 0x7100;
             const uint64_t kB13 =
                 reinterpret_cast<uint64_t>(guestCubeArrayBuilder);
-            const unsigned kCubeArrayOffset = 16384;
+            const unsigned kCubeArrayOffset = 4096;
             unsigned char* const vpool13 = reinterpret_cast<unsigned char*>(
-                (reinterpret_cast<uintptr_t>(poolRaw) + 16383u) &
+                (reinterpret_cast<uintptr_t>(poolRaw2) + 16383u) &
                 ~static_cast<uintptr_t>(16383u));
 
             nvngfx_texdesc ad13;
@@ -5580,7 +5614,7 @@ extern "C" int nvngfx_metal_selftest(void) {
             ad13.depth = 2;
             ad13.levels = 1;
             ad13.samples = 1;
-            ad13.pool = 0x5400;
+            ad13.pool = kCubePool;
             ad13.offset = kCubeArrayOffset;
             {
                 const unsigned char red[16] = {
@@ -5627,7 +5661,7 @@ extern "C" int nvngfx_metal_selftest(void) {
                 tex_builder_set_levels(ctx, x);
                 x[0] = kB13; x[1] = 1;
                 tex_builder_set_samples(ctx, x);
-                x[0] = kB13; x[1] = 0x5400; x[2] = kCubeArrayOffset;
+                x[0] = kB13; x[1] = kCubePool; x[2] = kCubeArrayOffset;
                 tex_builder_set_storage(ctx, x);
                 x[0] = kTexGuestCubeArray; x[1] = kB13;
                 tex_initialize(ctx, x);
@@ -5804,6 +5838,9 @@ extern "C" int nvngfx_metal_selftest(void) {
         forget<Tex>(0x6F00);
         forget<Program>(0x7000);
         forget<CmdBuf>(0x7100);
+        forget<Pool>(0x7300);
+        g_pool_specs.erase(0x7400);
+        std::free(poolRaw2);
         g_tex_specs.erase(kTexSrcBuilder);
         g_tex_specs.erase(0x6450);
         g_sampler_specs.erase(kSamplerBuilder5);
