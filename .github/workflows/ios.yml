@@ -140,12 +140,18 @@ jobs:
           echo "simulator: $UDID"
           if ! xcodebuild test -project BotW.xcodeproj -scheme BotW \
                -configuration Debug -destination "id=$UDID" \
+               -destination-timeout 120 \
                -derivedDataPath build-test \
                CODE_SIGNING_ALLOWED=NO > test-sim.log 2>&1; then
-            grep -E "(error:|failed|Test Case.*failed)" test-sim.log | head -30 | while read -r line; do
+            # Annotations are the only part of a step log that is visible
+            # without repo admin rights, so the tail goes there verbatim.
+            tail -60 test-sim.log | while read -r line; do
               echo "::error::$line"
             done
-            tail -80 test-sim.log
+            echo "::error::simulators available:"
+            xcrun simctl list devices available | head -30 | while read -r line; do
+              echo "::error::$line"
+            done
             exit 1
           fi
           grep -E "Test Suite|Test Case" test-sim.log | tail -12
