@@ -414,6 +414,16 @@ layer 0 全红、layer 1 全黄。运行时先检查 `MTLTexture.textureType == 
 这条已在 run 41070475247 的 iOS job（124113134061）上执行通过，
 同一段日志里 `texture upload` 报 `layers=2 staging=32 bytes`。
 
+M3.92 补上另外两种层形状：第十二条建 `MTLTextureTypeCube`（`arrayLength=1`、
+6 个 slice），NVN 面 4（+Z）涂红、面 5（-Z）涂黄、其余四面涂绿，片段着色器
+分别沿 `(0,0,1)` 与 `(0,0,-1)` 采样，左红右黄才算过；第十三条建
+`MTLTextureTypeCubeArray`，`depth=2` 即 `arrayLength=2`、12 个 slice，
+红放在 slice 4、黄放在 slice 11，着色器从 cube 0 取 +Z、从 cube 1 取 -Z。
+后者同时验证“Metal 的数组长度”和“上传的总 slice 数”没有混用：把 12 写成 2
+会让 slice 11 落空，写成 6 则越界。失败码 `16401/16402`（cube）、
+`16403/16404`（cube array）。这两条在本地只能过语法与 fixture 检查，
+端到端结果以提交后的 iOS job 为准。
+
 第五条在模拟器里走的是**直连纹理/采样器绑定**：模拟器的
 `MTLTexture.gpuResourceID` 是 0，参数缓冲区的纹理条目在那里没有意义
 （见 `docs/ROADMAP.md` 的 M3.83 / M3.84 段）。所以“Metal 这半边是通的”

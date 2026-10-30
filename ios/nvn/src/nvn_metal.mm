@@ -30,7 +30,7 @@
  *         on a computer, never in the repository.  Everything else on that
  *         path -- pipeline creation with a real vertex descriptor, buffer
  *         binding, draw encoding, pixel readback -- is executed by
- *         nvngfx_metal_selftest() in CI's iOS Simulator: eleven draws, a
+ *         nvngfx_metal_selftest() in CI's iOS Simulator: thirteen draws, a
  *         bindless table probe, and a vertex-stage argument-buffer draw whose
  *         shifted pixels are read back.  The ninth builds a block-linear
  *         texture in a guest memory pool and proves that the sampled pixels
@@ -5338,6 +5338,428 @@ extern "C" int nvngfx_metal_selftest(void) {
             }
         }
 
+        {
+            /* --- Draw 12: a cube map from guest memory --------------------
+             * NVN's face order is +X, -X, +Y, -Y, +Z, -Z, so slices 4 and 5
+             * are the two Z faces.  Metal's cube has one array entry and six
+             * implicit slices, but the upload still has to name slice 4 and
+             * slice 5; the other four faces are green so a wrong face is
+             * visible instead of passing. */
+            alignas(16) unsigned char guestCubeBuilder[0x80] = {};
+            const uint64_t kTexGuestCube = 0x6C00;
+            const uint64_t kProg12 = 0x6D00;
+            const uint64_t kCb12 = 0x6E00;
+            const uint64_t kB12 =
+                reinterpret_cast<uint64_t>(guestCubeBuilder);
+            const unsigned kCubeOffset = 13312;
+            unsigned char* const vpool12 = reinterpret_cast<unsigned char*>(
+                (reinterpret_cast<uintptr_t>(poolRaw) + 16383u) &
+                ~static_cast<uintptr_t>(16383u));
+
+            nvngfx_texdesc cd;
+            nvngfx_texdesc_defaults(&cd);
+            cd.target = 8;                       /* NVN_TEXTURE_TARGET_CUBEMAP */
+            cd.format = 0x25;                    /* RGBA8_UNORM */
+            cd.width = 2;
+            cd.height = 2;
+            cd.depth = 1;
+            cd.levels = 1;
+            cd.samples = 1;
+            cd.pool = 0x5400;
+            cd.offset = kCubeOffset;
+            {
+                const unsigned char red[16] = {
+                    255, 0, 0, 255, 255, 0, 0, 255,
+                    255, 0, 0, 255, 255, 0, 0, 255};
+                const unsigned char yellow[16] = {
+                    255, 255, 0, 255, 255, 255, 0, 255,
+                    255, 255, 0, 255, 255, 255, 0, 255};
+                const unsigned char green[16] = {
+                    0, 255, 0, 255, 0, 255, 0, 255,
+                    0, 255, 0, 255, 0, 255, 0, 255};
+                nvngfx_texlayout cl = {};
+                bool ok = nvngfx_tex_layout(&cd, &cl) == 0 &&
+                          cl.layers == 6 && cl.size <= 1024;
+                for (unsigned face = 0; ok && face < 6; ++face) {
+                    const unsigned char* const src =
+                        face == 4 ? red : (face == 5 ? yellow : green);
+                    ok = nvngfx_tex_swizzle(&cd, 0, face, src, 8,
+                                            vpool12 + kCubeOffset) == 0;
+                }
+                if (!ok) {
+                    std::fprintf(stderr,
+                                 "[selftest] draw 12: guest cube layout failed "
+                                 "(layers=%u size=%llu)\n",
+                                 cl.layers,
+                                 static_cast<unsigned long long>(cl.size));
+                    rc = 16401;
+                    goto done;
+                }
+            }
+            {
+                x[0] = kB12;
+                tex_builder_set_defaults(ctx, x);
+                x[0] = kB12; x[1] = 8;
+                tex_builder_set_target(ctx, x);
+                x[0] = kB12; x[1] = 0x25;
+                tex_builder_set_format(ctx, x);
+                x[0] = kB12; x[1] = 2; x[2] = 2;
+                tex_builder_set_size2d(ctx, x);
+                x[0] = kB12; x[1] = 1;
+                tex_builder_set_depth(ctx, x);
+                x[0] = kB12; x[1] = 1;
+                tex_builder_set_levels(ctx, x);
+                x[0] = kB12; x[1] = 1;
+                tex_builder_set_samples(ctx, x);
+                x[0] = kB12; x[1] = 0x5400; x[2] = kCubeOffset;
+                tex_builder_set_storage(ctx, x);
+                x[0] = kTexGuestCube; x[1] = kB12;
+                tex_initialize(ctx, x);
+            }
+            Tex* cubeTex = find<Tex>(kTexGuestCube);
+            if (x[0] != 1 || !cubeTex || !cubeTex->mtl ||
+                cubeTex->mtl.textureType != MTLTextureTypeCube ||
+                cubeTex->mtl.arrayLength != 1 || cubeTex->layers != 6) {
+                std::fprintf(stderr,
+                             "[selftest] draw 12: cube texture is not "
+                             "Cube x1 / 6 slices (type=%lu array=%lu "
+                             "layers=%u)\n",
+                             cubeTex
+                                 ? static_cast<unsigned long>(
+                                       cubeTex->mtl.textureType)
+                                 : 0ul,
+                             cubeTex
+                                 ? static_cast<unsigned long>(
+                                       cubeTex->mtl.arrayLength)
+                                 : 0ul,
+                             cubeTex ? cubeTex->layers : 0u);
+                rc = 16401;
+                goto done;
+            }
+
+            struct { uint64_t data; uint64_t control; } sd12[2];
+            sd12[0].data = reinterpret_cast<uint64_t>(const_cast<char*>(
+                nvngfx_shader_selftest_msl_variant(NVNGFX_STAGE_VERTEX, 10)));
+            sd12[0].control = 0;
+            sd12[1].data = reinterpret_cast<uint64_t>(const_cast<char*>(
+                nvngfx_shader_selftest_msl_variant(NVNGFX_STAGE_FRAGMENT, 10)));
+            sd12[1].control = 0;
+            x[0] = kProg12; x[1] = 0;
+            prog_initialize(ctx, x);
+            x[0] = kProg12; x[1] = 2;
+            x[2] = reinterpret_cast<uint64_t>(&sd12[0]);
+            prog_set_shaders(ctx, x);
+            if (x[0] != 1) {
+                std::fprintf(stderr,
+                             "[selftest] draw 12: SetShaders failed\n");
+                rc = 16401;
+                goto done;
+            }
+            x[0] = kTexPool; x[1] = 6; x[2] = kTexGuestCube; x[3] = 0;
+            tex_pool_register_texture(ctx, x);
+
+            const uint64_t target12 = kTex;
+            const float clear12[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+            x[0] = kCb12;
+            cmdbuf_begin_recording(ctx, x);
+            x[0] = kCb12; x[1] = 1;
+            x[2] = reinterpret_cast<uint64_t>(&target12);
+            x[3] = 0; x[4] = 0; x[5] = 0;
+            cmdbuf_set_render_targets(ctx, x);
+            x[0] = kCb12; x[1] = 0;
+            x[2] = reinterpret_cast<uint64_t>(clear12);
+            x[3] = 0xF;
+            cmdbuf_clear_color(ctx, x);
+            x[0] = kCb12; x[1] = kTexPool;
+            cmdbuf_set_texture_pool(ctx, x);
+            x[0] = kCb12; x[1] = kSampPool;
+            cmdbuf_set_sampler_pool(ctx, x);
+            x[0] = 0; x[1] = 6; x[2] = 9;
+            dev_get_texture_handle(ctx, x);
+            const uint64_t chandle = x[0];
+            x[0] = kCb12; x[1] = 1; x[2] = 0; x[3] = chandle;
+            cmdbuf_bind_texture(ctx, x);
+            x[0] = kCb12; x[1] = kProg12; x[2] = 0;
+            cmdbuf_bind_program(ctx, x);
+            x[0] = kCb12; x[1] = 0; x[2] = 0; x[3] = 3;
+            cmdbuf_draw_arrays(ctx, x);
+            x[0] = kCb12;
+            cmdbuf_end_recording(ctx, x);
+
+            CmdBuf* b12 = find<CmdBuf>(kCb12);
+            if (!b12 || !b12->last) {
+                std::fprintf(stderr,
+                             "[selftest] draw 12: nothing committed\n");
+                rc = 16401;
+                goto done;
+            }
+            [b12->last waitUntilCompleted];
+            if (b12->last.status == MTLCommandBufferStatusError) {
+                std::fprintf(stderr,
+                             "[selftest] draw 12 command buffer error: %s\n",
+                             b12->last.error
+                                 ? [[b12->last.error localizedDescription]
+                                       UTF8String]
+                                 : "(no description)");
+                rc = 16401;
+                goto done;
+            }
+            if (!cubeTex->uploaded || cubeTex->uploadedLevels != 1 ||
+                b12->encoded != 1) {
+                std::fprintf(stderr,
+                             "[selftest] draw 12: cube not used "
+                             "(uploaded=%d levels=%u encoded=%u)\n",
+                             cubeTex->uploaded ? 1 : 0,
+                             cubeTex->uploadedLevels, b12->encoded);
+                rc = 16401;
+                goto done;
+            }
+            {
+                unsigned char left[4] = {0, 0, 0, 0};
+                unsigned char right[4] = {0, 0, 0, 0};
+                const int wantRed[4] = {255, 0, 0, 255};
+                const int wantYellow[4] = {255, 255, 0, 255};
+                if (!read_pixel_at(dev, c->queue, t->mtl, kSide,
+                                   kSide / 8, kSide / 2, left) ||
+                    !read_pixel_at(dev, c->queue, t->mtl, kSide,
+                                   (7 * kSide) / 8, kSide / 2, right)) {
+                    std::fprintf(stderr,
+                                 "[selftest] draw 12 readback failed\n");
+                    rc = 16402;
+                    goto done;
+                }
+                if (!pixels_near(left, wantRed, 2) ||
+                    !pixels_near(right, wantYellow, 2)) {
+                    std::fprintf(stderr,
+                                 "[selftest] draw 12 +Z/-Z are "
+                                 "(%u,%u,%u,%u) / (%u,%u,%u,%u), want "
+                                 "(%d,%d,%d,%d) / (%d,%d,%d,%d); the cube "
+                                 "faces did not reach the shader\n",
+                                 left[0], left[1], left[2], left[3],
+                                 right[0], right[1], right[2], right[3],
+                                 wantRed[0], wantRed[1], wantRed[2], wantRed[3],
+                                 wantYellow[0], wantYellow[1], wantYellow[2],
+                                 wantYellow[3]);
+                    rc = 16402;
+                    goto done;
+                }
+                std::fprintf(stderr,
+                             "[selftest] draw 12: cube faces 4/5 sampled "
+                             "from guest memory\n");
+            }
+        }
+
+        {
+            /* --- Draw 13: a cube array from guest memory ------------------
+             * Six slices per cube: `arrayLength` is 2 but the upload must
+             * reach slice 11, the -Z face of cube 1.  Reading +Z of cube 0
+             * and -Z of cube 1 on the two halves catches both a wrong
+             * arrayLength and an upload that stopped after depth * 1. */
+            alignas(16) unsigned char guestCubeArrayBuilder[0x80] = {};
+            const uint64_t kTexGuestCubeArray = 0x6F00;
+            const uint64_t kProg13 = 0x7000;
+            const uint64_t kCb13 = 0x7100;
+            const uint64_t kB13 =
+                reinterpret_cast<uint64_t>(guestCubeArrayBuilder);
+            const unsigned kCubeArrayOffset = 13824;
+            unsigned char* const vpool13 = reinterpret_cast<unsigned char*>(
+                (reinterpret_cast<uintptr_t>(poolRaw) + 16383u) &
+                ~static_cast<uintptr_t>(16383u));
+
+            nvngfx_texdesc ad13;
+            nvngfx_texdesc_defaults(&ad13);
+            ad13.target = 9;                  /* NVN_TEXTURE_TARGET_CUBEMAP_ARRAY */
+            ad13.format = 0x25;               /* RGBA8_UNORM */
+            ad13.width = 2;
+            ad13.height = 2;
+            ad13.depth = 2;
+            ad13.levels = 1;
+            ad13.samples = 1;
+            ad13.pool = 0x5400;
+            ad13.offset = kCubeArrayOffset;
+            {
+                const unsigned char red[16] = {
+                    255, 0, 0, 255, 255, 0, 0, 255,
+                    255, 0, 0, 255, 255, 0, 0, 255};
+                const unsigned char yellow[16] = {
+                    255, 255, 0, 255, 255, 255, 0, 255,
+                    255, 255, 0, 255, 255, 255, 0, 255};
+                const unsigned char green[16] = {
+                    0, 255, 0, 255, 0, 255, 0, 255,
+                    0, 255, 0, 255, 0, 255, 0, 255};
+                nvngfx_texlayout al13 = {};
+                bool ok = nvngfx_tex_layout(&ad13, &al13) == 0 &&
+                          al13.layers == 12 && al13.size <= 1024;
+                for (unsigned face = 0; ok && face < 12; ++face) {
+                    const unsigned char* const src =
+                        face == 4 ? red : (face == 11 ? yellow : green);
+                    ok = nvngfx_tex_swizzle(&ad13, 0, face, src, 8,
+                                            vpool13 + kCubeArrayOffset) == 0;
+                }
+                if (!ok) {
+                    std::fprintf(stderr,
+                                 "[selftest] draw 13: guest cube array layout "
+                                 "failed (layers=%u size=%llu)\n",
+                                 al13.layers,
+                                 static_cast<unsigned long long>(al13.size));
+                    rc = 16403;
+                    goto done;
+                }
+            }
+            {
+                x[0] = kB13;
+                tex_builder_set_defaults(ctx, x);
+                x[0] = kB13; x[1] = 9;
+                tex_builder_set_target(ctx, x);
+                x[0] = kB13; x[1] = 0x25;
+                tex_builder_set_format(ctx, x);
+                x[0] = kB13; x[1] = 2; x[2] = 2;
+                tex_builder_set_size2d(ctx, x);
+                x[0] = kB13; x[1] = 2;
+                tex_builder_set_depth(ctx, x);
+                x[0] = kB13; x[1] = 1;
+                tex_builder_set_levels(ctx, x);
+                x[0] = kB13; x[1] = 1;
+                tex_builder_set_samples(ctx, x);
+                x[0] = kB13; x[1] = 0x5400; x[2] = kCubeArrayOffset;
+                tex_builder_set_storage(ctx, x);
+                x[0] = kTexGuestCubeArray; x[1] = kB13;
+                tex_initialize(ctx, x);
+            }
+            Tex* cubeArrayTex = find<Tex>(kTexGuestCubeArray);
+            if (x[0] != 1 || !cubeArrayTex || !cubeArrayTex->mtl ||
+                cubeArrayTex->mtl.textureType != MTLTextureTypeCubeArray ||
+                cubeArrayTex->mtl.arrayLength != 2 ||
+                cubeArrayTex->layers != 12) {
+                std::fprintf(stderr,
+                             "[selftest] draw 13: cube array texture is not "
+                             "CubeArray x2 / 12 slices (type=%lu array=%lu "
+                             "layers=%u)\n",
+                             cubeArrayTex
+                                 ? static_cast<unsigned long>(
+                                       cubeArrayTex->mtl.textureType)
+                                 : 0ul,
+                             cubeArrayTex
+                                 ? static_cast<unsigned long>(
+                                       cubeArrayTex->mtl.arrayLength)
+                                 : 0ul,
+                             cubeArrayTex ? cubeArrayTex->layers : 0u);
+                rc = 16403;
+                goto done;
+            }
+
+            struct { uint64_t data; uint64_t control; } sd13[2];
+            sd13[0].data = reinterpret_cast<uint64_t>(const_cast<char*>(
+                nvngfx_shader_selftest_msl_variant(NVNGFX_STAGE_VERTEX, 11)));
+            sd13[0].control = 0;
+            sd13[1].data = reinterpret_cast<uint64_t>(const_cast<char*>(
+                nvngfx_shader_selftest_msl_variant(NVNGFX_STAGE_FRAGMENT, 11)));
+            sd13[1].control = 0;
+            x[0] = kProg13; x[1] = 0;
+            prog_initialize(ctx, x);
+            x[0] = kProg13; x[1] = 2;
+            x[2] = reinterpret_cast<uint64_t>(&sd13[0]);
+            prog_set_shaders(ctx, x);
+            if (x[0] != 1) {
+                std::fprintf(stderr,
+                             "[selftest] draw 13: SetShaders failed\n");
+                rc = 16403;
+                goto done;
+            }
+            x[0] = kTexPool; x[1] = 8; x[2] = kTexGuestCubeArray; x[3] = 0;
+            tex_pool_register_texture(ctx, x);
+
+            const uint64_t target13 = kTex;
+            const float clear13[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+            x[0] = kCb13;
+            cmdbuf_begin_recording(ctx, x);
+            x[0] = kCb13; x[1] = 1;
+            x[2] = reinterpret_cast<uint64_t>(&target13);
+            x[3] = 0; x[4] = 0; x[5] = 0;
+            cmdbuf_set_render_targets(ctx, x);
+            x[0] = kCb13; x[1] = 0;
+            x[2] = reinterpret_cast<uint64_t>(clear13);
+            x[3] = 0xF;
+            cmdbuf_clear_color(ctx, x);
+            x[0] = kCb13; x[1] = kTexPool;
+            cmdbuf_set_texture_pool(ctx, x);
+            x[0] = kCb13; x[1] = kSampPool;
+            cmdbuf_set_sampler_pool(ctx, x);
+            x[0] = 0; x[1] = 8; x[2] = 9;
+            dev_get_texture_handle(ctx, x);
+            const uint64_t cahandle = x[0];
+            x[0] = kCb13; x[1] = 1; x[2] = 0; x[3] = cahandle;
+            cmdbuf_bind_texture(ctx, x);
+            x[0] = kCb13; x[1] = kProg13; x[2] = 0;
+            cmdbuf_bind_program(ctx, x);
+            x[0] = kCb13; x[1] = 0; x[2] = 0; x[3] = 3;
+            cmdbuf_draw_arrays(ctx, x);
+            x[0] = kCb13;
+            cmdbuf_end_recording(ctx, x);
+
+            CmdBuf* b13 = find<CmdBuf>(kCb13);
+            if (!b13 || !b13->last) {
+                std::fprintf(stderr,
+                             "[selftest] draw 13: nothing committed\n");
+                rc = 16403;
+                goto done;
+            }
+            [b13->last waitUntilCompleted];
+            if (b13->last.status == MTLCommandBufferStatusError) {
+                std::fprintf(stderr,
+                             "[selftest] draw 13 command buffer error: %s\n",
+                             b13->last.error
+                                 ? [[b13->last.error localizedDescription]
+                                       UTF8String]
+                                 : "(no description)");
+                rc = 16403;
+                goto done;
+            }
+            if (!cubeArrayTex->uploaded || cubeArrayTex->uploadedLevels != 1 ||
+                b13->encoded != 1) {
+                std::fprintf(stderr,
+                             "[selftest] draw 13: cube array not used "
+                             "(uploaded=%d levels=%u encoded=%u)\n",
+                             cubeArrayTex->uploaded ? 1 : 0,
+                             cubeArrayTex->uploadedLevels, b13->encoded);
+                rc = 16403;
+                goto done;
+            }
+            {
+                unsigned char left[4] = {0, 0, 0, 0};
+                unsigned char right[4] = {0, 0, 0, 0};
+                const int wantRed[4] = {255, 0, 0, 255};
+                const int wantYellow[4] = {255, 255, 0, 255};
+                if (!read_pixel_at(dev, c->queue, t->mtl, kSide,
+                                   kSide / 8, kSide / 2, left) ||
+                    !read_pixel_at(dev, c->queue, t->mtl, kSide,
+                                   (7 * kSide) / 8, kSide / 2, right)) {
+                    std::fprintf(stderr,
+                                 "[selftest] draw 13 readback failed\n");
+                    rc = 16404;
+                    goto done;
+                }
+                if (!pixels_near(left, wantRed, 2) ||
+                    !pixels_near(right, wantYellow, 2)) {
+                    std::fprintf(stderr,
+                                 "[selftest] draw 13 (cube0 +Z, cube1 -Z) are "
+                                 "(%u,%u,%u,%u) / (%u,%u,%u,%u), want "
+                                 "(%d,%d,%d,%d) / (%d,%d,%d,%d); slice 11 did "
+                                 "not reach the shader\n",
+                                 left[0], left[1], left[2], left[3],
+                                 right[0], right[1], right[2], right[3],
+                                 wantRed[0], wantRed[1], wantRed[2], wantRed[3],
+                                 wantYellow[0], wantYellow[1], wantYellow[2],
+                                 wantYellow[3]);
+                    rc = 16404;
+                    goto done;
+                }
+                std::fprintf(stderr,
+                             "[selftest] draw 13: cube array layer 0 face 4 and "
+                             "layer 1 face 5 sampled from guest memory\n");
+            }
+        }
+
     done:
         nvngfx_shader_set_msl_passthrough(0);
         forget<CmdBuf>(kCb);
@@ -5370,6 +5792,12 @@ extern "C" int nvngfx_metal_selftest(void) {
         forget<Tex>(0x6900);
         forget<Program>(0x6A00);
         forget<CmdBuf>(0x6B00);
+        forget<Tex>(0x6C00);
+        forget<Program>(0x6D00);
+        forget<CmdBuf>(0x6E00);
+        forget<Tex>(0x6F00);
+        forget<Program>(0x7000);
+        forget<CmdBuf>(0x7100);
         g_tex_specs.erase(kTexSrcBuilder);
         g_tex_specs.erase(0x6450);
         g_sampler_specs.erase(kSamplerBuilder5);

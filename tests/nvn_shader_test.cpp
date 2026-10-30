@@ -77,6 +77,37 @@ int main() {
     CHECK(nvngfx_shader_selftest_msl_variant(NVNGFX_STAGE_COMPUTE, 9) ==
           nullptr);
 
+    /* Variants 10 and 11 are the cube and cube-array draws.  Like the array
+     * case, a plain texture2d would still compile and bind, so the fixture
+     * pins the Metal type and the sampled faces / layers. */
+    const char* fs_cube = nvngfx_shader_selftest_msl_variant(
+        NVNGFX_STAGE_FRAGMENT, 10);
+    CHECK(fs_cube != nullptr &&
+          std::strstr(fs_cube, "texturecube<float>") != nullptr);
+    CHECK(fs_cube != nullptr &&
+          std::strstr(fs_cube, "float3(0.0, 0.0, 1.0)") != nullptr);
+    CHECK(fs_cube != nullptr &&
+          std::strstr(fs_cube, "float3(0.0, 0.0, -1.0)") != nullptr);
+    CHECK(nvngfx_shader_selftest_msl_variant(NVNGFX_STAGE_VERTEX, 10) ==
+          nvngfx_shader_selftest_msl_variant(NVNGFX_STAGE_VERTEX, 4));
+    CHECK(nvngfx_shader_selftest_msl_variant(NVNGFX_STAGE_COMPUTE, 10) ==
+          nullptr);
+
+    const char* fs_cube_array = nvngfx_shader_selftest_msl_variant(
+        NVNGFX_STAGE_FRAGMENT, 11);
+    CHECK(fs_cube_array != nullptr &&
+          std::strstr(fs_cube_array, "texturecube_array<float>") != nullptr);
+    CHECK(fs_cube_array != nullptr &&
+          std::strstr(fs_cube_array,
+                      "tex.sample(smp, float3(0.0, 0.0, 1.0), 0)") != nullptr);
+    CHECK(fs_cube_array != nullptr &&
+          std::strstr(fs_cube_array,
+                      "tex.sample(smp, float3(0.0, 0.0, -1.0), 1)") != nullptr);
+    CHECK(nvngfx_shader_selftest_msl_variant(NVNGFX_STAGE_VERTEX, 11) ==
+          nvngfx_shader_selftest_msl_variant(NVNGFX_STAGE_VERTEX, 4));
+    CHECK(nvngfx_shader_selftest_msl_variant(NVNGFX_STAGE_COMPUTE, 11) ==
+          nullptr);
+
 
     /* Offline MSL blobs: what the Windows-side chain produces is installed by
      * key, looked up case-insensitively, and a bad table is rejected whole
@@ -364,6 +395,6 @@ int main() {
         return 1;
     }
     std::printf("nvn_shader_test: ok (seam, blob table, packed slots, "
-                "bindless, c1, SHA-256, shader key, layered fixture)\n");
+                "bindless, c1, SHA-256, shader key, layered/cube fixtures)\n");
     return 0;
 }

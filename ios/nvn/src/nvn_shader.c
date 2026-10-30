@@ -169,6 +169,45 @@ static const char* const kFsTextureArray =
     "}\n";
 
 
+/* Variant 10: a cube map.  NVN face order is +X, -X, +Y, -Y, +Z, -Z, so the
+ * two Z faces are slices 4 and 5 of the very same upload.  Metal hides the six
+ * slices behind one array entry, but destinationSlice:4/5 during the upload
+ * still has to reach the right face.  Sampling both directions and showing
+ * them on the two halves means a wrong face shows green instead of failing to
+ * compile. */
+static const char* const kFsTextureCube =
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "\n"
+    "struct NvngfxVaryings { float4 position [[position]]; float2 uv; };\n"
+    "\n"
+    "fragment float4 nvngfx_main_fs(NvngfxVaryings in [[stage_in]],\n"
+    "                               texturecube<float> tex [[texture(0)]],\n"
+    "                               sampler smp [[sampler(0)]]) {\n"
+    "    float4 plusZ = tex.sample(smp, float3(0.0, 0.0, 1.0));\n"
+    "    float4 minusZ = tex.sample(smp, float3(0.0, 0.0, -1.0));\n"
+    "    return in.uv.x < 0.5 ? plusZ : minusZ;\n"
+    "}\n";
+
+/* Variant 11: a cube array.  `arrayLength` counts cubes while the upload
+ * addresses all depth * 6 slices, so layer 1 face 5 is slice 11.  Sampling
+ * (0,0,1) from cube 0 and (0,0,-1) from cube 1 forces Metal to keep both
+ * counts apart; if the backend recorded the cube as a plain 2D image, or
+ * stored 6 slices instead of 12, one half cannot be the expected colour. */
+static const char* const kFsTextureCubeArray =
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "\n"
+    "struct NvngfxVaryings { float4 position [[position]]; float2 uv; };\n"
+    "\n"
+    "fragment float4 nvngfx_main_fs(NvngfxVaryings in [[stage_in]],\n"
+    "                               texturecube_array<float> tex [[texture(0)]],\n"
+    "                               sampler smp [[sampler(0)]]) {\n"
+    "    float4 lo = tex.sample(smp, float3(0.0, 0.0, 1.0), 0);\n"
+    "    float4 hi = tex.sample(smp, float3(0.0, 0.0, -1.0), 1);\n"
+    "    return in.uv.x < 0.5 ? lo : hi;\n"
+    "}\n";
+
 /* The same textured draw, but the argument-buffer ids are 5 / 9 / 12 instead
  * of 0 / 1 / 2.  The self-test uses this variant to prove that the fixed
  * 8-byte table's stride and holes follow the shader's layout sidecar and not
@@ -487,6 +526,16 @@ const char* nvngfx_shader_selftest_msl_variant(nvngfx_stage stage, int variant) 
     if (variant == 9) {
         if (stage == NVNGFX_STAGE_VERTEX) return kVsUv;
         if (stage == NVNGFX_STAGE_FRAGMENT) return kFsTextureArray;
+        return NULL;
+    }
+    if (variant == 10) {
+        if (stage == NVNGFX_STAGE_VERTEX) return kVsUv;
+        if (stage == NVNGFX_STAGE_FRAGMENT) return kFsTextureCube;
+        return NULL;
+    }
+    if (variant == 11) {
+        if (stage == NVNGFX_STAGE_VERTEX) return kVsUv;
+        if (stage == NVNGFX_STAGE_FRAGMENT) return kFsTextureCubeArray;
         return NULL;
     }
     if (stage == NVNGFX_STAGE_VERTEX) return kVs;

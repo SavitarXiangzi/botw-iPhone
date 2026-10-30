@@ -3445,6 +3445,55 @@ BOTW_SELFTEST rc=0
 `layers=2` 说明上传确实按两个 slice 走，`staging=32` 是两个 16 字节 slice 的和
 （旧实现共用一块 16 字节暂存区时这里是 16，且回读两边同色）。
 
+## M3.92 cube / cube-array 的真实 draw 自检
+
+覆盖仍是 **131 / 513（25.5%）**。M3.91 只把 cube 与 cube-array 的**布局和
+Metal 描述**修对了，端到端只有 2D array 跑过；这一轮补上最后两种层形状的
+真实上传 → 采样 → 回读。
+
+### 第十二条 draw：cube
+
+- guest pool offset 13312 放一个 2×2 RGBA8 cube，6 个 slice 共 96 字节；
+- 面序按 NVN：+X, -X, +Y, -Y, +Z, -Z。面 4 红、面 5 黄、其余绿；
+- 描述必须是 `MTLTextureTypeCube`、`arrayLength = 1`，而
+  `nvn_texlayout::layers = 6`——两个计数不同正是上一轮修的点；
+- 片段着色器沿 `(0,0,1)` 与 `(0,0,-1)` 各采一次，左半屏放前者、右半屏放后者；
+- 回读左红右黄。若 face 5 没被上传，右边是绿色，检查立刻失败。
+
+### 第十三条 draw：cube array
+
+- guest pool offset 13824，`depth = 2` 的两层 cube，12 个 slice 共 192 字节；
+- 红放在 slice 4（cube 0 的 +Z），黄放在 slice 11（cube 1 的 -Z），其余绿；
+- Metal 侧必须是 `MTLTextureTypeCubeArray`、`arrayLength = 2`、
+  `layers = 12`；
+- 着色器 `texturecube_array` 从 layer 0 沿 +Z、从 layer 1 沿 -Z 采样，
+  回读左红右黄。
+
+`destinationSlice:11` 是这里最关键的一条：如果实现把 `arrayLength` 当成
+“要上传的 slice 数”，循环只走到 1 或 5，slice 11 永远不会被写；反过来把
+12 传给 Metal 的 `arrayLength` 会直接建纹理失败。
+
+### 可移植测试
+
+`tests/nvn_shader_test.cpp` 新增两个 fixture：variant 10 必须声明
+`texturecube<float>` 并出现两个 ±Z 方向；variant 11 必须声明
+`texturecube_array<float>`，且采样语句带 layer `0` / `1`。两者都要求
+顶点阶段与 variant 4 同一个 `kVsUv`。
+
+### 本地证据
+
+```text
+nvn_shader_test: ok (seam, blob table, packed slots, bindless, c1, SHA-256, shader key, layered/cube fixtures)
+syntax_check_metal: ok (clang++.exe)
+build_abi_test: all tests passed
+verify_ios: ok
+```
+
+第十二、十三条 draw 的模拟器结果待本次 iOS job 确认；在拿到
+`draw 12: cube faces 4/5 sampled from guest memory` 与
+`draw 13: cube array layer 0 face 4 and layer 1 face 5 sampled from guest memory`
+两行日志之前，不把 M3.92 记成 CI 已验证。
+
 ### 仍然没有的
 
 | 缺口 | 后果 |
