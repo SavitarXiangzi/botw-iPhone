@@ -73,8 +73,9 @@ int main() {
     CHECK(why != nullptr && std::strstr(why, "no offline MSL blob table") != nullptr);
 
     static const nvngfx_shader_blob blobs[] = {
-        {"0123456789ABCDEF", NVNGFX_STAGE_VERTEX, "vertex void nvngfx_main_vs() {}"},
-        {"fedcba9876543210", NVNGFX_STAGE_FRAGMENT, "fragment void nvngfx_main_fs() {}"},
+        {"0123456789ABCDEF", NVNGFX_STAGE_VERTEX, "vertex void nvngfx_main_vs() {}", nullptr, 0},
+        {"fedcba9876543210", NVNGFX_STAGE_FRAGMENT, "fragment void nvngfx_main_fs() {}",
+         nullptr, 0},
     };
     CHECK(nvngfx_shader_set_blobs(blobs, 2) == 0);
     CHECK(nvngfx_shader_blob_count() == 2);
@@ -93,8 +94,8 @@ int main() {
 
     /* A duplicate key+stage is rejected, and the installed table survives. */
     static const nvngfx_shader_blob dup[] = {
-        {"0123456789abcdef", NVNGFX_STAGE_VERTEX, "x"},
-        {"0123456789ABCDEF", NVNGFX_STAGE_VERTEX, "y"},
+        {"0123456789abcdef", NVNGFX_STAGE_VERTEX, "x", nullptr, 0},
+        {"0123456789ABCDEF", NVNGFX_STAGE_VERTEX, "y", nullptr, 0},
     };
     CHECK(nvngfx_shader_set_blobs(dup, 2) == -2);
     CHECK(nvngfx_shader_blob_count() == 2);
@@ -103,7 +104,7 @@ int main() {
 
     /* Compute blobs are refused rather than silently never matched. */
     static const nvngfx_shader_blob cs[] = {
-        {"0123456789abcdef", NVNGFX_STAGE_COMPUTE, "z"},
+        {"0123456789abcdef", NVNGFX_STAGE_COMPUTE, "z", nullptr, 0},
     };
     CHECK(nvngfx_shader_set_blobs(cs, 1) == -1);
     CHECK(nvngfx_shader_set_blobs(nullptr, 1) == -1);
