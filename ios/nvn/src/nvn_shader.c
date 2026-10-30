@@ -46,16 +46,25 @@ static const char* const kFs =
 
 /* Variant 1: the positions come from [[attribute(0)]] instead of
  * [[vertex_id]].  The fragment colour differs from variant 0, so a readback
- * shows which program drew the pixel. */
+ * shows which program drew the pixel.
+ *
+ * The shape is the one spirv-cross emits -- one `[[stage_in]]` struct whose
+ * members carry the attribute locations -- rather than a bare
+ * `[[attribute(0)]]` parameter.  Both are legal MSL, but the test exists to
+ * exercise the shape the translator actually produces. */
 static const char* const kVsAttr =
     "#include <metal_stdlib>\n"
     "using namespace metal;\n"
     "\n"
     "struct NvngfxVaryings { float4 position [[position]]; };\n"
     "\n"
-    "vertex NvngfxVaryings nvngfx_main_vs(float2 p [[attribute(0)]]) {\n"
+    "struct NvngfxVertexIn {\n"
+    "    float2 position [[attribute(0)]];\n"
+    "};\n"
+    "\n"
+    "vertex NvngfxVaryings nvngfx_main_vs(NvngfxVertexIn in [[stage_in]]) {\n"
     "    NvngfxVaryings v;\n"
-    "    v.position = float4(p, 0.0, 1.0);\n"
+    "    v.position = float4(in.position, 0.0, 1.0);\n"
     "    return v;\n"
     "}\n";
 

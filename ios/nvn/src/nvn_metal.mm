@@ -166,6 +166,11 @@ struct Tex {
 struct CmdBuf {
     bool recording = false;
     unsigned draws = 0;
+    /* Draws actually handed to Metal, as opposed to draws asked for.
+     * A self-test pixel check cannot tell "dropped upstream" from
+     * "encoded but wrong", and that difference is the whole
+     * diagnosis, so it is a number rather than a guess. */
+    unsigned encoded = 0;
     id<MTLCommandBuffer> cb = nil;
     id<MTLRenderCommandEncoder> enc = nil;
     /* Render targets of the current pass, as guest NVNtexture addresses. */
@@ -1347,6 +1352,7 @@ void cmdbuf_begin_recording(nvngfx_ctx* ctx, uint64_t* x) {
     b->cb = [c->queue commandBuffer];
     b->recording = true;
     b->draws = 0;
+    b->encoded = 0;
     b->numColor = 0;
     b->depth = 0;
     b->pendingClear = false;
@@ -1440,20 +1446,49 @@ void cmdbuf_draw_arrays(nvngfx_ctx* ctx, uint64_t* x) {
     [b->enc drawPrimitives:to_metal_primitive(primitive)
                vertexStart:first
                vertexCount:count];
+    b->encoded++;
 }
 
 /* nvnCommandBufferDrawElements(NVNcommandBuffer*, NVNdrawPrimitive,
- *                              NVNindexType, int count, NVNbufferAddress) */
+ *                              NVNindexType, int count, NVNbufferAddress)
+ *
+ * NVNindexType follows nxnative's reading of it: 1 is 16-bit, 2 is 32-bit
+ * (its recorder rejects anything outside 1..2).  The values themselves are
+ * *not* verified against Nintendo's header -- they are what a working public
+ * implementation uses -- so an unknown type drops the draw with a log line
+ * instead of guessing. */
 void cmdbuf_draw_elements(nvngfx_ctx* ctx, uint64_t* x) {
     Ctx* c = ctx_of(ctx);
     CmdBuf* b = find<CmdBuf>(x[0]);
     if (!b) return;
     b->draws++;
     if (!ensure_encoder(c, b)) return;
+    if (!ensure_pipeline(c, b)) {
+        log_once("nvnCommandBufferDrawElements.noPipeline", 1);
+        return;
+    }
+    const uint32_t primitive = static_cast<uint32_t>(x[1]);
     const uint32_t indexType = static_cast<uint32_t>(x[2]);
-    log_once("nvnCommandBufferDrawElements.indexType", indexType);
-    /* An indexed draw needs the bound index buffer and the real NVNindexType
-     * values; neither is verified, so this counts and stops. */
+    const unsigned count = static_cast<unsigned>(x[3]);
+    const unsigned indexSize = indexType == 1 ? 2u : indexType == 2 ? 4u : 0u;
+    if (indexSize == 0) {
+        log_once("nvnCommandBufferDrawElements.indexType", indexType);
+        return;
+    }
+    id<MTLBuffer> ibuf = nil;
+    size_t ioff = 0;
+    if (!pool_span(x[4], static_cast<size_t>(count) * indexSize, &ibuf, &ioff)) {
+        log_once("nvnCommandBufferDrawElements.indexBuffer", indexType);
+        return;
+    }
+    [b->enc setRenderPipelineState:b->pso];
+    if (b->numAttrib > 0 && !bind_vertex_streams(b)) return;
+    [b->enc drawIndexedPrimitives:to_metal_primitive(primitive)
+                       indexCount:count
+                        indexType:indexSize == 2 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32
+                      indexBuffer:ibuf
+                indexBufferOffset:ioff];
+    b->encoded++;
 }
 
 /* nvnCommandBufferSetViewport(NVNcommandBuffer*, int x, int y, int w, int h) */
@@ -1988,6 +2023,11 @@ extern "C" int nvngfx_metal_selftest(void) {
             {
                 unsigned char px[4] = {0, 0, 0, 0};
                 const int want[4] = {0, 255, 0, 255};
+                /* b2 was scoped to the recording block; the counts still live
+                 * on the command buffer, so look it up again. */
+                CmdBuf* const b2s = find<CmdBuf>(kCb2);
+                const unsigned b2draws = b2s ? b2s->draws : 0u;
+                const unsigned b2encoded = b2s ? b2s->encoded : 0u;
                 if (!read_center_pixel(dev, c->queue, t->mtl, kSide, px)) {
                     std::fprintf(stderr, "[selftest] draw 2 readback failed\n");
                     rc = 2048;
@@ -1996,9 +2036,9 @@ extern "C" int nvngfx_metal_selftest(void) {
                 if (!pixels_near(px, want, 2)) {
                     std::fprintf(stderr,
                                  "[selftest] draw 2 centre pixel is (%u,%u,%u,%u), "
-                                 "want (%d,%d,%d,%d)\n",
+                                 "want (%d,%d,%d,%d); draws asked %u, encoded %u\n",
                                  px[0], px[1], px[2], px[3], want[0], want[1], want[2],
-                                 want[3]);
+                                 want[3], b2draws, b2encoded);
                     rc = 2048;
                     goto done;
                 }
@@ -2006,6 +2046,74 @@ extern "C" int nvngfx_metal_selftest(void) {
                              "[selftest] draw 2 ([[attribute(0)]] from a pool) produced "
                              "the expected pixel\n");
             }
+        }
+
+        {
+            /* --- Third draw: the same vertices, indexed -----------------
+             * Unity (which is what this title runs on) issues almost every
+             * draw as DrawElements, so this path matters more than
+             * DrawArrays.  The state bound for draw 2 -- program, attributes,
+             * stream, vertex buffer -- is still in the command buffer, which
+             * is exactly NVN's rule: state lives on the command buffer, not
+             * on the pass. */
+            const uint64_t kCb2 = 0x5700;
+            const uintptr_t poolBase = reinterpret_cast<uintptr_t>(poolRaw);
+            const uintptr_t poolAligned =
+                (poolBase + 16383u) & ~static_cast<uintptr_t>(16383u);
+            uint16_t* const indices =
+                reinterpret_cast<uint16_t*>(poolAligned + 8192);
+            indices[0] = 0;
+            indices[1] = 1;
+            indices[2] = 2;
+
+            const uint64_t target = kTex;
+            const float clear3[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+            x[0] = kCb2;
+            cmdbuf_begin_recording(ctx, x);
+            x[0] = kCb2; x[1] = 1; x[2] = reinterpret_cast<uint64_t>(&target);
+            x[3] = 0; x[4] = 0; x[5] = 0;
+            cmdbuf_set_render_targets(ctx, x);
+            x[0] = kCb2; x[1] = 0; x[2] = reinterpret_cast<uint64_t>(clear3);
+            x[3] = 0xF;
+            cmdbuf_clear_color(ctx, x);
+            /* primitive 0 (triangles), index type 1 (16-bit), 3, index address */
+            x[0] = kCb2; x[1] = 0; x[2] = 1; x[3] = 3;
+            x[4] = reinterpret_cast<uint64_t>(indices);
+            cmdbuf_draw_elements(ctx, x);
+            x[0] = kCb2;
+            cmdbuf_end_recording(ctx, x);
+
+            CmdBuf* b3 = find<CmdBuf>(kCb2);
+            if (!b3 || !b3->last) {
+                std::fprintf(stderr, "[selftest] draw 3 committed nothing\n");
+                rc = 4096;
+                goto done;
+            }
+            [b3->last waitUntilCompleted];
+            if (b3->last.status == MTLCommandBufferStatusError) {
+                std::fprintf(stderr, "[selftest] draw 3 command buffer error: %s\n",
+                             b3->last.error
+                                 ? [[b3->last.error localizedDescription] UTF8String]
+                                 : "(no description)");
+                rc = 4096;
+                goto done;
+            }
+
+            unsigned char px[4] = {0, 0, 0, 0};
+            const int want[4] = {0, 255, 0, 255};
+            if (!read_center_pixel(dev, c->queue, t->mtl, kSide, px) ||
+                !pixels_near(px, want, 2)) {
+                std::fprintf(stderr,
+                             "[selftest] draw 3 centre pixel is (%u,%u,%u,%u), "
+                             "want (%d,%d,%d,%d); draws asked %u, encoded %u\n",
+                             px[0], px[1], px[2], px[3], want[0], want[1], want[2],
+                             want[3], b3->draws, b3->encoded);
+                rc = 4096;
+                goto done;
+            }
+            std::fprintf(stderr,
+                         "[selftest] draw 3 (DrawElements, 16-bit indices) produced "
+                         "the expected pixel\n");
         }
 
     done:

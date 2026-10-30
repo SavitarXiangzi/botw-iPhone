@@ -2354,3 +2354,114 @@ NVN host-HLE 64/513 (12.5%)   P0 blockers open: 0/6
 | 真实 shader 的 draw | 没有一条；自检用内置 MSL |
 | 模拟器执行第二条 draw | 本机无 Metal，**只有 CI 能证明**；本轮推送后看 `ios` job |
 | 真机 | **没有真机运行记录** |
+
+## M3.80 DrawElements 接通：索引缓冲、16/32 位索引与第三条自检 draw（本轮）
+
+Unity（《旷野之息》用的引擎）几乎每一次几何提交都是
+`nvnCommandBufferDrawElements`，而之前它只会"计数 + 打一行日志"。本轮把它接到
+`drawIndexedPrimitives`，并让模拟器自检用**第三条 draw** 走完索引路径。
+覆盖数不变（**64/513**）：这个入口本来就在 64 个里，本轮改的是它的行为。
+
+### 签名与 index type
+
+原型来自 `ios/nvn/signatures.json`（由真实调用形状量出来）：
+
+```
+nvnCommandBufferDrawElements(NVNcommandBuffer*, NVNdrawPrimitive,
+                             NVNindexType, int count, NVNbufferAddress)
+```
+
+`NVNindexType` 的数值**没有 Nintendo 头文件可对**。本轮沿用 nxnative 的读法：
+`1 = uint16`、`2 = uint32`（它的录制器对 1..2 之外的值直接拒绝）。于是：
+
+| index type | 处理 |
+|---|---|
+| 1 | `MTLIndexTypeUInt16`，每索引 2 字节 |
+| 2 | `MTLIndexTypeUInt32`，每索引 4 字节 |
+| 其它 | **不画**，`log_once` 打出数值 |
+
+这条"推断值"的标注同时写进代码注释、`docs/IOS_PORTING.md` 与本节；等拿到
+Nintendo 的 `NVNindexType` 枚举再改成实测值。
+
+### 索引缓冲：和顶点一样零拷贝
+
+`NVNbufferAddress` 是客体虚拟地址，不是 `NVNbufferRange`。和顶点路径一致，
+用 `pool_span()` 在内存池里找到 `MTLBuffer` 与页内偏移：
+
+```
+pool_span(indexAddress, count * indexSize) -> (MTLBuffer*, offset)
+drawIndexedPrimitives:... indexBuffer:buf indexBufferOffset:offset
+```
+
+`count * indexSize` 用 64 位算，`pool_span` 里 `len > size - o` 的判断保证不越界；
+地址不在任何 pool 里、或长度越过 pool 尾部，就不画并记一条
+`nvnCommandBufferDrawElements.indexBuffer`。`count` 是 `int`，负值转成
+unsigned 会变成很大的数，但结果是 `pool_span` 失败 -> 不画，不会踩内存。
+
+### 前置条件与状态
+
+索引路径和 `DrawArrays` 共用同一套闸门：`ensure_pipeline()` 建管线、
+`bind_vertex_streams()` 绑顶点流，然后才编码。任一步失败都**不编码**，
+所以"没有管线却画了索引"不会发生。
+
+NVN 的状态挂在 command buffer 上，不是挂在 render pass 上；自检第三条 draw
+正是靠这一点：同一个 `CmdBuf`（0x5700）先 `EndRecording` 提交第二条、再
+`BeginRecording` 开第三条，`program` / `attrib` / `stream` / `vb` 都还在。
+`SetRenderTargets` 会让缓存的 `pso` 失效（颜色格式可能变），
+`ensure_pipeline()` 用原来的顶点布局键重建 —— 键没变，命中 `Program` 的
+4 槽缓存。
+
+### 自检：三条 draw
+
+| # | 入口 | 验证的东西 | 期望像素 |
+|---|---|---|---|
+| 1 | `DrawArrays` + `[[vertex_id]]` | 管线、编码、回读 | (64,128,191,255) |
+| 2 | `DrawArrays` + `[[attribute(0)]]` | pool、顶点描述符、属性读回 | (0,255,0,255) |
+| 3 | **`DrawElements`，16 位索引 `0,1,2`** | **索引地址寻址、index type 映射、`drawIndexedPrimitives` 编码** | (0,255,0,255) |
+
+第三条复用第二条的 program / 顶点缓冲，只在 pool 的 +8192 偏移处写三个
+`uint16_t`，然后走客体入口 `nvnCommandBufferDrawElements`。任一环节失败
+都返回 `4096`。
+
+### 证据
+
+```
+build_abi_test: all tests passed
+  nvn_vertex_test: ok (packing, 26 formats, layout id)
+  syntax_check_metal: ok
+verify_ios: ok (metal bindings: 64/513)
+NVN host-HLE 64/513 (12.5%)   P0 blockers open: 0/6
+```
+
+模拟器上的第三条 draw 只有 CI 能证明（本机无 Metal）；结论看本轮推送后的
+`ios` job，**不在这里预先声称通过**。
+
+### 两次 CI 才看清的自检缺陷
+
+本轮的自检不是一次写对的，两个 run 的反馈都记在这里：
+
+| run | 结果 | 原因 |
+|---|---|---|
+| 41006846112 (`09fb5f7`) | `rc=2048` | 池大小写成 `sizeof(vertexPool)`；`vertexPool` 是 `unsigned char*`，所以池只有 **8 字节**，`pool_span()` 拒掉 24 字节的顶点跨度，draw 2 被静默丢弃。修复 `d33f9ba`：尺寸改用一个常量，分配 / memset / builder 三处共用 |
+| 41007654642 (`d33f9ba`) | 仍 `rc=2048` | 池大小不是唯一原因；而此时"被丢弃"和"画错了"在同一张像素上无法区分 |
+
+第二个 run 之后，可观测性补上了三件事：
+
+* `CmdBuf::encoded`：**真正交给 Metal 的 draw 条数**（`draws` 是"被请求的条数"）。
+  自检失败时同时打印两者，一眼能分出"上游丢弃"还是"编码了但画错"。
+* CI 用 `simctl launch --console` 启动 App，把 `[nvn]` / `[selftest]` 的
+  stderr 抓进日志；失败时逐行变成 check-run annotation（读原始日志需要 token，
+  annotation 不需要）。
+* draw 2 / 3 的顶点着色器改成 spirv-cross 的形状（一个 `[[stage_in]]` 结构体，
+  成员带 `[[attribute(0)]]`），而不是裸的 `[[attribute(0)]]` 参数 —— 自检要
+  测的正是翻译器实际产出的形式。
+
+### 仍然没有的
+
+| 缺口 | 后果 |
+|---|---|
+| argument buffer（UBO / 纹理 / sampler） | 真实场景仍画不出正确画面，**这是下一块墙** |
+| `NVNindexType` 的枚举值 | 1/2 来自 nxnative，不是 Nintendo 头文件 |
+| `DrawElementsInstanced` / `DrawArraysInstanced` | 未做（原型已在 `signatures.json` 里） |
+| 真实 shader 的 draw | 仍然是 0 条；三条自检都用内置 MSL |
+| 真机 | **没有真机运行记录** |

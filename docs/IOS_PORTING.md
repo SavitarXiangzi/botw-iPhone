@@ -218,7 +218,7 @@ iOS 是统一内存，guest 堆本来就是宿主可读的，所以
 |---|---:|---|
 | Window | 6/12 | 创建 CAMetalLayer、acquire、present interval、active textures |
 | WindowBuilder | 5/12 | native window、textures、interval、active count |
-| CommandBuffer | 11/144 | begin/end recording(+commit)、drawArrays、drawElements(计数)、viewport、scissor、clearColor、setRenderTargets、BindProgram、BindVertexBuffer(s) |
+| CommandBuffer | 11/144 | begin/end recording(+commit)、drawArrays、drawElements（16/32 位索引）、viewport、scissor、clearColor、setRenderTargets、BindProgram、BindVertexBuffer(s) |
 | MemoryPool | 3/10 | builder storage/flags、initialize(零拷贝)、getSize |
 | MemoryPoolBuilder | 3/8 | defaults、storage、flags |
 | Device | 2/27 | initialize（建 queue）、getProcAddress |
@@ -311,18 +311,21 @@ NVN 窗口另建一个**没人能看见**的 `CAMetalLayer`——客体的帧全
 
 - ✅ `nvnProgramInitialize` / `nvnProgramSetShaders` / `nvnProgramFinalize`
 - ✅ `nvnCommandBufferBindProgram` -> `ensure_pipeline()` -> `MTLRenderPipelineState`
-- ✅ `nvnCommandBufferBindVertexBuffer(s)`（只记录地址，没有 draw 用它）
-- ✅ draw 真的编码：`setRenderPipelineState` + `drawPrimitives`
+- ✅ `nvnCommandBufferBindVertexBuffer(s)`（真的读 `NVNbufferRange`，draw 真的用它）
+- ✅ `nvnCommandBufferBindVertexAttribState` / `BindVertexStreamState`（M3.79，
+  客体 4 / 8 字节记录 -> `MTLVertexDescriptor`）
+- ✅ draw 真的编码：`setRenderPipelineState` + `drawPrimitives` / `drawIndexedPrimitives`
+- ✅ `nvnCommandBufferDrawElements`（M3.80；16/32 位索引 **数值仍是推断**：
+  1=uint16、2=uint32，来自 nxnative，不是 Nintendo 头文件）
 - ❌ `nvngfx_shader_to_msl()` 没有翻译器 -> 客体的 program 永远建不出管线
-- ❌ `nvnCommandBufferBindVertexAttribState`（布局未验证，没做）
-- ❌ `nvnCommandBufferDrawElements`（index type 仍是猜的，只计数）
 
 **已经能证明的部分**：`nvngfx_metal_selftest()` 用内置 MSL 走完
 texture -> render target -> clear -> program -> pipeline -> draw -> 回读，
 CI 在 iOS 模拟器里用 `simctl` 启动 App（`--selftest`），App 在 `init()` 里跑它、
 把 `BOTW_SELFTEST rc=<n>` 写进容器的 `Documents/selftest.txt` 并 `exit(rc)`；
-断言中心像素等于 `(64,128,191,255)`，也就是 rc=0。**已在 CI 上跑通**
-（run 40997940031）。所以“Metal 这半边是通的”是可执行的结论，不是声称；
+现在跑**三条** draw（`[[vertex_id]]` / `[[attribute(0)]]` / 16 位索引的
+`DrawElements`），每条断言中心像素、全部通过才 rc=0。M3.76 的 run
+40997940031 证明了第一条，M3.79 / M3.80 的两条等各自的 `ios` job 给结论。所以“Metal 这半边是通的”是可执行的结论，不是声称；
 “客体的 shader 能跑”仍然完全没验证。
 
 **阶段 C：纹理正确**
@@ -426,7 +429,7 @@ constexpr int kEnumsVerified = 0;
 | P0 | 真实 shader 的第一次 draw | 锚点已通；现在缺的是 argument buffer（UBO / 纹理） |
 | P1 | `nvnTextureBuilder*` 剩余 29 个 | 已做 14 个；剩余主要是 getter 与 pool/offset 细节 |
 | P1 | `nvnSamplerBuilder*`（25）+ `nvnSamplerInitialize` | 采样状态 |
-| P1 | `nvnCommandBufferDrawElements` 的真实 index type | 现在只计数 |
+| P1 | `NVNindexType` 枚举值核对 | 实现按 1=uint16 / 2=uint32（nxnative 的读法）；没有 Nintendo 头文件佐证，未知值不画 |
 | P0 | Maxwell SASS -> MSL 翻译器 | 不是入口点，是整条链的墙 |
 | P2 | 各 `*StateSetDefaults` / `*StateGet*` | 让 guest 的查询路径不崩 |
 | P2 | `nvnCommandBufferBarrier` / `nvnSync*` / `nvnEvent*` | 正确性，不是画面 |

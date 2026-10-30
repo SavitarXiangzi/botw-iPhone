@@ -163,6 +163,11 @@ typedef enum MTLVertexStepFunction : NSUInteger {
 @property (readonly) MTLVertexBufferLayoutDescriptorArray* layouts;
 @end
 
+typedef enum MTLIndexType : NSUInteger {
+    MTLIndexTypeUInt16 = 0,
+    MTLIndexTypeUInt32 = 1,
+} MTLIndexType;
+
 typedef enum MTLPrimitiveType : NSUInteger {
     MTLPrimitiveTypePoint = 0,
     MTLPrimitiveTypeLine = 1,
@@ -229,6 +234,11 @@ destinationBytesPerImage:(NSUInteger)bpi;
 - (void)drawPrimitives:(MTLPrimitiveType)type
            vertexStart:(NSUInteger)start
            vertexCount:(NSUInteger)count;
+- (void)drawIndexedPrimitives:(MTLPrimitiveType)type
+                   indexCount:(NSUInteger)count
+                    indexType:(MTLIndexType)type
+                  indexBuffer:(id<MTLBuffer>)buffer
+            indexBufferOffset:(NSUInteger)offset;
 - (void)setViewport:(MTLViewport)viewport;
 - (void)setScissorRect:(MTLScissorRect)rect;
 - (void)setRenderPipelineState:(id<MTLRenderPipelineState>)state;

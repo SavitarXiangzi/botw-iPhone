@@ -158,10 +158,17 @@ jobs:
           xcrun simctl install "$UDID" "$APP"
           # stdout is attached after launch and the hook exits immediately, so
           # the result is written to Documents/selftest.txt as well.
+          # --console attaches the app's stdout/stderr, which is where the
+          # [nvn] diagnostics go.  Without it a failed pixel check says
+          # only "rc=2048" and the reason is lost with the process.
           set +e
-          xcrun simctl launch --terminate-running-process "$UDID" dev.botw.app --selftest
-          sleep 3
+          xcrun simctl launch --console --terminate-running-process \
+            "$UDID" dev.botw.app --selftest > /tmp/selftest-console.log 2>&1
+          LAUNCH_RC=$?
+          sleep 1
           set -e
+          echo "launch exit status: $LAUNCH_RC"
+          tail -20 /tmp/selftest-console.log 2>/dev/null || true
           DATA=$(xcrun simctl get_app_container "$UDID" dev.botw.app data)
           echo "container: $DATA"
           cat "$DATA/Documents/selftest.txt" 2>/dev/null || echo "(no selftest.txt)"
@@ -171,6 +178,8 @@ jobs:
             # the run's raw log needs a token to read.  Annotations do not.
             cat "$DATA/Documents/selftest.txt" 2>/dev/null \
               | while IFS= read -r l; do echo "::error::selftest| $l"; done
+            tail -40 /tmp/selftest-console.log 2>/dev/null \
+              | while IFS= read -r l; do echo "::error::console| $l"; done
             ls -la "$DATA/Documents" 2>/dev/null | while IFS= read -r l; do echo "::error::$l"; done
             xcrun simctl spawn "$UDID" log show --style compact --last 2m \
               --predicate 'process == "BotW"' 2>/dev/null | tail -40 \

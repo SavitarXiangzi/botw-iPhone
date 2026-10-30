@@ -149,8 +149,10 @@ C:\Python314\python.exe scripts\shader_chain\gen_blobs.py --msl build\shader-cha
    `MTLVertexDescriptor`，顶点地址按 pool 找到对应 `MTLBuffer`。
 2. 资源绑定：MSL 用的是 `--msl-argument-buffers`，所有常量/纹理走
    `buffer(0)` 的 `spvDescriptorSetBuffer0`，槽位约定见 §6。**这就是下一块墙**。
-3. 真实 draw：key 找得到 MSL、顶点也能绑，但常量与纹理还没进
-   argument buffer，所以仍然没有一条**真实** shader 在 Metal 里执行过。
+3. 几何路径：`DrawArrays` 与 `DrawElements`（16/32 位索引）都已编码，
+   顶点与索引都按 pool 零拷贝绑定（M3.79 / M3.80）。也就是说**画什么形状
+   已经不缺了**，缺的是第 2 条：常量与纹理还没进 argument buffer，
+   所以仍然没有一条**真实** shader 在 Metal 里执行过。
 
 ## 6. 绑定约定（nxnative 的驱动段布局）
 
@@ -174,12 +176,12 @@ C:\Python314\python.exe scripts\shader_chain\gen_blobs.py --msl build\shader-cha
 | `xcrun metal` → `.metallib` | 未做；只能在 macOS/CI 上做，本机没有 |
 | 整作 19,592 个 shader 全量构建 | 未做；只验证了 1 个 pack 的 5,102 个 key 中的 2 个 |
 | 编译期校验（MSL 语法） | 未做；Windows 没有 Metal 前端，MSL 只在 CI 的 macOS 上才能编 |
-| 真机 / 模拟器上跑真实 shader | 未做。自检用的仍是内置 MSL（但 M3.79 起已经是**两条** draw，第二条走真实的顶点描述符与 pool 绑定） |
+| 真机 / 模拟器上跑真实 shader | 未做。自检用的仍是内置 MSL（M3.80 起是**三条** draw：`[[vertex_id]]`、顶点属性、以及 16 位索引的 `DrawElements`） |
 | compute / geometry shader | 未做（`extract` 目前跳过 cs） |
 | 运行时按 key 取 MSL | **已接线**（M3.78，见 §5.1） |
 | 顶点描述符 | **已接**（M3.79） |
 | argument buffer（UBO / 纹理） | 未接线，见 §5.3 第 2 条 |
 
 一句话：**链的前 2/3 在 Windows 上真的通了，后 1/3（`xcrun metal`）要在 CI 的
-macOS 上补；运行时按 key 取 MSL 已接线（M3.78），但顶点与资源绑定还没接，
-所以还没有任何一条真实 shader 在 Metal 里执行过。**
+macOS 上补；运行时按 key 取 MSL 已接线（M3.78），顶点与索引都已接（M3.79 / M3.80），
+但资源绑定（argument buffer）还没接，所以还没有任何一条真实 shader 在 Metal 里执行过。**
