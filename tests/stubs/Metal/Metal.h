@@ -29,7 +29,18 @@ __attribute__((objc_root_class))
 
 @interface NSString : NSObject
 - (const char*)UTF8String;
++ (instancetype)stringWithUTF8String:(const char*)utf8;
 @end
+
+@interface NSError : NSObject
+- (NSString*)localizedDescription;
+@end
+
+typedef NSUInteger MTLCommandBufferStatus;
+enum {
+    MTLCommandBufferStatusCompleted = 4,
+    MTLCommandBufferStatusError = 5,
+};
 
 @protocol MTLBuffer;
 
@@ -62,6 +73,28 @@ enum {
     MTLStorageModeShared = 0,
     MTLStorageModePrivate = 2,
 };
+
+@protocol MTLFunction;
+@protocol MTLLibrary
+- (id<MTLFunction>)newFunctionWithName:(NSString*)name;
+@end
+
+@protocol MTLRenderPipelineState
+@end
+
+@interface MTLRenderPipelineColorAttachmentDescriptor : NSObject
+@property MTLPixelFormat pixelFormat;
+@end
+
+@interface MTLRenderPipelineColorAttachmentDescriptorArray : NSObject
+- (MTLRenderPipelineColorAttachmentDescriptor*)objectAtIndexedSubscript:(NSUInteger)index;
+@end
+
+@interface MTLRenderPipelineDescriptor : NSObject
+@property (retain) id<MTLFunction> vertexFunction;
+@property (retain) id<MTLFunction> fragmentFunction;
+@property (readonly) MTLRenderPipelineColorAttachmentDescriptorArray* colorAttachments;
+@end
 
 typedef NSUInteger MTLPrimitiveType;
 enum {
@@ -114,6 +147,15 @@ typedef void (^MTLDeallocator)(void* pointer, NSUInteger length);
        destinationLevel:(NSUInteger)dstLevel
       destinationOrigin:(MTLOrigin)dstOrigin;
 - (void)endEncoding;
+- (void)copyFromTexture:(id<MTLTexture>)src
+            sourceSlice:(NSUInteger)slice
+            sourceLevel:(NSUInteger)level
+           sourceOrigin:(MTLOrigin)origin
+             sourceSize:(MTLSize)size
+               toBuffer:(id<MTLBuffer>)dst
+      destinationOffset:(NSUInteger)dstOffset
+ destinationBytesPerRow:(NSUInteger)bpr
+destinationBytesPerImage:(NSUInteger)bpi;
 @end
 
 @protocol MTLRenderCommandEncoder
@@ -123,6 +165,7 @@ typedef void (^MTLDeallocator)(void* pointer, NSUInteger length);
            vertexCount:(NSUInteger)count;
 - (void)setViewport:(MTLViewport)viewport;
 - (void)setScissorRect:(MTLScissorRect)rect;
+- (void)setRenderPipelineState:(id<MTLRenderPipelineState>)state;
 @end
 
 @class MTLRenderPassDescriptor;
@@ -132,6 +175,9 @@ typedef void (^MTLDeallocator)(void* pointer, NSUInteger length);
 - (id<MTLRenderCommandEncoder>)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor*)descriptor;
 - (void)presentDrawable:(id)drawable;
 - (void)commit;
+- (void)waitUntilCompleted;
+@property (readonly) MTLCommandBufferStatus status;
+@property (readonly) NSError* error;
 @end
 
 @interface MTLRenderPassColorAttachmentDescriptor : NSObject
@@ -155,6 +201,7 @@ typedef void (^MTLDeallocator)(void* pointer, NSUInteger length);
 @end
 
 @protocol MTLBuffer
+- (void*)contents;
 @end
 
 @interface MTLTextureDescriptor : NSObject
@@ -177,6 +224,13 @@ typedef void (^MTLDeallocator)(void* pointer, NSUInteger length);
                                    length:(NSUInteger)length
                                   options:(MTLResourceOptions)options
                               deallocator:(MTLDeallocator)deallocator;
+- (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length
+                            options:(MTLResourceOptions)options;
+- (id<MTLLibrary>)newLibraryWithSource:(NSString*)source
+                               options:(id)options
+                                 error:(NSError**)error;
+- (id<MTLRenderPipelineState>)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor*)d
+                                                             error:(NSError**)error;
 @end
 
 id<MTLDevice> MTLCreateSystemDefaultDevice(void);

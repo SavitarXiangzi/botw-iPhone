@@ -1,4 +1,7 @@
 nvnCommandBufferBeginRecording
+nvnCommandBufferBindProgram
+nvnCommandBufferBindVertexBuffer
+nvnCommandBufferBindVertexBuffers
 nvnCommandBufferClearColor
 nvnCommandBufferDrawArrays
 nvnCommandBufferDrawElements
@@ -17,6 +20,9 @@ nvnMemoryPoolBuilderSetStorage
 nvnMemoryPoolFinalize
 nvnMemoryPoolGetSize
 nvnMemoryPoolInitialize
+nvnProgramFinalize
+nvnProgramInitialize
+nvnProgramSetShaders
 nvnQueuePresentTexture
 nvnTextureBuilderSetDefaults
 nvnTextureBuilderSetDepth

@@ -6,13 +6,20 @@
  *   DONE  device / queue / window / swapchain lifecycle
  *         memory pool -> zero-copy MTLBuffer over guest memory
  *         command buffer -> MTLCommandBuffer, viewport / scissor / drawArrays
+ *         render targets + one render pass (colour[0]) + ClearColor as a load
+ *           action, opened lazily by the first draw
+ *         texture objects, built from the values nvnTextureBuilderSet* was
+ *           given (no guest struct offsets are read)
+ *         program objects and the pipeline cache fed by nvngfx_shader_to_msl()
  *         present (blit fast path, cleared-drawable fallback)
  *
- *   TODO  render-target binding (nvnCommandBufferSetRenderTargets): until it
- *         exists no MTLRenderCommandEncoder is ever created, so guest draws
- *         are counted but not executed
- *         texture objects (builder field offsets unverified) -> no MTLTexture
- *         shader translation (NVN ships prebuilt Maxwell SASS, not source)
+ *   TODO  shader translation: the guest hands NVN Maxwell SASS and
+ *         nvngfx_shader_to_msl() has no translator, so no pipeline is ever
+ *         built and a guest draw stops at "noPipeline".  Everything else on
+ *         that path -- pipeline creation, draw encoding, readback -- is
+ *         executed by nvngfx_metal_selftest() in CI's iOS Simulator.
+ *         MRT / depth attachment / texture views
+ *         guest-pixel upload (textures are host-owned, not aliased)
  *         texture tiling, BCn -> ASTC/ETC2 transcode, compute, sync/fence
  *
  * Argument ABI: measured, not guessed
@@ -54,6 +61,7 @@
 
 #include "nvn_backend.h"
 #include "nvn_metal.h"
+#include "nvn_shader.h"
 #include "nvn_texture.h"
 
 #include <cmath>
@@ -93,6 +101,17 @@ void log_once(const char* what, unsigned value) {
     if (!seen[what].insert(value).second) return;
     std::fprintf(stderr, "[nvn] UNVERIFIED %s = 0x%X (call dropped, see nvn_metal.mm)\n",
                  what, value);
+}
+
+/* Same dedupe, but for a message that is already a string (a translator's
+ * reason, a Metal error).  Repeats of the identical message are dropped. */
+void log_once_str(const char* what, const char* msg) {
+    static std::unordered_map<std::string, std::string> seen;
+    const char* text = msg ? msg : "(no message)";
+    auto it = seen.find(what);
+    if (it != seen.end() && it->second == text) return;
+    seen[what] = text;
+    std::fprintf(stderr, "[nvn] %s: %s\n", what, text);
 }
 
 /* ------------------------------------------------------------------ */
@@ -148,6 +167,22 @@ struct CmdBuf {
     int clearIndex = 0;
     int clearMask = 0;
     float clear[4] = {0, 0, 0, 0};
+    /* Program bound by nvnCommandBufferBindProgram and the pipeline it
+     * produced.  The pipeline stays nil until nvngfx_shader_to_msl() can
+     * actually translate something. */
+    uint64_t program = 0;
+    id<MTLRenderPipelineState> pso = nil;
+    /* Vertex buffers as guest addresses.  Recorded, not consumed: Metal needs
+     * an MTLBuffer, which needs the pool the address belongs to, and no draw
+     * path fetches vertices before a pipeline exists. */
+    unsigned numVb = 0;
+    uint64_t vb[16] = {0};
+    uint64_t vbSize[16] = {0};
+    /* The last committed buffer.  nvnQueueSubmitCommands is not implemented,
+     * so a frame is committed at EndRecording; keeping the handle lets a
+     * caller (the self-test) wait for it and keeps the door open for real
+     * submit semantics. */
+    id<MTLCommandBuffer> last = nil;
 };
 
 /* Builder specs are gathered in a side table keyed by the guest's builder
@@ -648,6 +683,210 @@ void tex_initialize(nvngfx_ctx* ctx, uint64_t* x) {
 }
 
 /* ------------------------------------------------------------------ */
+/* programs and pipelines                                              */
+/* ------------------------------------------------------------------ */
+
+/* One guest NVNprogram reduced to what the replay layer needs.  The shader
+ * data is recorded exactly as handed over (a guest GPU address plus the
+ * control section); no guest memory is read here. */
+struct Program {
+    unsigned numStages = 0;
+    uint64_t code[3] = {0, 0, 0};
+    uint64_t control[3] = {0, 0, 0};
+    /* Metal bakes the colour format into a render pipeline, so the cache is
+     * keyed by it as well as by the program address (the table key). */
+    id<MTLRenderPipelineState> pso = nil;
+    NSUInteger psoFormat = 0;
+};
+
+/* Compiles the program's MSL into a render pipeline for `fmt`.
+ *
+ * This is the function a translator plugs into: it only knows
+ * nvngfx_shader_to_msl().  Today that returns NULL, so the reason is reported
+ * once and every draw afterwards stops at "noPipeline". */
+id<MTLRenderPipelineState> program_pipeline(Ctx* c, Program* p, NSUInteger fmt,
+                                            const char** why) {
+    if (p->pso && p->psoFormat == fmt) return p->pso;
+
+    const char* whyVs = nullptr;
+    const char* whyFs = nullptr;
+    const char* vs = nvngfx_shader_to_msl(
+        reinterpret_cast<const void*>(p->code[NVNGFX_STAGE_VERTEX]), 0,
+        NVNGFX_STAGE_VERTEX, &whyVs);
+    const char* fs = nvngfx_shader_to_msl(
+        reinterpret_cast<const void*>(p->code[NVNGFX_STAGE_FRAGMENT]), 0,
+        NVNGFX_STAGE_FRAGMENT, &whyFs);
+    if (!vs || !fs) {
+        if (why) *why = !vs ? (whyVs ? whyVs : "no vertex shader")
+                            : (whyFs ? whyFs : "no fragment shader");
+        return nil;
+    }
+
+    @autoreleasepool {
+        NSError* err = nil;
+        id<MTLLibrary> vlib =
+            [c->device newLibraryWithSource:[NSString stringWithUTF8String:vs]
+                                    options:nil
+                                      error:&err];
+        if (!vlib) {
+            log_once_str("nvnProgram.pipeline.vertexLibrary",
+                         err ? [[err localizedDescription] UTF8String] : "nil library");
+            return nil;
+        }
+        err = nil;
+        id<MTLLibrary> flib =
+            [c->device newLibraryWithSource:[NSString stringWithUTF8String:fs]
+                                    options:nil
+                                      error:&err];
+        if (!flib) {
+            log_once_str("nvnProgram.pipeline.fragmentLibrary",
+                         err ? [[err localizedDescription] UTF8String] : "nil library");
+            return nil;
+        }
+
+        /* The names are the contract a translator has to emit. */
+        id<MTLFunction> vfn = [vlib newFunctionWithName:@"nvngfx_main_vs"];
+        id<MTLFunction> ffn = [flib newFunctionWithName:@"nvngfx_main_fs"];
+        if (!vfn || !ffn) {
+            log_once_str("nvnProgram.pipeline.function",
+                         "MSL did not define nvngfx_main_vs / nvngfx_main_fs");
+            return nil;
+        }
+
+        MTLRenderPipelineDescriptor* pd = [[MTLRenderPipelineDescriptor alloc] init];
+        pd.vertexFunction = vfn;
+        pd.fragmentFunction = ffn;
+        pd.colorAttachments[0].pixelFormat = fmt;
+
+        err = nil;
+        id<MTLRenderPipelineState> pso =
+            [c->device newRenderPipelineStateWithDescriptor:pd error:&err];
+        if (!pso) {
+            log_once_str("nvnProgram.pipeline.state",
+                         err ? [[err localizedDescription] UTF8String] : "nil pipeline");
+            return nil;
+        }
+        p->pso = pso;
+        p->psoFormat = fmt;
+        return pso;
+    }
+}
+
+/* Builds the pipeline for the bound program if it is not built yet.  Failures
+ * are reported once per reason; a draw then stops instead of encoding
+ * something Metal would reject. */
+bool ensure_pipeline(Ctx* c, CmdBuf* b) {
+    if (b->pso) return true;
+    if (!b->program) return false;
+    if (!c || !c->ready || b->numColor < 1) return false;
+    Program* p = find<Program>(b->program);
+    Tex* t = find<Tex>(b->color[0]);
+    if (!p || !t || !t->mtl) return false;
+    const char* why = nullptr;
+    b->pso = program_pipeline(c, p, t->mtl.pixelFormat, &why);
+    if (!b->pso) log_once_str("nvnCommandBufferDraw.pipeline", why ? why : "unknown");
+    return b->pso != nil;
+}
+
+/* nvnProgramInitialize(NVNprogram*, NVNdevice*) -> NVNboolean */
+void prog_initialize(nvngfx_ctx*, uint64_t* x) {
+    Program* p = find_or_add<Program>(x[0]);
+    x[0] = p ? 1u : 0u;
+}
+
+/* nvnProgramSetShaders(NVNprogram*, int, const NVNshaderData*) -> NVNboolean
+ *
+ * NVNshaderData is { NVNbufferAddress data; const void* control; }, 16 bytes,
+ * the layout the public nxnative HLE reads (its nvnProgramSetShaders copies
+ * n * sizeof *sd).  The array order is the stage order.
+ *
+ * The control section is only guaranteed valid during this call -- a real
+ * implementation has to consume it here (that is where the shader key lives).
+ * This one records the address and nothing else, and says so. */
+void prog_set_shaders(nvngfx_ctx*, uint64_t* x) {
+    Program* p = find_or_add<Program>(x[0]);
+    const int n = static_cast<int>(x[1]);
+    const uint64_t* sd = guest_ptr<const uint64_t>(x[2]);
+    if (!p) {
+        x[0] = 0;
+        return;
+    }
+    if (n < 0 || n > 3 || (n > 0 && !sd)) {
+        log_once("nvnProgramSetShaders.stageCount", static_cast<unsigned>(n));
+        x[0] = 0;
+        return;
+    }
+    p->numStages = static_cast<unsigned>(n);
+    for (int i = 0; i < 3; ++i) {
+        p->code[i] = i < n ? sd[2 * i] : 0;
+        p->control[i] = i < n ? sd[2 * i + 1] : 0;
+    }
+    /* New shaders invalidate the cached pipeline. */
+    p->pso = nil;
+    p->psoFormat = 0;
+    x[0] = 1;
+}
+
+/* nvnProgramFinalize(NVNprogram*) */
+void prog_finalize(nvngfx_ctx*, uint64_t* x) {
+    Program* p = find<Program>(x[0]);
+    if (p) p->pso = nil;
+    forget<Program>(x[0]);
+}
+
+/* nvnCommandBufferBindProgram(NVNcommandBuffer*, const NVNprogram*, int)
+ *
+ * The third argument is a "what changed" flag; it does not affect the state
+ * this layer keeps, so it is ignored rather than guessed at. */
+void cmdbuf_bind_program(nvngfx_ctx* ctx, uint64_t* x) {
+    Ctx* c = ctx_of(ctx);
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    if (!b) return;
+    b->program = x[1];
+    b->pso = nil;
+    /* BindProgram may run before the targets are known; ensure_pipeline()
+     * then returns false here and the draw path retries once the pass knows
+     * its colour format. */
+    ensure_pipeline(c, b);
+}
+
+/* nvnCommandBufferBindVertexBuffer(NVNcommandBuffer*, int index,
+ *                                  NVNbufferAddress, size_t) */
+void cmdbuf_bind_vertex_buffer(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    if (!b) return;
+    const unsigned i = static_cast<unsigned>(static_cast<int>(x[1]));
+    if (i >= 16) {
+        log_once("nvnCommandBufferBindVertexBuffer.index", i);
+        return;
+    }
+    b->vb[i] = x[2];
+    b->vbSize[i] = x[3];
+    if (i + 1 > b->numVb) b->numVb = i + 1;
+}
+
+/* nvnCommandBufferBindVertexBuffers(NVNcommandBuffer*, int first, int count,
+ *                                   const NVNbufferRange*)
+ *
+ * NVNbufferRange is { address, size }.  Its contents are deliberately not
+ * read: nothing consumes vertex buffers yet, and a wrong stride would be a
+ * silent misread rather than a crash.  Only the range is recorded. */
+void cmdbuf_bind_vertex_buffers(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    if (!b) return;
+    const int first = static_cast<int>(x[1]);
+    const int count = static_cast<int>(x[2]);
+    if (first < 0 || count < 0 || first + count > 16) {
+        log_once("nvnCommandBufferBindVertexBuffers.range",
+                 static_cast<unsigned>(count));
+        return;
+    }
+    if (first + count > static_cast<int>(b->numVb)) {
+        b->numVb = static_cast<unsigned>(first + count);
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* command buffer                                                      */
 /* ------------------------------------------------------------------ */
 
@@ -713,6 +952,7 @@ void cmdbuf_end_recording(nvngfx_ctx*, uint64_t* x) {
     end_encoder(b);
     if (b->cb) {
         [b->cb commit];
+        b->last = b->cb;
         b->cb = nil;
     }
     b->recording = false;
@@ -736,6 +976,8 @@ void cmdbuf_set_render_targets(nvngfx_ctx*, uint64_t* x) {
         b->color[i] = (list && i < b->numColor) ? list[i] : 0u;
     }
     b->depth = x[4];
+    /* A pipeline is compiled for one colour format. */
+    b->pso = nil;
     /* Texture views are not supported yet; passing a view is legal but the
      * base texture format is what gets attached. */
     if (x[3] || x[5]) log_once("nvnCommandBufferSetRenderTargets.views", 1);
@@ -767,17 +1009,21 @@ void cmdbuf_draw_arrays(nvngfx_ctx* ctx, uint64_t* x) {
     CmdBuf* b = find<CmdBuf>(x[0]);
     if (!b) return;
     b->draws++;
-    /* Opening the pass is what makes the recorded clear happen; the draw
-     * itself still needs a pipeline, and nvnCommandBufferBindProgram is not
-     * implemented, so there is nothing to draw with. */
+    /* Opening the pass is what makes a recorded ClearColor happen. */
     if (!ensure_encoder(c, b)) return;
+    if (!ensure_pipeline(c, b)) {
+        /* The honest line: there is no translated shader, so there is no
+         * pipeline, so this draw is dropped.  Once per process. */
+        log_once("nvnCommandBufferDrawArrays.noPipeline", 1);
+        return;
+    }
     const uint32_t primitive = static_cast<uint32_t>(x[1]);
     const unsigned first = static_cast<unsigned>(x[2]);
     const unsigned count = static_cast<unsigned>(x[3]);
-    (void)primitive;
-    (void)first;
-    (void)count;
-    log_once("nvnCommandBufferDrawArrays.noPipeline", 1);
+    [b->enc setRenderPipelineState:b->pso];
+    [b->enc drawPrimitives:to_metal_primitive(primitive)
+               vertexStart:first
+               vertexCount:count];
 }
 
 /* nvnCommandBufferDrawElements(NVNcommandBuffer*, NVNdrawPrimitive,
@@ -930,6 +1176,10 @@ const Binding kBindings[] = {
     BIND("nvnTextureBuilderSetFlags", tex_builder_set_flags),
     BIND("nvnTextureInitialize", tex_initialize),
 
+    BIND("nvnProgramInitialize", prog_initialize),
+    BIND("nvnProgramSetShaders", prog_set_shaders),
+    BIND("nvnProgramFinalize", prog_finalize),
+
     BIND("nvnCommandBufferBeginRecording", cmdbuf_begin_recording),
     BIND("nvnCommandBufferEndRecording", cmdbuf_end_recording),
     BIND("nvnCommandBufferSetRenderTargets", cmdbuf_set_render_targets),
@@ -938,6 +1188,9 @@ const Binding kBindings[] = {
     BIND("nvnCommandBufferDrawElements", cmdbuf_draw_elements),
     BIND("nvnCommandBufferSetViewport", cmdbuf_set_viewport),
     BIND("nvnCommandBufferSetScissor", cmdbuf_set_scissor),
+    BIND("nvnCommandBufferBindProgram", cmdbuf_bind_program),
+    BIND("nvnCommandBufferBindVertexBuffer", cmdbuf_bind_vertex_buffer),
+    BIND("nvnCommandBufferBindVertexBuffers", cmdbuf_bind_vertex_buffers),
 
     BIND("nvnQueuePresentTexture", queue_present_texture),
 };
@@ -952,6 +1205,187 @@ nvngfx_proc metal_resolve(void*, const char* name) {
 const nvngfx_backend k_metal = {"metal", nullptr, metal_resolve};
 
 }  /* namespace */
+
+/* ------------------------------------------------------------------ */
+/* self-test: one draw, through the entry points the guest would call  */
+/* ------------------------------------------------------------------ */
+
+/* Runs the whole replay path on whatever Metal device this process has:
+ * texture builder -> nvnTextureInitialize -> BeginRecording -> SetRenderTargets
+ * -> ClearColor -> BindProgram -> DrawArrays -> EndRecording, then blits the
+ * target into shared memory and checks the centre pixel.
+ *
+ * The program is the built-in MSL from nvn_shader.h, reached through the same
+ * nvngfx_shader_to_msl() seam a translator will use.  So this proves the
+ * Metal half of the pipeline, not that a guest shader can be translated.
+ *
+ * Returns 0 on success, or a bit telling which step failed:
+ *   1 no Metal device   2 backend not ready   4 texture     8 program
+ *  16 recording       32 pipeline         64 draw colour  128 readback */
+extern "C" int nvngfx_metal_selftest(void) {
+    /* Fake guest object addresses: table keys only, never dereferenced. */
+    const uint64_t kTex = 0x5100;
+    const uint64_t kTexBuilder = 0x5101;
+    const uint64_t kCb = 0x5200;
+    const uint64_t kProg = 0x5300;
+    const NSUInteger kSide = 64;
+
+    @autoreleasepool {
+        id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+        if (!dev) {
+            std::fprintf(stderr, "[selftest] no Metal device\n");
+            return 1;
+        }
+
+        nvngfx_ctx* ctx = nvngfx_metal_create();
+        nvngfx_metal_set_device(ctx, (__bridge void*)dev, nullptr);
+        Ctx* c = ctx_of(ctx);
+        if (!c || !c->ready) {
+            nvngfx_metal_destroy(ctx);
+            std::fprintf(stderr, "[selftest] backend not ready\n");
+            return 2;
+        }
+
+        uint64_t x[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        int rc = 0;
+
+        /* 64x64 RGBA8 render target, through the setters the guest uses. */
+        x[0] = kTexBuilder;
+        tex_builder_set_defaults(ctx, x);
+        x[0] = kTexBuilder; x[1] = 0;
+        tex_builder_set_target(ctx, x);            /* 2D */
+        x[0] = kTexBuilder; x[1] = 0x25;
+        tex_builder_set_format(ctx, x);            /* RGBA8_UNORM */
+        x[0] = kTexBuilder; x[1] = (uint64_t)kSide; x[2] = (uint64_t)kSide;
+        tex_builder_set_size2d(ctx, x);
+        x[0] = kTexBuilder; x[1] = 1;
+        tex_builder_set_levels(ctx, x);
+        x[0] = kTexBuilder; x[1] = 1;
+        tex_builder_set_samples(ctx, x);
+        x[0] = kTex; x[1] = kTexBuilder;
+        tex_initialize(ctx, x);
+        Tex* t = find<Tex>(kTex);
+        if (x[0] != 1 || !t || !t->mtl) {
+            std::fprintf(stderr, "[selftest] nvnTextureInitialize failed\n");
+            rc = 4;
+            goto done;
+        }
+
+        {
+            /* The built-in program, handed over exactly the way the guest hands
+             * over its shaders: NVNbufferAddress + control pointer. */
+            struct { uint64_t data; uint64_t control; } sd[2];
+            nvngfx_shader_set_msl_passthrough(1);
+            sd[0].data = reinterpret_cast<uint64_t>(const_cast<char*>(
+                nvngfx_shader_selftest_msl(NVNGFX_STAGE_VERTEX)));
+            sd[0].control = 0;
+            sd[1].data = reinterpret_cast<uint64_t>(const_cast<char*>(
+                nvngfx_shader_selftest_msl(NVNGFX_STAGE_FRAGMENT)));
+            sd[1].control = 0;
+
+            x[0] = kProg; x[1] = 0;
+            prog_initialize(ctx, x);
+            x[0] = kProg; x[1] = 2; x[2] = reinterpret_cast<uint64_t>(&sd[0]);
+            prog_set_shaders(ctx, x);
+            if (x[0] != 1) {
+                std::fprintf(stderr, "[selftest] nvnProgramSetShaders failed\n");
+                nvngfx_shader_set_msl_passthrough(0);
+                rc = 8;
+                goto done;
+            }
+        }
+
+        {
+            const uint64_t colourTarget = kTex;
+            const float clear[4] = {1.0f, 0.0f, 0.0f, 1.0f};
+
+            x[0] = kCb;
+            cmdbuf_begin_recording(ctx, x);
+            x[0] = kCb; x[1] = 1; x[2] = reinterpret_cast<uint64_t>(&colourTarget);
+            x[3] = 0; x[4] = 0; x[5] = 0;
+            cmdbuf_set_render_targets(ctx, x);
+            x[0] = kCb; x[1] = 0; x[2] = reinterpret_cast<uint64_t>(clear); x[3] = 0xF;
+            cmdbuf_clear_color(ctx, x);
+            x[0] = kCb; x[1] = kProg; x[2] = 0;
+            cmdbuf_bind_program(ctx, x);
+            x[0] = kCb; x[1] = 0; x[2] = 0; x[3] = 3;
+            cmdbuf_draw_arrays(ctx, x);
+            x[0] = kCb;
+            cmdbuf_end_recording(ctx, x);
+
+            CmdBuf* b = find<CmdBuf>(kCb);
+            if (!b || !b->last) {
+                std::fprintf(stderr, "[selftest] no command buffer was committed\n");
+                rc = 16;
+                goto done;
+            }
+            [b->last waitUntilCompleted];
+            if (b->last.status == MTLCommandBufferStatusError) {
+                std::fprintf(stderr, "[selftest] command buffer error: %s\n",
+                             b->last.error ? [[b->last.error localizedDescription] UTF8String]
+                                           : "(no description)");
+                rc = 32;
+                goto done;
+            }
+            if (b->draws != 1) {
+                std::fprintf(stderr, "[selftest] %u draws recorded\n", b->draws);
+                rc = 64;
+                goto done;
+            }
+        }
+
+        {
+            /* Read back the centre pixel: this is the step that turns "a draw
+             * was encoded" into "a draw produced pixels". */
+            const NSUInteger bpr = kSide * 4;
+            id<MTLBuffer> buf = [dev newBufferWithLength:bpr * kSide
+                                                 options:MTLResourceStorageModeShared];
+            id<MTLCommandBuffer> rcb = [c->queue commandBuffer];
+            id<MTLBlitCommandEncoder> blit = [rcb blitCommandEncoder];
+            [blit copyFromTexture:t->mtl
+                      sourceSlice:0
+                      sourceLevel:0
+                     sourceOrigin:MTLOriginMake(0, 0, 0)
+                       sourceSize:MTLSizeMake(kSide, kSide, 1)
+                         toBuffer:buf
+                destinationOffset:0
+           destinationBytesPerRow:bpr
+         destinationBytesPerImage:bpr * kSide];
+            [blit endEncoding];
+            [rcb commit];
+            [rcb waitUntilCompleted];
+
+            const unsigned char* px =
+                static_cast<const unsigned char*>([buf contents]) +
+                (kSide / 2) * bpr + (kSide / 2) * 4;
+            /* The fragment shader returns (0.25, 0.5, 0.75, 1.0). */
+            const int want[4] = {64, 128, 191, 255};
+            int bad = 0;
+            for (int i = 0; i < 4; ++i) {
+                const int got = static_cast<int>(px[i]);
+                const int diff = got > want[i] ? got - want[i] : want[i] - got;
+                if (diff > 2) bad = 1;
+            }
+            if (bad) {
+                std::fprintf(stderr,
+                             "[selftest] centre pixel is (%u,%u,%u,%u), want (%d,%d,%d,%d)\n",
+                             px[0], px[1], px[2], px[3], want[0], want[1], want[2], want[3]);
+                rc = 128;
+                goto done;
+            }
+            std::fprintf(stderr, "[selftest] one draw produced the expected pixel\n");
+        }
+
+    done:
+        nvngfx_shader_set_msl_passthrough(0);
+        forget<CmdBuf>(kCb);
+        forget<Tex>(kTex);
+        forget<Program>(kProg);
+        g_tex_specs.erase(kTexBuilder);
+        nvngfx_metal_destroy(ctx);
+        return rc;
+    }
+}
 
 extern "C" const nvngfx_backend* nvngfx_metal_backend(void) {
     return &k_metal;

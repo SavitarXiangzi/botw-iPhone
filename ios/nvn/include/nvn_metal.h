@@ -41,6 +41,20 @@ void nvngfx_metal_set_layer(nvngfx_ctx* ctx, void* caMetalLayer);
  * missing". */
 int nvngfx_metal_present_clear(nvngfx_ctx* ctx, float r, float g, float b);
 
+/* Executes one complete frame through the guest-facing entry points:
+ * texture builder -> nvnTextureInitialize -> BeginRecording -> SetRenderTargets
+ * -> ClearColor -> BindProgram -> DrawArrays -> EndRecording, then blits the
+ * target into shared memory and checks the centre pixel.
+ *
+ * Returns 0 on success, otherwise a bitmask of the step that failed.  Runs on
+ * any Metal device, the iOS Simulator included, which is what makes it a CI
+ * regression test instead of a manual check.
+ *
+ * The program it draws is the built-in MSL from nvn_shader.h reached through
+ * the same nvngfx_shader_to_msl() seam a translator will use -- it proves the
+ * Metal half, not that a guest shader can be translated. */
+int nvngfx_metal_selftest(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -3,10 +3,11 @@
 本文是 `ios/` 目录的操作手册。它描述的是**已经写进仓库的东西**和
 **机器能验证的事实**，不是你付钱就能玩到游戏的承诺。当前状态一句话：
 
-> iOS 侧的壳、C ABI、513 个 NVN 入口点的分发表、46 个 Metal 后端入口，
-> 都能在非 Apple 主机上编译并跑通自测；纹理对象已经能真的建出
-> `MTLTexture`，渲染目标能绑上，encoder 能开。**但仍然没有一条 draw 真正
-> 执行**：着色器翻译和管线状态都还没做。
+> iOS 侧的壳、C ABI、513 个 NVN 入口点的分发表、52 个 Metal 后端入口，
+> 都能在非 Apple 主机上编译并跑通自测；纹理能建、渲染目标能绑、encoder
+> 能开，program -> pipeline -> draw -> 回读这条链已经在 **CI 的 iOS 模拟器**
+> 里跑通了一条合成 draw。**但客体的 draw 依然一条都不执行**：唯一的缺口是
+> Maxwell SASS -> MSL 的翻译器。
 
 ---
 
@@ -27,16 +28,19 @@ ios/nvn/include/nvn_api.h     生成：名字表 + 函数指针 ABI
 ios/nvn/src/nvn_dispatch.cpp  生成：二分查找 + 缺失上报
 ios/nvn/include/nvn_backend.h 后端接口（null / metal 二选一）
 ios/nvn/src/nvn_null.cpp      空后端，任何主机都能编译
-ios/nvn/src/nvn_metal.mm      Metal 后端（46 个入口，含大量 TODO）
+ios/nvn/src/nvn_metal.mm      Metal 后端（52 个入口，含大量 TODO）
 ios/nvn/src/nvn_texture.c     157 项 NVNformat -> MTLPixelFormat 表（附 lossy 标记）
 ios/nvn/include/nvn_texture.h 纹理描述结构 + 表查询接口
-ios/nvn/implemented_metal.txt 46 行，和 BIND(...) 列表由门禁强制相等
+ios/nvn/src/nvn_shader.c      着色器翻译的唯一接口：现在只会说"没有翻译器"
+ios/BotWTests/                XCTest：在模拟器里跑一条真 draw 并回读像素
+ios/nvn/implemented_metal.txt 52 行，和 BIND(...) 列表由门禁强制相等
 ios/nvn/shaders/              空目录 + 路线说明（见该目录 README）
 docs/NVN_COVERAGE.md          生成的逐域覆盖表
 scripts/                      提取、生成、校验、编译脚本
 tests/nvn_abi_test.cpp        513 个入口点的名字/顺序/查找一致性
 tests/core_smoke_test.cpp     C ABI 冒烟：创建、查覆盖数、跑帧、销毁
 tests/nvn_texture_test.cpp    157 项格式表的抽查：精确项、替代项、越界、重复
+tests/nvn_shader_test.cpp     翻译接口的行为：拒绝 SASS、passthrough 需显式打开
 ```
 
 `.xcodeproj` 不入库是刻意的：它是生成物，入库只会制造冲突，且在没有 Mac 的
@@ -68,8 +72,9 @@ C:\Python314\python.exe scripts\syntax_check_metal.py
 nvn_abi_test: ok (513 procs)                 exit=0
 core_smoke_test: ok (nvn 0/513 on null)      exit=0
 nvn_texture_test: ok (157 formats in table)  exit=0
+nvn_shader_test: ok (seam refuses SASS, passthrough opt-in)  exit=0
 syntax_check_metal: ok (clang++.exe)
-verify_ios: ok (metal bindings: 46/513)
+verify_ios: ok (metal bindings: 52/513)
 build_abi_test: all tests passed
 ```
 
@@ -206,7 +211,7 @@ iOS 是统一内存，guest 堆本来就是宿主可读的，所以
 
 ---
 
-## 6. 已经实现的 46 个入口点
+## 6. 已经实现的 52 个入口点
 
 按域分布（完整明细见 `docs/NVN_COVERAGE.md`）：
 
@@ -214,7 +219,7 @@ iOS 是统一内存，guest 堆本来就是宿主可读的，所以
 |---|---:|---|
 | Window | 6/12 | 创建 CAMetalLayer、acquire、present interval、active textures |
 | WindowBuilder | 5/12 | native window、textures、interval、active count |
-| CommandBuffer | 8/144 | begin/end recording(+commit)、drawArrays、viewport、scissor、clearColor、setRenderTargets |
+| CommandBuffer | 11/144 | begin/end recording(+commit)、drawArrays、drawElements(计数)、viewport、scissor、clearColor、setRenderTargets、BindProgram、BindVertexBuffer(s) |
 | MemoryPool | 3/10 | builder storage/flags、initialize(零拷贝)、getSize |
 | MemoryPoolBuilder | 3/8 | defaults、storage、flags |
 | Device | 2/27 | initialize（建 queue）、getProcAddress |
@@ -222,8 +227,9 @@ iOS 是统一内存，guest 堆本来就是宿主可读的，所以
 | Queue | 1/15 | presentTexture（blit 快路径） |
 | Texture | 1/45 | initialize 用 builder 记录的值真建 `MTLTexture`（host 分配） |
 | TextureBuilder | 14/43 | defaults + 13 个 setter：target/format/size1D/2D/3D/宽高深/levels/samples/storage/stride/flags |
+| Program | 3/7 | Initialize / SetShaders / Finalize；只记录 shader 的 guest 地址与 control 指针 |
 
-**必须说清楚的五件事**，否则这张表会误导人：
+**必须说清楚的六件事**，否则这张表会误导人：
 
 0. 所有入口的参数解码都按 `signatures.json` 的真实原型写，不是猜的。
    `SetViewport`/`SetScissor` 是 4 个 `int`（曾被当成 double 读），
@@ -242,13 +248,19 @@ iOS 是统一内存，guest 堆本来就是宿主可读的，所以
 2. `nvnCommandBufferClearColor` 不再丢弃：它先关掉当前 encoder，把颜色记成
    `pendingClear`，下一次 draw 前的 `ensure_encoder()` 把它变成
    `loadAction = .clear`。mask 仍只记录（那是未验证的枚举）。
-3. `MTLRenderCommandEncoder` 现在**会**在绑了渲染目标之后由
-   `ensure_encoder()` 创建，draw 也确实走到 encoder——但 `DrawArrays`
-   只打一条 `noPipeline` 日志就返回，因为还没有 program、管线、顶点缓冲。
-   **当前仍然不会产生任何 draw call。**
+3. `MTLRenderCommandEncoder` 会在绑了渲染目标之后由 `ensure_encoder()` 创建，
+   draw 也确实走到 encoder。`BindProgram` 之后 `ensure_pipeline()` 会调用
+   `nvngfx_shader_to_msl()`；**它现在返回 NULL**（没有翻译器），所以
+   `DrawArrays` 打一条 `noPipeline` 日志就返回。**客体的 draw 仍然是 0 条。**
+   但这条链本身已经能跑：`nvngfx_metal_selftest()` 用内置 MSL 走完
+   program -> pipeline -> draw -> 回读，并由 CI 的 `BotWTests` 在模拟器里执行。
 4. 只挂 `colorAttachments[0]`：`numColor > 1` 的 MRT、以及 `setRenderTargets`
    的 texture view 参数都只记日志。`EndRecording` 直接 `[cb commit]`，
    `nvnQueueSubmitCommands` 还没实现，所以“提交”这件事目前不等队列。
+
+5. 顶点缓冲只记录 guest 地址，**没有任何一条 draw 用到它**：`BindVertexAttribState`
+   还是 TODO，`NVNbufferRange` 的内容也没读。自检的三角形是用
+   `[[vertex_id]]` 生成的，故意不需要顶点缓冲。
 
 ---
 
@@ -296,11 +308,21 @@ NVN 窗口另建一个**没人能看见**的 `CAMetalLayer`——客体的帧全
 只对“绑了 `color[0]` 且该纹理确实建成功”的路径成立——在真机上看到之前，
 这只是**代码路径**，不是现象。
 
-**阶段 B：几何能出来**（需要 program + vertex state）
+**阶段 B：几何能出来**（代码通路已建，缺翻译器）
 
-- 实现 `nvnCommandBufferBindProgram`（拿到 shader 的 GPU 码地址）
-- 实现 `nvnCommandBufferBindVertexBuffer(s)` / `BindVertexAttribState`
-- 实现 `nvnCommandBufferDrawElements`（index type 现在是猜的，必须验证）
+- ✅ `nvnProgramInitialize` / `nvnProgramSetShaders` / `nvnProgramFinalize`
+- ✅ `nvnCommandBufferBindProgram` -> `ensure_pipeline()` -> `MTLRenderPipelineState`
+- ✅ `nvnCommandBufferBindVertexBuffer(s)`（只记录地址，没有 draw 用它）
+- ✅ draw 真的编码：`setRenderPipelineState` + `drawPrimitives`
+- ❌ `nvngfx_shader_to_msl()` 没有翻译器 -> 客体的 program 永远建不出管线
+- ❌ `nvnCommandBufferBindVertexAttribState`（布局未验证，没做）
+- ❌ `nvnCommandBufferDrawElements`（index type 仍是猜的，只计数）
+
+**已经能证明的部分**：`nvngfx_metal_selftest()` 用内置 MSL 走完
+texture -> render target -> clear -> program -> pipeline -> draw -> 回读，
+`BotWTests` 在 CI 的 iOS 模拟器里跑它并断言中心像素等于
+`(64,128,191,255)`。所以“Metal 这半边是通的”是可执行的结论，不是声称；
+“客体的 shader 能跑”仍然完全没验证。
 
 **阶段 C：纹理正确**
 
@@ -344,6 +366,22 @@ NVN 窗口另建一个**没人能看见**的 `CAMetalLayer`——客体的帧全
 Maxwell SASS，Metal 不接受，必须 SASS → IR → SPIR-V → MSL 离线翻译。
 这是整个移植里技术风险最高的一块，不要指望“先跑起来再说”。
 
+**这一轮把“翻译器之外的一切”做完了**，并且给出唯一接口：
+
+```
+guest NVNshaderData { data, control }   (Maxwell SASS)
+        |
+        v
+nvngfx_shader_to_msl(code, size, stage, &why)   <- 现在返回 NULL + 理由
+        |
+        v
+MTLLibrary -> MTLRenderPipelineState -> draw     <- 已实现，自检已跑通
+```
+
+`nvn_shader.h` 里还有一个 `nvngfx_shader_set_msl_passthrough()`：打开后
+`code` 被当作 MSL 源码原样返回。它**不翻译任何东西**，只让自检（以及将来
+的离线 MSL 缓存）能在没有翻译器时走通后半条链。默认关闭。
+
 ---
 
 ## 9. 为什么 Release 现在编不过
@@ -375,18 +413,19 @@ constexpr int kEnumsVerified = 0;
 
 ---
 
-## 10. 剩余 467 个入口点的优先级
+## 10. 剩余 461 个入口点的优先级
 
 不要按字母序做。按“挡住第一个 draw call 的”排序：
 
 | 优先级 | 入口 | 理由 |
 |---|---|---|
 | P0 | ~~`nvnCommandBufferSetRenderTargets`~~ | ✅ 本轮已实现；只剩 MRT / 深度 / view |
-| P0 | `nvnCommandBufferBindProgram` / `nvnProgramInitialize` | B 阶段的前提 |
-| P0 | `nvnCommandBufferBindVertexBuffer(s)` / `BindVertexAttribState` | 同上 |
+| P0 | ~~`nvnCommandBufferBindProgram` / `nvnProgramInitialize`~~ | ✅ 本轮已实现（管线建到 `nvngfx_shader_to_msl` 为止） |
+| P0 | `nvnCommandBufferBindVertexAttribState` | 唯一还开着的 P0；布局未验证 |
 | P1 | `nvnTextureBuilder*` 剩余 29 个 | 已做 14 个；剩余主要是 getter 与 pool/offset 细节 |
 | P1 | `nvnSamplerBuilder*`（25）+ `nvnSamplerInitialize` | 采样状态 |
 | P1 | `nvnCommandBufferDrawElements` 的真实 index type | 现在只计数 |
+| P0 | Maxwell SASS -> MSL 翻译器 | 不是入口点，是整条链的墙 |
 | P2 | 各 `*StateSetDefaults` / `*StateGet*` | 让 guest 的查询路径不崩 |
 | P2 | `nvnCommandBufferBarrier` / `nvnSync*` / `nvnEvent*` | 正确性，不是画面 |
 | P3 | `nvnQueue*` 的其余 14 个 | 只有在用多队列时才需要 |
@@ -402,9 +441,10 @@ constexpr int kEnumsVerified = 0;
 | 缺口 | 现状 | 影响 |
 |---|---|---|
 | 渲染目标绑定 | 只挂 `color[0]`，深度/view 只记录 | MRT 与深度测试不可用 |
-| 着色器翻译 | 未开始 | 无法出任何几何 |
+| 着色器翻译 | 只留了接口，没有实现 | 客体的 draw 全部停在 `noPipeline` |
 | 纹理创建 | 建 host `MTLTexture`，不与 guest alias | 当目标可用；采样 guest 像素仍全黑 |
-| draw 执行 | encoder 会开，但没有 pipeline | 仍然是 0 条 draw，只打一次 `noPipeline` 日志 |
+| draw 执行 | 有 pipeline 就真的编码 draw；没有就丢弃 | 客体仍是 0 条；自检的 1 条在 CI 上被执行并回读 |
+| 顶点输入 | 只记录地址，没读 `NVNbufferRange` | 任何依赖顶点缓冲的 draw 都还画不出来 |
 | 浮点参数 | 不在 `x[8]` 里 | 少数入口需要单独签名 |
 | 同步/fence | 未实现 | 长时间跑可能撕裂 |
 | compute | 未实现 | 后处理不可用 |
@@ -431,7 +471,8 @@ Swift 侧同理：`Renderer.swift` / `GameView.swift` 只做了括号与结构�
 | `verify_ios` 说 generated artifacts are stale | 跑了 `gen_nvn.py --repo .` 但没提交生成物 |
 | `verify_ios` 说 bound but not declared implemented | 加了 `BIND(...)` 但没加进 `implemented_metal.txt` |
 | `pool wrap failed` | guest 存储没按 4 KiB 对齐，或长度不是页整数倍 |
-| 屏幕全黑但 `frame` 在涨 | 正常：没有 pipeline，draw 被丢掉（第 6 节第 3 条） |
+| 屏幕全黑但 `frame` 在涨 | 正常：没有翻译器就没有 pipeline，draw 被丢掉（第 6 节第 3 条） |
+| `[nvn] nvnCommandBufferDraw.pipeline: no translator...` | 正常，这条就是当前的墙；自检不经过它 |
 | 屏幕全黑且 `frame` 不动 | `MTKView.delegate` 是 weak，Pump 必须被 Coordinator 强引用（已在 `GameView.swift` 修过一次） |
 | `[nvn] UNVERIFIED xxx = 0x...` | 正常，那是诚实闸门在报未验证的枚举 |
-| `[nvn] not implemented: nvnYyy` | 该入口不在 46 个里，按第 10 节排期 |
+| `[nvn] not implemented: nvnYyy` | 该入口不在 52 个里，按第 10 节排期 |

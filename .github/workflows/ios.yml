@@ -45,13 +45,16 @@ jobs:
           # nvn_texture.c is plain C: compile it as C so the header's extern "C"
           # is exercised, then link the result into every test.
           clang -std=c11 -Wall -Wextra -Werror $INC -c ios/nvn/src/nvn_texture.c -o /tmp/nvn_texture.o
-          LIB="ios/nvn/src/nvn_dispatch.cpp ios/nvn/src/nvn_null.cpp core/src/botw_core.cpp /tmp/nvn_texture.o"
+          clang -std=c11 -Wall -Wextra -Werror $INC -c ios/nvn/src/nvn_shader.c  -o /tmp/nvn_shader.o
+          LIB="ios/nvn/src/nvn_dispatch.cpp ios/nvn/src/nvn_null.cpp core/src/botw_core.cpp /tmp/nvn_texture.o /tmp/nvn_shader.o"
           clang++ $FLAGS $INC tests/nvn_abi_test.cpp      $LIB -o /tmp/nvn_abi_test
           clang++ $FLAGS $INC tests/core_smoke_test.cpp   $LIB -o /tmp/core_smoke_test
           clang++ $FLAGS $INC tests/nvn_texture_test.cpp  $LIB -o /tmp/nvn_texture_test
+          clang++ $FLAGS $INC tests/nvn_shader_test.cpp   $LIB -o /tmp/nvn_shader_test
           /tmp/nvn_abi_test
           /tmp/core_smoke_test
           /tmp/nvn_texture_test
+          /tmp/nvn_shader_test
 
       # nvn_metal.mm is ObjC++; this parses it against tests/stubs/ so a type
       # error in the Metal backend is caught without a mac runner.
@@ -66,6 +69,8 @@ jobs:
             -fsyntax-only ios/nvn/include/nvn_api.h
           clang -std=c11 -Wall -Wextra -Werror -I ios/nvn/include \
             -fsyntax-only ios/nvn/include/nvn_texture.h
+          clang -std=c11 -Wall -Wextra -Werror -I ios/nvn/include \
+            -fsyntax-only ios/nvn/include/nvn_shader.h
 
   ios:
     needs: portable
@@ -117,6 +122,33 @@ jobs:
             exit "$rc"
           fi
           tail -20 build-sim.log
+
+      # The only place the replay layer is executed rather than compiled.
+      # BotWTests drives one frame through the NVN entry points and reads the
+      # centre pixel back, so "the Metal path works" is measured on every push.
+      - name: Run the replay-layer self-test in the simulator
+        working-directory: ios
+        run: |
+          set -o pipefail
+          UDID=$(xcrun simctl list devices available -j | python3 -c \
+            "import json,sys; d=json.load(sys.stdin)['devices']; w=[(rt,x['udid']) for rt,v in d.items() for x in v if x['name'].startswith('iPhone')]; print(w[-1][1] if w else '')")
+          if [ -z "$UDID" ]; then
+            xcrun simctl list devices available
+            echo "::error::no iPhone simulator found"
+            exit 1
+          fi
+          echo "simulator: $UDID"
+          if ! xcodebuild test -project BotW.xcodeproj -scheme BotW \
+               -configuration Debug -destination "id=$UDID" \
+               -derivedDataPath build-test \
+               CODE_SIGNING_ALLOWED=NO > test-sim.log 2>&1; then
+            grep -E "(error:|failed|Test Case.*failed)" test-sim.log | head -30 | while read -r line; do
+              echo "::error::$line"
+            done
+            tail -80 test-sim.log
+            exit 1
+          fi
+          grep -E "Test Suite|Test Case" test-sim.log | tail -12
 
       # Debug on purpose: nvn_metal.mm refuses an NDEBUG build while the NVN
       # enum values are unverified, so a Release build here would always fail.

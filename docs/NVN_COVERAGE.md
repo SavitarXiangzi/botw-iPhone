@@ -7,8 +7,8 @@
 `nvn*` 字符串（运行时按名解析，所以名字本身就暴露了完整接口面）。
 
 - 接口总数：**513**
-- Metal 后端已实现：**46**（9.0%）
-- 仍未实现：**467**
+- Metal 后端已实现：**52**（10.1%）
+- 仍未实现：**461**
 
 > 只有出现在 `ios/nvn/implemented_metal.txt` 里、且确实在
 > `ios/nvn/src/nvn_metal.mm` 中定义过的名字才算“已实现”。
@@ -18,7 +18,7 @@
 
 | 域 | 已实现 | 总数 | 进度 |
 |---|---:|---:|---|
-| CommandBuffer | 8 | 144 | `#         ` |
+| CommandBuffer | 11 | 144 | `#         ` |
 | Texture | 1 | 45 | `          ` |
 | TextureBuilder | 14 | 43 | `###       ` |
 | Device | 2 | 27 | `#         ` |
@@ -40,7 +40,7 @@
 | BufferBuilder | 0 | 7 | `          ` |
 | ColorState | 0 | 7 | `          ` |
 | Event | 0 | 7 | `          ` |
-| Program | 0 | 7 | `          ` |
+| Program | 3 | 7 | `####      ` |
 | Sync | 0 | 6 | `          ` |
 | VertexAttribState | 0 | 5 | `          ` |
 | VertexStreamState | 0 | 5 | `          ` |
@@ -112,7 +112,7 @@
 - [ ] `nvnColorStateSetDefaults`
 - [ ] `nvnColorStateSetLogicOp`
 
-### CommandBuffer (8/144)
+### CommandBuffer (11/144)
 
 - [ ] `nvnCommandBufferAddCommandMemory`
 - [ ] `nvnCommandBufferAddControlMemory`
@@ -128,7 +128,7 @@
 - [ ] `nvnCommandBufferBindImages`
 - [ ] `nvnCommandBufferBindMultisampleState`
 - [ ] `nvnCommandBufferBindPolygonState`
-- [ ] `nvnCommandBufferBindProgram`
+- [x] `nvnCommandBufferBindProgram`
 - [ ] `nvnCommandBufferBindSeparateSampler`
 - [ ] `nvnCommandBufferBindSeparateSamplers`
 - [ ] `nvnCommandBufferBindSeparateTexture`
@@ -142,8 +142,8 @@
 - [ ] `nvnCommandBufferBindUniformBuffer`
 - [ ] `nvnCommandBufferBindUniformBuffers`
 - [ ] `nvnCommandBufferBindVertexAttribState`
-- [ ] `nvnCommandBufferBindVertexBuffer`
-- [ ] `nvnCommandBufferBindVertexBuffers`
+- [x] `nvnCommandBufferBindVertexBuffer`
+- [x] `nvnCommandBufferBindVertexBuffers`
 - [ ] `nvnCommandBufferBindVertexStreamState`
 - [ ] `nvnCommandBufferCallCommands`
 - [ ] `nvnCommandBufferClearBuffer`
@@ -383,13 +383,13 @@
 - [ ] `nvnPolygonStateSetPolygonMode`
 - [ ] `nvnPolygonStateSetPolygonOffsetEnables`
 
-### Program (0/7)
+### Program (3/7)
 
-- [ ] `nvnProgramFinalize`
-- [ ] `nvnProgramInitialize`
+- [x] `nvnProgramFinalize`
+- [x] `nvnProgramInitialize`
 - [ ] `nvnProgramSetDebugLabel`
 - [ ] `nvnProgramSetSampleShading`
-- [ ] `nvnProgramSetShaders`
+- [x] `nvnProgramSetShaders`
 - [ ] `nvnProgramSetShadersExt`
 - [ ] `nvnProgramSetSubroutineLinkage`
 

@@ -2071,7 +2071,7 @@ build_abi_test: all tests passed
 ```
 
 CI：`portable` 与 `ios`（xcodegen / 模拟器 Debug / 真机 Debug / Release 必须失败）
-在本轮推送后确认。**没有真机运行记录**，本机无设备。
+全部通过（run 40989294645，commit `2967a41`）。**没有真机运行记录**，本机无设备。
 
 ### 仍然没有的东西（别把 46 读成“快能玩了”）
 
@@ -2091,3 +2091,85 @@ CI：`portable` 与 `ios`（xcodegen / 模拟器 Debug / 真机 Debug / Release 
 `ensure_encoder()` 开出的 pass 里第一次出现**真正的** pipeline。但在着色器
 翻译有结论之前，这一步只能验证“Metal 侧把管线建起来了”，不能验证
 “客体的 shader 跑起来了”。
+
+## M3.76 第一条真 draw：把翻译器之外的一切做完，并让它被 CI 执行
+
+上一轮的结论是“着色器翻译是墙”。这一轮没有去撞墙，而是**把墙两侧都建好**：
+墙的右边（MSL -> Metal 管线 -> draw -> 回读）现在能跑，墙的左边（SASS -> MSL）
+只剩一个接口，返回 NULL 和理由。
+
+### 为什么先做右边
+
+如果没有一条能执行的 draw，之后任何翻译器都无法验证：分不清“翻译错了”和
+“管线建错了 / 顶点没绑对 / 目标格式不对”。所以先造一个**已知正确**的最小
+程序，把 Metal 侧的每一环串起来，再让翻译器往里填。
+
+### 接口
+
+```c
+const char* nvngfx_shader_to_msl(const void* code, unsigned long long size,
+                                 nvngfx_stage stage, const char** why);
+```
+
+* 现在返回 NULL，`why` = “no translator: Maxwell SASS -> MSL is not implemented”；
+* 约定翻译器要产出 `nvngfx_main_vs` / `nvngfx_main_fs` 两个入口；
+* `nvngfx_shader_set_msl_passthrough(1)` 是给自检和将来的离线 MSL 缓存用的：
+  它把 `code` 原样当 MSL 返回，**不做任何翻译**，默认关闭。
+
+### 新增的 6 个入口（46 -> 52）
+
+| 入口 | 做了什么 |
+|---|---|
+| `nvnProgramInitialize` | 建侧表项，返回 1 |
+| `nvnProgramSetShaders` | 记录每个 stage 的 `NVNshaderData{data, control}`；数组顺序即 stage 顺序 |
+| `nvnProgramFinalize` | 释放缓存管线并删除侧表项 |
+| `nvnCommandBufferBindProgram` | 设当前 program，尝试建管线（目标格式已知时） |
+| `nvnCommandBufferBindVertexBuffer` | 记录 guest 地址与长度（**没有 draw 用它**） |
+| `nvnCommandBufferBindVertexBuffers` | 只记录范围；`NVNbufferRange` 的内容故意不读 |
+
+`DrawArrays` 现在：有管线就 `setRenderPipelineState` + `drawPrimitives`，
+没有就打一次 `noPipeline` 并返回。`SetRenderTargets` 会清掉缓存的管线，
+因为 Metal 把颜色格式烘进 pipeline。
+
+### 自检：一条真的 draw，回读像素
+
+`nvngfx_metal_selftest()` 走的是**客体入口点**，不是直接调 Metal：
+
+```
+TextureBuilder 5 个 setter -> nvnTextureInitialize (64x64 RGBA8)
+BeginRecording -> SetRenderTargets -> ClearColor(红)
+BindProgram(内置 MSL) -> DrawArrays(3) -> EndRecording
+blit 到 shared buffer -> 检查中心像素 == (64,128,191,255)
+```
+
+顶点用 `[[vertex_id]]` 生成全屏三角形，所以**不需要顶点缓冲**——这正是
+“先把管线跑通、顶点输入留到后面”的意思。
+
+`ios/BotWTests/MetalReplayTests.mm` 在 CI 的 iOS 模拟器里跑它，并连跑 3 次，
+用来抓全局侧表里的状态泄漏。
+
+### 证据
+
+```
+nvn_abi_test: ok (513 procs)
+core_smoke_test: ok (nvn 0/513 on null)
+nvn_texture_test: ok (157 formats in table)
+nvn_shader_test: ok (seam refuses SASS, passthrough opt-in)
+syntax_check_metal: ok (clang++.exe)
+verify_ios: ok (metal bindings: 52/513)
+build_abi_test: all tests passed
+```
+
+覆盖：**52 / 513（10.1%）**；CommandBuffer 8 -> 11 / 144，Program 0 -> 3 / 7。
+`P0 blockers open: 1/6`（只剩 `BindVertexAttribState`）。
+
+### 没有做到的事
+
+| 缺口 | 后果 |
+|---|---|
+| Maxwell SASS -> MSL | 客体的 draw 仍然全部停在 `noPipeline` |
+| `BindVertexAttribState` | 顶点布局没有落地，任何真实几何都画不出来 |
+| `DrawElements` | index type 未验证，仍然只计数 |
+| 模拟器 Metal 的实测 | 本轮推送前没跑过，CI 结果见下 |
+
+**没有真机运行记录**，本机无设备。
