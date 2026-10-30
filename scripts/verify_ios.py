@@ -214,6 +214,12 @@ def check_swift() -> None:
         fail("ios/BotW: no @main entry point")
     if "MetalView" not in joined:
         fail("ios/BotW: MetalView is not wired")
+    # The whole point of the shell rewrite: the NVN window must present into
+    # the layer the app displays, not a private one.
+    if "native_layer" not in joined:
+        fail("ios/BotW: the app never passes CAMetalLayer to the core "
+             "(botw_core_desc.native_layer); guest frames would go nowhere")
+
     notes.append(f"swift sources: {len(files)}")
 
 

@@ -216,12 +216,16 @@ guest 业务代码
 | 未实现 | 481 | 按"挡住第一个 draw call"排序，见 `docs/IOS_PORTING.md` |
 | 生成的代码 | 2 个文件 | `gen_nvn.py` 生成 `nvn_api.h` / `nvn_dispatch.cpp`，`--check` 防手改 |
 
-三条诚实说明：
+四条诚实说明：
 
-1. **现在不会产生 draw call**：`MTLRenderCommandEncoder` 从未创建（渲染目标绑定未实现），
+1. **屏幕上的颜色不是游戏画的**。`MetalView` 是 CAMetalLayer 视图，这块层通过
+   `botw_core_desc.native_layer` 交给核心；还没有标题代码可跑，所以
+   `botw_core_frame()` 用宿主 clear + present 驱动交换链，HUD 的 `presents`
+   就是这条路的计数。它证明层/绘制/上屏通了，不代表渲染通了。
+2. **现在不会产生 draw call**：`MTLRenderCommandEncoder` 从未创建（渲染目标绑定未实现），
    所有 `drawArrays` 直接返回。
-2. **纹理只分配句柄**：`NVNtextureBuilder` 字段偏移未验证，猜偏移会得到"跑得正常、采样全黑"。
-3. **Release 编不过**：`kEnumsVerified = 0`，`nvn_metal.mm` 用 `#error` 拒绝 NDEBUG 构建。
+3. **纹理只分配句柄**：`NVNtextureBuilder` 字段偏移未验证，猜偏移会得到"跑得正常、采样全黑"。
+4. **Release 编不过**：`kEnumsVerified = 0`，`nvn_metal.mm` 用 `#error` 拒绝 NDEBUG 构建。
    把没验证的 NVN 枚举值带上船，等于发一个颜色全错的版本。
 
 ## 本地验证（不需要 Mac）

@@ -41,6 +41,8 @@ int main() {
     CHECK(s.total > 400);
     CHECK(s.implemented == 0);          /* null backend implements nothing */
     CHECK(s.backend != nullptr && std::strcmp(s.backend, "null") == 0);
+    /* The null backend has no swapchain, so nothing may ever be presented. */
+    CHECK(s.presents == 0);
 
     CHECK(botw_core_nvn_has(core, "nvnCommandBufferDrawArrays") == 0);
     CHECK(botw_core_nvn_has(core, "nvnDefinitelyNotARealProc") == 0);

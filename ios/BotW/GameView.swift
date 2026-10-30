@@ -1,91 +1,71 @@
 import Observation
 import SwiftUI
-import MetalKit
+import UIKit
+import QuartzCore
 
 /// Debug HUD.  Deliberately tiny: it exists so the number of NVN entry points
-/// the backend actually owns is visible on a real device, next to the code
-/// that generates that number.
+/// the backend actually owns, and the number of frames that reached the
+/// display, are visible on a real device next to the code that produces them.
 @Observable
 final class HUDModel {
     var backend = "…"
     var implemented = 0
     var total = 0
+    var presents = 0
     var error = "…"
-    var frames: UInt64 = 0
 }
 
-struct MetalView: UIViewRepresentable {
+/// A UIView whose backing layer is a CAMetalLayer.
+///
+/// The layer is the surface the NVN window presents into, so it has to be a
+/// real on-screen layer owned by the view hierarchy.  drawableSize is set here
+/// because CAMetalLayer does not follow bounds/resize on its own the way
+/// MTKView does.
+final class MetalView: UIView {
+    override class var layerClass: AnyClass { CAMetalLayer.self }
+
+    var metalLayer: CAMetalLayer { layer as! CAMetalLayer }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        let scale = traitCollection.displayScale > 0 ? traitCollection.displayScale : UIScreen.main.scale
+        metalLayer.contentsScale = scale
+        metalLayer.drawableSize = CGSize(width: bounds.width * scale, height: bounds.height * scale)
+    }
+}
+
+struct GameView: UIViewRepresentable {
     let hud: HUDModel
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
-    func makeUIView(context: Context) -> MTKView {
-        let v = MTKView(frame: .zero, device: MTLCreateSystemDefaultDevice())
-        let r = Renderer(view: v)
-        context.coordinator.renderer = r
-        if let r {
-            hud.backend = r.stats.backend
-            hud.implemented = r.stats.nvnImplemented
-            hud.total = r.stats.nvnTotal
-            hud.error = r.stats.coreError
-            context.coordinator.hud = hud
-            // MTKView.delegate is weak.  The Pump has to be owned by the
-            // coordinator or it is deallocated before the first frame and the
-            // view stays black forever.
-            let pump = Pump(renderer: r, hud: hud)
-            context.coordinator.pump = pump
-            v.delegate = pump
-        }
-        return v
+    func makeUIView(context: Context) -> MetalView {
+        let view = MetalView(frame: .zero)
+        view.backgroundColor = .black
+        // The driver must outlive makeUIView; MTKView taught us that a weak
+        // delegate quietly deallocates and the screen stays black.
+        context.coordinator.driver = CoreDriver(view: view, hud: hud)
+        return view
     }
 
-    func updateUIView(_ uiView: MTKView, context: Context) {}
+    func updateUIView(_ uiView: MetalView, context: Context) {}
 
     final class Coordinator {
-        var renderer: Renderer?
-        var hud: HUDModel?
-        var pump: Pump?
-    }
-
-    /// Forwards MTKViewDelegate callbacks to the renderer while occasionally
-    /// refreshing the HUD off the render path.
-    final class Pump: NSObject, MTKViewDelegate {
-        private let renderer: Renderer
-        private let hud: HUDModel
-        private var tick = 0
-
-        init(renderer: Renderer, hud: HUDModel) {
-            self.renderer = renderer
-            self.hud = hud
-            super.init()
-        }
-
-        func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
-            renderer.mtkView(view, drawableSizeWillChange: size)
-        }
-
-        func draw(in view: MTKView) {
-            renderer.draw(in: view)
-            tick &+= 1
-            if tick % 30 == 0 {
-                hud.frames = renderer.frameIndex
-                hud.implemented = renderer.stats.nvnImplemented
-            }
-        }
+        var driver: CoreDriver?
     }
 }
 
-struct GameView: View {
+struct GameViewRoot: View {
     @State private var hud = HUDModel()
 
     var body: some View {
         ZStack(alignment: .topLeading) {
-            MetalView(hud: hud)
+            GameView(hud: hud)
             VStack(alignment: .leading, spacing: 2) {
-                Text("BOTW iOS · M0 renderer")
+                Text("BOTW iOS · shell")
                     .fontWeight(.semibold)
                 Text("nvn \(hud.implemented)/\(hud.total) on \(hud.backend)")
-                Text("frame \(hud.frames)")
+                Text("presents \(hud.presents)")
                 Text(hud.error)
                     .foregroundStyle(.orange)
             }

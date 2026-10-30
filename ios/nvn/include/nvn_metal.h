@@ -21,6 +21,26 @@ extern "C" {
 nvngfx_ctx* nvngfx_metal_create(void);
 void nvngfx_metal_destroy(nvngfx_ctx* ctx);
 
+/* Adopts the app's MTLDevice and MTLCommandQueue (bridged, not retained: the
+ * app owns them).  Call this before nvngfx_metal_set_layer so commands and
+ * drawables come from the same device the view uses.  Passing NULL for the
+ * queue makes the backend create its own from the device. */
+void nvngfx_metal_set_device(nvngfx_ctx* ctx, void* mtlDevice, void* mtlCommandQueue);
+
+/* Binds the CAMetalLayer the app displays (bridged, not retained: the view
+ * owns it).  The NVN window then presents into it instead of a private layer.
+ * May be called before or after nvnWindowInitialize. */
+void nvngfx_metal_set_layer(nvngfx_ctx* ctx, void* caMetalLayer);
+
+/* Host-side swapchain self-test: clear + present one frame with no guest
+ * command stream at all.  Returns 1 if a frame reached the display.
+ *
+ * This exists to prove the layer / drawable / command-buffer / present path on
+ * a real device before the title produces any commands.  It is not the game
+ * rendering; it is the harness that says "the swapchain works, the rest is
+ * missing". */
+int nvngfx_metal_present_clear(nvngfx_ctx* ctx, float r, float g, float b);
+
 #ifdef __cplusplus
 }
 #endif

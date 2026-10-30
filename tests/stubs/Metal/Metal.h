@@ -50,6 +50,19 @@ enum {
     MTLPrimitiveTypeTriangle = 3,
 };
 
+typedef struct { double width, height; } CGSize;
+
+typedef struct { double red, green, blue, alpha; } MTLClearColor;
+static inline MTLClearColor MTLClearColorMake(double r, double g, double b, double a) {
+    MTLClearColor c; c.red = r; c.green = g; c.blue = b; c.alpha = a; return c;
+}
+
+typedef NSUInteger MTLLoadAction;
+enum { MTLLoadActionDontCare = 0, MTLLoadActionLoad = 1, MTLLoadActionClear = 2 };
+
+typedef NSUInteger MTLStoreAction;
+enum { MTLStoreActionDontCare = 0, MTLStoreActionStore = 1 };
+
 typedef struct { double originX, originY, width, height, znear, zfar; } MTLViewport;
 typedef struct { NSUInteger x, y, width, height; } MTLScissorRect;
 typedef struct { NSUInteger x, y, z; } MTLOrigin;
@@ -92,10 +105,29 @@ typedef void (^MTLDeallocator)(void* pointer, NSUInteger length);
 - (void)setScissorRect:(MTLScissorRect)rect;
 @end
 
+@class MTLRenderPassDescriptor;
+
 @protocol MTLCommandBuffer
 - (id<MTLBlitCommandEncoder>)blitCommandEncoder;
+- (id<MTLRenderCommandEncoder>)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor*)descriptor;
 - (void)presentDrawable:(id)drawable;
 - (void)commit;
+@end
+
+@interface MTLRenderPassColorAttachmentDescriptor : NSObject
+@property (retain) id<MTLTexture> texture;
+@property MTLLoadAction loadAction;
+@property MTLStoreAction storeAction;
+@property MTLClearColor clearColor;
+@end
+
+@interface MTLRenderPassColorAttachmentDescriptorArray : NSObject
+- (MTLRenderPassColorAttachmentDescriptor*)objectAtIndexedSubscript:(NSUInteger)index;
+@end
+
+@interface MTLRenderPassDescriptor : NSObject
++ (MTLRenderPassDescriptor*)renderPassDescriptor;
+@property (readonly) MTLRenderPassColorAttachmentDescriptorArray* colorAttachments;
 @end
 
 @protocol MTLCommandQueue

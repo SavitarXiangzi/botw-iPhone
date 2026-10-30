@@ -23,6 +23,10 @@ typedef struct {
     uint32_t height;
     void*    metal_device;      /* id<MTLDevice>, bridged */
     void*    metal_command_queue;
+    /* CAMetalLayer* the NVN window presents into.  This must be the layer the
+     * app actually displays, not a private one: otherwise the guest's frames
+     * go to a surface nobody can see.  NULL lets the backend make its own. */
+    void*    native_layer;
     const char* romfs_root;     /* path to the mounted content/ tree */
 } botw_core_desc;
 
@@ -45,6 +49,9 @@ typedef struct {
     uint32_t total;
     uint32_t implemented;
     const char* backend;   /* "metal" or "null" */
+    /* Frames the host swapchain actually handed to the display.  0 means the
+     * layer was never presentable (not attached, wrong size, no drawable). */
+    uint32_t presents;
 } botw_core_nvn_stats;
 
 void botw_core_nvn_stats_get(const botw_core* core, botw_core_nvn_stats* out);

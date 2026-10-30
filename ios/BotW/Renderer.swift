@@ -1,139 +1,115 @@
-import MetalKit
-import simd
+import Foundation
+import Metal
+import QuartzCore
 
-/// M0 renderer: proves the Metal path on device (triangle + constant buffer +
-/// a real frame pump), and drives the C core through its ABI so the boundary
-/// is exercised on every frame rather than only at launch.
+/// Drives the C core one frame at a time.
 ///
-/// The triangle is deliberately not the point.  What matters is that
-/// `botw_core` is created with the same MTLDevice/queue the view uses, that
-/// `botw_core_nvn_stats` reports the generated NVN registry on device, and
-/// that `botw_core_frame` is called at display rate.  When the ARM64 core is
-/// linked in, this file does not change.
-final class Renderer: NSObject, MTKViewDelegate {
-    private let device: MTLDevice
-    private let queue: MTLCommandQueue
-    private let pipeline: MTLRenderPipelineState
-    private var time: Float = 0
-    private(set) var frameIndex: UInt64 = 0
-
-    private var core: OpaquePointer?
-    private(set) var stats = Stats()
-
+/// There is no MTKView here on purpose.  The NVN window has to own the layer
+/// the app displays, otherwise the guest's swapchain presents into a surface
+/// nobody can see -- which is exactly what the first version of this shell did
+/// (MTKView drew a triangle on its own layer while the NVN window made a
+/// private one that went nowhere).  So the view is a plain UIView backed by a
+/// CAMetalLayer, and that layer is handed to botw_core at creation time.
+final class CoreDriver: NSObject {
     struct Stats {
         var backend = "none"
         var nvnImplemented = 0
         var nvnTotal = 0
+        var presents = 0
         var coreError = ""
     }
 
-    struct Uniforms { var time: Float; var aspect: Float }
+    private(set) var core: OpaquePointer?
+    private(set) var stats = Stats()
 
-    init?(view: MTKView) {
-        guard let dev = view.device ?? MTLCreateSystemDefaultDevice(),
-              let q = dev.makeCommandQueue() else { return nil }
-        device = dev
-        queue = q
-        view.device = dev
-        view.colorPixelFormat = .bgra8Unorm
-        view.clearColor = MTLClearColor(red: 0.02, green: 0.03, blue: 0.05, alpha: 1)
+    private let hud: HUDModel
+    /// Kept alive here because the core borrows it (__bridge, no retain).
+    private var queue: MTLCommandQueue?
+    private var link: CADisplayLink?
+    private var lastTimestamp: CFTimeInterval = 0
+    private var ticksSincePublish = 0
 
-        let src = """
-        #include <metal_stdlib>
-        using namespace metal;
-
-        struct Uniforms { float time; float aspect; };
-
-        struct VOut { float4 pos [[position]]; float2 uv; };
-
-        vertex VOut v_main(uint vid [[vertex_id]], constant Uniforms &u [[buffer(0)]]) {
-            float2 p[3] = { float2(0.0, 0.6), float2(-0.6, -0.5), float2(0.6, -0.5) };
-            float2 v = p[vid];
-            float s = sin(u.time), c = cos(u.time);
-            v = float2(v.x * c - v.y * s, v.x * s + v.y * c);
-            v.x /= u.aspect;
-            VOut o;
-            o.pos = float4(v, 0.0, 1.0);
-            o.uv = v * 0.5 + 0.5;
-            return o;
-        }
-
-        fragment float4 f_main(VOut in [[stage_in]]) {
-            return float4(in.uv.x, in.uv.y, 0.6, 1.0);
-        }
-        """
-        guard let lib = try? dev.makeLibrary(source: src, options: nil),
-              let vfn = lib.makeFunction(name: "v_main"),
-              let ffn = lib.makeFunction(name: "f_main") else { return nil }
-
-        let desc = MTLRenderPipelineDescriptor()
-        desc.vertexFunction = vfn
-        desc.fragmentFunction = ffn
-        desc.colorAttachments[0].pixelFormat = view.colorPixelFormat
-        guard let p = try? dev.makeRenderPipelineState(descriptor: desc) else { return nil }
-        pipeline = p
-
+    init(view: MetalView, hud: HUDModel) {
+        self.hud = hud
         super.init()
 
-        // The C core gets the very same device/queue the view renders with.
-        var cdesc = botw_core_desc()
-        cdesc.width = UInt32(max(view.drawableSize.width, 1))
-        cdesc.height = UInt32(max(view.drawableSize.height, 1))
-        cdesc.metal_device = Unmanaged.passUnretained(dev).toOpaque()
-        cdesc.metal_command_queue = Unmanaged.passUnretained(q).toOpaque()
-        cdesc.romfs_root = nil
-        if let c = botw_core_create(&cdesc) {
-            core = c
-            var s = botw_core_nvn_stats()
-            botw_core_nvn_stats_get(c, &s)
-            stats.backend = s.backend.map { String(cString: $0) } ?? "?"
-            stats.nvnImplemented = Int(s.implemented)
-            stats.nvnTotal = Int(s.total)
-            stats.coreError = String(cString: botw_core_last_error(c))
-        } else {
-            stats.coreError = "botw_core_create failed"
+        guard let device = view.metalLayer.device ?? MTLCreateSystemDefaultDevice(),
+              let queue = device.makeCommandQueue() else {
+            stats.coreError = "no Metal device/queue"
+            publish()
+            return
         }
+        self.queue = queue
+        view.metalLayer.device = device
+        view.metalLayer.pixelFormat = .bgra8Unorm
+        // The guest's target is blitted in, so the drawable must not be
+        // framebuffer-only.
+        view.metalLayer.framebufferOnly = false
+        view.metalLayer.isOpaque = true
 
-        // NOTE: the delegate is installed by MetalView's coordinator (it owns
-        // the Pump); setting view.delegate = self here would be overwritten.
-        // 60 is the honest default: the guest's own frame pacing is what the
-        // NVN present interval controls, not this number.
-        view.preferredFramesPerSecond = 60
-        view.isPaused = false
-        view.enableSetNeedsDisplay = false
+        var desc = botw_core_desc()
+        desc.width = UInt32(max(view.metalLayer.drawableSize.width, 1))
+        desc.height = UInt32(max(view.metalLayer.drawableSize.height, 1))
+        desc.metal_device = Unmanaged.passUnretained(device).toOpaque()
+        // Same device and queue the view renders with; the core borrows both.
+        desc.metal_command_queue = Unmanaged.passUnretained(queue).toOpaque()
+        desc.native_layer = Unmanaged.passUnretained(view.metalLayer).toOpaque()
+        desc.romfs_root = nil
+
+        guard let c = botw_core_create(&desc) else {
+            stats.coreError = "botw_core_create failed"
+            publish()
+            return
+        }
+        core = c
+        publish()
+
+        let link = CADisplayLink(target: self, selector: #selector(tick(_:)))
+        link.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 120, preferred: 60)
+        link.add(to: .main, forMode: .common)
+        self.link = link
     }
 
     deinit {
+        link?.invalidate()
         if let c = core { botw_core_destroy(c) }
     }
 
-    func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
+    @objc private func tick(_ link: CADisplayLink) {
         guard let c = core else { return }
-        _ = c
-        var s = botw_core_nvn_stats()
-        botw_core_nvn_stats_get(c, &s)
-        stats.nvnImplemented = Int(s.implemented)
+        var dt = lastTimestamp > 0 ? link.timestamp - lastTimestamp : 1.0 / 60.0
+        lastTimestamp = link.timestamp
+        if dt <= 0 || dt > 0.25 { dt = 1.0 / 60.0 }
+
+        _ = botw_core_frame(c, dt)
+
+        ticksSincePublish += 1
+        if ticksSincePublish >= 15 {
+            ticksSincePublish = 0
+            publish()
+        }
     }
 
-    func draw(in view: MTKView) {
-        guard let rpd = view.currentRenderPassDescriptor,
-              let drawable = view.currentDrawable,
-              let cb = queue.makeCommandBuffer(),
-              let enc = cb.makeRenderCommandEncoder(descriptor: rpd) else { return }
-        time += 1.0 / 60.0
-        frameIndex &+= 1
+    /// Copies the core's counters into the HUD.  Cheap, but not per-frame:
+    /// @Observable mutations trigger SwiftUI invalidation.
+    private func publish() {
+        var s = botw_core_nvn_stats()
+        if let c = core { botw_core_nvn_stats_get(c, &s) }
 
+        stats.backend = s.backend.map { String(cString: $0) } ?? "?"
+        stats.nvnImplemented = Int(s.implemented)
+        stats.nvnTotal = Int(s.total)
+        stats.presents = Int(s.presents)
+        // Only overwrite the recorded error when there is a core to ask;
+        // otherwise keep whatever the initialisation failure said.
         if let c = core {
-            _ = botw_core_frame(c, 1.0 / 60.0)
+            stats.coreError = String(cString: botw_core_last_error(c))
         }
 
-        var u = Uniforms(time: time,
-                         aspect: Float(max(view.drawableSize.width, 1) / max(view.drawableSize.height, 1)))
-        enc.setRenderPipelineState(pipeline)
-        enc.setVertexBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 0)
-        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
-        enc.endEncoding()
-        cb.present(drawable)
-        cb.commit()
+        hud.backend = stats.backend
+        hud.implemented = stats.nvnImplemented
+        hud.total = stats.nvnTotal
+        hud.presents = stats.presents
+        hud.error = stats.coreError
     }
 }

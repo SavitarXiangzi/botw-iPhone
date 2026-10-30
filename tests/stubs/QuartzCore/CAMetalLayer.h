@@ -19,6 +19,7 @@
  * which let a real build error through to CI.  Keep this file no looser than
  * the SDK it stands in for. */
 @property NSUInteger maximumDrawableCount;
+@property CGSize drawableSize;
 - (id<CAMetalDrawable>)nextDrawable;
 @end
 

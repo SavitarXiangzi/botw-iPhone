@@ -2,6 +2,7 @@
 
 #include "nvn_backend.h"
 
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 
@@ -12,6 +13,7 @@
 struct botw_core {
     botw_core_desc desc{};
     uint64_t frame = 0;
+    unsigned presents = 0;
     int nvn_total = 0;
     int nvn_ready = 0;
     const char* backend = "none";
@@ -19,6 +21,7 @@ struct botw_core {
 
 #if defined(__APPLE__)
     nvngfx_ctx* nvn_ctx = nullptr;
+    float phase = 0.0f;
 #endif
 };
 
@@ -29,6 +32,12 @@ extern "C" botw_core* botw_core_create(const botw_core_desc* d) {
 
 #if defined(__APPLE__)
     c->nvn_ctx = nvngfx_metal_create();
+    /* Share the app's device and queue, so guest textures and drawables live on
+     * the same device the view renders with.  Then hand the backend the layer
+     * the app actually shows -- without it the guest's swapchain would present
+     * into a surface nobody can see. */
+    nvngfx_metal_set_device(c->nvn_ctx, d->metal_device, d->metal_command_queue);
+    nvngfx_metal_set_layer(c->nvn_ctx, d->native_layer);
     nvngfx_install(nvngfx_metal_backend());
     c->backend = "metal";
 #else
@@ -56,9 +65,25 @@ extern "C" void botw_core_destroy(botw_core* c) {
     delete c;
 }
 
-extern "C" int botw_core_frame(botw_core* c, double) {
+extern "C" int botw_core_frame(botw_core* c, double dt) {
     if (!c) return -1;
     c->frame++;
+#if defined(__APPLE__)
+    /* No title code is running yet, so the only honest frame source is the
+     * host: clear the swapchain and present it.  This proves
+     * layer -> drawable -> command buffer -> display works on the device and
+     * makes `presents` a number the HUD can show.  When the ARM64 core is
+     * linked in, this branch is what it replaces. */
+    if (c->nvn_ctx) {
+        c->phase += static_cast<float>(dt) * 0.7f;
+        const float r = 0.5f + 0.5f * static_cast<float>(std::sin(c->phase));
+        const float g = 0.5f + 0.5f * static_cast<float>(std::sin(c->phase + 2.0944));
+        const float b = 0.5f + 0.5f * static_cast<float>(std::sin(c->phase + 4.1888));
+        if (nvngfx_metal_present_clear(c->nvn_ctx, r, g, b)) c->presents++;
+    }
+#else
+    (void)dt;
+#endif
     return 0;
 }
 
@@ -70,6 +95,7 @@ extern "C" void botw_core_nvn_stats_get(const botw_core* c, botw_core_nvn_stats*
     out->total = c ? static_cast<uint32_t>(c->nvn_total) : 0u;
     out->implemented = c ? static_cast<uint32_t>(c->nvn_ready) : 0u;
     out->backend = c ? c->backend : "none";
+    out->presents = c ? c->presents : 0u;
 }
 
 extern "C" int botw_core_nvn_has(const botw_core* c, const char* name) {

@@ -38,7 +38,9 @@
 #import <QuartzCore/CAMetalLayer.h>
 
 #include "nvn_backend.h"
+#include "nvn_metal.h"
 
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <set>
@@ -84,6 +86,8 @@ void log_once(const char* what, unsigned value) {
 struct Ctx {
     id<MTLDevice> device = nil;
     id<MTLCommandQueue> queue = nil;
+    /* The layer the app displays.  Borrowed: the view owns it. */
+    CAMetalLayer* nativeLayer = nil;
     unsigned presents = 0;
     unsigned dropped = 0;
     bool ready = false;
@@ -190,12 +194,14 @@ void dev_initialize(nvngfx_ctx* ctx, uint64_t* x) {
     Ctx* c = ctx_of(ctx);
     if (!c) return;
     (void)x;
-    c->device = MTLCreateSystemDefaultDevice();
+    /* The app normally already handed us its device (nvngfx_metal_set_device);
+     * only fall back to the system default when the backend is used headless. */
+    if (!c->device) c->device = MTLCreateSystemDefaultDevice();
     if (!c->device) {
         std::fprintf(stderr, "[nvn] no Metal device\n");
         return;
     }
-    c->queue = [c->device newCommandQueue];
+    if (!c->queue) c->queue = [c->device newCommandQueue];
     c->ready = (c->queue != nil);
     std::fprintf(stderr, "[nvn] metal device: %s\n", [[c->device name] UTF8String]);
 }
@@ -242,6 +248,33 @@ void win_builder_set_num_active_textures(nvngfx_ctx*, uint64_t* x) {
         static_cast<unsigned>(x[1]);
 }
 
+/* Clears `layer` to one colour and presents it.  Returns true if the frame
+ * reached the display.  Shared by the host self-test and by
+ * nvnQueuePresentTexture when the guest texture has no MTLTexture yet. */
+bool present_clear(Ctx* c, CAMetalLayer* layer, float r, float g, float b) {
+    if (!c || !c->ready || !layer) return false;
+    if (layer.drawableSize.width < 1.0 || layer.drawableSize.height < 1.0) return false;
+    @autoreleasepool {
+        id<CAMetalDrawable> drawable = [layer nextDrawable];
+        if (!drawable) {
+            c->dropped++;
+            return false;
+        }
+        MTLRenderPassDescriptor* rpd = [MTLRenderPassDescriptor renderPassDescriptor];
+        rpd.colorAttachments[0].texture = drawable.texture;
+        rpd.colorAttachments[0].loadAction = MTLLoadActionClear;
+        rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
+        rpd.colorAttachments[0].clearColor = MTLClearColorMake(r, g, b, 1.0);
+        id<MTLCommandBuffer> cb = [c->queue commandBuffer];
+        id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rpd];
+        [enc endEncoding];
+        [cb presentDrawable:drawable];
+        [cb commit];
+    }
+    c->presents++;
+    return true;
+}
+
 void win_initialize(nvngfx_ctx* ctx, uint64_t* x) {
     Ctx* c = ctx_of(ctx);
     if (!c || !c->ready) return;
@@ -253,7 +286,14 @@ void win_initialize(nvngfx_ctx* ctx, uint64_t* x) {
     if (it != g_win_specs.end()) spec = it->second;
 
     Win* w = new Win();
-    w->layer = static_cast<CAMetalLayer*>([CAMetalLayer layer]);
+    /* spec.nativeWindow is the guest's nn::vi handle, which is NOT a
+     * CAMetalLayer -- casting it here would message a random pointer.  Until
+     * vi layer handles are mapped onto host layers, the only safe surface is
+     * the one the app gave us in nvngfx_metal_set_layer().  Falling back to a
+     * private layer keeps the backend usable headless; frames then go nowhere
+     * visible, which is what botw_core_nvn_stats.presents reports as 0. */
+    w->layer = c->nativeLayer ? c->nativeLayer
+                              : static_cast<CAMetalLayer*>([CAMetalLayer layer]);
     w->layer.device = c->device;
     w->layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
     w->layer.framebufferOnly = NO;  /* we blit the guest's target in */
@@ -463,6 +503,17 @@ void queue_present_texture(nvngfx_ctx* ctx, uint64_t* x) {
     Tex* t = obj<Tex>(x[2]);
     if (!c || !c->ready || !w || !w->layer) return;
 
+    if (!t || !t->mtl) {
+        /* The guest asked to present a texture the host never materialised
+         * (nvnTextureInitialize is still a stub).  Presenting a cleared frame
+         * keeps the swapchain honest: the frame counter moves and the HUD can
+         * show a present count.  Dropping the frame instead would look like
+         * the app is hung. */
+        log_once("nvnQueuePresentTexture.noTexture", 1);
+        present_clear(c, w->layer, 0.05f, 0.06f, 0.09f);
+        return;
+    }
+
     @autoreleasepool {
         id<CAMetalDrawable> drawable = [w->layer nextDrawable];
         if (!drawable) {
@@ -470,7 +521,7 @@ void queue_present_texture(nvngfx_ctx* ctx, uint64_t* x) {
             return;
         }
         id<MTLCommandBuffer> cb = [c->queue commandBuffer];
-        if (t && t->mtl && t->mtl.width == drawable.texture.width &&
+        if (t->mtl.width == drawable.texture.width &&
             t->mtl.height == drawable.texture.height &&
             t->mtl.pixelFormat == drawable.texture.pixelFormat) {
             /* Fast path: same layout, straight blit. */
@@ -487,7 +538,8 @@ void queue_present_texture(nvngfx_ctx* ctx, uint64_t* x) {
             [blit endEncoding];
         } else {
             /* Needs a fullscreen resolve pass (format/scale mismatch). */
-            log_once("present.formatMismatch", t && t->mtl ? static_cast<unsigned>(t->mtl.pixelFormat) : 0u);
+            log_once("present.formatMismatch",
+                     static_cast<unsigned>(t->mtl.pixelFormat));
             c->dropped++;
         }
         [cb presentDrawable:drawable];
@@ -565,6 +617,31 @@ extern "C" const nvngfx_backend* nvngfx_metal_backend(void) {
 /* Lifetime is owned by the app: create once, install, destroy at exit. */
 extern "C" nvngfx_ctx* nvngfx_metal_create(void) {
     return reinterpret_cast<nvngfx_ctx*>(new Ctx());
+}
+
+/* __bridge everywhere below: the app owns the device, the queue and the layer,
+ * and they outlive the core.  Retaining them here would just hide ownership.
+ * A caller that replaces one of them must call the setter again. */
+extern "C" void nvngfx_metal_set_device(nvngfx_ctx* ctx, void* mtlDevice,
+                                        void* mtlCommandQueue) {
+    Ctx* c = reinterpret_cast<Ctx*>(ctx);
+    if (!c) return;
+    if (mtlDevice) c->device = (__bridge id<MTLDevice>)mtlDevice;
+    if (mtlCommandQueue) c->queue = (__bridge id<MTLCommandQueue>)mtlCommandQueue;
+    if (c->device && !c->queue) c->queue = [c->device newCommandQueue];
+    c->ready = (c->device != nil && c->queue != nil);
+}
+
+extern "C" void nvngfx_metal_set_layer(nvngfx_ctx* ctx, void* caMetalLayer) {
+    Ctx* c = reinterpret_cast<Ctx*>(ctx);
+    if (!c) return;
+    c->nativeLayer = (__bridge CAMetalLayer*)caMetalLayer;
+}
+
+extern "C" int nvngfx_metal_present_clear(nvngfx_ctx* ctx, float r, float g, float b) {
+    Ctx* c = reinterpret_cast<Ctx*>(ctx);
+    if (!c) return 0;
+    return present_clear(c, c->nativeLayer, r, g, b) ? 1 : 0;
 }
 
 extern "C" void nvngfx_metal_destroy(nvngfx_ctx* ctx) {

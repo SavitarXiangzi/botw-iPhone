@@ -15,8 +15,8 @@
 core/include/botw_core.h      Swift 能看到的全部 C 接口（只有这一个头）
 core/src/botw_core.cpp        C ABI 实现：创建时按平台装 Metal 或 null 后端
 ios/BotW/BotWApp.swift        @main，SwiftUI 入口
-ios/BotW/GameView.swift       MTKView + 调试 HUD（显示 nvn 覆盖数、帧号）
-ios/BotW/Renderer.swift       Metal 管线 + 每帧调用 botw_core_frame
+ios/BotW/GameView.swift       CAMetalLayer 视图 + 调试 HUD（nvn 覆盖数、presents）
+ios/BotW/Renderer.swift       CADisplayLink 驱动 botw_core_frame，把视图的层交给核心
 ios/BotW/BotWBridge.h         Swift/ObjC 桥接头，只 #import botw_core.h
 ios/project.yml               XcodeGen 工程描述（不提交 .xcodeproj）
 ios/nvn/registry.json         513 个入口点，从标题自己的 getproc 字符串提取
@@ -215,6 +215,31 @@ iOS 是统一内存，guest 堆本来就是宿主可读的，所以
 
 按“能最早看到东西”的顺序排：
 
+### 6b. 第一次上屏：宿主驱动的 clear + present（已完成一半）
+
+原生层交给核心这件事已经做了，而且是**架构性**的：之前 `MTKView` 自己画一个三角形，
+NVN 窗口另建一个**没人能看见**的 `CAMetalLayer`——客体的帧全部 present 到一块
+不显示的 surface 上。现在：
+
+* `GameView.swift` 的 `MetalView` 是普通 `UIView`，`layerClass = CAMetalLayer`，
+  `layoutSubviews()` 里按 `displayScale` 设 `drawableSize`；
+* `botw_core_desc.native_layer` 把这块层传给核心，`nvngfx_metal_set_layer()`
+  用 `__bridge` 借存（层由视图持有，核心不 retain）；
+* `nvnWindowInitialize` **只用**这块层；`nvnWindowBuilderSetNativeWindow` 传进来的
+  是 guest 的 `nn::vi` 句柄，**不是** CAMetalLayer，直接当指针用会崩，所以刻意不采信；
+* `CADisplayLink` 每帧调 `botw_core_frame()`；
+* `botw_core_frame()` 在还没有标题代码可跑时，用
+  `nvngfx_metal_present_clear()` 清屏并 present，`presents` 计数写进
+  `botw_core_nvn_stats`，HUD 直接显示。
+
+**它证明了什么**：层绑定 → `nextDrawable` → command buffer → present 这条路在
+真机上能走通，且 HUD 的 `presents` 会涨。
+**它没证明什么**：这不是游戏在渲染。没有 render target 绑定、没有 shader、
+没有纹理，客体的 draw 仍然一条都不执行。屏幕上的颜色是宿主画的。
+
+> 证据边界：这段代码通过了 CI 的模拟器 Debug 构建和真机 Debug 构建
+> （`xcodebuild -sdk iphoneos`），**没有**真机运行记录——本机没有设备。
+
 **阶段 A：清屏能出颜色**（不依赖任何 shader）
 
 - 实现 `nvnCommandBufferSetRenderTargets`（拿到颜色纹理）
@@ -222,8 +247,9 @@ iOS 是统一内存，guest 堆本来就是宿主可读的，所以
   `loadAction = .clear`，`clearColor` 用 `nvnCommandBufferClearColor` 记下的值
 - 结束时 `presentTexture` 走 blit（已有）
 
-做完 A，屏幕上应该出现纯色，HUD 的 `frame` 会真的增长。这是第一个
-“肉眼可验证”的里程碑，也是本轮之后最值得先做的一件事。
+做完 A，**客体提交的** clear 才会真正被执行（现在上屏的是宿主自己的 clear，
+见 6b）。区别在于：A 完成后 `nvnCommandBufferClearColor` 记下的颜色才有意义，
+`presents` 才由客体命令驱动而不是由 `botw_core_frame` 代劳。
 
 **阶段 B：几何能出来**（需要 program + vertex state）
 
@@ -339,6 +365,8 @@ Swift 侧同理：`Renderer.swift` / `GameView.swift` 只做了括号与结构�
 
 | 现象 | 先查 |
 |---|---|
+| 屏幕全黑，`presents` 一直是 0 | `native_layer` 没传（视图层不是 CAMetalLayer）、`drawableSize` 是 0（`layoutSubviews` 没跑）、或视图不在 window 上 |
+| 屏幕有颜色但 `presents` 不涨 | `CADisplayLink` 没加进 run loop，或 `botw_core_create` 返回空 |
 | `verify_ios` 说 generated artifacts are stale | 跑了 `gen_nvn.py --repo .` 但没提交生成物 |
 | `verify_ios` 说 bound but not declared implemented | 加了 `BIND(...)` 但没加进 `implemented_metal.txt` |
 | `pool wrap failed` | guest 存储没按 4 KiB 对齐，或长度不是页整数倍 |

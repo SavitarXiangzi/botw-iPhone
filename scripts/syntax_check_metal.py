@@ -61,6 +61,11 @@ def main() -> int:
         "-x", "objective-c++",
         "-std=c++20",
         "-fblocks",
+        # The real target is ARC + the modern runtime.  Without these clang
+        # falls back to the GNUstep/fragile ABI, where Objective-C subscripting
+        # (rpd.colorAttachments[0]) is not even parsed.
+        "-fobjc-arc",
+        "-fobjc-runtime=ios-17.0",
         "-Wall", "-Wextra", "-Werror",
         "-D__APPLE__=1",
         "-I", "tests/stubs",

@@ -1886,3 +1886,62 @@ M3.71 把唯一未解问题收敛成「58.2 MiB 该由谁满足」，三个候�
 2. 验证 `NVNtextureBuilder` 字段偏移，`nvnTextureInitialize` 建出真 `MTLTexture`。
 3. `nvnCommandBufferBindProgram` + `nvnProgramInitialize`，开始 SASS 翻译。
 4. 剩下的 481 个按 `scripts/nvn_status.py` 的 P0/P1/P2 顺序推。
+## M3.73 第一次上屏：把 NVN 窗口接到 App 真正的 CAMetalLayer
+
+### 先说清楚这不是什么
+
+屏幕上的颜色**不是游戏画的**。现在没有任何标题代码在跑，`botw_core_frame()` 用
+宿主的 clear + present 驱动交换链。它证明的是"层 → drawable → command buffer →
+present"这条路在 iOS 上能走通，不证明渲染管线通了。
+
+### 修掉的架构错误
+
+之前 `Renderer.swift` 用 `MTKView` 画一个自娱自乐的三角形，而
+`nvnWindowInitialize` 另建了一个 `CAMetalLayer`——**没有任何视图持有它**。
+换句话说：即使客体的 NVN 命令全部正确，画面也会 present 到一个不显示的
+surface 上。这不是"还没做"，是"做了也看不见"。
+
+现在：
+
+* `MetalView: UIView`，`override class var layerClass: AnyClass { CAMetalLayer.self }`，
+  `layoutSubviews()` 里按 `displayScale` 设 `contentsScale` / `drawableSize`。
+* `botw_core_desc.native_layer` 把这块层交给核心；`nvngfx_metal_set_layer()`
+  用 `__bridge` 借存（视图持所有权，核心不 retain）。
+* `nvnWindowInitialize` **只用**这块层。`nvnWindowBuilderSetNativeWindow` 传来的
+  是 guest 的 `nn::vi` 句柄，不是 CAMetalLayer——直接 `__bridge` 成
+  CAMetalLayer* 会向随机指针发消息，所以刻意不采信，只用 App 给的那一块。
+* `CADisplayLink` 驱动 `botw_core_frame()`；`presents` 通过
+  `botw_core_nvn_stats` 暴露给 HUD。
+* `nvnQueuePresentTexture` 在客体纹理还没有 `MTLTexture` 时不再丢帧，而是
+  清屏 present，并 `log_once` 一次——丢帧会让 App 看起来像卡死。
+
+### 顺手修掉的
+
+* `CADisplayLink` 的 target 由 `CoreDriver` 自己强引用并 `invalidate()`；
+  上一版的 `MTKView.delegate` 是 weak，`Pump` 建完就释放（屏幕全黑、帧号不动）。
+* `syntax_check_metal.py` 增加 `-fobjc-arc` 与 `-fobjc-runtime=ios-17.0`。
+  没有后者，clang 走 GNUstep 运行时，连 `rpd.colorAttachments[0]` 都解析不了。
+* `tests/stubs` 补上 `MTLRenderPassDescriptor` / `MTLClearColor` / `CGSize` /
+  `CAMetalLayer.drawableSize`。
+
+### 证据
+
+```
+nvn_abi_test: ok (513 procs)                 exit=0
+core_smoke_test: ok (nvn 0/513 on null)      exit=0     (新增 presents == 0 断言)
+syntax_check_metal: ok (clang++.exe)                   (-fobjc-arc -Werror)
+verify_ios: ok
+```
+
+CI（本机无 Mac，全靠 runner）：`portable` 全绿；`ios` job 的
+`xcodegen generate` / 模拟器 Debug 构建 / 真机 Debug 构建 / **Release 必须失败**
+全部通过。
+
+**没有真机运行记录**——本机没有 iPhone。`presents` 会涨这件事是设计意图，
+不是实测结论。
+
+### 下一步
+
+`nvnCommandBufferSetRenderTargets`：拿到客体的颜色目标后，`beginRecording`
+时就能建 `MTLRenderCommandEncoder`，`nvnCommandBufferClearColor` 才会真的
+生效，draw 才有机会执行。这是阶段 A 的剩余部分。
