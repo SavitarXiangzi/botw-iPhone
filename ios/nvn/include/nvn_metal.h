@@ -50,9 +50,10 @@ int nvngfx_metal_present_clear(nvngfx_ctx* ctx, float r, float g, float b);
  * any Metal device, the iOS Simulator included, which is what makes it a CI
  * regression test instead of a manual check.
  *
- * The program it draws is the built-in MSL from nvn_shader.h reached through
- * the same nvngfx_shader_to_msl() seam a translator will use -- it proves the
- * Metal half, not that a guest shader can be translated. */
+ * Most draws use the built-in MSL from nvn_shader.h reached through the same
+ * nvngfx_shader_to_msl() seam a translator will use.  The last one loads MSL
+ * from <app>/shaders/manifest.tsv by a guest shader key.  Both are synthetic:
+ * this proves the Metal half, not that a title shader can be translated. */
 int nvngfx_metal_selftest(void);
 
 #ifdef __cplusplus

@@ -74,9 +74,13 @@ def check(cond, what):
         failures += 1
 
 
-def run(msl, out):
-    return subprocess.run([sys.executable, GEN, "--msl", msl, "--out", out],
-                          capture_output=True, text=True)
+def run(msl, out=None, bundle_out=None):
+    argv = [sys.executable, GEN, "--msl", msl]
+    if out:
+        argv += ["--out", out]
+    if bundle_out:
+        argv += ["--bundle-out", bundle_out]
+    return subprocess.run(argv, capture_output=True, text=True)
 
 
 def block(text, name):
@@ -164,6 +168,50 @@ def main():
         check("c1=1 shader(s), 16 bytes" in r.stdout,
               "summary should count c1 bytes: " + r.stdout)
 
+        # Bundle output is the replaceable form the iOS app loads at startup.
+        # It must describe exactly the same bytes and bindings as the C table.
+        bundle = os.path.join(tmp, "bundle")
+        r_bundle = run(msl, bundle_out=bundle)
+        check(r_bundle.returncode == 0,
+              "bundle generator failed: " + r_bundle.stderr.strip())
+        manifest = os.path.join(bundle, "manifest.tsv")
+        check(os.path.isfile(manifest), "bundle should write manifest.tsv")
+        check(os.path.isfile(os.path.join(bundle, "aaaaaaaaaaaaaaaa_ps.msl")),
+              "bundle should write the ps MSL")
+        check(os.path.isfile(os.path.join(bundle, "bbbbbbbbbbbbbbbb_vs.msl")),
+              "bundle should write the vs MSL")
+        check(os.path.isfile(os.path.join(bundle, "aaaaaaaaaaaaaaaa_ps.c1")),
+              "bundle should write the c1 sidecar")
+        with open(os.path.join(bundle, "aaaaaaaaaaaaaaaa_ps.msl"),
+                  encoding="utf-8") as f:
+            check(f.read() == PS, "bundle MSL should be byte-for-byte source text")
+        with open(os.path.join(bundle, "aaaaaaaaaaaaaaaa_ps.c1"), "rb") as f:
+            check(f.read() == c1, "bundle c1 should be byte-for-byte source bytes")
+        with open(manifest, encoding="utf-8") as f:
+            manifest_text = f.read()
+        entries = [ln for ln in manifest_text.splitlines()
+                   if ln and not ln.startswith("#")]
+        check(len(entries) == 2, "manifest should contain two entries: %r" % entries)
+        want_args = ",".join(
+            "%d:%d:%d:%d:%d" % (aid, slot, packed_slot,
+                                 gen_blobs.ARG_NUMBER[kind], offset)
+            for aid, kind, slot, packed_slot, offset in gen_blobs.layout(PS))
+        want_ps = "\t".join(("aaaaaaaaaaaaaaaa", "ps", "aaaaaaaaaaaaaaaa_ps.msl",
+                              "aaaaaaaaaaaaaaaa_ps.c1", want_args))
+        check(want_ps in entries, "manifest ps row is wrong: %r" % entries)
+        want_vs = "\t".join(("bbbbbbbbbbbbbbbb", "vs", "bbbbbbbbbbbbbbbb_vs.msl",
+                              "-", "-"))
+        check(want_vs in entries, "manifest vs row is wrong: %r" % entries)
+        check("bundle -> %s/manifest.tsv" % bundle in r_bundle.stdout,
+              "bundle summary should name its output: " + r_bundle.stdout)
+
+        # At least one output is required; silently writing nothing is a bug.
+        r_neither = subprocess.run([sys.executable, GEN, "--msl", msl],
+                                   capture_output=True, text=True)
+        check(r_neither.returncode != 0, "generator accepted no output option")
+        check("--bundle-out" in (r_neither.stderr + r_neither.stdout),
+              "no-output error should mention the options")
+
         # A c1 declaration without its sidecar is a build error, not a draw
         # that reads an unset pointer.
         os.remove(c1_path)
@@ -183,6 +231,16 @@ def main():
             empty_text = f.read()
         check("kEmptyC1" in empty_text, "empty c1 should use the shared zero array")
         check("kEmptyC1, 0" in empty_text, "empty c1 should have size zero")
+        empty_bundle = os.path.join(tmp, "empty-bundle")
+        r_empty_bundle = run(msl, bundle_out=empty_bundle)
+        check(r_empty_bundle.returncode == 0,
+              "bundle rejected an empty c1: " + r_empty_bundle.stderr)
+        empty_c1 = os.path.join(empty_bundle, "aaaaaaaaaaaaaaaa_ps.c1")
+        check(os.path.isfile(empty_c1), "empty c1 must remain an explicit file")
+        check(os.path.getsize(empty_c1) == 0, "explicit c1 should be zero bytes")
+        with open(os.path.join(empty_bundle, "manifest.tsv"), encoding="utf-8") as f:
+            check("aaaaaaaaaaaaaaaa_ps.c1" in f.read(),
+                  "manifest must not turn an empty c1 into '-'")
 
         # And an oversized sidecar is refused before it can allocate.
         with open(c1_path, "wb") as f:
@@ -207,7 +265,7 @@ def main():
     if failures:
         print("test_gen_blobs: %d failure(s)" % failures)
         return 1
-    print("test_gen_blobs: ok (ids, packed slots, bindless, c1, holes, refusals)")
+    print("test_gen_blobs: ok (ids, packed slots, bindless, c1, bundle, holes, refusals)")
     return 0
 
 

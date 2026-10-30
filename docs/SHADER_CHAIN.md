@@ -138,17 +138,35 @@ control + code 上，和 Python 命名文件用的 key 逐个比。5102 个全�
 
 ### 5.2 离线产物怎么进 App
 
-`ios/nvn/src/nvn_shader_blobs.gen.c` 里是 `nvngfx_shader_install_offline_blobs()`。
-**入库的那份是空表**（仓库不含任何游戏内容）；本机跑完 §3 的三步后再执行：
+有两条路，产物都只在本机或 CI 生成，**不入库**：
 
-```powershell
-C:\Python314\python.exe scripts\shader_chain\gen_blobs.py --msl build\shader-chain\msl `
-  --out ios\nvn\src\nvn_shader_blobs.gen.c
-```
+1. **C 表**：`nvngfx_shader_blobs.gen.c` 里的
+   `nvngfx_shader_install_offline_blobs()`。入库的那份是空表。
 
-生成表里是 `{key, stage, MSL 文本}`，一条 shader 一个 C 字面量（每 4000 字符切一段，
-避免单个字面量过大）。5,102 个 key 全量塞进去大约几十 MB 文本，**不适合入库**，
-真正打包时应该改成 `.metallib` + 一个小索引表（那要 `xcrun metal`）。
+   ```powershell
+   C:\Python314\python.exe scripts\shader_chain\gen_blobs.py --msl build\shader-chain\msl `
+     --out ios\nvn\src\nvn_shader_blobs.gen.c
+   ```
+
+   一条 shader 一个 C 字面量（每 4000 字符切一段）；5,102 个 key 全量塞进去
+   大约几十 MB，**不适合入库**。
+
+2. **文件 bundle**（M3.90）：`manifest.tsv` 加 `<key>_<stage>.msl` / `.c1`。
+   把目录放进 App 的 `<app>/shaders`，或用 `NVNGFX_SHADER_DIR` 指向它；
+   `nvngfx_shader_load_bundle()` 启动时读取，和生成的 C 表合并，同一 bundle
+   重复加载只替换不累积。
+
+   ```powershell
+   C:\Python314\python.exe scripts\shader_chain\gen_blobs.py --msl build\shader-chain\msl `
+     --bundle-out build\shader-chain\shaders
+   ```
+
+   manifest 是 tab 分隔的五列：
+   `key  stage  msl-file  c1-file  args`，其中 args 是
+   `id:slot:packed:kind[:offset]`；`kind` 是 `nvngfx_arg_kind` 的**数值**
+   （1..10），不是 C 枚举名。空 c1 必须写成真实文件名而不是 `-`。
+   这仍是 MSL 文本，运行时由 Metal 编译；`.metallib` 打包与 `xcrun metal`
+   的编译期校验还没做。
 
 ### 5.3 还差的接线（下一步）
 
@@ -304,7 +322,7 @@ packed slot 写进 blob，尚未接（M3.85 的自检暴露了这一点）。
 | `xcrun metal` → `.metallib` | 未做；只能在 macOS/CI 上做，本机没有 |
 | 整作 19,592 个 shader 全量构建 | 未做；只验证了 1 个 pack 的 5,102 个 key 中的 2 个 |
 | 编译期校验（MSL 语法） | 未做；Windows 没有 Metal 前端，MSL 只在 CI 的 macOS 上才能编 |
-| 真机 / 模拟器上跑真实 shader | 未做。自检用的仍是内置 MSL（九条 draw：`[[vertex_id]]`、顶点属性、16 位索引的 `DrawElements`、`BindUniformBuffer` 参数缓冲区、texture pool + sampler pool 采样、只通过 `[[id(0)]]` 读 c1 常量段、bindless 句柄表、顶点阶段参数缓冲区、从 guest 池解块上传的 2x2 纹理；另加一条 sampler 状态创建/比较路径） |
+| 真机 / 模拟器上跑真实 shader | 未做。自检用的是内置 MSL 和自写合成 bundle（十条 draw：`[[vertex_id]]`、顶点属性、16 位索引的 `DrawElements`、`BindUniformBuffer` 参数缓冲区、texture pool + sampler pool 采样、只通过 `[[id(0)]]` 读 c1 常量段、bindless 句柄表、顶点阶段参数缓冲区、从 guest 池解块上传的 2x2 纹理、从离线 bundle 按 guest key 取 MSL；另加一条 sampler 状态创建/比较路径） |
 | compute / geometry shader | 未做（`extract` 目前跳过 cs） |
 | 运行时按 key 取 MSL | **已接线**（M3.78，见 §5.1） |
 | 顶点描述符 | **已接**（M3.79） |
@@ -316,6 +334,7 @@ macOS 上补；运行时按 key 取 MSL 已接线（M3.78），顶点与索引�
 UBO 已进 argument buffer（M3.81），sampler 状态对象已能创建（M3.82），
 texture/sampler 条目也已接（M3.83，模拟器走直连绑定），真实 shader 的
 `[[id(k)]]` 布局侧车已接（M3.84），c1 已接（M3.85）；bindless 与顶点参数缓冲区已接（M3.86 / M3.87）；
-block-linear 解块与 guest 池纹理上传已接（M3.88 / M3.89）。**真实 shader 仍然
-没有在 Metal 里执行过**：缺的是把离线 MSL 打进 App 并用标题自己的 key 命中的
-那一步，以及 `xcrun metal` 的编译期校验。
+block-linear 解块与 guest 池纹理上传已接（M3.88 / M3.89），离线 MSL bundle
+也已在模拟器里按 guest key 命中和绘制（M3.90）。**真实标题 shader 仍然没有在
+Metal 里执行过**：现在缺的是把真实翻译产物放进 bundle 后跑通首次标题 draw，
+以及 `xcrun metal` 的编译期校验和 `.metallib` 打包。

@@ -30,12 +30,14 @@
  *         on a computer, never in the repository.  Everything else on that
  *         path -- pipeline creation with a real vertex descriptor, buffer
  *         binding, draw encoding, pixel readback -- is executed by
- *         nvngfx_metal_selftest() in CI's iOS Simulator: eight draws, a
+ *         nvngfx_metal_selftest() in CI's iOS Simulator: ten draws, a
  *         bindless table probe, and a vertex-stage argument-buffer draw whose
- *         shifted pixels are read back.  The last draw builds a block-linear
+ *         shifted pixels are read back.  The ninth builds a block-linear
  *         texture in a guest memory pool and proves that the sampled pixels
- *         came from that storage, not from a host-side upload.  A sampler
- *         state object is also created, compared and read back.
+ *         came from that storage, not from a host-side upload.  The tenth
+ *         computes a guest shader key, loads its MSL from <app>/shaders and
+ *         reads back orange.  A sampler state object is also created,
+ *         compared and read back.
  *         MRT / depth attachment / texture views
  *         streaming texture updates and a LINEAR-storage upload path
  *         BCn -> ASTC/ETC2 transcode, compute, sync/fence
@@ -4930,6 +4932,14 @@ extern "C" int nvngfx_metal_selftest(void) {
              * builds the pipeline.  The fixture is synthetic (ios/nvn/shaders),
              * so no title data is involved. */
             if (nvngfx_shader_bundle_count() == 0) {
+                const char* require = std::getenv("BOTW_REQUIRE_SHADER_BUNDLE");
+                if (require && std::strcmp(require, "1") == 0) {
+                    std::fprintf(stderr,
+                                 "[selftest] draw 10: no MSL bundle installed "
+                                 "(BOTW_REQUIRE_SHADER_BUNDLE=1)\n");
+                    rc = 16397;
+                    goto done;
+                }
                 std::fprintf(stderr,
                              "[selftest] draw 10 skipped: no MSL bundle installed\n");
             } else {

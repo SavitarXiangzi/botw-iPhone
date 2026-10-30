@@ -13,9 +13,12 @@ e01e5955f6f39e29  ps    bundle-fs.msl   -   -
   `docs/SHADER_CHAIN.md` §4），自检第十条 draw 现场算出来再查。
 - 运行时 `nvngfx_shader_load_bundle()` 读这个目录；App 里默认找
   `<app>/shaders`，`NVNGFX_SHADER_DIR` 可以覆盖。
-- 真实翻译产物（几千个 `.msl` + `.c1`）同样按这个格式放，**不要入库**。
+- 真实翻译产物（几千个 `.msl` + `.c1`）同样按这个格式放，**不要入库**；
+  `gen_blobs.py --bundle-out <dir>` 可以直接生成这一目录。
+- manifest 的 args 列中，`kind` 是 `nvngfx_arg_kind` 的数值（1..10），
+  不是 C 枚举名。
 
-这个目录现在**没有可用的着色器**，只放说明。原因是 NVN 和 Metal 在这一点上
+这个目录现在**只有合成 fixture，没有真实标题着色器**。原因是 NVN 和 Metal 在这一点上
 没有可自动翻译的公共层：
 
 - 标题交给 NVN 的不是着色器源码，而是**已经编译好的 Maxwell（Tegra X1）GPU

@@ -6,7 +6,8 @@
 > iOS 侧的壳、C ABI、513 个 NVN 入口点的分发表、131 个 Metal 后端入口，
 > 都能在非 Apple 主机上编译并跑通自测；纹理能建、渲染目标能绑、encoder
 > 能开，program -> pipeline -> draw -> 回读这条链已经在 **CI 的 iOS 模拟器**
-> 里跑通了九条合成 draw，其中包括从 guest 内存池解块上传的纹理。
+> 里跑通了十条合成 draw，其中包括从 guest 内存池解块上传的纹理，以及从
+> 离线 MSL bundle 按 guest key 命中的 shader。
 > **但客体的 draw 依然一条都不执行**：首要缺口仍是 Maxwell SASS -> MSL 的
 > 翻译器，纹理分层、BCn 转码和同步也还没有闭环。
 
@@ -342,10 +343,11 @@ texture -> render target -> clear -> program -> pipeline -> draw -> 回读，
 并额外创建、比较和读回 `MTLSamplerState`。CI 在 iOS 模拟器里用 `simctl`
 启动 App（`--selftest`），App 在 `init()` 里跑它、把
 `BOTW_SELFTEST rc=<n>` 写进容器的 `Documents/selftest.txt` 并 `exit(rc)`；
-现在跑**九条** draw（`[[vertex_id]]` / `[[attribute(0)]]` / 16 位索引的
+现在跑**十条** draw（`[[vertex_id]]` / `[[attribute(0)]]` / 16 位索引的
 `DrawElements` / `BindUniformBuffer` 参数缓冲区 / 从 texture pool + sampler pool
 取句柄并采样 2x2 纹理 / 只通过 `[[id(0)]]` 读 c1 常量段 / bindless 句柄表 / 顶点阶段
-参数缓冲区 / 从 guest pool 解块上传的 2x2 纹理）加一条 sampler 状态路径，
+参数缓冲区 / 从 guest pool 解块上传的 2x2 纹理 / 从 `<app>/shaders` 的
+`manifest.tsv` 装载 MSL 并按 guest key 建管线）加一条 sampler 状态路径，
 全部通过才 rc=0。
 M3.76 的 run 40997940031 证明了第一条；run 41008588834 证明当时的三条；
 M3.82 的 run 41018975699 以 `BOTW_SELFTEST rc=0` 通过；M3.83 的 run
@@ -385,6 +387,22 @@ M3.86–M3.89 的 run `41045568006`（packed slot 与 bindless）、`41046781000
 [selftest] guest texture: 1 level(s) deswizzled from the pool and sampled back
 ```
 
+M3.90 把离线翻译产物接成文件 bundle：`<app>/shaders/manifest.tsv` 加
+`<key>_<stage>.msl` / `.c1`，启动时由 `nvngfx_shader_load_bundle()` 取代或补充
+生成的 C 表。自检第十条 draw 在运行时构造合成 control/code，算出 key
+`e01e5955f6f39e29`，只通过 bundle 查 VS/PS，画一条全屏三角形并回读橙色。
+run `41064580709` 的 iOS job `124092690787` 成功；第一次模拟器启动卡住，重试后
+日志为：
+
+```
+[selftest] draw 10: MSL loaded from the bundle drew key e01e5955f6f39e29
+BOTW_SELFTEST rc=0
+```
+
+CI 现在用 `SIMCTL_CHILD_BOTW_REQUIRE_SHADER_BUNDLE=1` 要求这条必须执行；
+没有 bundle 时返回 `16397`，不会再把 draw 10 记成 skipped。
+`gen_blobs.py --bundle-out <dir>` 可以直接从 `nx_shader.py translate` 的输出
+生成同一种目录。这仍是我们自写的合成 MSL，不是标题 shader。
 
 第五条在模拟器里走的是**直连纹理/采样器绑定**：模拟器的
 `MTLTexture.gpuResourceID` 是 0，参数缓冲区的纹理条目在那里没有意义
@@ -519,7 +537,7 @@ constexpr int kEnumsVerified = 0;
 | 渲染目标绑定 | 只挂 `color[0]`，深度/view 只记录 | MRT 与深度测试不可用 |
 | 着色器翻译 | 只留了接口，没有实现 | 客体的 draw 全部停在 `noPipeline` |
 | 纹理创建 | 建 host `MTLTexture`，首次采样时从 guest pool 一次性解块/上传 | 基础 2D block-linear 纹理可采样；分层、LINEAR、BCn 与后续更新仍不完整 |
-| draw 执行 | 有 pipeline 就真的编码 draw；没有就丢弃 | 客体仍是 0 条；自检九条 draw 加 sampler 状态由 CI 执行 |
+| draw 执行 | 有 pipeline 就真的编码 draw；没有就丢弃 | 客体仍是 0 条；自检十条 draw 加 sampler 状态由 CI 执行 |
 | 顶点输入 | attrib/stream 已接，缓冲从 pool 零拷贝绑到 `MTLBuffer` | 自检的第二条 draw 就是这条路；客体尚未跑到 |
 | 浮点参数 | `nvngfx_args.f[8]` 已扩展，float 在低 32 位 | 本仓库外 guest 调用端仍需实现 s/d 寄存器桥 |
 | 采样器资源 | builder/object、sampler pool 与 `MTLSamplerState` 已建，句柄可解析 | `[[id(k)]]`、c1、packed slot、bindless 与顶点参数缓冲区已接；真实标题 shader 仍缺离线翻译链 |

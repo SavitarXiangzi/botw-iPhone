@@ -23,6 +23,8 @@ jobs:
 
       - name: NVN argument shapes are consistent
         run: python scripts/extract_nvn_signatures.py --check
+      - name: Shader generator produces C tables and file bundles
+        run: python scripts/shader_chain/test_gen_blobs.py
       - name: Repository invariants (registry / bindings / no title data)
         run: python scripts/verify_ios.py
 
@@ -188,6 +190,9 @@ jobs:
             # [nvn] diagnostics go.  Without it a failed pixel check says
             # only "rc=2048" and the reason is lost with the process.
             set +e
+            # The fixture is part of this check: a missing bundle must fail the
+            # job instead of turning draw 10 into a silent skip.
+            SIMCTL_CHILD_BOTW_REQUIRE_SHADER_BUNDLE=1 \
             xcrun simctl launch --console --terminate-running-process \
               "$UDID" dev.botw.app --selftest > "/tmp/selftest-console.$ATTEMPT.log" 2>&1 &
             LAUNCH_PID=$!

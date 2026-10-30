@@ -3255,3 +3255,104 @@ run `41051685313`（commit `3178261`）：portable job `124049028971`、ios job
 | BCn | Apple GPU 无对应格式，必须转码 |
 | 真实 shader 的 draw | 仍是 0 条 |
 | 真机 | 没有真机运行记录 |
+
+## M3.90 离线 MSL bundle
+
+覆盖仍是 **131 / 513**。这一轮把“翻译产物怎样在不重编 App 的前提下到达运行时”
+接上了。此前只有编译进二进制的 C 表；一个标题有约 19,000 个 shader，把全部
+MSL 变成 C 字面量既大又无法在设备上替换。
+
+### 文件格式
+
+```
+<dir>/manifest.tsv
+<dir>/<key>_<stage>.msl
+<dir>/<key>_<stage>.c1       optional
+```
+
+`manifest.tsv` 是 tab 分隔的五列：
+
+```
+key    stage    msl-file    c1-file    args
+```
+
+- `key`：16 位十六进制 guest shader key，大小写均可。
+- `stage`：`vs` / `ps`（也接受 `vertex` / `fs` / `fragment`）。
+- `msl`：bundle 内的 MSL 文件名，加载时读入。
+- `c1`：`-` 表示没有 c1；**空文件**表示显式空 c1，二者不能混为一谈。
+- `args`：`-` 或逗号分隔的 `id:slot:packed:kind[:offset]`，与 C 表的
+  `nvngfx_shader_arg` 一一对应；`kind` 是 `nvngfx_arg_kind` 的数值（1..10），
+  不是枚举名。
+- `#` 开头是注释。
+
+所有条目先经过 `nvngfx_shader_set_blobs()` 的完整校验。任何一行失败都会保留
+旧表不变；加载成功后安装为“生成的 C 表 + bundle”，重复加载同一目录是替换而
+不是累积。API 在 `ios/nvn/include/nvn_shader.h`：
+
+```c
+int nvngfx_shader_load_bundle(const char* dir, char* why, size_t why_size);
+size_t nvngfx_shader_bundle_count(void);
+void nvngfx_shader_unload_bundle(void);
+```
+
+运行时默认读 `<app>/shaders`，也可以用环境变量 `NVNGFX_SHADER_DIR` 覆盖。
+没有 bundle 是正常状态，只打印一行日志，不阻止 App 启动。实现在
+`ios/nvn/src/nvn_shader_bundle.c`，不依赖 Metal，portable job 的
+`tests/nvn_shader_bundle_test.cpp` 覆盖 manifest、合并、c1、空 c1、坏 manifest
+拒绝、重复加载和 unload。
+
+### 生成器
+
+`scripts/shader_chain/gen_blobs.py` 新增 `--bundle-out`：
+
+```powershell
+python scripts/shader_chain/gen_blobs.py --msl build\shader-chain\msl `
+  --bundle-out build\shader-chain\shaders
+```
+
+它直接生成 `manifest.tsv` + `.msl` + `.c1`，不再只有 C 表；`--out` 现在是可选的，
+两者可以在同一次运行中同时生成。`test_gen_blobs.py` 验证 bundle 的文件内容、
+manifest 五列、参数编码、显式空 c1，以及“必须指定至少一种输出”。
+
+### 自检：第十条 draw
+
+自检在运行时构造合成 control/code，令 control 长 0x880、code 长 0x40，
+control+0x20 = 0x880、control+0x704 = 0x40，code 为 0..0x3F。运行时
+`nvngfx_shader_key_from_guest()` 算出的 key 是
+`e01e5955f6f39e29`。该 key 的两条 MSL 只存在于 `ios/nvn/shaders` 的合成
+fixture 中：
+
+```
+e01e5955f6f39e29<TAB>vs<TAB>bundle-vs.msl<TAB>-<TAB>-
+e01e5955f6f39e29<TAB>ps<TAB>bundle-fs.msl<TAB>-<TAB>-
+```
+
+顶点 shader 画全屏三角形，像素 shader 返回橙色 `(1.0, 0.5, 0.0, 1.0)`。
+draw 10 从 bundle 查 VS/PS、检查 `Program::key` 等于 guest key、清黑、绘制并
+回读中心像素。这个橙色没有任何其他自检 draw 会产生，所以通过就说明文件里的
+MSL 真的进入了 GPU 管线。
+
+失败码：`16397`（key / bundle 查找 / SetShaders 失败），`16398`
+（命令缓冲或像素不对）。CI 传入 `SIMCTL_CHILD_BOTW_REQUIRE_SHADER_BUNDLE=1`；
+bundle 缺失时直接 `rc=16397`，不再允许 draw 10 静默 skipped。
+
+### 证据
+
+run `41064580709`（commit `ae139bb`，ios job `124092690787`）成功。第一次
+启动被模拟器卡住并由 150 秒看门狗重试，第二次启动的日志：
+
+```
+[selftest] draw 10: MSL loaded from the bundle drew key e01e5955f6f39e29
+BOTW_SELFTEST rc=0
+```
+
+### 仍然没有的
+
+| 缺口 | 后果 |
+|---|---|
+| 真实标题 MSL | fixture 是自写合成 shader，没有用游戏数据 |
+| `.metallib` | 仍是运行时 `newLibraryWithSource`，首次启动会编译 MSL |
+| 真实 shader 的第一次 draw | 还缺标题资源、真实 key 与完整绑定状态的组合验证 |
+| 分层 / cubemap / LINEAR / BCn | 纹理路径仍未闭环 |
+| 连续纹理更新、blend/depth、fence | 未接 |
+| 真机 | 没有真机运行记录 |
