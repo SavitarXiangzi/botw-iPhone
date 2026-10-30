@@ -3838,3 +3838,108 @@ REST 下载原始 job 日志返回 **403**，所以这里只记录 job/step 状�
 | 精确 FlushTexels | 没有脏页表，整条 mip 链重传，更新一个 texel 也可能付出整张纹理的拷贝 |
 | RMW 内存 | WriteTexels 需要整级临时线性图像，大纹理会抬高 CPU 内存峰值 |
 | 真机 | 仍只有 CI 的 iOS 模拟器记录，没有 iPhone/iPad 真机帧率与内存数据 |
+
+### M3.96 私有 harness：真实 guest draw 打通（并撤回 M3.65–M3.71 的一个结论）
+
+本轮工作全部在 Windows 侧的发现装置（`C:\botw-work\tools`，Unicorn + Python）
+里完成，不进本仓库；iOS 侧的 NVN/Metal 实现不受影响。写在这里是因为它**推翻了
+文档里的一条结论**，而且给出了真实 guest 的 draw/present 证据。
+
+#### 1. `draws=0` 的第二个结构性原因：入口命名
+
+M3.21 修的是"独立式 `nvnDrawArrays` 一族没实现"。这次发现 1.6.0 真正解析到的是
+**command-buffer 风格**入口（cb 作为第一个参数）：
+
+```text
+nvnCommandBufferDrawArrays / DrawElements / DrawArraysInstanced /
+DrawElementsInstanced / DrawElementsBaseVertex / DrawArraysIndirect /
+DrawElementsIndirect / DispatchCompute / DispatchComputeIndirect
+```
+
+`registry.json`（从标题自己的 getproc 字符串提取）里本来就有这些名字，iOS 侧
+M3.21 起也已经实现；**只有 harness 的 `m3_nvn.py` 漏了这一族**，所以那套装置的
+`DRAWS[0]` 一直是 0，而游戏其实每帧都在逐 draw 设置状态
+（`nvnCommandBufferBindUniformBuffer` 9 万次、`nvnSamplerCompare` 9.1 万次）。
+
+补齐后第一次抓到真实 draw：
+
+```text
+first draw: op=DRAW_IDX cb=0x701F1C88 mode=4(TRIANGLES) type=1(UNSIGNED_SHORT)
+            count=3 indexBuf=0x141C22000 offset=0
+            caller=main+0x1D2BA6C  frame#8
+```
+
+#### 2. Yaz0 的双缓冲源（并撤回 M3.65–M3.71 的"58.2 MiB"结论）
+
+反汇编 `main+0x191F770` 可见第 `tok` 块的实际位置是：
+
+```text
+src + ((tok - 1) & 1) * stride
+```
+
+即压缩源在 guest 内存里是**两块交替缓冲**，不是逻辑连续的。旧实现按
+`src + 绝对偏移` 读，从 `tok >= 3` 起就读错数据，解压到约 55% 后卡死，并在
+LightEvent 上表现为死锁。
+
+改正后 `Font_JP.sbfarc` / `agl_nin_pack` / `Bootup_Graphics` 全部 `done=1`；
+回归 `_test_yazdouble.py` 用"整包喂 / 连续分块喂 / 双缓冲交替喂"三种方式，
+输出与参考实现逐字节一致。
+
+**结论撤回**：M3.65–M3.71 把"58.2 MiB 分配返回 0"当成真正的卡点（`57352 * 0x428 + 8`），
+那是**解压源读错导致的次生现象**——解压出的资源长度/内容本身就是错的。
+当时的 `yaz1_A83000.out` 与 `blk.bin` 不可再用。
+
+#### 3. `0x414E01BC` 的 O(n²) 去重表
+
+初始化期会逐条构建 0x30 字节记录表，每插入一条都对已有记录做 `memcmp` 线性扫描：
+
+```text
+0x414E01AC  cbz  x21, 0x414E040C      ; 第 0 条直接追加
+0x414E01BC  loop: memcmp(tab[x21], tab[x22], 0x30)
+0x414E01D0  cbz  w0, 0x414E01E4       ; 前缀命中 -> 子记录深度比较
+0x414E01D4  x22++; cmp x22,x21; b.lo loop
+0x414E01E4  ...深度比较...; 失败回 0x414E01D4 继续扫描
+0x414E0400  ptr[x21] = ptr[x22]
+0x414E040C  追加新记录
+```
+
+表长涨到 1.4 万条时单线程被拖死（300 秒只推进 7,700 条）。宿主在循环头接管：
+维护"记录 → 首个下标"索引，**命中就跳回 `0x414E01E4`**，让 guest 自己完成子记录
+深度比较（失败时 guest 回循环头，我们按 `x22` 续扫）；未命中跳 `0x414E040C`
+走 guest 的追加路径。语义与原始循环逐指令等价，等价性用两种方式对拍：
+
+* 采样真值线性扫描：79 次比对，**0 失配**；
+* 周期整表重建比对：15 次，**0 漂移**（说明记录插入后不会被改写，这是 dict 首匹配等价的前提）。
+
+表在 ~70 秒内走完，不再是瓶颈。
+
+#### 4. 记录层修正（harness）
+
+* `emit()` 写 guest 命令内存前按 4 KiB 对齐补映射——pool storage 是宿主 `alloc`
+  出来的，Unicorn 里未必已映射，未对齐的 `mem_map` 会失败并被误记成"命令内存满"；
+* 段满时把记录**镜像到宿主帧表**，分析数据不再缺帧；
+* `EndRecording` 显式指定目标 cb——BOTW 会交织录制多个 command buffer
+  （Begin A → Begin B → End A），按"当前 cb"记会把 END 记到别人头上。
+
+#### 5. 证据：660 秒严格门禁
+
+```text
+M3: 660.0s  frames=8329 (13 fps)  status=budget
+    objects: 3974 buffer / 2626 program / 450 texture / 418 pool / 366 sampler
+    draw=701  overflow=236 (full=236 write=0, max ops/frame=23)
+    presents=301
+    first draw: op=13 vals=[cb,mode=4,type=1,count=3,indexBuf,0,0,1]
+                caller=0x41D2BA6C main+0x1D2BA6C
+RESULT: PASS
+```
+
+门禁 `m3_verify.py` 现在安装 `m2_yaz0`（真实解压路径）与可选的 `m2_dedup`，
+`BOTW_M3_STRICT=1` 时要求 `DRAWS[0] > 0` 且 `PRESENTS[0] > 0`。
+
+#### 还没有的
+
+| 缺口 | 后果 |
+|---|---|
+| harness 侧 `nvnCommandBufferBind*` 仍是 no-op | 进 `NVN_MISS`、不产生记录；回放层还原管线还缺这些状态 |
+| 段满 236 次只镜像到宿主帧表 | guest 命令内存里没有这些记录，真机语义下应触发 memory callback 扩容 |
+| 去重加速默认关闭（`BOTW_FAST_DEDUP=1` 才开） | 未默认启用，避免未验证路径影响回归 |

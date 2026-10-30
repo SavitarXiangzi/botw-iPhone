@@ -36,7 +36,7 @@ docs/           路线图、HLE 边界、NVN 覆盖表、iOS 移植手册、着�
 | M1 | 解包/装载 NSO，跑通 `.text` | ✅ 私有工作区 |
 | M2 | 启动链 HLE（nn::oe / fs / vi / nv / NVN 引导） | ✅ nn::init::Start 跑完 |
 | M2.5 | Horizon 线程 + IPC/CMIF 服务端（hid/sm/pctl） | 🟢 主循环已跑起来 |
-| M3 | NVN 对象层 + 命令流录制（`m3_nvn.py`） | 🟢 对象/记录已就绪，draw=0（游戏还没提交几何） |
+| M3 | NVN 对象层 + 命令流录制（`m3_nvn.py`） | ✅ 记录层就绪；真实 guest draw/present 见 M3.96 |
 | M3.8 | LightEvent 同步（SVC 0x34/0x35），资源加载真正完成 | ✅ 53 MB FSHA 可完整落盘并重定位 |
 | M3.10 | `mrs CNTPCT_EL0` 恒为 0 → `GetSystemTick` 改成 HLE（**宿主时钟那版已被 M3.18 取代**） | ✅ 定时/超时循环不再自旋 |
 | M3.11 | `svcSleepThread` 从"空让出"改为真按 ns 挂起 | ✅ 空闲轮询不再吃满 CPU |
@@ -56,9 +56,10 @@ docs/           路线图、HLE 边界、NVN 覆盖表、iOS 移植手册、着�
 | M3.26 | 互斥真正修好：主线程 tag=0 让 M3.24 的互斥形同虚设；现在线程真同步、资源真加载 | 🟢 20 帧 + 541 MiB，卡在吞吐 |
 | M3.27 | `GetSystemTick` 的 HLE 往返 35 µs × 几十万次 = 30 s 死窗口；改成入口一条 `b` + 内联计数器 | ✅ 死窗口消失 |
 | M3.28 | 178 帧后静止的全量快照：主线程无限等 LightEvent，32 线程 idle，唯一活动是 250 µs 轮询 worker | 🔴 缺完成通知 |
-| M3.65–M3.71 | 12 MB 缓冲区是包尾 `0x49E000` 的逐字节拷贝；真正卡点是 58.2 MiB 分配返回 0；最小跳过让字节序转换器返回 | ✅ 结论已定，draws 仍为 0 |
+| M3.65–M3.71 | 12 MB 缓冲区是包尾 `0x49E000` 的逐字节拷贝；真正卡点是 58.2 MiB 分配返回 0；最小跳过让字节序转换器返回 | ⚠️ 结论已按 M3.96 撤回；draws 仍为 0 |
 | M3.94 | BC1/BC2/BC3/BC4U/BC5U 在首次采样时解成 RGBA8；sRGB 变体保留 transfer function | ✅ 第十五条 draw 左红右蓝，run 41086648054 |
 | M3.95 | `nvnTextureWriteTexels*` 按 guest 布局做整级 RMW，`FlushTexels` 标脏；下次采样重传 | ✅ 第十六条 draw 在两次显式更新后都回读正确，run 41090664172 |
+| M3.96 | 私有 harness：`nvnCommandBufferDraw*` 补齐、Yaz0 双缓冲源、0x414E01BC 去重表 | ✅ 真实 guest draw 701 / present 301（660 s 严格门禁） |
 | iOS 骨架 | 513 入口点注册表 + 生成分发表 + Metal 后端 134 项 + 三重门禁 | 🟡 十六条合成 draw，其中十五条已在 CI 模拟器通过（纹理连续更新：run 41090664172；BC1：run 41086648054；LINEAR：run 41083158406；cube：run 41080975529）；第十三条 cube array 需 `BOTW_SELFTEST_CUBE_ARRAY=1`，模拟器的 Metal 建 CubeArray 会崩。含 bindless、顶点参数缓冲区、c1 常量段、guest pool 解块/BCn 上传、显式纹理更新和离线 MSL bundle；客体仍无画面 |
 | M4 | NVN → Metal 回放（管线/纹理/命令缓冲） | ⬜ |
 | M5 | 音频（nn::audio → AVAudioEngine）、输入 | ⬜ |
