@@ -167,13 +167,17 @@ jobs:
           cat "$DATA/Documents/selftest.txt" 2>/dev/null || echo "(no selftest.txt)"
           if ! grep -q "BOTW_SELFTEST rc=0" "$DATA/Documents/selftest.txt" 2>/dev/null; then
             echo "::error::self-test did not report rc=0"
+            # The rc is the only clue when the body of the run is lost, and
+            # the run's raw log needs a token to read.  Annotations do not.
+            cat "$DATA/Documents/selftest.txt" 2>/dev/null \
+              | while IFS= read -r l; do echo "::error::selftest| $l"; done
             ls -la "$DATA/Documents" 2>/dev/null | while IFS= read -r l; do echo "::error::$l"; done
             xcrun simctl spawn "$UDID" log show --style compact --last 2m \
               --predicate 'process == "BotW"' 2>/dev/null | tail -40 \
               | while IFS= read -r l; do echo "::error::log| $l"; done
             exit 1
           fi
-          echo "replay-layer self-test: one draw, pixel readback, rc=0"
+          echo "replay-layer self-test: draws encoded, pixels read back, rc=0"
 
       # Debug on purpose: nvn_metal.mm refuses an NDEBUG build while the NVN
       # enum values are unverified, so a Release build here would always fail.

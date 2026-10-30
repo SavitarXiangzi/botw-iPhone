@@ -1851,7 +1851,13 @@ extern "C" int nvngfx_metal_selftest(void) {
              * cannot ask for more than 8 KiB of alignment portably. */
             /* malloc + manual rounding: std::aligned_alloc is not declared by
              * MSVC's C library, and this file also has to type-check there. */
-            poolRaw = std::malloc(16384 + 16384);
+            /* One constant, because the three places that need the size
+             * (allocation, memset, builder) must agree.  Using
+             * sizeof(vertexPool) here was a bug: vertexPool is a
+             * pointer, so the pool was 8 bytes and every span check
+             * rejected the 24-byte vertex range. */
+            const size_t kPoolSize = 16384;
+            poolRaw = std::malloc(kPoolSize + kPoolSize);
             if (!poolRaw) {
                 std::fprintf(stderr, "[selftest] could not allocate the pool page\n");
                 rc = 256;
@@ -1860,7 +1866,7 @@ extern "C" int nvngfx_metal_selftest(void) {
             const uintptr_t poolBase = reinterpret_cast<uintptr_t>(poolRaw);
             const uintptr_t poolAligned = (poolBase + 16383u) & ~static_cast<uintptr_t>(16383u);
             unsigned char* const vertexPool = reinterpret_cast<unsigned char*>(poolAligned);
-            std::memset(vertexPool, 0, 16384);
+            std::memset(vertexPool, 0, kPoolSize);
             {
                 float* v = reinterpret_cast<float*>(vertexPool);
                 v[0] = -1.0f; v[1] = -1.0f;
@@ -1878,7 +1884,7 @@ extern "C" int nvngfx_metal_selftest(void) {
             pool_builder_set_defaults(ctx, x);
             x[0] = kPoolBuilder;
             x[1] = reinterpret_cast<uint64_t>(vertexPool);
-            x[2] = sizeof vertexPool;
+            x[2] = kPoolSize;
             pool_builder_set_storage(ctx, x);
             x[0] = kPool;
             x[1] = kPoolBuilder;
