@@ -62,8 +62,9 @@ C:\Python314\python.exe scripts\shader_chain\nx_shader.py translate `
   --spirv-cross build\shader-chain\tools\spirv-cross.exe
 ```
 
-产物：`<key>_<stage>.metal`（入口已改名成 `nvngfx_main_vs` / `nvngfx_main_fs`）
-和 `<key>_<stage>.json`（反射：cbuf/sbuf/texture 的 binding 与槽位、翻译器 notes）。
+产物：`<key>_<stage>.metal`（入口已改名成 `nvngfx_main_vs` / `nvngfx_main_fs`）、
+`<key>_<stage>.json`（反射：cbuf/sbuf/texture 的 binding 与槽位、翻译器 notes），
+以及仅在 MSL 声明了 c1 时出现的 `<key>_<stage>.c1`（原始常量段字节）。
 
 ## 4. 格式要点（写代码时别再踩）
 
@@ -79,7 +80,9 @@ C:\Python314\python.exe scripts\shader_chain\nx_shader.py translate `
   `0x02060461`、像素是 `0x00061462`）。
 * **c1 常量段**：`control+0x700` = c1 相对 code area 的偏移，`+0x704` = code area
   总长，c1 = `code[c1o:c1t]`。间接跳转（BRX）的跳转表在这里，不给它翻译出来
-  的控制流是错的（粒子着色器会死循环）。
+  的控制流是错的（粒子着色器会死循环）。M3.85 起 `nx_shader.py` 把这段
+  抽成 `.c1` 侧车，`gen_blobs.py` 原样写进 blob，运行时按
+  `NVNGFX_ARG_C1` 绑定。
 * shader key（与 nxnative 的 `shader_map.tsv` 第 4 列、我们 `prog_key` 一致）：
   `sha256(control 前 0x880 字节（控制段更短时取全长）+ code area)[0..8]`，
   小写 16 进制。code area **含** 0x30 头。
@@ -223,7 +226,7 @@ M3.83 之后这**已经**是资源绑定的一部分：`nvnSamplerPoolInitialize
 | `fp_t_tcb_5A` | 独立纹理 | `SEPARATE_TEXTURE` 0 |
 | `fp_t_cb2_1C` | c2 驱动表纹理 | `TEXTURE` |
 | `fp_t_cb7_2A` | bindless，句柄在统一缓冲里 | `UNSUPPORTED` |
-| `fp_c1` | c1 常量段 | `UNSUPPORTED` |
+| `fp_c1` | c1 常量段（`<key>_<stage>.c1`） | `C1`，slot -1 |
 | `fp_i_*` / `fp_s3` | image / storage buffer | `UNSUPPORTED` |
 
 本地 `Bootup_Graphics` 的两个真实 shader（数据不入库）暴露了尺寸问题：
@@ -233,11 +236,20 @@ M3.83 之后这**已经**是资源绑定的一部分：`nvnSamplerPoolInitialize
 | `d756ff62a57fc508_vs` | 7 | 6 | 3 UBO + 2 纹理 + 2 采样器 |
 | `029de06ee5b5d21b_ps` | 42 | 41 | 5 UBO + 18 纹理 + 18 采样器 + 1 c1 |
 
-两项合计 49 项：8 UBO、20 纹理、20 采样器、1 个 unsupported（`fp_c1`）。
+两项合计 49 项：8 UBO、20 纹理、20 采样器、1 个 c1。
 `Program::args` 因此扩到 `NVNGFX_MAX_ARGS`（64），参数表按最高 id 分配；
 纹理和采样器槽位各 32 个。布局随 blob 下发，`nvngfx_shader_lookup_blob()` /
 `nvngfx_shader_copy_args()` 在 `prog_set_shaders()` 里取同一份记录，避免 MSL 与
 布局来自不同版本。
+
+c1 也随 blob 下发：`<key>_<stage>.c1` 存在且长度为 0 表示显式空 c1，缺失表示
+该 stage 不声明 c1；MSL 声明了 c1 却没有 sidecar 时生成器直接失败。运行时限
+64 KiB，并复制进 `Program`，第一次 draw 时才分配共享缓冲。
+
+参数缓冲区的字节偏移还有一条 Metal 规则：成员按**声明顺序**紧凑排布，
+`[[id(k)]]` 只是 encoder 的绑定号，不是字节偏移。当前表按 `id*8` 写，只在 id
+连续时成立；BOTW 实测的 0..41 连续，所以这条路径正确。带空洞的布局需要把
+packed slot 写进 blob，尚未接（M3.85 的自检暴露了这一点）。
 
 `UNSUPPORTED` 不会被静默填零：`argument_buffer()` 直接丢 draw，并记
 `nvnCommandBufferDraw.argUnsupported`；缺 UBO 同理。生成器对 id ≥ 64、
@@ -261,8 +273,8 @@ M3.83 之后这**已经**是资源绑定的一部分：`nvnSamplerPoolInitialize
 - 纹理注册只保存客体地址；`nvnTextureFinalize` 后再采样会解析失败并丢 draw。
 - `nvnTexturePoolGetMemoryPool` / `nvnSamplerPoolGetMemoryPool` 不在
   `signatures.json` 的 470 个形状里，未绑。
-- 真实 shader 的 `[[id(k)]]` 顺序已由 M3.84 侧车解出；c1、bindless、image /
-  storage buffer 仍标为 `UNSUPPORTED`。
+- c1 已由 M3.85 侧车接上；bindless、image / storage buffer 仍标为
+  `UNSUPPORTED`。
 - 参数缓冲区的 texture / sampler 条目要写 `gpuResourceID`。iOS 模拟器
   （`apple7=0 metal3=0`）的纹理 ID 恒为 0，所以那里只能走直连绑定；
   该条目本身**只在 Metal 3 硬件上有意义，尚未验证**。
@@ -292,16 +304,16 @@ M3.83 之后这**已经**是资源绑定的一部分：`nvnSamplerPoolInitialize
 | `xcrun metal` → `.metallib` | 未做；只能在 macOS/CI 上做，本机没有 |
 | 整作 19,592 个 shader 全量构建 | 未做；只验证了 1 个 pack 的 5,102 个 key 中的 2 个 |
 | 编译期校验（MSL 语法） | 未做；Windows 没有 Metal 前端，MSL 只在 CI 的 macOS 上才能编 |
-| 真机 / 模拟器上跑真实 shader | 未做。自检用的仍是内置 MSL（五条 draw：`[[vertex_id]]`、顶点属性、16 位索引的 `DrawElements`、`BindUniformBuffer` 参数缓冲区、texture pool + sampler pool 采样；另加一条 sampler 状态创建/比较路径） |
+| 真机 / 模拟器上跑真实 shader | 未做。自检用的仍是内置 MSL（六条 draw：`[[vertex_id]]`、顶点属性、16 位索引的 `DrawElements`、`BindUniformBuffer` 参数缓冲区、texture pool + sampler pool 采样、只通过 `[[id(0)]]` 读 c1 常量段；另加一条 sampler 状态创建/比较路径） |
 | compute / geometry shader | 未做（`extract` 目前跳过 cs） |
 | 运行时按 key 取 MSL | **已接线**（M3.78，见 §5.1） |
 | 顶点描述符 | **已接**（M3.79） |
-| argument buffer（UBO / 纹理 / sampler） | UBO 已接（M3.81）；texture/sampler 条目按固定 8 字节 ABI 写入（M3.83）；真实 shader 的 `[[id(k)]]` 布局侧车已接（M3.84），但 c1 / bindless / 顶点参数缓冲区仍未解 |
+| argument buffer（UBO / 纹理 / sampler / c1） | UBO 已接（M3.81）；texture/sampler 条目按固定 8 字节 ABI 写入（M3.83）；真实 shader 的 `[[id(k)]]` 布局侧车已接（M3.84）；c1 已接（M3.85），但 bindless / 顶点参数缓冲区仍未解 |
 | Metal 3 参数缓冲区的纹理条目 | 未验证；模拟器 `gpuResourceID == 0` 改走直连绑定，需原生 macOS Metal 离屏测试或真机 |
 
 一句话：**链的前 2/3 在 Windows 上真的通了，后 1/3（`xcrun metal`）要在 CI 的
 macOS 上补；运行时按 key 取 MSL 已接线（M3.78），顶点与索引都已接（M3.79 / M3.80），
 UBO 已进 argument buffer（M3.81），sampler 状态对象已能创建（M3.82），
 texture/sampler 条目也已接（M3.83，模拟器走直连绑定），真实 shader 的
-`[[id(k)]]` 布局侧车已接（M3.84）；c1、bindless、顶点参数缓冲区仍未解，
-所以还没有任何一条真实 shader 在 Metal 里执行过。**
+`[[id(k)]]` 布局侧车已接（M3.84），c1 已接（M3.85）；bindless 与顶点参数
+缓冲区仍未解，所以还没有任何一条真实 shader 在 Metal 里执行过。**

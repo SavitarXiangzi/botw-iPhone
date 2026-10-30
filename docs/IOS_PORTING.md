@@ -332,12 +332,13 @@ texture -> render target -> clear -> program -> pipeline -> draw -> 回读，
 并额外创建、比较和读回 `MTLSamplerState`。CI 在 iOS 模拟器里用 `simctl`
 启动 App（`--selftest`），App 在 `init()` 里跑它、把
 `BOTW_SELFTEST rc=<n>` 写进容器的 `Documents/selftest.txt` 并 `exit(rc)`；
-现在跑**五条** draw（`[[vertex_id]]` / `[[attribute(0)]]` / 16 位索引的
+现在跑**六条** draw（`[[vertex_id]]` / `[[attribute(0)]]` / 16 位索引的
 `DrawElements` / `BindUniformBuffer` 参数缓冲区 / 从 texture pool + sampler pool
-取句柄并采样 2x2 纹理）加一条 sampler 状态路径，全部通过才 rc=0。
+取句柄并采样 2x2 纹理 / 只通过 `[[id(0)]]` 读 c1 常量段）加一条
+sampler 状态路径，全部通过才 rc=0。
 M3.76 的 run 40997940031 证明了第一条；run 41008588834 证明当时的三条；
 M3.82 的 run 41018975699 以 `BOTW_SELFTEST rc=0` 通过；M3.83 的 run
-41034005513（ios job 123990428590）五条全过。M3.84 的 run 41037369546
+41034005513（ios job 123990428590）当时五条全过。M3.84 的 run 41037369546
 （portable job 124001430324、ios job 124001563704）也以 `BOTW_SELFTEST rc=0`
 通过，日志里多了侧车查找/拷贝的证据：
 
@@ -346,12 +347,28 @@ M3.82 的 run 41018975699 以 `BOTW_SELFTEST rc=0` 通过；M3.83 的 run
 [selftest] textured draw sampled all four pool texels
 ```
 
+M3.85 的 run 41042618062（portable job 124018857722、ios job 124019022555）也以
+`BOTW_SELFTEST rc=0` 通过；第六条 draw 只读 c1：
+
+```
+[selftest] c1 sidecar: key=00000000000000a6 bytes=256 id=0
+[selftest] c1 buffer: gpuAddress=0x15004b0000 bytes=256
+[selftest] c1 draw read back its copied constants
+```
+
+第一次 `3d8ba8f` 的 run 41040694114 在 iOS 上以 `rc=16392` 失败（中心像素全
+0）：自检把单个 c1 成员声明在 `[[id(2)]]`，而 Metal 参数缓冲区按成员声明顺序
+紧凑排布，运行时按 `id*8` 写到了偏移 16。`ddde8f8` 改成 `[[id(0)]]` 后通过。
+真实 BOTW shader 的 id 0..41 连续，所以真实 c1（id=2）不受影响；带空洞的布局
+仍需要把 packed slot 写进 blob（见 `docs/ROADMAP.md` 的 M3.85 段）。
+
 第五条在模拟器里走的是**直连纹理/采样器绑定**：模拟器的
 `MTLTexture.gpuResourceID` 是 0，参数缓冲区的纹理条目在那里没有意义
 （见 `docs/ROADMAP.md` 的 M3.83 / M3.84 段）。所以“Metal 这半边是通的”
 是已经执行过的结论；“客体的 shader 能跑”仍然完全没验证。模拟器覆盖到池、
-句柄、上传、sampler 状态、直连绑定、侧车布局拷贝与像素回读，不覆盖 Metal 3
-参数缓冲区的纹理条目，也不覆盖真实 shader 的 c1 / bindless 路径。
+句柄、上传、sampler 状态、直连绑定、侧车布局拷贝、c1 常量段与像素回读，
+不覆盖 Metal 3 参数缓冲区的纹理条目，也不覆盖真实 shader 的 bindless /
+顶点参数缓冲区路径。
 
 **阶段 C：纹理正确**
 
@@ -367,8 +384,8 @@ M3.82 的 run 41018975699 以 `BOTW_SELFTEST rc=0` 通过；M3.83 的 run
 - ✅ Sampler：M3.82 完成 builder、object、getter 和真实的
   `MTLSamplerState`；M3.83 完成 sampler pool、`BindSeparateSampler(s)` 与
   参数缓冲区/直连绑定两条路径。M3.84 已把真实 shader 的 `[[id(k)]]` 顺序
-  写成 `gen_blobs.py` 侧车并在 `prog_set_shaders()` 里应用；c1、bindless、
-  顶点阶段的参数缓冲区仍未接
+  写成 `gen_blobs.py` 侧车并在 `prog_set_shaders()` 里应用；M3.85 接上
+  c1 常量段；bindless、顶点阶段的参数缓冲区仍未接
 - `nvnCommandBufferBarrier`、fence/sync、events
 
 ---
@@ -455,7 +472,7 @@ constexpr int kEnumsVerified = 0;
 | P0 | ~~`nvnCommandBufferSetRenderTargets`~~ | ✅ 本轮已实现；只剩 MRT / 深度 / view |
 | P0 | ~~`nvnCommandBufferBindProgram` / `nvnProgramInitialize`~~ | ✅ 本轮已实现（管线建到 `nvngfx_shader_to_msl` 为止） |
 | P0 | ~~`nvnCommandBufferBindVertexAttribState`~~ | ✅ 本轮已实现（含 `nvnVertexAttribState*` / `nvnVertexStreamState*` 与 `BindVertexStreamState`） |
-| P0 | 真实 shader 的第一次 draw | UBO、texture、sampler 三类 argument buffer 条目都已跑过；`[[id(k)]]` 侧车映射已接（M3.84）；仍缺 c1、bindless、顶点参数缓冲区，以及把标题 shader 真正翻成 MSL 的离线链路 |
+| P0 | 真实 shader 的第一次 draw | UBO、texture、sampler 三类 argument buffer 条目都已跑过；`[[id(k)]]` 侧车映射已接（M3.84）；c1 已接（M3.85）；仍缺 bindless、顶点参数缓冲区，以及把标题 shader 真正翻成 MSL 的离线链路 |
 | P1 | `nvnTextureBuilder*` 剩余 29 个 | 已做 14 个；剩余主要是 getter 与 pool/offset 细节 |
 | P1 | ~~`nvnSamplerBuilder*` + `nvnSampler*` + sampler pool~~ | ✅ M3.82/M3.83：38 个 sampler 入口、8 个 pool/bind 入口，能建 `MTLSamplerState` 并从 pool 解析句柄；`SamplerBuilderGetDevice` 无已知形状、`SamplerGetDebugID` 的返回值语义未定 |
 | P1 | `NVNindexType` 枚举值核对 | nxnative 的 `nvn.h` 给出 0=u8 / 1=u16 / 2=u32；后端只接 1/2，u8 未知值不画，且该头文件是 reimplementation 而非 Nintendo SDK |
@@ -477,10 +494,10 @@ constexpr int kEnumsVerified = 0;
 | 渲染目标绑定 | 只挂 `color[0]`，深度/view 只记录 | MRT 与深度测试不可用 |
 | 着色器翻译 | 只留了接口，没有实现 | 客体的 draw 全部停在 `noPipeline` |
 | 纹理创建 | 建 host `MTLTexture`，不与 guest alias | 当目标可用；采样 guest 像素仍全黑 |
-| draw 执行 | 有 pipeline 就真的编码 draw；没有就丢弃 | 客体仍是 0 条；自检五条 draw 加 sampler 状态检查由 CI 执行 |
+| draw 执行 | 有 pipeline 就真的编码 draw；没有就丢弃 | 客体仍是 0 条；自检六条 draw 加 sampler 状态检查由 CI 执行 |
 | 顶点输入 | attrib/stream 已接，缓冲从 pool 零拷贝绑到 `MTLBuffer` | 自检的第二条 draw 就是这条路；客体尚未跑到 |
 | 浮点参数 | `nvngfx_args.f[8]` 已扩展，float 在低 32 位 | 本仓库外 guest 调用端仍需实现 s/d 寄存器桥 |
-| 采样器资源 | builder/object、sampler pool 与 `MTLSamplerState` 已建，句柄可解析 | 真实 shader 的 `[[id(k)]]` 侧车已接（M3.84）；c1 / bindless 仍未解 |
+| 采样器资源 | builder/object、sampler pool 与 `MTLSamplerState` 已建，句柄可解析 | 真实 shader 的 `[[id(k)]]` 侧车已接（M3.84）；c1 已接（M3.85）；bindless 仍未解 |
 | 同步/fence | 未实现 | 长时间跑可能撕裂 |
 | compute | 未实现 | 后处理不可用 |
 | 多线程 | 单队列 | 与真机行为有差异 |

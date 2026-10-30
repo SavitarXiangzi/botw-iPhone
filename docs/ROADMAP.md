@@ -2830,13 +2830,13 @@ texture/sampler 条目——那需要 `gpuResourceID != 0` 的硬件，GitHub �
 |---|---|
 | guest 纹理上传 | 自检的像素是宿主 blit；BOTW 放进池里的像素还读不到 |
 | tiled / block-linear 布局 | 即使上传，未解块的纹理仍是花屏 |
-| 真实 shader 的 `[[id(k)]]` 侧车 | M3.84 已补：真实 MSL 的参数布局已进 blob；真实 shader 仍不能采样，因为 c1、bindless、guest 纹理上传都没接 |
+| 真实 shader 的 `[[id(k)]]` 侧车 | M3.84 已补：真实 MSL 的参数布局已进 blob；M3.85 补 c1；真实 shader 仍不能采样，因为 bindless / guest 纹理上传还没接 |
 | Metal 3 的 argument-buffer 纹理条目 | 只有 UBO 条目在 CI 里真正走过；纹理/采样器条目只在直连路径上验证过 |
 | MRT / depth attachment | 只有单 color attachment，深度/模板未接 |
 | 非 pixel stage 的绑定 | 顶点/几何/计算的纹理绑定只记日志 |
 | `nvnTexturePoolGetMemoryPool` / `SamplerPoolGetMemoryPool` | 不在 470 个已测形状里，未绑 |
 | `nvnCommandBufferBindImage(s)` | compute 图像路径未接 |
-| 真实 shader 的 draw | 仍是 0 条；五条自检 draw 都用内置 MSL |
+| 真实 shader 的 draw | 仍是 0 条；六条自检 draw 都用内置 MSL |
 | 真机 | **没有真机运行记录** |
 
 ## M3.84 真实 shader 的 `[[id(k)]]` 侧车（本轮）
@@ -2866,15 +2866,15 @@ texture/sampler 条目——那需要 `gpuResourceID != 0` 的硬件，GitHub �
 | `fp_t_tcb_5A` | c2 `0x168` 起的独立纹理 | `SEPARATE_TEXTURE` 0 |
 | `fp_t_cb2_1C` | c2 驱动表，按普通纹理解 | `TEXTURE` |
 | `fp_t_cb7_2A` | 句柄写在统一缓冲里（bindless） | `UNSUPPORTED` |
-| `fp_c1` | c1 常量段 | `UNSUPPORTED` |
+| `fp_c1` | c1 常量段 | M3.84 当时记作 `UNSUPPORTED`；M3.85 改为 `C1` |
 | `fp_i_*` / `fp_s3` | image / storage buffer | `UNSUPPORTED` |
 
 `decode_tex` 与 nxnative 的 `dmsh_build.py` 同源（MIT），数字来自 §6 的驱动段
 布局。生成器把布局写进 `kArgs_<key>_<stage>[]`，和 MSL 一起下发；id ≥ 64、
 槽位越界或 id 重复时**构建失败**，不会产出一张运行时会拒绝的表。
 
-两个真实 shader 一共解出 49 项：8 UBO、20 纹理、20 采样器、1 个 unsupported
-（就是 `fp_c1`）。
+两个真实 shader 一共解出 49 项：8 UBO、20 纹理、20 采样器、1 个 c1
+（M3.84 当时把它记成 unsupported，M3.85 补上）。
 
 ### 运行时：MSL 与布局来自同一个 blob
 
@@ -2900,8 +2900,10 @@ texture/sampler 条目——那需要 `gpuResourceID != 0` 的硬件，GitHub �
 ```
 
 非直连设备把布局应用到程序；模拟器走直连时 `numArgs=0` 是预期的（直连不看
-id）。Metal 3 真机的 fragment 用 variant 5（`[[id(5)]]`/`[[id(9)]]`/`[[id(12)]]`），
-回读四角顺带证明表的步长与空洞。
+id）。Metal 3 真机的 fragment 原本打算用 variant 5（`[[id(5)]]`/`[[id(9)]]`/
+`[[id(12)]]`）回读四角顺带证明表的步长与空洞；M3.85 发现 Metal 参数缓冲区按
+声明顺序紧凑排布，`id*8` 只在 id 连续时成立，所以这个空洞布局在真机上仍未
+验证（见 M3.85）。
 
 ### 证据（CI）
 
@@ -2918,11 +2920,137 @@ CI 用 `-Wextra` 就报；`09b0327` 补全。
 
 | 缺口 | 后果 |
 |---|---|
-| c1 常量段 | fragment 里唯一解不出的一项；当前链不产出 c1 内容，不能填零假装正确 |
+| ~~c1 常量段~~ | M3.85 已补：侧车产出真实字节，运行时按 Program 复制并绑定；真实 shader 仍未在 Metal 里跑过 |
 | bindless（句柄在统一缓冲里） | `fp_t_cb7_*` 要运行时读统一缓冲再解句柄 |
 | image / typed buffer | compute 与部分像素路径 |
 | 顶点阶段的参数缓冲区 | 与顶点流 0 号槽冲突，偏移约定未定 |
 | guest 纹理上传 / tiled 布局 | 侧车只解决"填哪一格"，不解决"格子里是什么" |
-| 真实 shader 的 draw | 仍是 0 条；本地 shader 的 c1 未解，CI 也不含标题数据 |
+| 真实 shader 的 draw | 仍是 0 条；c1 已解（M3.85），还缺 bindless / 顶点参数缓冲区，CI 也不含标题数据 |
 | blob 表查找 | 线性表；19,592 条时每次 SetShaders 是 O(n)，量起来要换哈希 |
+| 真机 | **没有真机运行记录** |
+
+## M3.85 内嵌 c1 常量段（本轮）
+
+覆盖仍是 **131 / 513（25.5%）**：本轮没有新增 NVN 入口。M3.84 的参数布局里
+只剩 `fp_c1` 没有数据来源；这一轮把它从“unsupported”变成真正可绑定的段。
+
+### c1 是什么：code area 尾部的一段常量
+
+每个 stage 的 control 段给出两个数：
+
+| 偏移 | 含义 |
+|---|---|
+| `control+0x700` | c1 相对 code area 起点的偏移 |
+| `control+0x704` | code area 总长 |
+
+`c1 = code[c1o:c1t]`，按 guest 原样保存。它不是命令缓冲区的绑定，而是编译进
+shader 的常量段；间接跳转（BRX）的跳转表也在这里，所以不能填零。nxnative 侧
+实测 BOTW 的 c1 用到 0 / 256 / 512 / 768 字节；后端把 64 KiB 作为硬上限，
+防止损坏的侧车让手机分配无界缓冲。
+
+### blob 与运行时
+
+`nvngfx_shader_blob` 增加 `c1` / `c1_size` 两个字段，`NVNGFX_ARG_C1` 是新的
+kind（值 6；`UNSUPPORTED` 顺延到 7，生成器和运行时必须一起重建）：
+
+- `c1 == NULL && c1_size == 0`：这个 shader 没有 c1（没有布局项时必须如此）
+- `c1 != NULL && c1_size == 0`：显式空 c1（MSL 声明了成员，但段长为 0）
+- `c1 != NULL && c1_size > 0`：真实字节，最多 64 KiB
+- 布局里有 `NVNGFX_ARG_C1` 时必须有非空 `c1` 指针；C1 的 slot 必须是 -1
+
+`prog_apply_arg_layout()` 把字节**复制**进 `Program::c1`，所以临时 blob 的
+生命周期结束后仍然有效。第一次需要 c1 的 draw 才分配 `MTLBuffer`：
+
+- 数据向上取整到 256 字节，再加 256 字节零间隙（nxnative 的共享 bank 规则）
+- 显式空 c1 也分配 512 字节零缓冲，不创建零长度 `MTLBuffer`
+- 参数表写 `c1Buffer.gpuAddress`，并对 fragment 阶段 `useResource:usage:`
+- 只有 c1、没有 UBO/texture/sampler 的 fragment shader 也会绑定 `buffer(0)`
+
+### 生成器：sidecar 缺失必须是构建错误
+
+`nx_shader.py translate` 在写 `<key>_<stage>.metal` 时检查该 stage 是否真的
+声明了 `*_c1`：只有声明了才写同名 `.c1`，并删除上一轮遗留的 sidecar。于是：
+
+| 情况 | 产物 |
+|---|---|
+| MSL 没有 c1 | 没有 `.c1`，blob 写 `0, 0` |
+| 声明了 c1，段长为 0 | 空 `.c1`，blob 写 `kEmptyC1, 0` |
+| 声明了 c1，有字节 | `.c1` 保存原始字节，blob 指向 `kC1_<key>_<stage>` |
+
+`gen_blobs.py` 对“MSL 声明 c1 但 sidecar 缺失”、重复 blob、超过 64 KiB
+都直接让构建失败；不会产出一张运行时才拒绝的表。
+
+### 本地真 shader 验证
+
+`Bootup_Graphics` 的两个真实 shader（数据不入库）重新生成：
+
+```
+gen_blobs: 49 argument(s): c1=1, sampler_of_texture=20, texture=20, ubo=8;
+c1=1 shader(s), 256 bytes
+```
+
+真实 fragment 里的布局项是 `{2, NVNGFX_ARG_C1, -1}`，c1 共 256 字节；顶点
+shader 不声明 c1，因此不再产出空的 `.c1`。
+
+### 自检：第六条 draw
+
+内置 variant 6 是一个**只有 c1** 的 fragment shader：
+`constant float4* c1 [[id(0)]]`。第六条 draw 用临时 key
+`00000000000000a6`，把 256 字节写成 `(0.25, 0.5, 0.75, 1.0)`，应用布局后
+立刻把源数据填成 `0xAA`——回读仍是 `(64,128,191,255)`，证明 `Program`
+拥有的是副本而不是外部指针。失败码：
+
+- `16390`：SetShaders / blob 查找 / SetBlobs 失败
+- `16391`：draw 没有编码，或命令缓冲报错
+- `16392`：中心像素不是期望颜色
+
+预期日志：
+
+```
+[selftest] c1 sidecar: key=00000000000000a6 bytes=256 id=0
+[selftest] c1 buffer: gpuAddress=0x... bytes=256
+[selftest] c1 draw read back its copied constants
+BOTW_SELFTEST rc=0
+```
+
+### 额外发现：参数缓冲区按声明顺序排布
+
+第一次把 c1 放在 `[[id(2)]]` 时，draw 编码成功、命令缓冲也完成，但中心像素是
+`(0,0,0,0)`。原因不是 c1 没复制，而是 Metal **按成员声明顺序紧凑排布**参数
+缓冲区：单个 `[[id(2)]]` 成员仍然在字节 0，`id` 只是 encoder 的绑定号，不是
+字节偏移。运行时按 `id*8` 写表，所以在“只有一个 id=2 成员”的合成 shader 上写
+到了偏移 16，shader 读偏移 0，得到零。
+
+真实 BOTW fragment shader 的 id 是 0..41 连续，声明顺序与 id 顺序一致，所以
+UBO/c1 路径不受影响；M3.84 的 5/9/12 空洞布局只在模拟器直连路径跑过，Metal 3
+上的 raw table 仍未验证。M3.86 做 bindless 时会把 packed slot（声明顺序）也写进
+blob，一并修掉带空洞的布局。
+
+### 证据
+
+本地门禁：`build_abi_test.ps1` 全过、`test_gen_blobs.py` 覆盖 c1 的
+正常/缺失/空/超限四种情况、`verify_ios.py` 与 `syntax_check_metal.py` 通过。
+
+第一次推送 `3d8ba8f` 的 run `41040694114`（portable job `124012453451` success）
+在 iOS 自检里失败：`BOTW_SELFTEST rc=16392`，c1 draw 中心像素 `(0,0,0,0)`。
+原因就是上一节的声明顺序。`ddde8f8` 把自检成员改成 `[[id(0)]]` 后，run
+`41042618062`（portable job `124018857722`、ios job `124019022555`）两个 job
+都 success，`BOTW_SELFTEST rc=0`：
+
+```
+[selftest] c1 sidecar: key=00000000000000a6 bytes=256 id=0
+[selftest] c1 buffer: gpuAddress=0x15004b0000 bytes=256
+[selftest] c1 draw read back its copied constants
+```
+
+### 仍然没有的
+
+| 缺口 | 后果 |
+|---|---|
+| bindless（句柄在统一缓冲里） | `fp_t_cb7_*` 要运行时读统一缓冲再解句柄 |
+| image / typed buffer | compute 与部分像素路径 |
+| 顶点阶段的参数缓冲区 | 与顶点流 0 号槽冲突，偏移约定未定 |
+| guest 纹理上传 / tiled 布局 | c1 只解决常量，不解决“纹理里是什么” |
+| 真实 shader 的 draw | 仍是 0 条；c1、UBO、纹理、采样器布局都已解，但还没有标题 shader 的离线 MSL 全链路 |
+| blob 表查找 | 线性表；19,592 条时每次 SetShaders 是 O(n) |
 | 真机 | **没有真机运行记录** |
