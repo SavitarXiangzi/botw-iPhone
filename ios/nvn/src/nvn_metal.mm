@@ -40,8 +40,8 @@
  *         reads red from layer 0 and yellow from layer 1.  A sampler state
  *         object is also created, compared and read back.
  *         MRT / depth attachment / texture views
- *         streaming texture updates and a LINEAR-storage upload path
- *         BCn -> ASTC/ETC2 transcode, compute, sync/fence
+ *         streaming texture updates, texture views, compute, sync/fence
+ *         BC6H/BC7 and signed BCn (unsigned BC1-BC5 decode to RGBA8)
  *
  * Argument ABI: measured, not guessed
  * -----------------------------------
@@ -2645,8 +2645,8 @@ bool tex_upload(Ctx* c, CmdBuf* b, Tex* t) {
     if (transcoded) {
         std::fprintf(stderr,
                      "[nvn] texture upload transcode: NVNformat 0x%X BCn -> "
-                     "RGBA8%d\n",
-                     format, nvngfx_bcn_is_srgb(t->desc.format) ? 1 : 0);
+                     "RGBA8\n",
+                     format);
     }
     std::fflush(stderr);
     id<MTLBuffer> stg = [c->device newBufferWithLength:stagingTotal

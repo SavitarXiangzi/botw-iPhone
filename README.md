@@ -16,11 +16,12 @@ ios/nvn/        NVN host-HLE：513 入口点注册表、生成的分发表、Met
   src/nvn_metal.mm 131 个入口点的 Metal 实现（其余是日志桩）
   src/nvn_shader.c 着色器翻译接口（现在只会返回 NULL + 理由）
   src/nvn_texture.c 157 项 NVNformat -> MTLPixelFormat 映射表（带 lossy 标记）
+  src/nvn_bcn.c   BC1/BC2/BC3/BC4U/BC5U -> RGBA8 解码器（iOS 没有 BCn 像素格式）
   src/nvn_null.cpp 空后端：任何主机都能编译、跑 ABI 测试
   shaders/        空目录，路线说明在里面的 README
 core/           与 iOS 对接的 C ABI（Swift 只能看到 botw_core.h）
 scripts/        注册表提取、代码生成、门禁校验、MSVC 编译脚本
-tests/          513 入口点一致性 + C ABI 冒烟 + 157 项纹理格式表测试
+tests/          513 入口点一致性 + C ABI 冒烟 + 纹理格式/布局/BCn 解码测试
 docs/           路线图、HLE 边界、NVN 覆盖表、iOS 移植手册、着色器链
 .github/        GitHub Actions：无 Mac 也能编译验证
 ```
@@ -56,7 +57,8 @@ docs/           路线图、HLE 边界、NVN 覆盖表、iOS 移植手册、着�
 | M3.27 | `GetSystemTick` 的 HLE 往返 35 µs × 几十万次 = 30 s 死窗口；改成入口一条 `b` + 内联计数器 | ✅ 死窗口消失 |
 | M3.28 | 178 帧后静止的全量快照：主线程无限等 LightEvent，32 线程 idle，唯一活动是 250 µs 轮询 worker | 🔴 缺完成通知 |
 | M3.65–M3.71 | 12 MB 缓冲区是包尾 `0x49E000` 的逐字节拷贝；真正卡点是 58.2 MiB 分配返回 0；最小跳过让字节序转换器返回 | ✅ 结论已定，draws 仍为 0 |
-| iOS 骨架 | 513 入口点注册表 + 生成分发表 + Metal 后端 131 项 + 三重门禁 | 🟡 十四条合成 draw，其中十三条已在 CI 模拟器通过（LINEAR：run 41083158406；cube：run 41080975529）；第十三条 cube array 需 `BOTW_SELFTEST_CUBE_ARRAY=1`，模拟器的 Metal 建 CubeArray 会崩。含 bindless、顶点参数缓冲区、c1 常量段、guest pool 解块上传和离线 MSL bundle；客体仍无画面 |
+| M3.94 | BC1/BC2/BC3/BC4U/BC5U 在首次采样时解成 RGBA8；sRGB 变体保留 transfer function | ✅ 第十五条 draw 左红右蓝，run 41086648054 |
+| iOS 骨架 | 513 入口点注册表 + 生成分发表 + Metal 后端 131 项 + 三重门禁 | 🟡 十五条合成 draw，其中十四条已在 CI 模拟器通过（BC1：run 41086648054；LINEAR：run 41083158406；cube：run 41080975529）；第十三条 cube array 需 `BOTW_SELFTEST_CUBE_ARRAY=1`，模拟器的 Metal 建 CubeArray 会崩。含 bindless、顶点参数缓冲区、c1 常量段、guest pool 解块/BCn 上传和离线 MSL bundle；客体仍无画面 |
 | M4 | NVN → Metal 回放（管线/纹理/命令缓冲） | ⬜ |
 | M5 | 音频（nn::audio → AVAudioEngine）、输入 | ⬜ |
 | M6 | 真机性能与内存（6 GB 机型起步） | ⬜ |
@@ -228,14 +230,15 @@ guest 业务代码
 2. **客体的 draw 仍然一条都不执行**：program、管线、draw 编码都写好了，
    但 `nvngfx_shader_to_msl()` 没有翻译器（NVN 给的是 Maxwell SASS），
    所以管线建不出来，draw 停在一条 `noPipeline` 日志。
-   **例外且刻意**：`nvngfx_metal_selftest()` 用内置 MSL 和离线 bundle 跑十三条合成 draw（cube array 是第十三条，模拟器跳过），
+   **例外且刻意**：`nvngfx_metal_selftest()` 用内置 MSL 和离线 bundle 跑到第十五条合成 draw（cube array 是第十三条，模拟器跳过），
    由 CI 用 `simctl` 启动 App（`BOTW_SELFTEST=1`）执行并回读像素。它证明的是
    Metal 这半边，不是客体能跑。
 3. **采样纹理是宿主分配的 `MTLTexture`，首次采样时才从 guest 池填充**：
    `tex_upload()` 按 Tegra X1 的 block-linear 布局逐 mip 解块，再用 blit 拷进
    私有纹理。M3.91 已接 2D 数组的端到端上传，并修正 cube / cube-array 的
-   层数与 Metal 描述；目前仍是**一次性**上传，不跟踪 guest 后续修改，LINEAR
-   存储、连续更新和 BCn 转码仍未接。渲染目标始终由本后端独占写入。
+   层数与 Metal 描述；M3.93 接上 LINEAR 行距；M3.94 把 BC1/2/3/4U/5U 解成
+   RGBA8（BC6H/BC7 仍未支持，且 BC1 会放大到 8 倍内存）。目前仍是**一次性**
+   上传，不跟踪 guest 后续修改。渲染目标始终由本后端独占写入。
 4. **Release 编不过**：`kEnumsVerified = 0`，`nvn_metal.mm` 用 `#error` 拒绝 NDEBUG 构建。
    把没验证的 NVN 枚举值带上船，等于发一个颜色全错的版本。
 
@@ -259,7 +262,8 @@ core_smoke_test: ok (nvn 0/513 on null)      exit=0
 nvn_texture_test: ok (157 formats in table)  exit=0
 nvn_shader_test: ok (seam, blob table, packed slots, bindless, c1, SHA-256, shader key, layered fixture)  exit=0
 nvn_vertex_test: ok (packing, 26 formats, layout id)  exit=0
-nvn_texlayout_test: ok (block shapes, sizes, offsets, round trip, refusals)  exit=0
+nvn_texlayout_test: ok (block shapes, sizes, offsets, round trip, linear, refusals)  exit=0
+nvn_bcn_test: ok (BC1 4/3-colour, BC2 alpha, BC3 alpha, BC4/BC5, image clipping, refusals)  exit=0
 nvn_shader_bundle_test: ok (manifest, merge, c1, refusals)  exit=0
 test_gen_blobs: ok (ids, packed slots, bindless, c1, bundle, holes, refusals)
 syntax_check_metal: ok (clang++.exe)
@@ -271,7 +275,7 @@ Mac 侧还有一条**真的执行**的测试：CI 用 `simctl` 在 iOS 模拟器
 `--selftest` 让 App 在 `init()` 里跑完
 texture -> target -> clear -> pipeline -> draw -> 回读然后 `exit(rc)`，
 结果写进 App 容器的 `Documents/selftest.txt` 由工作流断言。
-现在执行十三条 draw；M3.85 的 run 41042618062、block-linear 布局的 run 41047317230、
+自检列到第十五条 draw，模拟器实际执行十四条；M3.85 的 run 41042618062、block-linear 布局的 run 41047317230、
 从 guest 池解块上传纹理的 run 41051685313、离线 MSL bundle 的 run 41064580709、
 分层纹理的 run 41070475247 均已通过。第十条真正从 `<app>/shaders/manifest.tsv` 取 MSL、按 guest key
 建管线并回读橙色像素；第十一条从 guest pool 上传两层 2D 数组，片段着色器
@@ -284,7 +288,10 @@ texture -> target -> clear -> pipeline -> draw -> 回读然后 `exit(rc)`，
 上排红/绿、下排蓝/白，回读左上与左下两个角；拷贝若忽略 stride，左下会读到
 padding 里的 0，变成黑色。CI 现在设置
 `BOTW_REQUIRE_SHADER_BUNDLE=1`，bundle 缺失会让自检返回 `rc=16397`，不能静默跳过。
-它不替代真机，但比“编过了”强一档。
+第十五条放一个 4×4 的 BC1 块进 guest pool：左半红、右半蓝，
+`nvnTextureInitialize` 必须建 RGBA8 而不是 iOS 不支持的 BC1 格式，上传时解块后
+回读左红右蓝（run 41086648054）。失败码 `16407`（布局 / 建纹理 / 编码）、
+`16408`（像素不对）。它不替代真机，但比“编过了”强一档。
 
 > 为什么不用 XCTest：本仓库先试过 unit-test bundle，`xcodebuild test` 在 runner 上
 > 只报 “Executed 0 tests” 然后 TEST FAILED，日志里没有任何原因（拿不到 admin 日志，

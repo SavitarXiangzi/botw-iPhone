@@ -6,8 +6,8 @@
  * to RGBA8 on the CPU while the texture is uploaded, which costs memory and
  * a memcpy but needs no ASTC encoder.
  *
- * Scope: the *unsigned* families the Switch actually ships in this game --
- * BC1 (0x41/0x42/0x45/0x46), BC2/DXT3 (0x43/0x47), BC3/DXT5 (0x44/0x48),
+ * Scope: the unsigned families this backend supports -- BC1
+ * (0x41/0x42/0x45/0x46), BC2/DXT3 (0x43/0x47), BC3/DXT5 (0x44/0x48),
  * BC4U (0x49) and BC5U (0x4B).  Signed BC4/BC5 and the BPTC families
  * (BC6H/BC7) have no decoder here and are reported as unsupported rather
  * than decoded wrongly.

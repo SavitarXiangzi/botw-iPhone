@@ -3620,7 +3620,9 @@ nvn_texlayout_test: ok (block shapes, sizes, offsets, round trip, linear, refusa
 
 这条抓的是“把 stride 当行宽”：若拷贝按 8 字节连续读，第二行会读到 padding，
 左下变黑；若把 padding 也上传成一行，右下会串色。失败码 `16405`（布局 / 建纹理 /
-编码）、`16406`（像素不对）。### CI 证据
+编码）、`16406`（像素不对）。
+
+### CI 证据
 
 run [41083158406](https://github.com/SavitarXiangzi/botw-iPhone/actions/runs/41083158406)，
 portable job 124157289034、iOS job 124157532695 均通过：
@@ -3637,3 +3639,95 @@ BOTW_SELFTEST rc=0
 - 每级独立 pitch（有的标题会给 mip 小级换更小的 pitch）没有建模，现在一条
   链共用一个 pitch。
 - 3D 线性纹理、线性渲染目标（`0x40`）都只有布局算术，没有真实使用场景。
+
+## M3.94 BCn：首次采样时解成 RGBA8
+
+覆盖仍是 **131 / 513（25.5%）**。这一轮补的是纹理格式表里已经映射、但 iOS
+Metal 根本建不出来的 BCn 家族。它不是入口点，所以覆盖率不会变；变的是
+`nvnTextureInitialize` 不会再向 iOS 设备要一个不存在的 `MTLPixelFormatBC*`。
+
+### 范围
+
+解码器支持 **BC1 / BC2(DXT3) / BC3(DXT5) / BC4U / BC5U** 的无符号变体：
+NVNformat `0x41/0x42/0x43/0x44/0x45/0x46/0x47/0x48/0x49/0x4B`。
+其中 `0x45–0x48` 是 sRGB；解码后的像素保持 sRGB 码值，目标纹理用
+`RGBA8Unorm_sRGB`，不会在 CPU 端先做一次错误的线性化。
+
+明确拒绝而不是猜的：BC4S/BC5S（`0x4A/0x4C`）和 BPTC（BC6H/BC7，`0x4D–0x50`）。
+这些格式返回“不支持”，纹理上传失败，draw 被丢弃；不会把有符号或 HDR 数据当成
+无符号 RGB 画出一张颜色错误的图。
+
+### 实现
+
+- `ios/nvn/src/nvn_bcn.c` 是纯 C、无 Metal，负责单块解码和整级/整 Z slice 解码。
+  `nvngfx_bcn_decode_image()` 接受带 padding 的源/目标 pitch，并把边缘 4×4
+  block 裁到真实的 `width × height`；这正是 BCn 纹理尺寸不必是 4 的倍数时
+  会走到的路径。
+- `nvnTextureInitialize` 在查 `nvngfx_format_to_mtl()` 之前拦截 BCn：
+  `MTLTexture` 建成 `RGBA8Unorm` 或 `RGBA8Unorm_sRGB`，尺寸仍是 guest 的
+  真实宽高，mip 数不变。
+- `tex_upload` 不再把压缩字节直接 blit 到目标。它先按原布局把压缩行
+  deswizzle 到一小块 CPU scratch，再用 `nvngfx_bcn_decode_image()` 解成
+  RGBA8 暂存区；暂存区按 `4 × width × height × slices` 计费，然后才 blit。
+  分层/cube 仍逐层走同一条路径，3D 按 Z slice 解码。
+- 这不是免费的：BC1 原本每纹素 0.5 字节，RGBA8 是 4 字节，显存放大 8 倍；
+  BC4 放大 4 倍，BC5 放大 4 倍。当前优先正确性，后续应由 ASTC 离线转码或
+  compute 解压取代。
+
+### 可移植测试
+
+`tests/nvn_bcn_test.cpp` 用手算的 S3TC/RGTC 期望值覆盖：
+
+- BC1 四色模式、三色+透明模式，以及 RGB_DXT1 强制不透明；
+- BC2 的 4-bit alpha nibble 顺序；
+- BC3 的 3-bit alpha 索引跨 32 位边界；
+- BC4U 的六值/八值模式，BC5U 的红绿两平面；
+- 整级解码：2 个 block、6×3 裁边、源/目标 pitch 都带 padding，确认 padding
+  不被写；窄 pitch、空指针、不支持格式全部拒绝。
+
+```text
+nvn_bcn_test: ok (BC1 4/3-colour, BC2 alpha, BC3 alpha, BC4/BC5, image clipping, refusals)
+syntax_check_metal: ok (clang++.exe)
+build_abi_test: all tests passed
+verify_ios: ok
+```
+
+MSVC 的 `/W4 /WX`、Linux clang 的 `-Wall -Wextra -Werror` 都跑过这条测试；
+CI 的 portable job 也把 `nvn_bcn.c` 编译进每个测试的公共链接集合。
+
+### 第十五条 draw：BC1 端到端
+
+自检在第二块 pool 页的 offset 14336 放一个 4×4 BC1 块：
+
+- `format = 0x42`（RGBA_DXT1）；
+- 端点 `c0 = 0xF800`（红）、`c1 = 0x001F`（蓝），每行索引 `0,0,1,1`；
+- 因此左半红、右半蓝。
+
+`tex_initialize` 必须报 `textureType == 2D`、`pixelFormat == RGBA8Unorm`，
+并且 `transcoded == true`；片段着色器仍用 variant 4 直接采样，回读左侧红、
+右侧蓝。若把 BC1 的 8 字节块当 RGBA8 直接拷，或把 `MTLTexture` 建成 BC1，
+这条会失败。失败码：`16407`（布局 / 建纹理 / 编码），`16408`（像素不对）。
+
+### CI 证据
+
+run [41086648054](https://github.com/SavitarXiangzi/botw-iPhone/actions/runs/41086648054)，
+portable job 124169430691、iOS job 124169655661 均通过。下面的日志是当前源码的
+预期输出：该 run 的二进制还会把 sRGB 标志拼在格式名后面（打印成 `RGBA80`），
+收尾时只清理了格式字符串，没有改变解码或回读逻辑。
+
+```text
+[nvn] texture upload: pool=0x7300 offset=14336 levels=1 layers=1 staging=64 bytes (largest slice=64)
+[nvn] texture upload transcode: NVNformat 0x42 BCn -> RGBA8
+[selftest] draw 15: BC1 texture decoded to RGBA8 and sampled from guest memory
+BOTW_SELFTEST rc=0
+```
+
+`staging=64` 是 4×4×4 字节的 RGBA8，而不是 BC1 的 8 字节 guest 块；
+这就是解块确实发生在 blit 之前的一个可观察证据。
+
+### 还没有的
+
+- BC6H/BC7 和 signed BC4/BC5；
+- guest 在首次上传后继续修改纹理内存时不会重传；
+- CPU scratch + 完整 RGBA8 staging 的内存开销还很高，尤其是大 BC1 纹理；
+- 没有真机记录。

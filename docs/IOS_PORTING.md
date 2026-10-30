@@ -6,10 +6,10 @@
 > iOS 侧的壳、C ABI、513 个 NVN 入口点的分发表、131 个 Metal 后端入口，
 > 都能在非 Apple 主机上编译并跑通自测；纹理能建、渲染目标能绑、encoder
 > 能开，program -> pipeline -> draw -> 回读这条链已经在 **CI 的 iOS 模拟器**
-> 里跑通了十条合成 draw，其中包括从 guest 内存池解块上传的纹理，以及从
-> 离线 MSL bundle 按 guest key 命中的 shader。
+> 里跑通了十五条合成 draw（模拟器实际执行十四条），其中包括从 guest 内存池
+> 解块上传的纹理，以及从离线 MSL bundle 按 guest key 命中的 shader。
 > **但客体的 draw 依然一条都不执行**：首要缺口仍是 Maxwell SASS -> MSL 的
-> 翻译器，纹理分层、BCn 转码和同步也还没有闭环。
+> 翻译器，纹理连续更新、BC6H/BC7 和同步也还没有闭环。
 
 ---
 
@@ -343,7 +343,7 @@ texture -> render target -> clear -> program -> pipeline -> draw -> 回读，
 并额外创建、比较和读回 `MTLSamplerState`。CI 在 iOS 模拟器里用 `simctl`
 启动 App（`--selftest`），App 在 `init()` 里跑它、把
 `BOTW_SELFTEST rc=<n>` 写进容器的 `Documents/selftest.txt` 并 `exit(rc)`；
-现在跑**十条** draw（`[[vertex_id]]` / `[[attribute(0)]]` / 16 位索引的
+现在跑**十五条** draw（模拟器实际执行十四条；`[[vertex_id]]` / `[[attribute(0)]]` / 16 位索引的
 `DrawElements` / `BindUniformBuffer` 参数缓冲区 / 从 texture pool + sampler pool
 取句柄并采样 2x2 纹理 / 只通过 `[[id(0)]]` 读 c1 常量段 / bindless 句柄表 / 顶点阶段
 参数缓冲区 / 从 guest pool 解块上传的 2x2 纹理 / 从 `<app>/shaders` 的
@@ -439,6 +439,14 @@ M3.92 补上另外两种层形状：第十二条建 `MTLTextureTypeCube`（`arra
 `draw 14: LINEAR texture rows sampled from guest memory at a 32-byte stride`，
 同段日志里 `texture upload ... offset=12288 ... staging=16 bytes`。
 
+M3.94 的第十五条 draw 把一块 4×4 BC1 放进 guest pool：`format = 0x42`，
+左半红、右半蓝。iOS Metal 没有 BCn 像素格式，所以 `nvnTextureInitialize`
+必须把目标格式改成 `RGBA8Unorm`；`tex_upload` 先把 block-linear 的 guest
+字节解成紧凑 BC1 行，再逐块解码到 RGBA8 暂存区并 blit，最后回读左红右蓝。
+sRGB 变体建 `RGBA8Unorm_sRGB`，不会丢 transfer function。失败码 `16407`
+（布局 / 建纹理 / 编码）、`16408`（像素不对）。这条已在 run 41086648054
+的 iOS job（124169655661）通过；portable job 是 124169430691。
+
 第五条在模拟器里走的是**直连纹理/采样器绑定**：模拟器的
 `MTLTexture.gpuResourceID` 是 0，参数缓冲区的纹理条目在那里没有意义
 （见 `docs/ROADMAP.md` 的 M3.83 / M3.84 段）。所以“Metal 这半边是通的”
@@ -451,10 +459,12 @@ M3.92 补上另外两种层形状：第十二条建 `MTLTextureTypeCube`（`arra
 
 - `nvnTextureBuilder*` 的字段偏移验证
 - ✅ 平铺：M3.88 的 Tegra X1 block-linear 尺寸 + 解块，M3.89 接到首次采样上传；
-  M3.91 接上 2D 数组的端到端上传，并修正 cube / cube-array 的层数与 Metal 描述。
-  仍缺 LINEAR 存储、cube 的真实 draw 自检和连续更新
-- BCn（BC1/BC3/BC4/BC5）在 Apple GPU 上没有对应格式，必须**离线转码**
-  成 ASTC/ETC2，或者运行时用 compute 解压。这是个体力活，不是难点。
+  M3.91 接上 2D 数组的端到端上传，并修正 cube / cube-array 的层数与 Metal 描述；
+  M3.93 接上 LINEAR 行距与逐行拷贝
+- ✅ BCn：M3.94 在首次采样上传时把 BC1/BC2/BC3/BC4U/BC5U 解成 RGBA8，
+  sRGB 变体用 sRGB 纹理；BC4S/BC5S、BC6H/BC7 仍拒绝。代价是 BC1 的
+  显存变成 8 倍，后续仍应由 ASTC 离线转码或 compute 解压取代
+- 仍缺：guest 连续更新、texture view、3D 线性纹理的真实场景
 
 **阶段 D：状态完整**
 
@@ -478,16 +488,19 @@ M3.92 补上另外两种层形状：第十二条建 `MTLTextureTypeCube`（`arra
 |---|---|
 | 描述来源 | builder setter 的记录值；**不读 guest builder 内存**，所以没有字段偏移风险 |
 | 像素归属 | 宿主所有，`MTLStorageModePrivate`，**不与 guest 内存 alias** |
-| 能干的事 | render target；第一次采样时从 guest pool 做一次性 block-linear 解块 + blit 上传 |
+| 能干的事 | render target；第一次采样时从 guest pool 做一次性 block-linear 解块 + blit 上传；BC1/2/3/4U/5U 先解成 RGBA8 |
 | 上传粒度 | 逐 mip、逐层；所有层都成功才允许采样，否则丢 draw，不读半张纹理 |
 | 格式 | 157 项表（见 `nvn_texture.c`），exact / substitute 分开标记，替代项返回 `lossy=1` |
-| 未支持 | texture view、LINEAR 存储上传、分层/立方体 MTLTexture 类型、BCn 解码、guest 后续更新同步 |
+| 未支持 | texture view、guest 后续更新同步、BC4S/BC5S、BC6H/BC7；BCn 解压后的 CPU/GPU 内存开销尚未优化 |
 
 所以别把“`nvnTextureInitialize` 返回 1”理解成“纹理能用了”。它只证明
 **描述符合法、Metal 分配成功**。
 
-**BCn**：在 iOS 上没有等价格式。可行路线有两条，都要离线或预计算：
+**BCn**：在 iOS 上没有等价格式。当前实现是路线 0：
 
+0. ✅ 首次采样时用 `nvn_bcn.c` 在 CPU 上解成 RGBA8（M3.94）。范围是
+   BC1/BC2/BC3/BC4U/BC5U；不认识的 signed/BPTC 格式明确返回失败，不会猜。
+   这条路线实现最简单，但 BC1 的每纹素 0.5 字节会变成 4 字节，显存是 8 倍。
 1. 打包时把 BCn 转 ASTC（画质和行为都稳定，代价是包体变大、需要额外工具）；
 2. 运行第一个场景时用 compute shader 解成 RGBA8 缓存起来（省包体，首帧卡顿）。
 
@@ -551,7 +564,7 @@ constexpr int kEnumsVerified = 0;
 | P0 | ~~`nvnCommandBufferSetRenderTargets`~~ | ✅ 本轮已实现；只剩 MRT / 深度 / view |
 | P0 | ~~`nvnCommandBufferBindProgram` / `nvnProgramInitialize`~~ | ✅ 本轮已实现（管线建到 `nvngfx_shader_to_msl` 为止） |
 | P0 | ~~`nvnCommandBufferBindVertexAttribState`~~ | ✅ 本轮已实现（含 `nvnVertexAttribState*` / `nvnVertexStreamState*` 与 `BindVertexStreamState`） |
-| P0 | 真实 shader 的第一次 draw | UBO/texture/sampler、`[[id(k)]]` 侧车、c1、packed slot、bindless、顶点参数缓冲区和 guest 纹理上传都已接上；仍缺把标题 shader 真正翻成 MSL 的离线链路，以及分层纹理/BCn 等格式缺口 |
+| P0 | 真实 shader 的第一次 draw | UBO/texture/sampler、`[[id(k)]]` 侧车、c1、packed slot、bindless、顶点参数缓冲区、分层/LINEAR/BC1–BC5 纹理上传都已接上；仍缺把标题 shader 真正翻成 MSL 的离线链路，以及 BC6H/BC7、texture view 和 guest 连续更新 |
 | P1 | `nvnTextureBuilder*` 剩余 29 个 | 已做 14 个；剩余主要是 getter 与 pool/offset 细节 |
 | P1 | ~~`nvnSamplerBuilder*` + `nvnSampler*` + sampler pool~~ | ✅ M3.82/M3.83：38 个 sampler 入口、8 个 pool/bind 入口，能建 `MTLSamplerState` 并从 pool 解析句柄；`SamplerBuilderGetDevice` 无已知形状、`SamplerGetDebugID` 的返回值语义未定 |
 | P1 | `NVNindexType` 枚举值核对 | nxnative 的 `nvn.h` 给出 0=u8 / 1=u16 / 2=u32；后端只接 1/2，u8 未知值不画，且该头文件是 reimplementation 而非 Nintendo SDK |
@@ -572,8 +585,8 @@ constexpr int kEnumsVerified = 0;
 |---|---|---|
 | 渲染目标绑定 | 只挂 `color[0]`，深度/view 只记录 | MRT 与深度测试不可用 |
 | 着色器翻译 | 只留了接口，没有实现 | 客体的 draw 全部停在 `noPipeline` |
-| 纹理创建 | 建 host `MTLTexture`，首次采样时从 guest pool 一次性解块/上传 | 基础 2D block-linear 纹理可采样；分层、LINEAR、BCn 与后续更新仍不完整 |
-| draw 执行 | 有 pipeline 就真的编码 draw；没有就丢弃 | 客体仍是 0 条；自检十条 draw 加 sampler 状态由 CI 执行 |
+| 纹理创建 | 建 host `MTLTexture`，首次采样时从 guest pool 一次性解块/上传 | 2D/数组/cube/LINEAR 和 BC1–BC5 可采样；BC6H/BC7、texture view 与后续更新仍不完整 |
+| draw 执行 | 有 pipeline 就真的编码 draw；没有就丢弃 | 客体仍是 0 条；自检十五条 draw（模拟器执行十四条）加 sampler 状态由 CI 执行 |
 | 顶点输入 | attrib/stream 已接，缓冲从 pool 零拷贝绑到 `MTLBuffer` | 自检的第二条 draw 就是这条路；客体尚未跑到 |
 | 浮点参数 | `nvngfx_args.f[8]` 已扩展，float 在低 32 位 | 本仓库外 guest 调用端仍需实现 s/d 寄存器桥 |
 | 采样器资源 | builder/object、sampler pool 与 `MTLSamplerState` 已建，句柄可解析 | `[[id(k)]]`、c1、packed slot、bindless 与顶点参数缓冲区已接；真实标题 shader 仍缺离线翻译链 |
