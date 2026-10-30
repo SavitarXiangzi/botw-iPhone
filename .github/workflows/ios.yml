@@ -151,8 +151,14 @@ jobs:
             grep -n -A4 -E "(: error:|^error:|Testing failed|TEST FAILED|Test Case .*failed)" test-sim.log | head -60 | while IFS= read -r line; do
               echo "::error::$line"
             done
-            echo "::error::last lines:"
-            tail -15 test-sim.log | while IFS= read -r line; do
+            echo "::error::diagnostics:"
+            grep -n -i -E "fail|error|crash|exception|unable|could not|assert|not found" test-sim.log \
+              | grep -v -E "Werror|error\\\\=|serialize-diagnostics|error\.resp" \
+              | head -30 | while IFS= read -r line; do
+              echo "::error::diag| $line"
+            done
+            echo "::error::last 70 numbered lines:"
+            tail -70 test-sim.log | nl -ba | while IFS= read -r line; do
               echo "::error::tail| $line"
             done
             echo "::error::simulators available:"
