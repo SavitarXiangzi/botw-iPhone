@@ -127,6 +127,24 @@ static const char* const kFsTexture =
     "    return s0.tex.sample(s0.smp, in.uv) * (*s0.tint);\n"
     "}\n";
 
+/* Variant 4: the same textured draw without an argument buffer.  A device
+ * that cannot provide Metal 3 resource IDs (the x86_64 simulator, for
+ * example) returns 0 from MTLTexture.gpuResourceID, so an argument-buffer
+ * texture entry cannot name it.  Direct texture/sampler bindings exercise the
+ * pool, handle, upload and sampler state on those devices; real translated
+ * shaders still use variant 3 on an Apple7/Metal3 device. */
+static const char* const kFsTextureDirect =
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "\n"
+    "struct NvngfxVaryings { float4 position [[position]]; float2 uv; };\n"
+    "\n"
+    "fragment float4 nvngfx_main_fs(NvngfxVaryings in [[stage_in]],\n"
+    "                               texture2d<float> tex [[texture(0)]],\n"
+    "                               sampler smp [[sampler(0)]]) {\n"
+    "    return tex.sample(smp, in.uv);\n"
+    "}\n";
+
 
 /* ------------------------------------------------------------------------- *
  * Offline MSL blobs
@@ -232,6 +250,11 @@ const char* nvngfx_shader_selftest_msl_variant(nvngfx_stage stage, int variant) 
     if (variant == 3) {
         if (stage == NVNGFX_STAGE_VERTEX) return kVsUv;
         if (stage == NVNGFX_STAGE_FRAGMENT) return kFsTexture;
+        return NULL;
+    }
+    if (variant == 4) {
+        if (stage == NVNGFX_STAGE_VERTEX) return kVsUv;
+        if (stage == NVNGFX_STAGE_FRAGMENT) return kFsTextureDirect;
         return NULL;
     }
     if (stage == NVNGFX_STAGE_VERTEX) return kVs;

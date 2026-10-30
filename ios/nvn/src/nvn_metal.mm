@@ -1482,6 +1482,11 @@ struct Program {
      * buffer(0).  Constant-colour programs do not, and binding the table to
      * those would feed them the wrong bytes. */
     bool hasArgBuffer = false;
+    /* A translated shader can also name its resources directly
+     * (`texture2d<T> tex [[texture(0)]]`).  That path does not need a
+     * Metal 3 resource ID, so it is the fallback for devices whose
+     * gpuResourceID is zero (notably the x86_64 iOS Simulator). */
+    bool directBindings = false;
 };
 
 /* The cached pipeline for (format, layout), or nil.  Also records the hit in
@@ -1520,6 +1525,8 @@ void pso_drop(Program* p) {
         p->slots[i].layout = 0;
         p->slots[i].hasLayout = false;
     }
+    p->hasArgBuffer = false;
+    p->directBindings = false;
 }
 
 /* Compiles the program's MSL into a render pipeline for `fmt`.
@@ -1701,6 +1708,10 @@ id<MTLRenderPipelineState> program_pipeline(Ctx* c, Program* p, MTLPixelFormat f
          * written with the fixed 8-byte-entry ABI below, matching the
          * working d2r-mobile backend. */
         p->hasArgBuffer = std::strstr(fs, "[[buffer(0)]]") != nullptr;
+        p->directBindings =
+            !p->hasArgBuffer &&
+            (std::strstr(fs, "[[texture(") != nullptr ||
+             std::strstr(fs, "[[sampler(") != nullptr);
 
         MTLRenderPipelineDescriptor* pd = [[MTLRenderPipelineDescriptor alloc] init];
         pd.vertexFunction = vfn;
@@ -2353,8 +2364,55 @@ id<MTLBuffer> argument_buffer(Ctx* c, CmdBuf* b) {
  * to bind or the binding succeeded; false means the draw must not be
  * encoded, because a shader that reads constants or samples a texture
  * would read the wrong thing. */
+/* Direct texture/sampler bindings for shaders that name resources with
+ * [[texture(k)]] / [[sampler(k)]].  This is the non-Metal3 fallback: it
+ * never needs gpuResourceID, so the simulator can still exercise the pool,
+ * handle, upload and sampler-state layers. */
+bool bind_direct_arguments(CmdBuf* b) {
+    bool bound = false;
+    for (unsigned i = 0; i < 16; ++i) {
+        if (b->ubo[i]) {
+            id<MTLBuffer> src = nil;
+            size_t off = 0;
+            const size_t len =
+                static_cast<size_t>(b->uboSize[i] ? b->uboSize[i] : 1);
+            if (!pool_span(b->ubo[i], len, &src, &off)) {
+                log_once("nvnCommandBufferDraw.directUniformBuffer", i);
+                return false;
+            }
+            [b->enc setFragmentBuffer:src offset:off atIndex:i];
+            bound = true;
+        }
+        const uint64_t texHandle =
+            b->texHandle[i] ? b->texHandle[i] : b->sepTexHandle[i];
+        if (texHandle) {
+            const Tex* t = bound_texture(b, texHandle);
+            if (!t || !t->mtl) {
+                log_once("nvnCommandBufferDraw.directTexture", i);
+                return false;
+            }
+            [b->enc setFragmentTexture:t->mtl atIndex:i];
+            bound = true;
+        }
+        const uint64_t sampHandle =
+            b->texHandle[i] ? b->texHandle[i] : b->sepSampHandle[i];
+        if (sampHandle) {
+            const PooledSampler* s = bound_sampler(b, sampHandle);
+            if (!s || !s->mtl) {
+                log_once("nvnCommandBufferDraw.directSampler", i);
+                return false;
+            }
+            [b->enc setFragmentSamplerState:s->mtl atIndex:i];
+            bound = true;
+        }
+    }
+    return bound;
+}
+
 bool bind_arguments(Ctx* c, CmdBuf* b) {
     if (!has_arguments(b)) return true;
+    Program* p = find<Program>(b->program);
+    if (p && p->directBindings) return bind_direct_arguments(b);
     id<MTLBuffer> ab = argument_buffer(c, b);
     if (!ab) return false;
     [b->enc setFragmentBuffer:ab offset:0 atIndex:0];
@@ -3506,13 +3564,43 @@ extern "C" int nvngfx_metal_selftest(void) {
                 }
             }
 
+            /* A Metal 3 device gives a texture a non-zero gpuResourceID,
+             * which is what an argument-buffer texture entry stores.  The
+             * x86_64 simulator reports neither Apple7 nor Metal3 and returns
+             * zero here; use direct bindings there instead of sampling a
+             * null resource ID. */
+            bool samplerHasResourceId = false;
             {
+                const SamplerPool* sp5 = find<SamplerPool>(kSampPool);
+                if (sp5) {
+                    auto it = sp5->samplers.find(sp5->base + 9);
+                    if (it != sp5->samplers.end() && it->second.mtl) {
+                        samplerHasResourceId =
+                            it->second.mtl.gpuResourceID._impl != 0;
+                    }
+                }
+            }
+            const bool textureHasResourceId =
+                src->mtl.gpuResourceID._impl != 0;
+            const bool useDirect = !textureHasResourceId || !samplerHasResourceId;
+            std::fprintf(stderr,
+                         "[selftest] textured draw path: %s "
+                         "(textureResourceId=%d samplerResourceId=%d)\n",
+                         useDirect ? "direct bindings" : "argument buffer",
+                         textureHasResourceId ? 1 : 0,
+                         samplerHasResourceId ? 1 : 0);
+            std::fflush(stderr);
+
+            {
+                const int variant = useDirect ? 4 : 3;
                 struct { uint64_t data; uint64_t control; } sd5[2];
                 sd5[0].data = reinterpret_cast<uint64_t>(const_cast<char*>(
-                    nvngfx_shader_selftest_msl_variant(NVNGFX_STAGE_VERTEX, 3)));
+                    nvngfx_shader_selftest_msl_variant(NVNGFX_STAGE_VERTEX,
+                                                       variant)));
                 sd5[0].control = 0;
                 sd5[1].data = reinterpret_cast<uint64_t>(const_cast<char*>(
-                    nvngfx_shader_selftest_msl_variant(NVNGFX_STAGE_FRAGMENT, 3)));
+                    nvngfx_shader_selftest_msl_variant(NVNGFX_STAGE_FRAGMENT,
+                                                       variant)));
                 sd5[1].control = 0;
                 x[0] = kProg5; x[1] = 0;
                 prog_initialize(ctx, x);
@@ -3527,12 +3615,15 @@ extern "C" int nvngfx_metal_selftest(void) {
             }
             /* The [[id(k)]] layout the translation sidecar will provide.  The
              * built-in MSL puts the constant pointer at id(0), the texture at
-             * id(1) and the sampler at id(2). */
-            if (Program* p5 = find<Program>(kProg5)) {
-                p5->numArgs = 3;
-                p5->args[0] = Program::ArgEntry{0, 0, 0};
-                p5->args[1] = Program::ArgEntry{1, 1, 0};
-                p5->args[2] = Program::ArgEntry{2, 2, 0};
+             * id(1) and the sampler at id(2).  The direct-binding variant has
+             * no argument buffer, so it must not get this sidecar. */
+            if (!useDirect) {
+                if (Program* p5 = find<Program>(kProg5)) {
+                    p5->numArgs = 3;
+                    p5->args[0] = Program::ArgEntry{0, 0, 0};
+                    p5->args[1] = Program::ArgEntry{1, 1, 0};
+                    p5->args[2] = Program::ArgEntry{2, 2, 0};
+                }
             }
 
             const uintptr_t poolBase5 =
@@ -3588,11 +3679,12 @@ extern "C" int nvngfx_metal_selftest(void) {
             std::fprintf(stderr,
                          "[selftest] textured draw state: pso=%d argbuf=%d "
                          "hasArgs=%d encoded=%u draws=%u hasArgBuffer=%d "
-                         "numArgs=%u ubo0=0x%llx tex0=0x%llx\n",
+                         "direct=%d numArgs=%u ubo0=0x%llx tex0=0x%llx\n",
                          b5 && b5->pso ? 1 : 0, haveTable ? 1 : 0,
                          b5 && has_arguments(b5) ? 1 : 0,
                          b5 ? b5->encoded : 0u, b5 ? b5->draws : 0u,
                          p5 && p5->hasArgBuffer ? 1 : 0,
+                         p5 && p5->directBindings ? 1 : 0,
                          p5 ? p5->numArgs : 0u,
                          b5 ? static_cast<unsigned long long>(b5->ubo[0]) : 0ull,
                          b5 ? static_cast<unsigned long long>(b5->texHandle[0])

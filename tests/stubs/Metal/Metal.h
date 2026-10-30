@@ -367,6 +367,8 @@ destinationBytesPerImage:(NSUInteger)bpi;
 - (void)setFragmentBuffer:(id<MTLBuffer>)buffer
                    offset:(NSUInteger)offset
                   atIndex:(NSUInteger)index;
+- (void)setFragmentTexture:(id<MTLTexture>)texture atIndex:(NSUInteger)index;
+- (void)setFragmentSamplerState:(id<MTLSamplerState>)sampler atIndex:(NSUInteger)index;
 - (void)useResource:(id<MTLResource>)resource usage:(MTLResourceUsage)usage stages:(MTLRenderStages)stages;
 @end
 
