@@ -68,43 +68,12 @@ targets:
         GCC_ENABLE_CPP_EXCEPTIONS: NO
         CLANG_ENABLE_OBJC_ARC: YES
 
-  # Logic tests (no host app): they link the NVN backend directly and run in
-  # the simulator, where Metal is available.  This is the only place the
-  # replay layer is actually executed.
-  BotWTests:
-    type: bundle.unit-test
-    platform: iOS
-    sources:
-      - path: BotWTests
-      - path: nvn/src
-        group: nvn
-      - path: nvn/include
-        group: nvn
-        buildPhase: none
-    dependencies:
-      - sdk: Metal.framework
-      - sdk: QuartzCore.framework
-    settings:
-      base:
-        PRODUCT_BUNDLE_IDENTIFIER: dev.botw.replay-tests
-        GENERATE_INFOPLIST_FILE: YES
-        HEADER_SEARCH_PATHS:
-          - $(SRCROOT)/nvn/include
-        OTHER_CPLUSPLUSFLAGS: "$(inherited) -Wall -Wextra -Werror"
-        OTHER_CFLAGS: "$(inherited) -Wall -Wextra -Werror"
-        GCC_ENABLE_CPP_EXCEPTIONS: NO
-        CLANG_ENABLE_OBJC_ARC: YES
-
 schemes:
   BotW:
     build:
       targets:
         BotW: all
-        BotWTests: [test]
     run:
       config: Debug
     test:
       config: Debug
-      targets:
-        - name: BotWTests
-          parallelizable: false

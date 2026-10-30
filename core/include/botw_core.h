@@ -59,6 +59,18 @@ void botw_core_nvn_stats_get(const botw_core* core, botw_core_nvn_stats* out);
 /* 1 if the backend implements `proc_name` (useful from the debug HUD). */
 int botw_core_nvn_has(const botw_core* core, const char* proc_name);
 
+/* Runs the Metal replay layer's self-test on the system default device: one
+ * frame through the NVN entry points (texture, render target, clear, program,
+ * pipeline, draw) followed by a readback of the centre pixel.
+ *
+ * Returns 0 on success, a non-zero bitmask naming the failed step, or -1 when
+ * the backend has no self-test (non-Apple builds).
+ *
+ * This is a debug hook, not part of the game path.  The iOS shell calls it at
+ * launch only when BOTW_SELFTEST=1, which is how CI executes the renderer
+ * instead of only compiling it. */
+int botw_core_selftest(void);
+
 #ifdef __cplusplus
 }
 #endif

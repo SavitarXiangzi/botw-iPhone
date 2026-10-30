@@ -229,7 +229,7 @@ guest 业务代码
    但 `nvngfx_shader_to_msl()` 没有翻译器（NVN 给的是 Maxwell SASS），
    所以管线建不出来，draw 停在一条 `noPipeline` 日志。
    **例外且刻意**：`nvngfx_metal_selftest()` 用内置 MSL 跑一条合成 draw，
-   由 `BotWTests` 在 CI 的 iOS 模拟器里执行并回读中心像素。它证明的是
+   由 CI 用 `simctl` 启动 App（`BOTW_SELFTEST=1`）执行并回读中心像素。它证明的是
    Metal 这半边，不是客体能跑。
 3. **纹理只是宿主分配的 `MTLTexture`**：描述来自 builder setter 的记录值
    （不猜字段偏移），但**不与 guest 内存 alias**，所以当渲染目标可用、
@@ -261,9 +261,14 @@ verify_ios: ok (metal bindings: 52/513)
 build_abi_test: all tests passed
 ```
 
-Mac 侧还有一条**真的执行**的测试：`xcodebuild test` 跑 `BotWTests`，在模拟器里
-走完 texture -> target -> clear -> pipeline -> draw -> 回读。它不替代真机，
-但比“编过了”强一档。
+Mac 侧还有一条**真的执行**的测试：CI 用 `simctl` 在 iOS 模拟器里安装并启动 App，
+`BOTW_SELFTEST=1` 让 App 在 `init()` 里跑完
+texture -> target -> clear -> pipeline -> draw -> 回读然后 `exit(rc)`。
+它不替代真机，但比“编过了”强一档。
+
+> 为什么不用 XCTest：本仓库先试过 unit-test bundle，`xcodebuild test` 在 runner 上
+> 只报 “Executed 0 tests” 然后 TEST FAILED，日志里没有任何原因（拿不到 admin 日志，
+> 注解里也只有 348 秒的等待）。`simctl` + 退出码是一条更短、能看见失败原因的路径。
 
 `syntax_check_metal.py` 用 `tests/stubs/` 里的最小 Metal/QuartzCore 桩头文件，
 让 clang 以 `-fsyntax-only -x objective-c++` 解析 `nvn_metal.mm`。它已经抓到过一个

@@ -102,3 +102,11 @@ extern "C" int botw_core_nvn_has(const botw_core* c, const char* name) {
     if (!c || !name) return 0;
     return nvngfx_is_implemented(name) ? 1 : 0;
 }
+
+extern "C" int botw_core_selftest(void) {
+#if defined(__APPLE__)
+    return nvngfx_metal_selftest();
+#else
+    return -1;
+#endif
+}

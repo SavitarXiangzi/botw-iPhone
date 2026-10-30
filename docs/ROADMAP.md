@@ -2145,8 +2145,12 @@ blit 到 shared buffer -> 检查中心像素 == (64,128,191,255)
 顶点用 `[[vertex_id]]` 生成全屏三角形，所以**不需要顶点缓冲**——这正是
 “先把管线跑通、顶点输入留到后面”的意思。
 
-`ios/BotWTests/MetalReplayTests.mm` 在 CI 的 iOS 模拟器里跑它，并连跑 3 次，
-用来抓全局侧表里的状态泄漏。
+CI 在 iOS 模拟器里用 `simctl` 安装并启动 App，`BOTW_SELFTEST=1` 让
+`BotWApp.init()` 跑完自检、打印 `BOTW_SELFTEST rc=0` 再 `exit(0)`。
+
+先试过 XCTest unit-test bundle：`xcodebuild test` 在该 runner 上只报
+“Executed 0 tests” 然后 TEST FAILED，日志里没有原因，注解里只有 348 秒等待。
+`simctl` + 退出码更短，也能看见失败原因，所以换成它。
 
 ### 证据
 

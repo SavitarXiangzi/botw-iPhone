@@ -32,7 +32,6 @@ ios/nvn/src/nvn_metal.mm      Metal 后端（52 个入口，含大量 TODO）
 ios/nvn/src/nvn_texture.c     157 项 NVNformat -> MTLPixelFormat 表（附 lossy 标记）
 ios/nvn/include/nvn_texture.h 纹理描述结构 + 表查询接口
 ios/nvn/src/nvn_shader.c      着色器翻译的唯一接口：现在只会说"没有翻译器"
-ios/BotWTests/                XCTest：在模拟器里跑一条真 draw 并回读像素
 ios/nvn/implemented_metal.txt 52 行，和 BIND(...) 列表由门禁强制相等
 ios/nvn/shaders/              空目录 + 路线说明（见该目录 README）
 docs/NVN_COVERAGE.md          生成的逐域覆盖表
@@ -253,7 +252,7 @@ iOS 是统一内存，guest 堆本来就是宿主可读的，所以
    `nvngfx_shader_to_msl()`；**它现在返回 NULL**（没有翻译器），所以
    `DrawArrays` 打一条 `noPipeline` 日志就返回。**客体的 draw 仍然是 0 条。**
    但这条链本身已经能跑：`nvngfx_metal_selftest()` 用内置 MSL 走完
-   program -> pipeline -> draw -> 回读，并由 CI 的 `BotWTests` 在模拟器里执行。
+   program -> pipeline -> draw -> 回读，并由 CI 用 `simctl` 在模拟器里执行 App 的自检钩子。
 4. 只挂 `colorAttachments[0]`：`numColor > 1` 的 MRT、以及 `setRenderTargets`
    的 texture view 参数都只记日志。`EndRecording` 直接 `[cb commit]`，
    `nvnQueueSubmitCommands` 还没实现，所以“提交”这件事目前不等队列。
@@ -320,8 +319,9 @@ NVN 窗口另建一个**没人能看见**的 `CAMetalLayer`——客体的帧全
 
 **已经能证明的部分**：`nvngfx_metal_selftest()` 用内置 MSL 走完
 texture -> render target -> clear -> program -> pipeline -> draw -> 回读，
-`BotWTests` 在 CI 的 iOS 模拟器里跑它并断言中心像素等于
-`(64,128,191,255)`。所以“Metal 这半边是通的”是可执行的结论，不是声称；
+CI 在 iOS 模拟器里用 `simctl` 启动 App，环境变量 `BOTW_SELFTEST=1` 让 App
+在 `init()` 里跑它、打印 `BOTW_SELFTEST rc=<n>` 并 `exit(rc)`；断言中心像素等于
+`(64,128,191,255)`（也就是 rc=0）。所以“Metal 这半边是通的”是可执行的结论，不是声称；
 “客体的 shader 能跑”仍然完全没验证。
 
 **阶段 C：纹理正确**
