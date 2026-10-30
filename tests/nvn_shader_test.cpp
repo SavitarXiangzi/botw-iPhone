@@ -108,6 +108,84 @@ int main() {
     CHECK(nvngfx_shader_set_blobs(cs, 1) == -1);
     CHECK(nvngfx_shader_set_blobs(nullptr, 1) == -1);
 
+    /* The argument layout sidecar.  A real fragment shader names 42 entries,
+     * so the interesting cases are a hole in the id range, a kind with no
+     * slot, and a table that has to be refused whole rather than half-used. */
+    {
+        static const nvngfx_shader_arg layout[] = {
+            {5, NVNGFX_ARG_UBO, 0},
+            {9, NVNGFX_ARG_TEXTURE, 0},
+            {12, NVNGFX_ARG_SAMPLER_OF_TEXTURE, 0},
+            {13, NVNGFX_ARG_UNSUPPORTED, -1},
+        };
+        static const nvngfx_shader_blob with_args[] = {
+            {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", layout, 4},
+        };
+        CHECK(nvngfx_shader_set_blobs(with_args, 1) == 0);
+        CHECK(nvngfx_shader_blob_count() == 1);
+
+        const nvngfx_shader_blob* b =
+            nvngfx_shader_lookup_blob("0011223344556677", NVNGFX_STAGE_FRAGMENT, &why);
+        CHECK(b == &with_args[0]);
+        CHECK(b != nullptr && b->num_args == 4);
+        CHECK(b != nullptr && b->args[2].kind == NVNGFX_ARG_SAMPLER_OF_TEXTURE);
+        CHECK(nvngfx_shader_lookup("0011223344556677", NVNGFX_STAGE_FRAGMENT, &why) ==
+              with_args[0].msl);
+
+        /* A blob's layout is copied verbatim, holes included. */
+        nvngfx_shader_arg copied[NVNGFX_MAX_ARGS] = {};
+        CHECK(nvngfx_shader_copy_args(b, copied, NVNGFX_MAX_ARGS) == 4);
+        CHECK(copied[0].id == 5 && copied[0].slot == 0);
+        CHECK(copied[1].id == 9 && copied[1].kind == NVNGFX_ARG_TEXTURE);
+        CHECK(copied[3].kind == NVNGFX_ARG_UNSUPPORTED && copied[3].slot == -1);
+        /* A destination that cannot hold the whole layout gets nothing. */
+        CHECK(nvngfx_shader_copy_args(b, copied, 3) == 0);
+        CHECK(nvngfx_shader_copy_args(nullptr, copied, NVNGFX_MAX_ARGS) == 0);
+
+        /* Every way a layout can be wrong; the installed table must survive. */
+        static const nvngfx_shader_arg descending[] = {
+            {9, NVNGFX_ARG_TEXTURE, 0},
+            {5, NVNGFX_ARG_UBO, 0},
+        };
+        static const nvngfx_shader_arg duplicate_id[] = {
+            {5, NVNGFX_ARG_UBO, 0},
+            {5, NVNGFX_ARG_TEXTURE, 0},
+        };
+        static const nvngfx_shader_arg texture_slot_too_high[] = {
+            {7, NVNGFX_ARG_TEXTURE, NVNGFX_MAX_TEXTURE_SLOTS},
+        };
+        static const nvngfx_shader_arg id_too_high[] = {
+            {NVNGFX_MAX_ARG_ID + 1, NVNGFX_ARG_UBO, 0},
+        };
+        static const nvngfx_shader_arg bad_kind[] = {
+            {1, 0, 0},
+        };
+        static const nvngfx_shader_arg unsupported_with_slot[] = {
+            {1, NVNGFX_ARG_UNSUPPORTED, 0},
+        };
+        static const nvngfx_shader_arg missing_slot[] = {
+            {1, NVNGFX_ARG_UBO, -1},
+        };
+        static const nvngfx_shader_arg too_many[NVNGFX_MAX_ARGS + 1] = {};
+        static const nvngfx_shader_blob bad[] = {
+            {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", descending, 2},
+            {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", duplicate_id, 2},
+            {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", texture_slot_too_high, 1},
+            {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", id_too_high, 1},
+            {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", bad_kind, 1},
+            {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", unsupported_with_slot, 1},
+            {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", missing_slot, 1},
+            {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", too_many,
+             NVNGFX_MAX_ARGS + 1},
+            {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", layout, 0},
+        };
+        for (std::size_t i = 0; i < sizeof bad / sizeof bad[0]; ++i)
+            CHECK(nvngfx_shader_set_blobs(&bad[i], 1) == -1);
+        CHECK(nvngfx_shader_blob_count() == 1);
+        CHECK(nvngfx_shader_set_blobs(nullptr, 0) == 0);
+        CHECK(nvngfx_shader_blob_count() == 0);
+    }
+
     nvngfx_shader_clear_blobs();
     CHECK(nvngfx_shader_blob_count() == 0);
 

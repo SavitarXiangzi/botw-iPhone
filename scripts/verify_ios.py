@@ -419,6 +419,25 @@ def check_shader_blobs() -> None:
         notes.append(f"{rel}: empty table (no title-derived MSL)")
 
 
+def check_gen_blobs() -> None:
+    """The offline generator must keep decoding spirv-cross argument layouts.
+
+    gen_blobs.py is the only place that maps [[id(k)]] to an NVN slot, and it
+    runs on a machine with the title, not here.  Its decoding test uses
+    hand-written MSL with the same resource names, so it can run everywhere.
+    """
+    tool = os.path.join(REPO, "scripts", "shader_chain", "test_gen_blobs.py")
+    if not os.path.exists(tool):
+        fail("missing scripts/shader_chain/test_gen_blobs.py")
+        return
+    r = subprocess.run([sys.executable, tool], capture_output=True, text=True)
+    if r.returncode != 0:
+        detail = (r.stdout + r.stderr).strip().splitlines()
+        fail("gen_blobs layout test failed: " + (detail[-1] if detail else "no output"))
+    else:
+        notes.append("gen_blobs.py: argument layout decoding ok")
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--release", action="store_true", help="apply release-only gates")
@@ -436,6 +455,7 @@ def main(argv: list[str] | None = None) -> int:
     check_doc_refs()
     check_leaks()
     check_shader_blobs()
+    check_gen_blobs()
 
     for n in notes:
         print("  . " + n)

@@ -148,6 +148,27 @@ static const char* const kFsTextureDirect =
     "}\n";
 
 
+/* The same textured draw, but the argument-buffer ids are 5 / 9 / 12 instead
+ * of 0 / 1 / 2.  The self-test uses this variant to prove that the fixed
+ * 8-byte table's stride and holes follow the shader's layout sidecar and not
+ * an assumed ordering. */
+static const char* const kFsTextureBlob =
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "\n"
+    "struct NvngfxVaryings { float4 position [[position]]; float2 uv; };\n"
+    "\n"
+    "struct spvDescriptorSetBuffer0 {\n"
+    "    constant float4* tint [[id(5)]];\n"
+    "    texture2d<float> tex [[id(9)]];\n"
+    "    sampler smp [[id(12)]];\n"
+    "};\n"
+    "\n"
+    "fragment float4 nvngfx_main_fs(NvngfxVaryings in [[stage_in]],\n"
+    "                               constant spvDescriptorSetBuffer0& s0 [[buffer(0)]]) {\n"
+    "    return s0.tex.sample(s0.smp, in.uv) * (*s0.tint);\n"
+    "}\n";
+
 /* ------------------------------------------------------------------------- *
  * Offline MSL blobs
  *
@@ -186,6 +207,45 @@ static int key_eq(const char* a, const char* b) {
     return 1;
 }
 
+/* A layout must be usable without a second validation pass in the backend:
+ * ascending unique ids, a kind whose slot fits the table it names, and -1 for
+ * everything unsupported.  A shader whose layout cannot be validated is
+ * rejected here rather than dropped later, so a bad generator shows up in
+ * nvngfx_shader_set_blobs' return value. */
+static int args_valid(const nvngfx_shader_blob* b) {
+    unsigned i;
+    if (b->num_args == 0) return b->args == NULL;
+    if (b->args == NULL || b->num_args > NVNGFX_MAX_ARGS) return 0;
+    for (i = 0; i < b->num_args; ++i) {
+        const nvngfx_shader_arg* a = &b->args[i];
+        if (a->id > NVNGFX_MAX_ARG_ID) return 0;
+        if (i > 0 && b->args[i - 1].id >= a->id) return 0;
+        if (a->kind < NVNGFX_ARG_UBO || a->kind > NVNGFX_ARG_UNSUPPORTED)
+            return 0;
+        if (a->kind == NVNGFX_ARG_UNSUPPORTED) {
+            if (a->slot != -1) return 0;
+            continue;
+        }
+        if (a->slot < 0) return 0;
+        switch (a->kind) {
+        case NVNGFX_ARG_UBO:
+            if (a->slot >= NVNGFX_MAX_UBO_SLOTS) return 0;
+            break;
+        case NVNGFX_ARG_TEXTURE:
+        case NVNGFX_ARG_SAMPLER_OF_TEXTURE:
+        case NVNGFX_ARG_SEPARATE_TEXTURE:
+            if (a->slot >= NVNGFX_MAX_TEXTURE_SLOTS) return 0;
+            break;
+        case NVNGFX_ARG_SEPARATE_SAMPLER:
+            if (a->slot >= NVNGFX_MAX_SAMPLER_SLOTS) return 0;
+            break;
+        default:
+            return 0;
+        }
+    }
+    return 1;
+}
+
 int nvngfx_shader_set_blobs(const nvngfx_shader_blob* blobs, size_t count) {
     size_t i, j;
     if (count != 0 && blobs == NULL) return -1;
@@ -195,6 +255,7 @@ int nvngfx_shader_set_blobs(const nvngfx_shader_blob* blobs, size_t count) {
         if (b->stage != NVNGFX_STAGE_VERTEX && b->stage != NVNGFX_STAGE_FRAGMENT)
             return -(int)(i + 1);
         if (b->msl == NULL || b->msl[0] == '\0') return -(int)(i + 1);
+        if (!args_valid(b)) return -(int)(i + 1);
         for (j = 0; j < i; ++j)
             if (blobs[j].stage == b->stage && key_eq(blobs[j].key, b->key))
                 return -(int)(i + 1);
@@ -213,8 +274,9 @@ void nvngfx_shader_clear_blobs(void) {
 
 size_t nvngfx_shader_blob_count(void) { return g_blob_count; }
 
-const char* nvngfx_shader_lookup(const char* key, nvngfx_stage stage,
-                                 const char** why) {
+const nvngfx_shader_blob* nvngfx_shader_lookup_blob(const char* key,
+                                                    nvngfx_stage stage,
+                                                    const char** why) {
     size_t i;
     if (!key_valid(key)) {
         if (why) *why = "shader key is not 16 hex digits";
@@ -228,10 +290,30 @@ const char* nvngfx_shader_lookup(const char* key, nvngfx_stage stage,
         if (g_blobs[i].stage != (int)stage) continue;
         if (!key_eq(g_blobs[i].key, key)) continue;
         if (why) *why = "offline MSL blob";
-        return g_blobs[i].msl;
+        return &g_blobs[i];
     }
     if (why) *why = "no offline MSL blob for this key";
     return NULL;
+}
+
+const char* nvngfx_shader_lookup(const char* key, nvngfx_stage stage,
+                                 const char** why) {
+    const nvngfx_shader_blob* b = nvngfx_shader_lookup_blob(key, stage, why);
+    return b ? b->msl : NULL;
+}
+
+const nvngfx_shader_blob* nvngfx_shader_blob_table(size_t* count) {
+    if (count) *count = g_blob_count;
+    return g_blobs;
+}
+
+unsigned nvngfx_shader_copy_args(const nvngfx_shader_blob* blob,
+                                 nvngfx_shader_arg* out, unsigned cap) {
+    unsigned i;
+    if (!blob || !blob->args || blob->num_args == 0 || !out) return 0;
+    if (cap < blob->num_args) return 0;
+    for (i = 0; i < blob->num_args; ++i) out[i] = blob->args[i];
+    return blob->num_args;
 }
 
 void nvngfx_shader_set_msl_passthrough(int on) { g_passthrough = on ? 1 : 0; }
@@ -257,6 +339,11 @@ const char* nvngfx_shader_selftest_msl_variant(nvngfx_stage stage, int variant) 
     if (variant == 4) {
         if (stage == NVNGFX_STAGE_VERTEX) return kVsUv;
         if (stage == NVNGFX_STAGE_FRAGMENT) return kFsTextureDirect;
+        return NULL;
+    }
+    if (variant == 5) {
+        if (stage == NVNGFX_STAGE_VERTEX) return kVsUv;
+        if (stage == NVNGFX_STAGE_FRAGMENT) return kFsTextureBlob;
         return NULL;
     }
     if (stage == NVNGFX_STAGE_VERTEX) return kVs;
