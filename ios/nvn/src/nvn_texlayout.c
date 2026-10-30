@@ -541,6 +541,7 @@ int nvngfx_tex_write_region(const nvngfx_texdesc* d, unsigned level,
     if (nvngfx_tex_level_geometry(d, level, layer, &row_bytes, &rows, &slices,
                                   NULL, NULL, NULL) != 0)
         return -1;
+    if (!row_bytes || !rows || !slices) return -1;
     if ((unsigned)z >= slices) return -1;
     if ((unsigned)x % t.bw || (unsigned)y % t.bh ||
         (unsigned)width % t.bw || (unsigned)height % t.bh)
