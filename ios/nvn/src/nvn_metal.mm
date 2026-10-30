@@ -1478,12 +1478,11 @@ struct Program {
     };
     ArgEntry args[8];
     unsigned numArgs = 0;
-    /* Kept so the argument encoder can be made lazily, only when this
-     * program is actually asked to bind resources.  Asking Metal for an
-     * encoder on a function that has no [[buffer(0)]] argument buffer can
-     * terminate the process; constant-colour self-test programs do exactly
-     * that on their first draw. */
-    id<MTLFunction> fsFn = nil;
+    /* Whether the fragment function declares an argument buffer at
+     * buffer(0).  Constant-colour programs do not, and asking Metal for an
+     * encoder on those can terminate the process.  The encoder itself is
+     * built while the function is in hand, before the pipeline state, which
+     * is also the order the working d2r-mobile backend uses. */
     bool hasArgBuffer = false;
     id<MTLArgumentEncoder> argEnc = nil;
     NSUInteger argLen = 0;
@@ -1700,13 +1699,15 @@ id<MTLRenderPipelineState> program_pipeline(Ctx* c, Program* p, MTLPixelFormat f
             return nil;
         }
 
-        /* Remember the function, but do not ask Metal for an argument
-         * encoder yet.  Not every fragment function declares one: the
-         * constant-colour programs take no arguments at all, and calling
-         * newArgumentEncoderWithBufferIndex: on those is not a harmless
-         * nil return on every simulator runtime. */
-        p->fsFn = ffn;
+        /* The fragment function knows where each [[id(k)]] sits in the
+         * argument buffer.  Only create an encoder for a function that
+         * actually declares buffer(0): the constant-colour self-test
+         * programs have no argument buffer and must skip this call. */
         p->hasArgBuffer = std::strstr(fs, "[[buffer(0)]]") != nullptr;
+        if (p->hasArgBuffer && !p->argEnc) {
+            p->argEnc = [ffn newArgumentEncoderWithBufferIndex:0];
+            p->argLen = p->argEnc ? [p->argEnc encodedLength] : 0;
+        }
 
         MTLRenderPipelineDescriptor* pd = [[MTLRenderPipelineDescriptor alloc] init];
         pd.vertexFunction = vfn;
@@ -2263,10 +2264,6 @@ id<MTLBuffer> argument_buffer(Ctx* c, CmdBuf* b) {
     if (b->argbuf) return b->argbuf;
     Program* p = find<Program>(b->program);
     if (!has_arguments(b)) return nil;
-    if (p && !p->argEnc && p->hasArgBuffer && p->fsFn) {
-        p->argEnc = [p->fsFn newArgumentEncoderWithBufferIndex:0];
-        p->argLen = p->argEnc ? [p->argEnc encodedLength] : 0;
-    }
     if (!p || !p->argEnc || p->argLen == 0) {
         log_once("nvnCommandBufferDraw.argumentLayout", p ? 1u : 0u);
         return nil;
