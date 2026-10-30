@@ -7,8 +7,8 @@
 `nvn*` 字符串（运行时按名解析，所以名字本身就暴露了完整接口面）。
 
 - 接口总数：**513**
-- Metal 后端已实现：**52**（10.1%）
-- 仍未实现：**461**
+- Metal 后端已实现：**64**（12.5%）
+- 仍未实现：**449**
 
 > 只有出现在 `ios/nvn/implemented_metal.txt` 里、且确实在
 > `ios/nvn/src/nvn_metal.mm` 中定义过的名字才算“已实现”。
@@ -18,7 +18,7 @@
 
 | 域 | 已实现 | 总数 | 进度 |
 |---|---:|---:|---|
-| CommandBuffer | 11 | 144 | `#         ` |
+| CommandBuffer | 13 | 144 | `#         ` |
 | Texture | 1 | 45 | `          ` |
 | TextureBuilder | 14 | 43 | `###       ` |
 | Device | 2 | 27 | `#         ` |
@@ -42,8 +42,8 @@
 | Event | 0 | 7 | `          ` |
 | Program | 3 | 7 | `####      ` |
 | Sync | 0 | 6 | `          ` |
-| VertexAttribState | 0 | 5 | `          ` |
-| VertexStreamState | 0 | 5 | `          ` |
+| VertexAttribState | 5 | 5 | `##########` |
+| VertexStreamState | 5 | 5 | `##########` |
 | ChannelMaskState | 0 | 3 | `          ` |
 | DeviceBuilder | 3 | 3 | `##########` |
 | Bootstrap | 0 | 1 | `          ` |
@@ -112,7 +112,7 @@
 - [ ] `nvnColorStateSetDefaults`
 - [ ] `nvnColorStateSetLogicOp`
 
-### CommandBuffer (11/144)
+### CommandBuffer (13/144)
 
 - [ ] `nvnCommandBufferAddCommandMemory`
 - [ ] `nvnCommandBufferAddControlMemory`
@@ -141,10 +141,10 @@
 - [ ] `nvnCommandBufferBindTransformFeedbackBuffers`
 - [ ] `nvnCommandBufferBindUniformBuffer`
 - [ ] `nvnCommandBufferBindUniformBuffers`
-- [ ] `nvnCommandBufferBindVertexAttribState`
+- [x] `nvnCommandBufferBindVertexAttribState`
 - [x] `nvnCommandBufferBindVertexBuffer`
 - [x] `nvnCommandBufferBindVertexBuffers`
-- [ ] `nvnCommandBufferBindVertexStreamState`
+- [x] `nvnCommandBufferBindVertexStreamState`
 - [ ] `nvnCommandBufferCallCommands`
 - [ ] `nvnCommandBufferClearBuffer`
 - [x] `nvnCommandBufferClearColor`
@@ -604,21 +604,21 @@
 - [ ] `nvnTexturePoolRegisterTexture`
 - [ ] `nvnTexturePoolSetDebugLabel`
 
-### VertexAttribState (0/5)
+### VertexAttribState (5/5)
 
-- [ ] `nvnVertexAttribStateGetFormat`
-- [ ] `nvnVertexAttribStateGetStreamIndex`
-- [ ] `nvnVertexAttribStateSetDefaults`
-- [ ] `nvnVertexAttribStateSetFormat`
-- [ ] `nvnVertexAttribStateSetStreamIndex`
+- [x] `nvnVertexAttribStateGetFormat`
+- [x] `nvnVertexAttribStateGetStreamIndex`
+- [x] `nvnVertexAttribStateSetDefaults`
+- [x] `nvnVertexAttribStateSetFormat`
+- [x] `nvnVertexAttribStateSetStreamIndex`
 
-### VertexStreamState (0/5)
+### VertexStreamState (5/5)
 
-- [ ] `nvnVertexStreamStateGetDivisor`
-- [ ] `nvnVertexStreamStateGetStride`
-- [ ] `nvnVertexStreamStateSetDefaults`
-- [ ] `nvnVertexStreamStateSetDivisor`
-- [ ] `nvnVertexStreamStateSetStride`
+- [x] `nvnVertexStreamStateGetDivisor`
+- [x] `nvnVertexStreamStateGetStride`
+- [x] `nvnVertexStreamStateSetDefaults`
+- [x] `nvnVertexStreamStateSetDivisor`
+- [x] `nvnVertexStreamStateSetStride`
 
 ### Window (6/12)
 

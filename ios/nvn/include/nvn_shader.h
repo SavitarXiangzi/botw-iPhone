@@ -115,6 +115,14 @@ int nvngfx_shader_msl_passthrough(void);
  * not derived from, and does not contain, any title data. */
 const char* nvngfx_shader_selftest_msl(nvngfx_stage stage);
 
+/* Same, with a variant selector:
+ *   0  the full-screen triangle built from [[vertex_id]] (no vertex buffer)
+ *   1  the same triangle with positions from [[attribute(0)]] (float2) and a
+ *      green fragment output -- this one needs a vertex descriptor, a stream
+ *      stride and a vertex buffer, so the self-test can prove those work and
+ *      the readback says which program drew. */
+const char* nvngfx_shader_selftest_msl_variant(nvngfx_stage stage, int variant);
+
 #ifdef __cplusplus
 }
 #endif

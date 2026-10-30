@@ -44,6 +44,29 @@ static const char* const kFs =
     "    return float4(0.25, 0.5, 0.75, 1.0);\n"
     "}\n";
 
+/* Variant 1: the positions come from [[attribute(0)]] instead of
+ * [[vertex_id]].  The fragment colour differs from variant 0, so a readback
+ * shows which program drew the pixel. */
+static const char* const kVsAttr =
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "\n"
+    "struct NvngfxVaryings { float4 position [[position]]; };\n"
+    "\n"
+    "vertex NvngfxVaryings nvngfx_main_vs(float2 p [[attribute(0)]]) {\n"
+    "    NvngfxVaryings v;\n"
+    "    v.position = float4(p, 0.0, 1.0);\n"
+    "    return v;\n"
+    "}\n";
+
+static const char* const kFsGreen =
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "\n"
+    "fragment float4 nvngfx_main_fs() {\n"
+    "    return float4(0.0, 1.0, 0.0, 1.0);\n"
+    "}\n";
+
 
 /* ------------------------------------------------------------------------- *
  * Offline MSL blobs
@@ -135,10 +158,19 @@ void nvngfx_shader_set_msl_passthrough(int on) { g_passthrough = on ? 1 : 0; }
 
 int nvngfx_shader_msl_passthrough(void) { return g_passthrough; }
 
-const char* nvngfx_shader_selftest_msl(nvngfx_stage stage) {
+const char* nvngfx_shader_selftest_msl_variant(nvngfx_stage stage, int variant) {
+    if (variant == 1) {
+        if (stage == NVNGFX_STAGE_VERTEX) return kVsAttr;
+        if (stage == NVNGFX_STAGE_FRAGMENT) return kFsGreen;
+        return NULL;
+    }
     if (stage == NVNGFX_STAGE_VERTEX) return kVs;
     if (stage == NVNGFX_STAGE_FRAGMENT) return kFs;
     return NULL;
+}
+
+const char* nvngfx_shader_selftest_msl(nvngfx_stage stage) {
+    return nvngfx_shader_selftest_msl_variant(stage, 0);
 }
 
 const char* nvngfx_shader_to_msl(const void* code, unsigned long long size,

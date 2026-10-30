@@ -86,6 +86,10 @@ enum {
 @protocol MTLRenderPipelineState
 @end
 
+/* Declared after the pipeline descriptor below; forward-declared here so the
+ * property can name it. */
+@class MTLVertexDescriptor;
+
 @interface MTLRenderPipelineColorAttachmentDescriptor : NSObject
 @property MTLPixelFormat pixelFormat;
 @end
@@ -98,6 +102,65 @@ enum {
 @property (retain) id<MTLFunction> vertexFunction;
 @property (retain) id<MTLFunction> fragmentFunction;
 @property (readonly) MTLRenderPipelineColorAttachmentDescriptorArray* colorAttachments;
+@property (retain) MTLVertexDescriptor* vertexDescriptor;
+@end
+
+/* MTLVertexFormat: every name nvn_metal.mm can select.  The real SDK's
+ * numeric values are not needed to type-check, and inventing them here would
+ * be worse than useless -- the .mm only ever names them. */
+typedef enum MTLVertexFormat : NSUInteger {
+    MTLVertexFormatInvalid = 0,
+    MTLVertexFormatUChar, MTLVertexFormatUChar2, MTLVertexFormatUChar3, MTLVertexFormatUChar4,
+    MTLVertexFormatChar, MTLVertexFormatChar2, MTLVertexFormatChar3, MTLVertexFormatChar4,
+    MTLVertexFormatUCharNormalized, MTLVertexFormatUChar2Normalized,
+    MTLVertexFormatUChar3Normalized, MTLVertexFormatUChar4Normalized,
+    MTLVertexFormatCharNormalized, MTLVertexFormatChar2Normalized,
+    MTLVertexFormatChar3Normalized, MTLVertexFormatChar4Normalized,
+    MTLVertexFormatUShort, MTLVertexFormatUShort2, MTLVertexFormatUShort3, MTLVertexFormatUShort4,
+    MTLVertexFormatShort, MTLVertexFormatShort2, MTLVertexFormatShort3, MTLVertexFormatShort4,
+    MTLVertexFormatUShortNormalized, MTLVertexFormatUShort2Normalized,
+    MTLVertexFormatUShort3Normalized, MTLVertexFormatUShort4Normalized,
+    MTLVertexFormatShortNormalized, MTLVertexFormatShort2Normalized,
+    MTLVertexFormatShort3Normalized, MTLVertexFormatShort4Normalized,
+    MTLVertexFormatHalf, MTLVertexFormatHalf2, MTLVertexFormatHalf3, MTLVertexFormatHalf4,
+    MTLVertexFormatFloat, MTLVertexFormatFloat2, MTLVertexFormatFloat3, MTLVertexFormatFloat4,
+    MTLVertexFormatInt, MTLVertexFormatInt2, MTLVertexFormatInt3, MTLVertexFormatInt4,
+    MTLVertexFormatUInt, MTLVertexFormatUInt2, MTLVertexFormatUInt3, MTLVertexFormatUInt4,
+    MTLVertexFormatInt1010102Normalized, MTLVertexFormatUInt1010102Normalized,
+    MTLVertexFormatUChar4Normalized_BGRA,
+    MTLVertexFormatFloatRG11B10, MTLVertexFormatFloatRGB9E5,
+} MTLVertexFormat;
+
+typedef enum MTLVertexStepFunction : NSUInteger {
+    MTLVertexStepFunctionConstant = 0,
+    MTLVertexStepFunctionPerVertex = 1,
+    MTLVertexStepFunctionPerInstance = 2,
+} MTLVertexStepFunction;
+
+@interface MTLVertexAttributeDescriptor : NSObject
+@property MTLVertexFormat format;
+@property NSUInteger offset;
+@property NSUInteger bufferIndex;
+@end
+
+@interface MTLVertexAttributeDescriptorArray : NSObject
+- (MTLVertexAttributeDescriptor*)objectAtIndexedSubscript:(NSUInteger)index;
+@end
+
+@interface MTLVertexBufferLayoutDescriptor : NSObject
+@property NSUInteger stride;
+@property MTLVertexStepFunction stepFunction;
+@property NSUInteger stepRate;
+@end
+
+@interface MTLVertexBufferLayoutDescriptorArray : NSObject
+- (MTLVertexBufferLayoutDescriptor*)objectAtIndexedSubscript:(NSUInteger)index;
+@end
+
+@interface MTLVertexDescriptor : NSObject
++ (MTLVertexDescriptor*)vertexDescriptor;
+@property (readonly) MTLVertexAttributeDescriptorArray* attributes;
+@property (readonly) MTLVertexBufferLayoutDescriptorArray* layouts;
 @end
 
 typedef enum MTLPrimitiveType : NSUInteger {
@@ -169,6 +232,9 @@ destinationBytesPerImage:(NSUInteger)bpi;
 - (void)setViewport:(MTLViewport)viewport;
 - (void)setScissorRect:(MTLScissorRect)rect;
 - (void)setRenderPipelineState:(id<MTLRenderPipelineState>)state;
+- (void)setVertexBuffer:(id<MTLBuffer>)buffer
+                 offset:(NSUInteger)offset
+                atIndex:(NSUInteger)index;
 @end
 
 @class MTLRenderPassDescriptor;

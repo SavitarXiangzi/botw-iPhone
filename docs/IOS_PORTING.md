@@ -422,7 +422,8 @@ constexpr int kEnumsVerified = 0;
 |---|---|---|
 | P0 | ~~`nvnCommandBufferSetRenderTargets`~~ | ✅ 本轮已实现；只剩 MRT / 深度 / view |
 | P0 | ~~`nvnCommandBufferBindProgram` / `nvnProgramInitialize`~~ | ✅ 本轮已实现（管线建到 `nvngfx_shader_to_msl` 为止） |
-| P0 | `nvnCommandBufferBindVertexAttribState` | 唯一还开着的 P0；布局未验证 |
+| P0 | ~~`nvnCommandBufferBindVertexAttribState`~~ | ✅ 本轮已实现（含 `nvnVertexAttribState*` / `nvnVertexStreamState*` 与 `BindVertexStreamState`） |
+| P0 | 真实 shader 的第一次 draw | 锚点已通；现在缺的是 argument buffer（UBO / 纹理） |
 | P1 | `nvnTextureBuilder*` 剩余 29 个 | 已做 14 个；剩余主要是 getter 与 pool/offset 细节 |
 | P1 | `nvnSamplerBuilder*`（25）+ `nvnSamplerInitialize` | 采样状态 |
 | P1 | `nvnCommandBufferDrawElements` 的真实 index type | 现在只计数 |
@@ -445,7 +446,7 @@ constexpr int kEnumsVerified = 0;
 | 着色器翻译 | 只留了接口，没有实现 | 客体的 draw 全部停在 `noPipeline` |
 | 纹理创建 | 建 host `MTLTexture`，不与 guest alias | 当目标可用；采样 guest 像素仍全黑 |
 | draw 执行 | 有 pipeline 就真的编码 draw；没有就丢弃 | 客体仍是 0 条；自检的 1 条在 CI 上被执行并回读 |
-| 顶点输入 | 只记录地址，没读 `NVNbufferRange` | 任何依赖顶点缓冲的 draw 都还画不出来 |
+| 顶点输入 | attrib/stream 已接，缓冲从 pool 零拷贝绑到 `MTLBuffer` | 自检的第二条 draw 就是这条路；客体尚未跑到 |
 | 浮点参数 | 不在 `x[8]` 里 | 少数入口需要单独签名 |
 | 同步/fence | 未实现 | 长时间跑可能撕裂 |
 | compute | 未实现 | 后处理不可用 |
@@ -472,7 +473,9 @@ Swift 侧同理：`Renderer.swift` / `GameView.swift` 只做了括号与结构�
 | `verify_ios` 说 generated artifacts are stale | 跑了 `gen_nvn.py --repo .` 但没提交生成物 |
 | `verify_ios` 说 bound but not declared implemented | 加了 `BIND(...)` 但没加进 `implemented_metal.txt` |
 | `pool wrap failed` | guest 存储没按 4 KiB 对齐，或长度不是页整数倍 |
-| 屏幕全黑但 `frame` 在涨 | 正常：没有翻译器就没有 pipeline，draw 被丢掉（第 6 节第 3 条） |
+| 屏幕全黑但 `frame` 在涨 | 正常：没有离线 MSL（表为空）就没有 pipeline，draw 被丢掉 |
+| `[nvn] nvnCommandBufferDraw.vertexBuffer: N` | 该 stream 的 guest 地址不在任何 pool 里，`pool_span` 拒绝绑定 |
+| `[nvn] nvnPipeline.vertexFormat: 0x..` | 该 NVNformat 没有 Metal 顶点格式（如 RGB8 / RGB16 / `_UI2F`） |
 | `[nvn] nvnCommandBufferDraw.pipeline: no translator...` | 正常，这条就是当前的墙；自检不经过它 |
 | 屏幕全黑且 `frame` 不动 | `MTKView.delegate` 是 weak，Pump 必须被 Coordinator 强引用（已在 `GameView.swift` 修过一次） |
 | `[nvn] UNVERIFIED xxx = 0x...` | 正常，那是诚实闸门在报未验证的枚举 |

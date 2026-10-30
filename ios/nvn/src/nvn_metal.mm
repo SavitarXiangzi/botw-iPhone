@@ -10,14 +10,22 @@
  *           action, opened lazily by the first draw
  *         texture objects, built from the values nvnTextureBuilderSet* was
  *           given (no guest struct offsets are read)
- *         program objects and the pipeline cache fed by nvngfx_shader_to_msl()
+ *         program objects; the pipeline cache is keyed by colour format and
+ *           vertex layout and fed by the shader key -> offline MSL blob
+ *           (docs/SHADER_CHAIN.md), with nvngfx_shader_to_msl() as the
+ *           fallback for a host that supplies MSL directly
+ *         vertex input: NVNvertexAttribState / NVNvertexStreamState decoded
+ *           from the guest's own bytes -> MTLVertexDescriptor, and the
+ *           stream's guest address -> the MTLBuffer of the pool that holds it
  *         present (blit fast path, cleared-drawable fallback)
  *
- *   TODO  shader translation: the guest hands NVN Maxwell SASS and
- *         nvngfx_shader_to_msl() has no translator, so no pipeline is ever
- *         built and a guest draw stops at "noPipeline".  Everything else on
- *         that path -- pipeline creation, draw encoding, readback -- is
- *         executed by nvngfx_metal_selftest() in CI's iOS Simulator.
+ *   TODO  a guest draw still stops at "noPipeline" whenever the offline blob
+ *         table is empty (the committed one is): it is filled from the game
+ *         on a computer, never in the repository.  Everything else on that
+ *         path -- pipeline creation with a real vertex descriptor, buffer
+ *         binding, draw encoding, pixel readback -- is executed by
+ *         nvngfx_metal_selftest() in CI's iOS Simulator (two draws: one from
+ *         [[vertex_id]], one from [[attribute(0)]] out of a memory pool).
  *         MRT / depth attachment / texture views
  *         guest-pixel upload (textures are host-owned, not aliased)
  *         texture tiling, BCn -> ASTC/ETC2 transcode, compute, sync/fence
@@ -63,6 +71,7 @@
 #include "nvn_metal.h"
 #include "nvn_shader.h"
 #include "nvn_texture.h"
+#include "nvn_vertex.h"
 
 #include <cmath>
 #include <cstdio>
@@ -178,6 +187,12 @@ struct CmdBuf {
     unsigned numVb = 0;
     uint64_t vb[16] = {0};
     uint64_t vbSize[16] = {0};
+    /* Vertex input: the attributes and streams the guest bound, decoded out
+     * of its own 4- and 8-byte records (nvn_vertex.h).  A vertex descriptor
+     * is baked into the Metal pipeline, so changing either invalidates it. */
+    nvngfx_vattr attrib[NVNGFX_MAX_VERTEX_ATTRIBS] = {};
+    unsigned numAttrib = 0;
+    nvngfx_vstream stream[NVNGFX_MAX_VERTEX_STREAMS] = {};
     /* The last committed buffer.  nvnQueueSubmitCommands is not implemented,
      * so a frame is committed at EndRecording; keeping the handle lets a
      * caller (the self-test) wait for it and keeps the door open for real
@@ -697,20 +712,168 @@ struct Program {
      * section did not describe a code area.  Computed at SetShaders, before
      * the guest is allowed to free the control section (Unity does). */
     char key[3][17] = {};
-    /* Metal bakes the colour format into a render pipeline, so the cache is
-     * keyed by it as well as by the program address (the table key). */
-    id<MTLRenderPipelineState> pso = nil;
-    MTLPixelFormat psoFormat = static_cast<MTLPixelFormat>(0);
+    /* Metal bakes the colour format *and* the vertex descriptor into a render
+     * pipeline.  A handful of slots is enough here: a title alternates between
+     * a few layouts, and a single slot would recompile on every switch (which
+     * on a device costs milliseconds).  slots[0] is the most recent. */
+    struct PsoSlot {
+        id<MTLRenderPipelineState> pso = nil;
+        MTLPixelFormat format = static_cast<MTLPixelFormat>(0);
+        unsigned long long layout = 0;   /* nvngfx_vertex_layout_id() */
+        bool hasLayout = false;          /* false: no vertex descriptor */
+    };
+    PsoSlot slots[4];
 };
+
+/* The cached pipeline for (format, layout), or nil.  Also records the hit in
+ * slot 0 so the next draw with the same key finds it first. */
+id<MTLRenderPipelineState> pso_lookup(Program* p, MTLPixelFormat fmt,
+                                     unsigned long long layout, bool hasLayout) {
+    for (unsigned i = 0; i < 4; ++i) {
+        Program::PsoSlot& s = p->slots[i];
+        if (s.pso && s.format == fmt && s.layout == layout && s.hasLayout == hasLayout) {
+            if (i != 0) {
+                const Program::PsoSlot keep = s;
+                s = p->slots[0];
+                p->slots[0] = keep;
+            }
+            return s.pso;
+        }
+    }
+    return nil;
+}
+
+void pso_store(Program* p, id<MTLRenderPipelineState> pso, MTLPixelFormat fmt,
+               unsigned long long layout, bool hasLayout) {
+    /* Shift down; slot 3 falls out.  Releasing the object it held is fine:
+     * the command buffers that used it keep their own reference. */
+    for (unsigned i = 3; i > 0; --i) p->slots[i] = p->slots[i - 1];
+    p->slots[0].pso = pso;
+    p->slots[0].format = fmt;
+    p->slots[0].layout = layout;
+    p->slots[0].hasLayout = hasLayout;
+}
+
+void pso_drop(Program* p) {
+    for (unsigned i = 0; i < 4; ++i) {
+        p->slots[i].pso = nil;
+        p->slots[i].format = static_cast<MTLPixelFormat>(0);
+        p->slots[i].layout = 0;
+        p->slots[i].hasLayout = false;
+    }
+}
 
 /* Compiles the program's MSL into a render pipeline for `fmt`.
  *
  * This is the function a translator plugs into: it only knows
  * nvngfx_shader_to_msl().  Today that returns NULL, so the reason is reported
  * once and every draw afterwards stops at "noPipeline". */
+/* nvngfx_vfmt + component count -> MTLVertexFormat.  Symbolic names on
+ * purpose: the numeric values of MTLVertexFormat are Apple's business, and a
+ * wrong integer here would be a silent vertex misread.  Rows follow the order
+ * of nvngfx_vfmt's scalar kinds: u8, u8n, i8, i8n, u16, u16n, i16, i16n,
+ * f16, u32, i32, f32. */
+static MTLVertexFormat mtl_vertex_format(nvngfx_vfmt kind, int comps) {
+    static const MTLVertexFormat kTable[12][4] = {
+        {MTLVertexFormatUChar, MTLVertexFormatUChar2, MTLVertexFormatUChar3, MTLVertexFormatUChar4},
+        {MTLVertexFormatUCharNormalized, MTLVertexFormatUChar2Normalized,
+         MTLVertexFormatUChar3Normalized, MTLVertexFormatUChar4Normalized},
+        {MTLVertexFormatChar, MTLVertexFormatChar2, MTLVertexFormatChar3, MTLVertexFormatChar4},
+        {MTLVertexFormatCharNormalized, MTLVertexFormatChar2Normalized,
+         MTLVertexFormatChar3Normalized, MTLVertexFormatChar4Normalized},
+        {MTLVertexFormatUShort, MTLVertexFormatUShort2, MTLVertexFormatUShort3, MTLVertexFormatUShort4},
+        {MTLVertexFormatUShortNormalized, MTLVertexFormatUShort2Normalized,
+         MTLVertexFormatUShort3Normalized, MTLVertexFormatUShort4Normalized},
+        {MTLVertexFormatShort, MTLVertexFormatShort2, MTLVertexFormatShort3, MTLVertexFormatShort4},
+        {MTLVertexFormatShortNormalized, MTLVertexFormatShort2Normalized,
+         MTLVertexFormatShort3Normalized, MTLVertexFormatShort4Normalized},
+        {MTLVertexFormatHalf, MTLVertexFormatHalf2, MTLVertexFormatHalf3, MTLVertexFormatHalf4},
+        {MTLVertexFormatUInt, MTLVertexFormatUInt2, MTLVertexFormatUInt3, MTLVertexFormatUInt4},
+        {MTLVertexFormatInt, MTLVertexFormatInt2, MTLVertexFormatInt3, MTLVertexFormatInt4},
+        {MTLVertexFormatFloat, MTLVertexFormatFloat2, MTLVertexFormatFloat3, MTLVertexFormatFloat4},
+    };
+    if (comps < 1 || comps > 4) return MTLVertexFormatInvalid;
+    switch (kind) {
+    case NVNGFX_VF_BGRA8N: return MTLVertexFormatUChar4Normalized_BGRA;
+    case NVNGFX_VF_F11_11_10: return MTLVertexFormatFloatRG11B10;
+    case NVNGFX_VF_F9E5: return MTLVertexFormatFloatRGB9E5;
+    case NVNGFX_VF_U10_10_10_2N: return MTLVertexFormatUInt1010102Normalized;
+    case NVNGFX_VF_I10_10_10_2N: return MTLVertexFormatInt1010102Normalized;
+    default: break;
+    }
+    const int row = static_cast<int>(kind) - static_cast<int>(NVNGFX_VF_U8);
+    if (row < 0 || row > 11) return MTLVertexFormatInvalid;
+    return kTable[row][comps - 1];
+}
+
+/* Builds the MTLVertexDescriptor for the vertex state bound on `b`.
+ *
+ * The attribute index is the shader's own: nvnCommandBufferBindVertexAttribState
+ * binds an array whose element i is attribute i, and spirv-cross emits
+ * [[attribute(i)]] in the same order, so no remapping is needed.  Each
+ * attribute names the stream that feeds it; the stream's stride and divisor
+ * come from nvnCommandBufferBindVertexStreamState.
+ *
+ * Returns nil and a reason when a bound attribute has no Metal counterpart or
+ * a used stream has no stride -- both are cases where drawing anyway would
+ * fetch garbage. */
+MTLVertexDescriptor* vertex_descriptor(const CmdBuf* b, unsigned long long* layout,
+                                      const char** why) {
+    *layout = nvngfx_vertex_layout_id(b->attrib, b->numAttrib, b->stream,
+                                     NVNGFX_MAX_VERTEX_STREAMS);
+    MTLVertexDescriptor* vd = [MTLVertexDescriptor vertexDescriptor];
+    bool used[NVNGFX_MAX_VERTEX_STREAMS] = {};
+    for (unsigned i = 0; i < b->numAttrib && i < NVNGFX_MAX_VERTEX_ATTRIBS; ++i) {
+        const nvngfx_vattr& a = b->attrib[i];
+        const nvngfx_vfmt kind = nvngfx_vertex_type(a.format);
+        if (kind == NVNGFX_VF_NONE) continue;
+        const int comps = nvngfx_vertex_components(a.format);
+        if (kind == NVNGFX_VF_UNSUPPORTED || comps < 1 ||
+            a.stream >= NVNGFX_MAX_VERTEX_STREAMS) {
+            log_once("nvnPipeline.vertexFormat", a.format);
+            if (why) *why = "vertex attribute format has no Metal counterpart";
+            return nil;
+        }
+        const MTLVertexFormat f = mtl_vertex_format(kind, comps);
+        if (f == MTLVertexFormatInvalid) {
+            log_once("nvnPipeline.vertexFormatRow", a.format);
+            if (why) *why = "vertex attribute format has no Metal vertex format";
+            return nil;
+        }
+        vd.attributes[i].format = f;
+        vd.attributes[i].offset = a.offset;
+        vd.attributes[i].bufferIndex = a.stream;
+        used[a.stream] = true;
+    }
+    for (unsigned st = 0; st < NVNGFX_MAX_VERTEX_STREAMS; ++st) {
+        if (!used[st]) continue;
+        if (b->stream[st].stride == 0) {
+            log_once("nvnPipeline.vertexStride", st);
+            if (why) *why = "vertex stream stride is zero";
+            return nil;
+        }
+        vd.layouts[st].stride = b->stream[st].stride;
+        if (b->stream[st].divisor) {
+            vd.layouts[st].stepFunction = MTLVertexStepFunctionPerInstance;
+            vd.layouts[st].stepRate = b->stream[st].divisor;
+        } else {
+            vd.layouts[st].stepFunction = MTLVertexStepFunctionPerVertex;
+            vd.layouts[st].stepRate = 1;
+        }
+    }
+    return vd;
+}
+
 id<MTLRenderPipelineState> program_pipeline(Ctx* c, Program* p, MTLPixelFormat fmt,
-                                            const char** why) {
-    if (p->pso && p->psoFormat == fmt) return p->pso;
+                                            const CmdBuf* b, const char** why) {
+    const bool hasLayout = b && b->numAttrib > 0;
+    unsigned long long layout = 0;
+    MTLVertexDescriptor* vd = nil;
+    if (hasLayout) {
+        vd = vertex_descriptor(b, &layout, why);
+        if (!vd) return nil;
+    }
+    if (id<MTLRenderPipelineState> hit = pso_lookup(p, fmt, layout, hasLayout)) return hit;
 
     const char* whyVs = nullptr;
     const char* whyFs = nullptr;
@@ -777,6 +940,7 @@ id<MTLRenderPipelineState> program_pipeline(Ctx* c, Program* p, MTLPixelFormat f
         pd.vertexFunction = vfn;
         pd.fragmentFunction = ffn;
         pd.colorAttachments[0].pixelFormat = fmt;
+        if (vd) pd.vertexDescriptor = vd;
 
         err = nil;
         id<MTLRenderPipelineState> pso =
@@ -786,10 +950,57 @@ id<MTLRenderPipelineState> program_pipeline(Ctx* c, Program* p, MTLPixelFormat f
                          err ? [[err localizedDescription] UTF8String] : "nil pipeline");
             return nil;
         }
-        p->pso = pso;
-        p->psoFormat = fmt;
+        pso_store(p, pso, fmt, layout, hasLayout);
         return pso;
     }
+}
+
+/* The MTLBuffer holding [addr, addr+len) and the byte offset into it.
+ *
+ * pool_initialize() wraps the guest's own storage with
+ * newBufferWithBytesNoCopy, so a guest address inside a pool is the same byte
+ * inside that MTLBuffer -- no copy, no per-draw upload. */
+bool pool_span(uint64_t addr, size_t len, id<MTLBuffer>* buf, size_t* off) {
+    if (!addr) return false;
+    for (auto& kv : table<Pool>()) {
+        Pool* p = kv.second;
+        if (!p || !p->buffer || !p->storage) continue;
+        const uint64_t base = reinterpret_cast<uint64_t>(p->storage);
+        if (addr < base) continue;
+        const uint64_t o = addr - base;
+        if (o > p->size || len > p->size - o) continue;
+        *buf = p->buffer;
+        *off = static_cast<size_t>(o);
+        return true;
+    }
+    return false;
+}
+
+/* Binds one MTLBuffer per stream that a bound attribute reads.
+ *
+ * A stream whose guest address is not inside any memory pool is not bindable:
+ * Metal would read whatever is at the offset, so the draw is dropped instead
+ * (once per stream, with the address, so the reason is visible). */
+bool bind_vertex_streams(CmdBuf* b) {
+    bool used[NVNGFX_MAX_VERTEX_STREAMS] = {};
+    for (unsigned i = 0; i < b->numAttrib && i < NVNGFX_MAX_VERTEX_ATTRIBS; ++i) {
+        const nvngfx_vattr& a = b->attrib[i];
+        if (nvngfx_vertex_type(a.format) == NVNGFX_VF_NONE) continue;
+        if (a.stream < NVNGFX_MAX_VERTEX_STREAMS) used[a.stream] = true;
+    }
+    for (unsigned st = 0; st < NVNGFX_MAX_VERTEX_STREAMS; ++st) {
+        if (!used[st]) continue;
+        id<MTLBuffer> buf = nil;
+        size_t off = 0;
+        uint64_t len = b->vbSize[st];
+        if (len == 0 && b->stream[st].stride) len = b->stream[st].stride;
+        if (!pool_span(b->vb[st], static_cast<size_t>(len ? len : 1u), &buf, &off)) {
+            log_once("nvnCommandBufferDraw.vertexBuffer", st);
+            return false;
+        }
+        [b->enc setVertexBuffer:buf offset:off atIndex:st];
+    }
+    return true;
 }
 
 /* Builds the pipeline for the bound program if it is not built yet.  Failures
@@ -803,7 +1014,7 @@ bool ensure_pipeline(Ctx* c, CmdBuf* b) {
     Tex* t = find<Tex>(b->color[0]);
     if (!p || !t || !t->mtl) return false;
     const char* why = nullptr;
-    b->pso = program_pipeline(c, p, t->mtl.pixelFormat, &why);
+    b->pso = program_pipeline(c, p, t->mtl.pixelFormat, b, &why);
     if (!b->pso) log_once_str("nvnCommandBufferDraw.pipeline", why ? why : "unknown");
     return b->pso != nil;
 }
@@ -851,16 +1062,15 @@ void prog_set_shaders(nvngfx_ctx*, uint64_t* x) {
             }
         }
     }
-    /* New shaders invalidate the cached pipeline. */
-    p->pso = nil;
-    p->psoFormat = static_cast<MTLPixelFormat>(0);
+    /* New shaders invalidate the cached pipelines. */
+    pso_drop(p);
     x[0] = 1;
 }
 
 /* nvnProgramFinalize(NVNprogram*) */
 void prog_finalize(nvngfx_ctx*, uint64_t* x) {
     Program* p = find<Program>(x[0]);
-    if (p) p->pso = nil;
+    if (p) pso_drop(p);
     forget<Program>(x[0]);
 }
 
@@ -914,6 +1124,178 @@ void cmdbuf_bind_vertex_buffers(nvngfx_ctx*, uint64_t* x) {
     if (first + count > static_cast<int>(b->numVb)) {
         b->numVb = static_cast<unsigned>(first + count);
     }
+    /* NVNbufferRange is { NVNbufferAddress address; uint64_t size; }.  With a
+     * vertex descriptor in place these ranges are what the draw reads, so they
+     * are recorded now (the earlier version deliberately did not). */
+    const uint64_t* rg = guest_ptr<const uint64_t>(x[3]);
+    if (!rg) return;
+    for (int i = 0; i < count; ++i) {
+        b->vb[first + i] = rg[2 * i];
+        b->vbSize[first + i] = rg[2 * i + 1];
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* vertex input state                                                  */
+/* ------------------------------------------------------------------ */
+
+/* The guest owns these structs (4 and 8 bytes), so the setters write its own
+ * bytes and the getters read them back.  A side table keyed by address would
+ * go stale the moment the guest copies a state struct, which is exactly what
+ * engines do when they keep a small array of states. */
+
+/* nvnVertexAttribStateSetDefaults(NVNvertexAttribState*) */
+void vattrib_set_defaults(nvngfx_ctx*, uint64_t* x) {
+    unsigned* w = guest_ptr<unsigned>(x[0]);
+    if (!w) return;
+    const nvngfx_vattr zero = {0u, 0u, 0u};
+    *w = nvngfx_vattr_pack(zero);
+}
+
+/* nvnVertexAttribStateSetFormat(NVNvertexAttribState*, NVNformat, ptrdiff_t) */
+void vattrib_set_format(nvngfx_ctx*, uint64_t* x) {
+    unsigned* w = guest_ptr<unsigned>(x[0]);
+    if (!w) return;
+    nvngfx_vattr a = nvngfx_vattr_unpack(*w);
+    const long long off = static_cast<long long>(x[2]);
+    if (off < 0 || off > 0x7FFFF) {
+        /* The hardware field is 19 bits wide; a larger offset would be
+         * silently truncated, so it is reported and dropped instead. */
+        log_once("nvnVertexAttribStateSetFormat.offset", static_cast<unsigned>(off));
+        if (off < 0) return;
+    }
+    if (x[1] > 0xFFu) log_once("nvnVertexAttribStateSetFormat.format",
+                               static_cast<unsigned>(x[1]));
+    a.format = static_cast<unsigned>(x[1]) & 0xFFu;
+    a.offset = static_cast<unsigned>(off) & 0x7FFFFu;
+    *w = nvngfx_vattr_pack(a);
+}
+
+/* nvnVertexAttribStateSetStreamIndex(NVNvertexAttribState*, int) */
+void vattrib_set_stream(nvngfx_ctx*, uint64_t* x) {
+    unsigned* w = guest_ptr<unsigned>(x[0]);
+    if (!w) return;
+    const int idx = static_cast<int>(x[1]);
+    if (idx < 0 || idx >= 32) {
+        log_once("nvnVertexAttribStateSetStreamIndex.index", static_cast<unsigned>(idx));
+        return;
+    }
+    nvngfx_vattr a = nvngfx_vattr_unpack(*w);
+    a.stream = static_cast<unsigned>(idx);
+    *w = nvngfx_vattr_pack(a);
+}
+
+/* nvnVertexAttribStateGetFormat(const NVNvertexAttribState*, NVNformat*,
+ *                               ptrdiff_t*) */
+void vattrib_get_format(nvngfx_ctx*, uint64_t* x) {
+    const unsigned* w = guest_ptr<const unsigned>(x[0]);
+    unsigned* fmt = guest_ptr<unsigned>(x[1]);
+    long long* off = guest_ptr<long long>(x[2]);
+    nvngfx_vattr a = {0u, 0u, 0u};
+    if (w) a = nvngfx_vattr_unpack(*w);
+    if (fmt) *fmt = a.format;
+    if (off) *off = static_cast<long long>(a.offset);
+}
+
+/* nvnVertexAttribStateGetStreamIndex(const NVNvertexAttribState*) -> int */
+void vattrib_get_stream(nvngfx_ctx*, uint64_t* x) {
+    const unsigned* w = guest_ptr<const unsigned>(x[0]);
+    x[0] = w ? nvngfx_vattr_unpack(*w).stream : 0u;
+}
+
+/* nvnVertexStreamStateSetDefaults(NVNvertexStreamState*) */
+void vstream_set_defaults(nvngfx_ctx*, uint64_t* x) {
+    unsigned* w = guest_ptr<unsigned>(x[0]);
+    if (!w) return;
+    nvngfx_vstream s;
+    nvngfx_vstream_defaults(&s);
+    w[0] = s.stride;
+    w[1] = s.divisor;
+}
+
+/* nvnVertexStreamStateSetStride(NVNvertexStreamState*, ptrdiff_t) */
+void vstream_set_stride(nvngfx_ctx*, uint64_t* x) {
+    unsigned* w = guest_ptr<unsigned>(x[0]);
+    if (!w) return;
+    const long long stride = static_cast<long long>(x[1]);
+    if (stride < 0 || stride > 0x7FFFFFFFll) {
+        log_once("nvnVertexStreamStateSetStride.value",
+                 static_cast<unsigned>(stride));
+        if (stride < 0) return;
+    }
+    w[0] = static_cast<unsigned>(stride);
+}
+
+/* nvnVertexStreamStateSetDivisor(NVNvertexStreamState*, int) */
+void vstream_set_divisor(nvngfx_ctx*, uint64_t* x) {
+    unsigned* w = guest_ptr<unsigned>(x[0]);
+    if (!w) return;
+    w[1] = static_cast<unsigned>(x[1]);
+}
+
+/* nvnVertexStreamStateGetStride(const NVNvertexStreamState*) -> ptrdiff_t */
+void vstream_get_stride(nvngfx_ctx*, uint64_t* x) {
+    const unsigned* w = guest_ptr<const unsigned>(x[0]);
+    x[0] = w ? w[0] : 0u;
+}
+
+/* nvnVertexStreamStateGetDivisor(const NVNvertexStreamState*) -> int */
+void vstream_get_divisor(nvngfx_ctx*, uint64_t* x) {
+    const unsigned* w = guest_ptr<const unsigned>(x[0]);
+    x[0] = w ? w[1] : 0u;
+}
+
+/* nvnCommandBufferBindVertexAttribState(NVNcommandBuffer*, int,
+ *                                      const NVNvertexAttribState*)
+ *
+ * Element i of the array is shader attribute i -- the same index spirv-cross
+ * writes into [[attribute(i)]].  The guest's 4 bytes are copied out here: it
+ * is free to reuse that memory once the call returns. */
+void cmdbuf_bind_vertex_attrib_state(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    if (!b) return;
+    const int n = static_cast<int>(x[1]);
+    const unsigned* st = guest_ptr<const unsigned>(x[2]);
+    if (n < 0 || n > NVNGFX_MAX_VERTEX_ATTRIBS || (n > 0 && !st)) {
+        log_once("nvnCommandBufferBindVertexAttribState.count", static_cast<unsigned>(n));
+        return;
+    }
+    for (int i = 0; i < NVNGFX_MAX_VERTEX_ATTRIBS; ++i) {
+        b->attrib[i].format = 0;
+        b->attrib[i].offset = 0;
+        b->attrib[i].stream = 0;
+        if (i < n) b->attrib[i] = nvngfx_vattr_unpack(st[i]);
+    }
+    b->numAttrib = static_cast<unsigned>(n);
+    /* The vertex descriptor is baked into the Metal pipeline. */
+    b->pso = nil;
+}
+
+/* nvnCommandBufferBindVertexStreamState(NVNcommandBuffer*, int,
+ *                                      const NVNvertexStreamState*)
+ *
+ * Interpreted as (count, array), the way nxnative's recorder does it and the
+ * way nvnCommandBufferBindVertexAttribState takes its array.  A single stream
+ * bound with index 0 behaves identically under either reading; a stream index
+ * other than 0 is not expressible in this shape. */
+void cmdbuf_bind_vertex_stream_state(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    if (!b) return;
+    const int n = static_cast<int>(x[1]);
+    const unsigned* st = guest_ptr<const unsigned>(x[2]);
+    if (n < 0 || n > NVNGFX_MAX_VERTEX_STREAMS || (n > 0 && !st)) {
+        log_once("nvnCommandBufferBindVertexStreamState.count", static_cast<unsigned>(n));
+        return;
+    }
+    for (int i = 0; i < NVNGFX_MAX_VERTEX_STREAMS; ++i) {
+        b->stream[i].stride = 0;
+        b->stream[i].divisor = 0;
+        if (i < n) {
+            b->stream[i].stride = st[2 * i];
+            b->stream[i].divisor = st[2 * i + 1];
+        }
+    }
+    b->pso = nil;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1051,6 +1433,9 @@ void cmdbuf_draw_arrays(nvngfx_ctx* ctx, uint64_t* x) {
     const unsigned first = static_cast<unsigned>(x[2]);
     const unsigned count = static_cast<unsigned>(x[3]);
     [b->enc setRenderPipelineState:b->pso];
+    /* No attribute state bound (the self-test's [[vertex_id]] program) means
+     * no vertex descriptor and nothing to bind. */
+    if (b->numAttrib > 0 && !bind_vertex_streams(b)) return;
     [b->enc drawPrimitives:to_metal_primitive(primitive)
                vertexStart:first
                vertexCount:count];
@@ -1221,6 +1606,18 @@ const Binding kBindings[] = {
     BIND("nvnCommandBufferBindProgram", cmdbuf_bind_program),
     BIND("nvnCommandBufferBindVertexBuffer", cmdbuf_bind_vertex_buffer),
     BIND("nvnCommandBufferBindVertexBuffers", cmdbuf_bind_vertex_buffers),
+    BIND("nvnCommandBufferBindVertexAttribState", cmdbuf_bind_vertex_attrib_state),
+    BIND("nvnCommandBufferBindVertexStreamState", cmdbuf_bind_vertex_stream_state),
+    BIND("nvnVertexAttribStateSetDefaults", vattrib_set_defaults),
+    BIND("nvnVertexAttribStateSetFormat", vattrib_set_format),
+    BIND("nvnVertexAttribStateSetStreamIndex", vattrib_set_stream),
+    BIND("nvnVertexAttribStateGetFormat", vattrib_get_format),
+    BIND("nvnVertexAttribStateGetStreamIndex", vattrib_get_stream),
+    BIND("nvnVertexStreamStateSetDefaults", vstream_set_defaults),
+    BIND("nvnVertexStreamStateSetStride", vstream_set_stride),
+    BIND("nvnVertexStreamStateSetDivisor", vstream_set_divisor),
+    BIND("nvnVertexStreamStateGetStride", vstream_get_stride),
+    BIND("nvnVertexStreamStateGetDivisor", vstream_get_divisor),
 
     BIND("nvnQueuePresentTexture", queue_present_texture),
 };
@@ -1252,6 +1649,47 @@ const nvngfx_backend k_metal = {"metal", nullptr, metal_resolve};
  * Returns 0 on success, or a bit telling which step failed:
  *   1 no Metal device   2 backend not ready   4 texture     8 program
  *  16 recording       32 pipeline         64 draw colour  128 readback */
+/* Copies the whole target into a shared buffer and hands back the centre
+ * pixel.  Blit + waitUntilCompleted is the same readback the first version
+ * did inline; pulling it out lets a second draw be checked the same way. */
+bool read_center_pixel(id<MTLDevice> dev, id<MTLCommandQueue> queue,
+                       id<MTLTexture> tex, NSUInteger side, unsigned char px[4]) {
+    if (!dev || !queue || !tex) return false;
+    const NSUInteger bpr = side * 4;
+    id<MTLBuffer> buf = [dev newBufferWithLength:bpr * side
+                                        options:MTLResourceStorageModeShared];
+    if (!buf) return false;
+    id<MTLCommandBuffer> cb = [queue commandBuffer];
+    id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+    [blit copyFromTexture:tex
+              sourceSlice:0
+              sourceLevel:0
+             sourceOrigin:MTLOriginMake(0, 0, 0)
+               sourceSize:MTLSizeMake(side, side, 1)
+                 toBuffer:buf
+        destinationOffset:0
+   destinationBytesPerRow:bpr
+ destinationBytesPerImage:bpr * side];
+    [blit endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+    if (cb.status == MTLCommandBufferStatusError) return false;
+    const unsigned char* p = static_cast<const unsigned char*>([buf contents]) +
+                             (side / 2) * bpr + (side / 2) * 4;
+    for (int i = 0; i < 4; ++i) px[i] = p[i];
+    return true;
+}
+
+/* True when every channel is within `tolerance` of `want`. */
+bool pixels_near(const unsigned char px[4], const int want[4], int tolerance) {
+    for (int i = 0; i < 4; ++i) {
+        const int got = static_cast<int>(px[i]);
+        const int diff = got > want[i] ? got - want[i] : want[i] - got;
+        if (diff > tolerance) return false;
+    }
+    return true;
+}
+
 extern "C" int nvngfx_metal_selftest(void) {
     /* NVN objects live in guest memory, and guest memory is host memory here.
      * The texture and its builder are written through by the backend
@@ -1373,44 +1811,179 @@ extern "C" int nvngfx_metal_selftest(void) {
 
         {
             /* Read back the centre pixel: this is the step that turns "a draw
-             * was encoded" into "a draw produced pixels". */
-            const NSUInteger bpr = kSide * 4;
-            id<MTLBuffer> buf = [dev newBufferWithLength:bpr * kSide
-                                                 options:MTLResourceStorageModeShared];
-            id<MTLCommandBuffer> rcb = [c->queue commandBuffer];
-            id<MTLBlitCommandEncoder> blit = [rcb blitCommandEncoder];
-            [blit copyFromTexture:t->mtl
-                      sourceSlice:0
-                      sourceLevel:0
-                     sourceOrigin:MTLOriginMake(0, 0, 0)
-                       sourceSize:MTLSizeMake(kSide, kSide, 1)
-                         toBuffer:buf
-                destinationOffset:0
-           destinationBytesPerRow:bpr
-         destinationBytesPerImage:bpr * kSide];
-            [blit endEncoding];
-            [rcb commit];
-            [rcb waitUntilCompleted];
-
-            const unsigned char* px =
-                static_cast<const unsigned char*>([buf contents]) +
-                (kSide / 2) * bpr + (kSide / 2) * 4;
-            /* The fragment shader returns (0.25, 0.5, 0.75, 1.0). */
+             * was encoded" into "a draw produced pixels".  The fragment shader
+             * returns (0.25, 0.5, 0.75, 1.0). */
+            unsigned char px[4] = {0, 0, 0, 0};
             const int want[4] = {64, 128, 191, 255};
-            int bad = 0;
-            for (int i = 0; i < 4; ++i) {
-                const int got = static_cast<int>(px[i]);
-                const int diff = got > want[i] ? got - want[i] : want[i] - got;
-                if (diff > 2) bad = 1;
+            if (!read_center_pixel(dev, c->queue, t->mtl, kSide, px)) {
+                std::fprintf(stderr, "[selftest] readback failed\n");
+                rc = 128;
+                goto done;
             }
-            if (bad) {
+            if (!pixels_near(px, want, 2)) {
                 std::fprintf(stderr,
                              "[selftest] centre pixel is (%u,%u,%u,%u), want (%d,%d,%d,%d)\n",
                              px[0], px[1], px[2], px[3], want[0], want[1], want[2], want[3]);
                 rc = 128;
                 goto done;
             }
-            std::fprintf(stderr, "[selftest] one draw produced the expected pixel\n");
+            std::fprintf(stderr, "[selftest] draw 1 ([[vertex_id]]) produced the expected pixel\n");
+        }
+
+        {
+            /* --- Second draw: a real vertex attribute -------------------
+             * The pieces a guest actually uses, driven through the guest
+             * entry points: a memory pool over host memory, an attribute
+             * state, a stream state and a vertex buffer.  The shader reads
+             * [[attribute(0)]] float2, so a vertex descriptor has to exist
+             * and the pool has to be found for the vertex address. */
+            const uint64_t kPool = 0x5400;
+            const uint64_t kProg2 = 0x5600;
+            const uint64_t kCb2 = 0x5700;
+            /* The pool wraps all 4096 bytes (Metal requires the range to be
+             * a page), and the triangle lives at offset 0. */
+            alignas(4096) static unsigned char vertexPool[4096] = {};
+            static bool pool_filled = false;
+            if (!pool_filled) {
+                float* v = reinterpret_cast<float*>(vertexPool);
+                v[0] = -1.0f; v[1] = -1.0f;
+                v[2] = 3.0f;  v[3] = -1.0f;
+                v[4] = -1.0f; v[5] = 3.0f;
+                pool_filled = true;
+            }
+            alignas(16) unsigned char poolBuilder[0x40] = {};
+            const uint64_t kPoolBuilder = reinterpret_cast<uint64_t>(poolBuilder);
+            alignas(16) unsigned char attribState[8] = {};
+            alignas(16) unsigned char streamState[8] = {};
+            const uint64_t kAttrib = reinterpret_cast<uint64_t>(attribState);
+            const uint64_t kStream = reinterpret_cast<uint64_t>(streamState);
+
+            x[0] = kPoolBuilder;
+            pool_builder_set_defaults(ctx, x);
+            x[0] = kPoolBuilder;
+            x[1] = reinterpret_cast<uint64_t>(vertexPool);
+            x[2] = 4096;
+            pool_builder_set_storage(ctx, x);
+            x[0] = kPool;
+            x[1] = kPoolBuilder;
+            pool_initialize(ctx, x);
+            if (x[0] != 1) {
+                std::fprintf(stderr, "[selftest] nvnMemoryPoolInitialize failed\n");
+                rc = 256;
+                goto done;
+            }
+
+            /* RG32F attribute 0 at offset 0, fed by stream 0 with stride 8. */
+            x[0] = kAttrib;
+            vattrib_set_defaults(ctx, x);
+            x[0] = kAttrib; x[1] = 0x16; x[2] = 0;
+            vattrib_set_format(ctx, x);
+            x[0] = kAttrib; x[1] = 0;
+            vattrib_set_stream(ctx, x);
+            x[0] = kStream;
+            vstream_set_defaults(ctx, x);
+            x[0] = kStream; x[1] = 8;
+            vstream_set_stride(ctx, x);
+
+            /* Read the state back the way a guest would: the setters must
+             * have written the 4-byte record the hardware format describes. */
+            unsigned gotFmt = 0xDEADu;
+            long long gotOff = -1;
+            x[0] = kAttrib; x[1] = reinterpret_cast<uint64_t>(&gotFmt);
+            x[2] = reinterpret_cast<uint64_t>(&gotOff);
+            vattrib_get_format(ctx, x);
+            if (gotFmt != 0x16u || gotOff != 0) {
+                std::fprintf(stderr,
+                             "[selftest] attrib state round trip gave format %#x offset %lld\n",
+                             gotFmt, gotOff);
+                rc = 512;
+                goto done;
+            }
+
+            {
+                struct { uint64_t data; uint64_t control; } sd2[2];
+                sd2[0].data = reinterpret_cast<uint64_t>(const_cast<char*>(
+                    nvngfx_shader_selftest_msl_variant(NVNGFX_STAGE_VERTEX, 1)));
+                sd2[0].control = 0;
+                sd2[1].data = reinterpret_cast<uint64_t>(const_cast<char*>(
+                    nvngfx_shader_selftest_msl_variant(NVNGFX_STAGE_FRAGMENT, 1)));
+                sd2[1].control = 0;
+                x[0] = kProg2; x[1] = 0;
+                prog_initialize(ctx, x);
+                x[0] = kProg2; x[1] = 2; x[2] = reinterpret_cast<uint64_t>(&sd2[0]);
+                prog_set_shaders(ctx, x);
+                if (x[0] != 1) {
+                    std::fprintf(stderr, "[selftest] program 2: SetShaders failed\n");
+                    rc = 512;
+                    goto done;
+                }
+            }
+
+            {
+                const uint64_t target = kTex;
+                const float clear2[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+                x[0] = kCb2;
+                cmdbuf_begin_recording(ctx, x);
+                x[0] = kCb2; x[1] = 1; x[2] = reinterpret_cast<uint64_t>(&target);
+                x[3] = 0; x[4] = 0; x[5] = 0;
+                cmdbuf_set_render_targets(ctx, x);
+                x[0] = kCb2; x[1] = 0; x[2] = reinterpret_cast<uint64_t>(clear2);
+                x[3] = 0xF;
+                cmdbuf_clear_color(ctx, x);
+                x[0] = kCb2; x[1] = 1;
+                x[2] = reinterpret_cast<uint64_t>(&attribState[0]);
+                cmdbuf_bind_vertex_attrib_state(ctx, x);
+                x[0] = kCb2; x[1] = 1;
+                x[2] = reinterpret_cast<uint64_t>(&streamState[0]);
+                cmdbuf_bind_vertex_stream_state(ctx, x);
+                x[0] = kCb2; x[1] = 0;
+                x[2] = reinterpret_cast<uint64_t>(vertexPool); x[3] = 24;
+                cmdbuf_bind_vertex_buffer(ctx, x);
+                x[0] = kCb2; x[1] = kProg2; x[2] = 0;
+                cmdbuf_bind_program(ctx, x);
+                x[0] = kCb2; x[1] = 0; x[2] = 0; x[3] = 3;
+                cmdbuf_draw_arrays(ctx, x);
+                x[0] = kCb2;
+                cmdbuf_end_recording(ctx, x);
+
+                CmdBuf* b2 = find<CmdBuf>(kCb2);
+                if (!b2 || !b2->last) {
+                    std::fprintf(stderr, "[selftest] draw 2 committed nothing\n");
+                    rc = 1024;
+                    goto done;
+                }
+                [b2->last waitUntilCompleted];
+                if (b2->last.status == MTLCommandBufferStatusError) {
+                    std::fprintf(stderr, "[selftest] draw 2 command buffer error: %s\n",
+                                 b2->last.error
+                                     ? [[b2->last.error localizedDescription] UTF8String]
+                                     : "(no description)");
+                    rc = 1024;
+                    goto done;
+                }
+            }
+
+            {
+                unsigned char px[4] = {0, 0, 0, 0};
+                const int want[4] = {0, 255, 0, 255};
+                if (!read_center_pixel(dev, c->queue, t->mtl, kSide, px)) {
+                    std::fprintf(stderr, "[selftest] draw 2 readback failed\n");
+                    rc = 2048;
+                    goto done;
+                }
+                if (!pixels_near(px, want, 2)) {
+                    std::fprintf(stderr,
+                                 "[selftest] draw 2 centre pixel is (%u,%u,%u,%u), "
+                                 "want (%d,%d,%d,%d)\n",
+                                 px[0], px[1], px[2], px[3], want[0], want[1], want[2],
+                                 want[3]);
+                    rc = 2048;
+                    goto done;
+                }
+                std::fprintf(stderr,
+                             "[selftest] draw 2 ([[attribute(0)]] from a pool) produced "
+                             "the expected pixel\n");
+            }
         }
 
     done:
@@ -1418,6 +1991,10 @@ extern "C" int nvngfx_metal_selftest(void) {
         forget<CmdBuf>(kCb);
         forget<Tex>(kTex);
         forget<Program>(kProg);
+        forget<Program>(0x5600);
+        forget<CmdBuf>(0x5700);
+        forget<Pool>(0x5400);
+        g_pool_specs.erase(0x5500);
         g_tex_specs.erase(kTexBuilder);
         nvngfx_metal_destroy(ctx);
         return rc;

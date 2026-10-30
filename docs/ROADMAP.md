@@ -2263,3 +2263,94 @@ key 哈希的 code area **含**开头 0x30 字节的头（`78 56 34 12 ...`）�
 | `xcrun metal` → `.metallib` | 未做；MSL 以 C 字符串进包，5,102 个约几十 MB，真正打包要换 metallib |
 | 全部 19,592 个 shader | 未做；只跑了一个 pack 的 5,102 个 |
 | 真机 | **没有真机运行记录**，本机无设备；CI 只在模拟器里验证自检 |
+
+## M3.79 顶点输入接通：最后一个 P0 落地（本轮）
+
+`nvnCommandBufferBindVertexAttribState` 一直是唯一开着的 P0。本轮把它连同
+配套的 5 个 `NVNvertexAttribState*`、5 个 `NVNvertexStreamState*`、
+`nvnCommandBufferBindVertexStreamState` 一起做完（**52 -> 64 / 513**，
+`P0 blockers open: 0/6`），并且让 CI 的模拟器自检**真的画了第二条 draw**。
+
+### 客体结构体的真实布局
+
+这两个结构体很小（4 / 8 字节），引擎通常把它们放在栈上反复 memcpy，所以
+**不能用"按地址查侧表"**——地址一复用就是静默错读。本轮直接读写客体自己的
+字节，布局来自 nxnative 里带编译期断言的声明
+（`dm/gfx/vn/nvn_obj.h`，`FITS(va_st, NVNvertexAttribState)`）：
+
+```
+NVNvertexAttribState: uint32 { format:8, offset:19, stream:5 }   4 字节
+NVNvertexStreamState: uint32 stride, uint32 divisor              8 字节
+```
+
+19 位的 offset 上限是 0x7FFFF（512 KiB - 1），nxnative 超过就报错；我们照做：
+越界不打洞、不截断，直接记一条日志并丢弃该字段。位域用手工移位实现
+（`nvngfx_vattr_pack/unpack`），不依赖编译器的位域分配顺序。
+
+### 格式表：宁可说"不支持"
+
+NVNformat 是纹理和顶点共用的一套枚举。`nvn_vertex.c` 只接受 Metal 真的有
+对应顶点格式的那些：
+
+| 情况 | 处理 | 原因 |
+|---|---|---|
+| 1/2/4 组件的 8/16/32 位标量 | 全支持 | 与 `MTLVertexFormat` 一一对应 |
+| RGB32F / RGB32UI / RGB32I | 支持 | 3×4 = 12 字节，正好等于 Metal 的 `Float3`/`UInt3`/`Int3` |
+| **RGB8 / RGB16 家族** | **不支持** | Metal 的 `UChar3`/`UShort3` 占 4/8 字节，NVN 是紧凑的 3/6 字节，读出来会整体错位 |
+| RGB10A2 / RGB10A2SN / R11G11B10F / RGB9E5F | 支持 | 单 32 位打包，Metal 有对应格式 |
+| BGRA8 | 支持 | `MTLVertexFormatUChar4Normalized_BGRA` |
+| RGBX8/16/32 | 按 4 组件处理 | 存储布局与 RGBA 相同，第 4 通道本来就没有定义 |
+| 深度/模板/sRGB/压缩/**`_UI2F`/`_I2F`** | 不支持 | 没有 Metal 顶点格式；nxnative 在 CPU 上转换，我们还没做 |
+
+遇到不支持的格式时**不画**：管线干脆不建，日志打一次格式值。悄悄画出来的
+错误顶点比不画更糟。
+
+### 管线与绑定
+
+* `MTLVertexDescriptor` 由「绑定的 attrib 数组 + stream 数组」现建；
+  属性下标就是着色器的 `[[attribute(i)]]` —— `BindVertexAttribState` 的第 i 个
+  元素就是属性 i，spirv-cross 也按这个顺序发射，中间不需要重映射。
+* 顶点缓冲不拷贝：`pool_initialize()` 用 `newBufferWithBytesNoCopy` 把客体的
+  pool 存储直接包成 `MTLBuffer`，`pool_span()` 按地址找到所属 pool 和页内偏移，
+  `setVertexBuffer:offset:atIndex:` 直接指过去。地址不在任何 pool 里就不画，
+  日志写明是哪个 stream。
+* 管线缓存的键从「program + 颜色格式」扩成「program + 颜色格式 + 顶点布局」
+  （布局 id 是 `nvngfx_vertex_layout_id()`，FNV-1a 过打包后的 guest 字）。
+  `Program` 留 4 个槽：标题会在几种布局之间来回切，单槽会每次切换重生管线。
+* `nvnCommandBufferBindVertexBuffers` 现在**真的读** `NVNbufferRange{address,size}`
+  （之前故意只记个数）。
+
+### 自检：第二条 draw 走完整条顶点路径
+
+`nvngfx_metal_selftest()` 现在画两条：
+
+| # | 顶点来源 | 验证的东西 | 期望像素 |
+|---|---|---|---|
+| 1 | `[[vertex_id]]` | 管线、编码、回读（原有） | (64,128,191,255) |
+| 2 | `[[attribute(0)]] float2` | **pool → MTLBuffer、attrib/stream 状态、顶点描述符、属性读回** | (0,255,0,255) |
+
+第二条走的是客体入口点：`nvnMemoryPoolBuilderSetStorage` → `nvnMemoryPoolInitialize`
+→ `nvnVertexAttribStateSetFormat/SetStreamIndex` → `nvnVertexStreamStateSetStride`
+→ `BindVertexAttribState` / `BindVertexStreamState` / `BindVertexBuffer`
+→ `DrawArrays`。中途还用 `nvnVertexAttribStateGetFormat` 把状态读回来核对
+（证明 setter 写出的 4 字节记录能被 getter 原样读回）。
+
+### 证据
+
+```
+build_abi_test: all tests passed
+  nvn_vertex_test: ok (packing, 26 formats, layout id)
+  syntax_check_metal: ok
+verify_ios: ok (metal bindings: 64/513)
+NVN host-HLE 64/513 (12.5%)   P0 blockers open: 0/6
+```
+
+### 仍然没有的
+
+| 缺口 | 后果 |
+|---|---|
+| argument buffer（UBO / 纹理 / sampler 绑定） | 真实 shader 现在能建管线、能绑顶点，但常量与纹理还没接，**真实场景仍画不出正确画面** |
+| `DrawElements` | index type 与 index buffer 仍未接 |
+| 真实 shader 的 draw | 没有一条；自检用内置 MSL |
+| 模拟器执行第二条 draw | 本机无 Metal，**只有 CI 能证明**；本轮推送后看 `ios` job |
+| 真机 | **没有真机运行记录** |
