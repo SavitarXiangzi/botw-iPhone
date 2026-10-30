@@ -3310,7 +3310,7 @@ extern "C" int nvngfx_metal_selftest(void) {
                 prog_set_shaders(ctx, x);
                 if (x[0] != 1) {
                     std::fprintf(stderr, "[selftest] program 4: SetShaders failed\n");
-                    rc = 8192;
+                    rc = 8192;  /* draw 4: shader setup */
                     goto done;
                 }
             }
@@ -3339,7 +3339,7 @@ extern "C" int nvngfx_metal_selftest(void) {
             CmdBuf* b4 = find<CmdBuf>(kCb4);
             if (!b4 || !b4->last) {
                 std::fprintf(stderr, "[selftest] draw 4 committed nothing\n");
-                rc = 8192;
+                rc = 8193;  /* draw 4: no command buffer */
                 goto done;
             }
             [b4->last waitUntilCompleted];
@@ -3348,7 +3348,7 @@ extern "C" int nvngfx_metal_selftest(void) {
                              b4->last.error
                                  ? [[b4->last.error localizedDescription] UTF8String]
                                  : "(no description)");
-                rc = 8192;
+                rc = 8194;  /* draw 4: GPU command buffer error */
                 goto done;
             }
             {
@@ -3361,7 +3361,7 @@ extern "C" int nvngfx_metal_selftest(void) {
                                  "want (%d,%d,%d,%d); draws asked %u, encoded %u\n",
                                  px[0], px[1], px[2], px[3], want[0], want[1],
                                  want[2], want[3], b4->draws, b4->encoded);
-                    rc = 8192;
+                    rc = 8195;  /* draw 4: wrong pixel */
                     goto done;
                 }
                 std::fprintf(stderr,
