@@ -2471,6 +2471,12 @@ bool tex_upload(Ctx* c, CmdBuf* b, Tex* t) {
         if (need > staging) staging = need;
     }
     if (staging == 0) return false;
+    std::fprintf(stderr,
+                 "[nvn] texture upload: pool=0x%llx offset=%lld levels=%u "
+                 "staging=%zu bytes\n",
+                 static_cast<unsigned long long>(t->desc.pool),
+                 t->desc.offset, levels, staging);
+    std::fflush(stderr);
     id<MTLBuffer> stg = [c->device newBufferWithLength:staging
                                                options:MTLResourceStorageModeShared];
     if (!stg) {
@@ -2533,6 +2539,8 @@ bool tex_upload(Ctx* c, CmdBuf* b, Tex* t) {
     }
     [blit endEncoding];
     t->uploadedLevels = done;
+    std::fprintf(stderr, "[nvn] texture upload encoded: %u level(s)\n", done);
+    std::fflush(stderr);
     /* Partial copies are not a usable texture: sampling a missing mip would
      * return whatever Metal left there.  Keep the draw dropped instead. */
     t->uploaded = done == levels;
@@ -4840,6 +4848,10 @@ extern "C" int nvngfx_metal_selftest(void) {
                 rc = 16396;
                 goto done;
             }
+            std::fprintf(stderr,
+                         "[selftest] guest texture: draw committed, waiting "
+                         "for the GPU\n");
+            std::fflush(stderr);
             [b9->last waitUntilCompleted];
             if (b9->last.status == MTLCommandBufferStatusError) {
                 std::fprintf(stderr,

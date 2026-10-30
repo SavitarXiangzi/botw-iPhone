@@ -176,8 +176,25 @@ jobs:
           # only "rc=2048" and the reason is lost with the process.
           set +e
           xcrun simctl launch --console --terminate-running-process \
-            "$UDID" dev.botw.app --selftest > /tmp/selftest-console.log 2>&1
-          LAUNCH_RC=$?
+            "$UDID" dev.botw.app --selftest > /tmp/selftest-console.log 2>&1 &
+          LAUNCH_PID=$!
+          # A hung GPU command buffer used to leave the workflow blocked until
+          # the job timeout, with the diagnostics still inside the simulator.
+          # Kill the launch after two minutes so the log dump below always runs.
+          for _ in $(seq 1 120); do
+            if ! kill -0 "$LAUNCH_PID" 2>/dev/null; then break; fi
+            sleep 1
+          done
+          if kill -0 "$LAUNCH_PID" 2>/dev/null; then
+            echo "::error::self-test did not finish within 120 s"
+            kill "$LAUNCH_PID" 2>/dev/null || true
+            xcrun simctl terminate "$UDID" dev.botw.app 2>/dev/null || true
+            wait "$LAUNCH_PID" 2>/dev/null
+            LAUNCH_RC=124
+          else
+            wait "$LAUNCH_PID"
+            LAUNCH_RC=$?
+          fi
           sleep 1
           set -e
           echo "launch exit status: $LAUNCH_RC"
