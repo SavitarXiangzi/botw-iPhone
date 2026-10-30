@@ -336,10 +336,13 @@ texture -> render target -> clear -> program -> pipeline -> draw -> 回读，
 `DrawElements` / `BindUniformBuffer` 参数缓冲区 / 从 texture pool + sampler pool
 取句柄并采样 2x2 纹理）加一条 sampler 状态路径，全部通过才 rc=0。
 M3.76 的 run 40997940031 证明了第一条；run 41008588834 证明当时的三条；
-M3.82 的 run 41018975699 以 `BOTW_SELFTEST rc=0` 通过；M3.83 的第五条
-draw 要等本轮推送后的 CI。
+M3.82 的 run 41018975699 以 `BOTW_SELFTEST rc=0` 通过；M3.83 的 run
+41034005513（ios job 123990428590）五条全过。第五条在模拟器里走的是
+**直连纹理/采样器绑定**：模拟器的 `MTLTexture.gpuResourceID` 是 0，
+参数缓冲区的纹理条目在那里没有意义（见 `docs/ROADMAP.md` 的 M3.83 段）。
 所以“Metal 这半边是通的”是已经执行过的结论；“客体的 shader 能跑”仍然完全
-没验证。
+没验证。模拟器覆盖到池、句柄、上传、sampler 状态、直连绑定与像素回读，
+不覆盖 Metal 3 参数缓冲区的纹理条目。
 
 **阶段 C：纹理正确**
 
@@ -354,8 +357,7 @@ draw 要等本轮推送后的 CI。
   （`*SetDefaults` 可以先给出全零/安全默认，让 guest 至少在依赖具体值之前跑通）
 - ✅ Sampler：M3.82 完成 builder、object、getter 和真实的
   `MTLSamplerState`；M3.83 完成 sampler pool、`BindSeparateSampler(s)` 与
-  argument buffer 的 sampler 条目。真实 shader 的 `[[id(k)]]` 顺序仍要从
-  侧车读
+  参数缓冲区/直连绑定两条路径。真实 shader 的 `[[id(k)]]` 顺序仍要从侧车读
 - `nvnCommandBufferBarrier`、fence/sync、events
 
 ---

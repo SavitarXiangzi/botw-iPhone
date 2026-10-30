@@ -2677,7 +2677,8 @@ GitHub Actions `macos-15` 模拟器结论；**CI 尚未确认**。
 | 真实 shader 的 draw | 仍是 0 条；四条自检 draw 都用内置 MSL |
 | 外部 guest 浮点寄存器桥 | `nvngfx_args.f[]` 已定义，仓库外调用端还没填 |
 | 真机 | **没有真机运行记录** |
-## M3.83 描述符池、句柄与采样纹理的 draw（本轮）
+
+## M3.83 描述符池、句柄与采样纹理的 draw（模拟器已通过）
 
 覆盖从 **104 -> 131 / 513（25.5%）**。新增 27 个入口：5 个句柄 getter、
 7 个 texture pool、7 个 sampler pool、8 个 command buffer 绑定。
@@ -2719,20 +2720,41 @@ Windows 上由 `tests/nvn_pool_test.cpp` 直接跑：
 所以在注册时快照 builder 的状态并**当场**建 `MTLSamplerState`，
 避免每帧 draw 重新分配。
 
-### 参数缓冲区改用 MTLArgumentEncoder
+### 参数缓冲区：固定 8 字节 ABI
 
-M3.81 手写了一个 16 项、每项 8 字节的地址表。本轮改成从 fragment function
-取 `newArgumentEncoderWithBufferIndex:0`，用 Metal 自己算出的布局：
+M3.83 一度改成从 fragment function 取 `newArgumentEncoderWithBufferIndex:0`，
+让 Metal 自己算布局。模拟器把这条路否掉了：
 
-- `setBuffer:offset:atIndex:` 写 uniform buffer；
-- `setTexture:atIndex:` 写纹理；
-- `setSamplerState:atIndex:` 写采样器（descriptor 的
-  `supportArgumentBuffers = YES` 是前提，M3.82 已设）。
+- 编码器对象**非 nil**，但 `encodedLength == 0`，offset 无从取得；
+- x86_64 模拟器 `MTLDevice` 报告 `apple7=0 metal3=0 unifiedMemory=0`，
+  且 `MTLTexture.gpuResourceID` **恒为 0**。参数缓冲区的纹理条目要写的正是
+  这个 ID，写 0 等于绑空纹理，采样结果是透明黑，而且**不报错**。
 
-`[[id(k)]]` 到 NVN 槽位的映射存在 `Program::args` 里。翻译产物还没带
-侧车，所以只有内置 MSL 声明了 `id(0)=常量 / id(1)=纹理 / id(2)=采样器`；
-`numArgs == 0` 时保留旧规则（buffer i 就是 id(i)），而这时如果有纹理被绑，
+所以现在写回的是一致的固定 ABI：`[[id(k)]]` 就是参数缓冲区第 k 个 64 位字，
+buffer 写 `gpuAddress + offset`，texture / sampler 写 `gpuResourceID`；表长按
+最高 id 分配（`(highestId + 1) * 8` 字节）。同一份 ABI 也是 d2r-mobile 的
+翻译产物用的。
+
+`Program::args` 仍是 `[[id(k)]]` ↔ NVN 槽位的映射表。翻译产物还没带侧车，
+所以只有内置 MSL 声明了 `id(0)=常量 / id(1)=纹理 / id(2)=采样器`；
+`numArgs == 0` 时保留旧规则（buffer i 就是 id(i)），这时如果有纹理被绑，
 draw 会被丢弃并记 `nvnCommandBufferDraw.textureLayout`，不会拿未填的槽位去采样。
+
+### 没有 Metal 3 时走直连绑定
+
+`gpuResourceID == 0` 说明这台设备给不出参数缓冲区需要的资源句柄。因此
+`program_pipeline()` 按 **fragment MSL 文本**选路（Apple 模拟器运行时的行为
+不能作为判据）：
+
+| fragment MSL 里出现 | 路径 | draw 前做的事 |
+|---|---|---|
+| `[[buffer(0)]]` | 参数缓冲区（固定 ABI） | `setFragmentBuffer:atIndex:0` |
+| 只有 `[[texture(k)]]` / `[[sampler(k)]]` | `directBindings` | UBO 走 `setFragmentBuffer`，纹理走 `setFragmentTexture:atIndex:`，采样器走 `setFragmentSamplerState:atIndex:` |
+
+直连路径不碰 `gpuResourceID`，所以模拟器也能验证池、句柄、上传和 sampler
+状态；参数缓冲区路径原样保留给 Metal 3 真机。自检的 fragment MSL 因此有两份：
+variant 3（`[[id(k)]]`）与 variant 4（`[[texture(0)]]` / `[[sampler(0)]]`），
+自检按两个资源的真实 ID 选。
 
 ### 自检：第五条 draw
 
@@ -2740,12 +2762,18 @@ draw 会被丢弃并记 `nvnCommandBufferDraw.textureLayout`，不会拿未填�
 
 1. 2x2 RGBA8 纹理经 `nvnTextureBuilder*` + `nvnTextureInitialize` 建出；
 2. `upload_rgba8()` 用 staging buffer + blit 填红/绿/蓝/白四格
-   （**宿主上传**，不是 guest 内存）；
+   （**宿主上传**，不是 guest 内存），随后回读源纹理四角，确认上传与坐标方向；
 3. sampler builder 设 nearest + clamp，`RegisterSamplerBuilder` 进池 id 9；
    再从 sampler 对象 `RegisterSampler` 进 id 10，两条注册路径都跑；
 4. `nvnDeviceGetTextureHandle(5, 9)` -> `BindTexture(cb, PIXEL, 0, h)`；
-5. 参数缓冲区 id(0) 是白色常量，id(1)/id(2) 是纹理和采样器；
+5. 读 `MTLTexture.gpuResourceID` / `MTLSamplerState.gpuResourceID`：两个都非 0
+   才用 variant 3 的参数缓冲区，否则用 variant 4 的直连绑定；
 6. 回读目标四角，必须分别等于红/绿/蓝/白（容差 2）。
+
+UV 方向不是默认就对的：顶点着色器把 NDC 的 `-1..1` 映射成 `0..1` 之后还要
+`v.uv.y = 1.0 - v.uv.y`。少了这一行，run 41033107396 的回读是
+`top-left pixel is (0,0,255,255), want (255,0,0,255)`——整幅上下镜像。
+Metal 的纹理原点在左上，而 NDC 的 +y 朝上。
 
 失败码：池/纹理 16385，draw 未编码或命令缓冲错误 16387，四角逐像素不符 16388。
 成功时 stderr 出现 `[selftest] textured draw sampled all four pool texels`。
@@ -2754,9 +2782,9 @@ draw 会被丢弃并记 `nvnCommandBufferDraw.textureLayout`，不会拿未填�
 
 ```
 nvn_abi_test: ok (513 procs)
-core_smoke_test: ok
+core_smoke_test: ok (nvn 0/513 on null)
 nvn_texture_test: ok (157 formats in table)
-nvn_shader_test: ok
+nvn_shader_test: ok (seam, blob table, SHA-256, shader key)
 nvn_vertex_test: ok (packing, 26 formats, layout id)
 nvn_sampler_test: ok (filters, wrap, compare, reduction, clamps)
 nvn_pool_test: ok (bases, slots, handles)
@@ -2770,10 +2798,31 @@ verify_ios: ok
 ```
 
 这些只证明 Windows 上的池算术、C ABI 和 Metal 源码通过类型检查。
-`MTLArgumentEncoder` 能否真的把 texture/sampler 写进参数缓冲区、四角像素
-是否对，仍要等本轮推送后的 GitHub Actions `macos-15` 模拟器结论；
-**CI 尚未确认**。上一轮（M3.82）的 run 41018975699 以
-`BOTW_SELFTEST rc=0` 通过，证明 sampler 状态路径在模拟器里是通的。
+
+### 证据（CI，iOS 模拟器）
+
+run `41034005513`（HEAD `67b6057`）两个 job 都 success：portable
+`123990267681`、ios `123990428590`。
+
+```
+[selftest] metal device: apple7=0 metal3=0 unifiedMemory=0
+[selftest] source texture readback: top-left=(255,0,0,255) top-right=(0,255,0,255) bottom-left=(0,0,255,255) bottom-right=(255,255,255,255)
+[selftest] textured draw path: direct bindings (textureResourceId=0 samplerResourceId=1)
+[selftest] textured draw state: pso=1 argbuf=0 hasArgs=1 encoded=1 draws=1 hasArgBuffer=0 direct=1 numArgs=0 ...
+[selftest] textured draw sampled all four pool texels
+BOTW_SELFTEST rc=0
+release gate correctly refuses to compile
+```
+
+`textureResourceId=0 / samplerResourceId=1` 是"有没有"的布尔值，不是句柄：
+模拟器给 sampler 分配了 ID，但纹理没有，所以整条路径必须走直连。
+`argbuf=0` 是直连路径的正常结果，不是失败。
+
+这证明的是：池、句柄、上传、sampler 状态、直连绑定、UV 方向与像素回读在
+**模拟器**里全部正确。**没有**证明的是 Metal 3 真机上参数缓冲区的
+texture/sampler 条目——那需要 `gpuResourceID != 0` 的硬件，GitHub 的 iOS
+模拟器给不了。要补这块，应该加一个原生 macOS Metal 离屏测试
+（`macos-15` runner 有 Apple GPU），而不是继续在模拟器里绕。
 
 ### 仍然没有的
 
@@ -2782,6 +2831,8 @@ verify_ios: ok
 | guest 纹理上传 | 自检的像素是宿主 blit；BOTW 放进池里的像素还读不到 |
 | tiled / block-linear 布局 | 即使上传，未解块的纹理仍是花屏 |
 | 真实 shader 的 `[[id(k)]]` 侧车 | 只有内置 MSL 有布局；翻译产物还不能采样 |
+| Metal 3 的 argument-buffer 纹理条目 | 只有 UBO 条目在 CI 里真正走过；纹理/采样器条目只在直连路径上验证过 |
+| MRT / depth attachment | 只有单 color attachment，深度/模板未接 |
 | 非 pixel stage 的绑定 | 顶点/几何/计算的纹理绑定只记日志 |
 | `nvnTexturePoolGetMemoryPool` / `SamplerPoolGetMemoryPool` | 不在 470 个已测形状里，未绑 |
 | `nvnCommandBufferBindImage(s)` | compute 图像路径未接 |

@@ -157,16 +157,19 @@ C:\Python314\python.exe scripts\shader_chain\gen_blobs.py --msl build\shader-cha
    **常量已经接上**（M3.81）：`nvnCommandBufferBindUniformBuffer` 记录地址。
    **texture / sampler 也已接上**（M3.83，见 §5.5）：texture pool /
    sampler pool 给出稳定句柄，`BindTexture` / `BindSeparateSampler` 记录句柄，
-   draw 前用 `newArgumentEncoderWithBufferIndex:0` 得到的 `MTLArgumentEncoder`
-   把 buffer（`setBuffer`）、texture（`setTexture`）、sampler
-   （`setSamplerState`）写进同一个参数缓冲区。偏移由 Metal 的编码器决定，
-   不再是手算的 8 字节表。**仍然缺的**是每个真实 shader 的
-   `[[id(k)]]` ↔ NVN 槽位映射：它只能来自翻译侧车（SPIR-V 描述符顺序），
-   内置 MSL 里是手工声明的。
+   draw 前按 `[[id(k)]]` 写一张每项 8 字节的参数表：buffer 写
+   `gpuAddress + offset`，texture / sampler 写 `gpuResourceID`。
+   **仍然缺的**是每个真实 shader 的 `[[id(k)]]` ↔ NVN 槽位映射：它只能来自
+   翻译侧车（SPIR-V 描述符顺序），内置 MSL 里是手工声明的。
+
+   为什么不用 `MTLArgumentEncoder`：模拟器返回的对象 `encodedLength == 0`，
+   而模拟器的纹理 `gpuResourceID` 又是 0——"让 Metal 自己算布局"这条路在那里
+   走不通。固定 8 字节 ABI 与 d2r-mobile 的翻译产物一致，也不需要运行时编译。
 3. 几何路径：`DrawArrays` 与 `DrawElements`（16/32 位索引）都已编码，
    顶点与索引都按 pool 零拷贝绑定（M3.79 / M3.80）。也就是说**画什么形状
-   已经不缺了**；常量已进 argument buffer，缺的是纹理与 sampler 条目，
-   所以仍然没有一条**真实** shader 在 Metal 里执行过。
+   已经不缺了**；常量、纹理、sampler 三条绑定都通了（模拟器上纹理/sampler
+   走直连，见 §5.5），缺的是真实 shader 的槽位映射，所以仍然没有一条
+   **真实** shader 在 Metal 里执行过。
 
 ### 5.4 Sampler 状态对象（M3.82）
 
@@ -204,12 +207,26 @@ M3.83 之后这**已经**是资源绑定的一部分：`nvnSamplerPoolInitialize
 `BindSeparateSampler(s)` 只消费 pixel stage；其他 stage 记一次日志后忽略，
 因为当前后端只建 fragment 的参数缓冲区。
 
+### 模拟器上走直连，Metal 3 上走参数缓冲区
+
+自检打印了真实 ID：模拟器 `apple7=0 metal3=0 unifiedMemory=0`，
+`MTLTexture.gpuResourceID == 0`，`MTLSamplerState.gpuResourceID != 0`。
+`program_pipeline()` 因此按 fragment MSL 文本选路：
+
+| fragment MSL 里出现 | 路径 |
+|---|---|
+| `[[buffer(0)]]` | 参数缓冲区（每项 8 字节；buffer 写 `gpuAddress + off`，texture/sampler 写 `gpuResourceID`） |
+| 只有 `[[texture(k)]]` / `[[sampler(k)]]` | `setFragmentTexture:atIndex:` / `setFragmentSamplerState:atIndex:` 直连 |
+
 限制：
 
 - 纹理注册只保存客体地址；`nvnTextureFinalize` 后再采样会解析失败并丢 draw。
 - `nvnTexturePoolGetMemoryPool` / `nvnSamplerPoolGetMemoryPool` 不在
   `signatures.json` 的 470 个形状里，未绑。
 - 真实 shader 的 `[[id(k)]]` 顺序仍缺侧车。
+- 参数缓冲区的 texture / sampler 条目要写 `gpuResourceID`。iOS 模拟器
+  （`apple7=0 metal3=0`）的纹理 ID 恒为 0，所以那里只能走直连绑定；
+  该条目本身**只在 Metal 3 硬件上有意义，尚未验证**。
 
 ## 6. 绑定约定（nxnative 的驱动段布局）
 
@@ -224,7 +241,10 @@ M3.83 之后这**已经**是资源绑定的一部分：`nvnSamplerPoolInitialize
 | separate sampler `r` | c2 `0x568 + 8r` |
 | storage buffer `r` | c0 base + 16r，base：vs `0x110` / cs `0x310` / gs `0x410` / ps `0x510` |
 
-窗口原点左上、深度 0..1，与 Metal 一致，翻译时**不做**翻转。
+窗口原点左上、深度 0..1，与 Metal 一致，viewport 不做翻转。但**纹理采样坐标
+要翻 V**：NDC 的 +y 朝上，Metal 的纹理原点在左上。自检里少了
+`v.uv.y = 1.0 - v.uv.y;` 这一行，四角回读就整幅上下镜像
+（run 41033107396：`top-left pixel is (0,0,255,255), want (255,0,0,255)`）。
 
 ## 7. 明确没做到的
 
@@ -237,9 +257,10 @@ M3.83 之后这**已经**是资源绑定的一部分：`nvnSamplerPoolInitialize
 | compute / geometry shader | 未做（`extract` 目前跳过 cs） |
 | 运行时按 key 取 MSL | **已接线**（M3.78，见 §5.1） |
 | 顶点描述符 | **已接**（M3.79） |
-| argument buffer（UBO / 纹理 / sampler） | UBO 已接（M3.81）；sampler 状态对象已建（M3.82）；texture/sampler 条目未接，见 §5.3 第 2 条与 §5.4 |
+| argument buffer（UBO / 纹理 / sampler） | UBO 已接（M3.81）；texture/sampler 条目按固定 8 字节 ABI 写入（M3.83）；模拟器因 `gpuResourceID == 0` 改走直连绑定，参数缓冲区的纹理条目未在 Metal 3 硬件上验证 |
 
 一句话：**链的前 2/3 在 Windows 上真的通了，后 1/3（`xcrun metal`）要在 CI 的
 macOS 上补；运行时按 key 取 MSL 已接线（M3.78），顶点与索引都已接（M3.79 / M3.80），
-UBO 已进 argument buffer（M3.81），sampler 状态对象已能创建（M3.82），但
-texture/sampler 条目还没接，所以还没有任何一条真实 shader 在 Metal 里执行过。**
+UBO 已进 argument buffer（M3.81），sampler 状态对象已能创建（M3.82），
+texture/sampler 条目也已接（M3.83，模拟器走直连绑定），但还没有任何一条真实
+shader 在 Metal 里执行过。**
