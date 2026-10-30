@@ -696,7 +696,7 @@ struct Program {
     /* Metal bakes the colour format into a render pipeline, so the cache is
      * keyed by it as well as by the program address (the table key). */
     id<MTLRenderPipelineState> pso = nil;
-    NSUInteger psoFormat = 0;
+    MTLPixelFormat psoFormat = static_cast<MTLPixelFormat>(0);
 };
 
 /* Compiles the program's MSL into a render pipeline for `fmt`.
@@ -704,7 +704,7 @@ struct Program {
  * This is the function a translator plugs into: it only knows
  * nvngfx_shader_to_msl().  Today that returns NULL, so the reason is reported
  * once and every draw afterwards stops at "noPipeline". */
-id<MTLRenderPipelineState> program_pipeline(Ctx* c, Program* p, NSUInteger fmt,
+id<MTLRenderPipelineState> program_pipeline(Ctx* c, Program* p, MTLPixelFormat fmt,
                                             const char** why) {
     if (p->pso && p->psoFormat == fmt) return p->pso;
 
@@ -823,7 +823,7 @@ void prog_set_shaders(nvngfx_ctx*, uint64_t* x) {
     }
     /* New shaders invalidate the cached pipeline. */
     p->pso = nil;
-    p->psoFormat = 0;
+    p->psoFormat = static_cast<MTLPixelFormat>(0);
     x[0] = 1;
 }
 

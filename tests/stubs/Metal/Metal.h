@@ -44,12 +44,16 @@ enum {
 
 @protocol MTLBuffer;
 
-/* MTLPixelFormat: only the two names nvn_metal.mm mentions. */
-typedef NSUInteger MTLPixelFormat;
-enum {
+/* MTLPixelFormat: only the two names nvn_metal.mm mentions.
+ *
+ * The real SDK declares this as NS_ENUM(NSUInteger, MTLPixelFormat), i.e. a
+ * distinct enum type, not a typedef to NSUInteger.  Keeping it an enum here
+ * is deliberate: CI caught a real "NSUInteger assigned to MTLPixelFormat"
+ * that an integer typedef had hidden. */
+typedef enum MTLPixelFormat : NSUInteger {
     MTLPixelFormatRGBA8Unorm = 70,
     MTLPixelFormatBGRA8Unorm = 80,
-};
+} MTLPixelFormat;
 
 typedef NSUInteger MTLResourceOptions;
 enum { MTLResourceStorageModeShared = 0 };
@@ -96,12 +100,11 @@ enum {
 @property (readonly) MTLRenderPipelineColorAttachmentDescriptorArray* colorAttachments;
 @end
 
-typedef NSUInteger MTLPrimitiveType;
-enum {
+typedef enum MTLPrimitiveType : NSUInteger {
     MTLPrimitiveTypePoint = 0,
     MTLPrimitiveTypeLine = 1,
     MTLPrimitiveTypeTriangle = 3,
-};
+} MTLPrimitiveType;
 
 typedef struct { double width, height; } CGSize;
 
