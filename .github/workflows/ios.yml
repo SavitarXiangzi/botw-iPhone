@@ -51,7 +51,8 @@ jobs:
           clang -std=c11 -Wall -Wextra -Werror $INC -c ios/nvn/src/nvn_vertex.c -o /tmp/nvn_vertex.o
           clang -std=c11 -Wall -Wextra -Werror $INC -c ios/nvn/src/nvn_pool.c -o /tmp/nvn_pool.o
           clang -std=c11 -Wall -Wextra -Werror $INC -c ios/nvn/src/nvn_sampler.c -o /tmp/nvn_sampler.o
-          LIB="ios/nvn/src/nvn_dispatch.cpp ios/nvn/src/nvn_null.cpp core/src/botw_core.cpp /tmp/nvn_texture.o /tmp/nvn_shader.o /tmp/nvn_shader_key.o /tmp/nvn_shader_blobs.o /tmp/nvn_vertex.o /tmp/nvn_sampler.o /tmp/nvn_pool.o"
+          clang -std=c11 -Wall -Wextra -Werror $INC -c ios/nvn/src/nvn_texlayout.c -o /tmp/nvn_texlayout.o
+          LIB="ios/nvn/src/nvn_dispatch.cpp ios/nvn/src/nvn_null.cpp core/src/botw_core.cpp /tmp/nvn_texture.o /tmp/nvn_shader.o /tmp/nvn_shader_key.o /tmp/nvn_shader_blobs.o /tmp/nvn_vertex.o /tmp/nvn_sampler.o /tmp/nvn_pool.o /tmp/nvn_texlayout.o"
           clang++ $FLAGS $INC tests/nvn_abi_test.cpp      $LIB -o /tmp/nvn_abi_test
           clang++ $FLAGS $INC tests/core_smoke_test.cpp   $LIB -o /tmp/core_smoke_test
           clang++ $FLAGS $INC tests/nvn_texture_test.cpp  $LIB -o /tmp/nvn_texture_test
@@ -59,6 +60,7 @@ jobs:
           clang++ $FLAGS $INC tests/nvn_vertex_test.cpp   $LIB -o /tmp/nvn_vertex_test
           clang++ $FLAGS $INC tests/nvn_sampler_test.cpp  $LIB -o /tmp/nvn_sampler_test
           clang++ $FLAGS $INC tests/nvn_pool_test.cpp     $LIB -o /tmp/nvn_pool_test
+          clang++ $FLAGS $INC tests/nvn_texlayout_test.cpp $LIB -o /tmp/nvn_texlayout_test
           /tmp/nvn_abi_test
           /tmp/core_smoke_test
           /tmp/nvn_texture_test
@@ -66,6 +68,7 @@ jobs:
           /tmp/nvn_vertex_test
           /tmp/nvn_sampler_test
           /tmp/nvn_pool_test
+          /tmp/nvn_texlayout_test
 
       # nvn_metal.mm is ObjC++; this parses it against tests/stubs/ so a type
       # error in the Metal backend is caught without a mac runner.

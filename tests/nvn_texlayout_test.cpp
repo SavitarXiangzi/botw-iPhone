@@ -1,0 +1,215 @@
+/* nvn_texlayout: NVN's block-linear storage arithmetic and the copy in and
+ * out of it.
+ *
+ * Run by scripts/build_abi_test.ps1 and by CI's portable job.  The sizes are
+ * checked against hand calculation from the rules (one GOB = 64 bytes x 8
+ * rows, blocks 2^tile_h GOBs high), and the copy is checked by a round trip:
+ * a synthetic image is written through nvngfx_tex_bl_offset into a storage
+ * buffer, then read back with nvngfx_tex_deswizzle.  No game data, no Metal.
+ */
+#include "nvn_texlayout.h"
+
+#include <cstdio>
+#include <cstring>
+#include <vector>
+
+static int g_failures = 0;
+
+#define CHECK(cond)                                                          \
+    do {                                                                     \
+        if (!(cond)) {                                                       \
+            std::printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond);      \
+            ++g_failures;                                                    \
+        }                                                                    \
+    } while (0)
+
+static nvngfx_texdesc make_desc(int format, int width, int height, int levels) {
+    nvngfx_texdesc d;
+    nvngfx_texdesc_defaults(&d);
+    d.format = format;
+    d.width = width;
+    d.height = height;
+    d.levels = levels;
+    return d;
+}
+
+/* NVNformat values used here: 0x25 RGBA8_UNORM, 0x31 R8, 0x42 BC1, 0x7E
+ * ASTC 8x5.  They are the same integers tests/nvn_texture_test.cpp maps. */
+static void test_block_shapes() {
+    unsigned bpb = 0, bw = 0, bh = 0;
+    CHECK(nvngfx_tex_format_block(0x25, &bpb, &bw, &bh));
+    CHECK(bpb == 4 && bw == 1 && bh == 1);
+    CHECK(nvngfx_tex_format_block(0x31, &bpb, &bw, &bh));
+    CHECK(bpb == 1 && bw == 1 && bh == 1);
+    CHECK(nvngfx_tex_format_block(0x42, &bpb, &bw, &bh));
+    CHECK(bpb == 8 && bw == 4 && bh == 4);
+    CHECK(nvngfx_tex_format_block(0x79, &bpb, &bw, &bh));
+    CHECK(bpb == 16 && bw == 4 && bh == 4);
+    CHECK(nvngfx_tex_format_block(0x7E, &bpb, &bw, &bh));
+    CHECK(bpb == 16 && bw == 8 && bh == 5);
+    /* 0x00 is the "none" hole: no layout can be computed for it. */
+    CHECK(!nvngfx_tex_format_block(0x00, &bpb, &bw, &bh));
+}
+
+static void test_sizes() {
+    nvngfx_texlayout L;
+    {
+        /* 64x64 RGBA8: 256-byte rows -> 4 GOB columns, 8 GOB rows, and
+         * 8 x 3 / 16 = 1 picks tile_h 3, i.e. one block of 8 GOB rows. */
+        const nvngfx_texdesc d = make_desc(0x25, 64, 64, 1);
+        CHECK(nvngfx_tex_layout(&d, &L) == 0);
+        CHECK(L.bytes_per_block == 4);
+        CHECK(L.tile_h == 3);
+        CHECK(L.tile_d == 0);
+        CHECK(L.layers == 1);
+        CHECK(L.layer_size == 16384);
+        CHECK(L.size == 16384);
+        CHECK(L.alignment == 512);
+    }
+    {
+        /* Same texture with two levels: level 1 (32x32) starts at 16384 and
+         * is 2 GOB columns x 4 GOB rows = 4096 bytes. */
+        const nvngfx_texdesc d = make_desc(0x25, 64, 64, 2);
+        CHECK(nvngfx_tex_layout(&d, &L) == 0);
+        CHECK(L.size == 20480);
+        CHECK(nvngfx_tex_level_offset(&d, 0) == 0);
+        CHECK(nvngfx_tex_level_offset(&d, 1) == 16384);
+    }
+    {
+        /* BC1 64x64: 16x16 blocks of 8 bytes = 128-byte rows, 16 block
+         * rows; 16 x 3 / 16 = 3 picks tile_h 1, so 2 GOB columns x 2 GOB
+         * rows of 2 -> 2048 bytes, exactly 64x64 at half a byte per texel. */
+        const nvngfx_texdesc d = make_desc(0x42, 64, 64, 1);
+        CHECK(nvngfx_tex_layout(&d, &L) == 0);
+        CHECK(L.bytes_per_block == 8);
+        CHECK(L.tile_h == 1);
+        CHECK(L.size == 2048);
+    }
+    {
+        /* ASTC 8x5: 8 x 13 blocks of 16 bytes = 128-byte rows and 13 block
+         * rows, which pad up to 2 GOB columns x 2 GOB rows. */
+        const nvngfx_texdesc d = make_desc(0x7E, 64, 64, 1);
+        CHECK(nvngfx_tex_layout(&d, &L) == 0);
+        CHECK(L.size == 2048);
+    }
+    {
+        /* LINEAR flag: the driver's stride wins, aligned to 32 bytes. */
+        const nvngfx_texdesc d = make_desc(0x25, 1, 1, 1);
+        nvngfx_texdesc lin = d;
+        lin.flags = 0x10;
+        CHECK(nvngfx_tex_layout(&lin, &L) == 0);
+        CHECK(L.size == 32);
+        CHECK(L.alignment == 32);
+    }
+    {
+        /* A 2D array: every layer starts on a block boundary. */
+        nvngfx_texdesc d = make_desc(0x25, 64, 64, 1);
+        d.target = 4;
+        d.depth = 4;
+        CHECK(nvngfx_tex_layout(&d, &L) == 0);
+        CHECK(L.layers == 4);
+        CHECK(L.layer_size == 16384);
+        CHECK(L.size == 4 * 16384);
+    }
+}
+
+static void test_bl_offset() {
+    /* 64-byte GOB: 32-byte halves, then 16-byte quarters, then row pairs. */
+    CHECK(nvngfx_tex_bl_offset(0, 0, 0, 256, 64, 3, 0) == 0);
+    CHECK(nvngfx_tex_bl_offset(16, 0, 0, 256, 64, 3, 0) == 32);
+    CHECK(nvngfx_tex_bl_offset(32, 0, 0, 256, 64, 3, 0) == 256);
+    CHECK(nvngfx_tex_bl_offset(48, 0, 0, 256, 64, 3, 0) == 288);
+    CHECK(nvngfx_tex_bl_offset(0, 1, 0, 256, 64, 3, 0) == 16);
+    CHECK(nvngfx_tex_bl_offset(0, 2, 0, 256, 64, 3, 0) == 64);
+    CHECK(nvngfx_tex_bl_offset(0, 8, 0, 256, 64, 3, 0) == 512);
+    /* The next block column starts one block (8 GOBs) further on. */
+    CHECK(nvngfx_tex_bl_offset(64, 0, 0, 256, 64, 3, 0) == 4096);
+    CHECK(nvngfx_tex_bl_offset(0, 64, 0, 256, 64, 3, 0) == 4 * 4096);
+}
+
+/* Writes `img` (rows x row_bytes) into `storage` through bl_offset, then reads
+ * it back with nvngfx_tex_deswizzle and compares. */
+static void round_trip(const char* what, const nvngfx_texdesc& d, unsigned level,
+                       unsigned row_bytes, unsigned rows) {
+    nvngfx_texlayout L;
+    CHECK(nvngfx_tex_layout(&d, &L) == 0);
+    std::vector<unsigned char> storage(static_cast<size_t>(L.size), 0xCC);
+    const size_t img = static_cast<size_t>(row_bytes) * rows;
+    std::vector<unsigned char> src(img), dst(img, 0);
+    for (size_t i = 0; i < img; ++i)
+        src[i] = static_cast<unsigned char>((i * 37u + 11u) & 0xFFu);
+
+    unsigned th = 0, td = 0;
+    unsigned long long base = 0;
+    CHECK(nvngfx_tex_level_geometry(&d, level, 0, nullptr, nullptr, nullptr,
+                                    &base, &th, &td) == 0);
+    const unsigned gobs = nvngfx_tex_level_gobs(&d, level);
+    const unsigned laid = gobs * 64u;
+    CHECK(base + static_cast<unsigned long long>(laid) * rows <= L.size);
+    for (unsigned y = 0; y < rows; ++y) {
+        for (unsigned x = 0; x < row_bytes; x += 16) {
+            const unsigned n = row_bytes - x < 16 ? row_bytes - x : 16;
+            std::memcpy(storage.data() + base +
+                            nvngfx_tex_bl_offset(x, y, 0, laid, rows, th, td),
+                        src.data() + static_cast<size_t>(y) * row_bytes + x, n);
+        }
+    }
+    CHECK(nvngfx_tex_deswizzle(&d, level, 0, storage.data(), dst.data(),
+                               row_bytes) == 0);
+    if (std::memcmp(src.data(), dst.data(), img) != 0)
+        std::printf("FAIL %s: deswizzle differs\n", what);
+
+    /* And once more in the other direction: swizzle a fresh storage from the
+     * same linear bytes and compare it with the hand-built one. */
+    std::vector<unsigned char> again(storage.size(), 0xCC);
+    CHECK(nvngfx_tex_swizzle(&d, level, 0, src.data(), row_bytes,
+                             again.data()) == 0);
+    if (std::memcmp(storage.data(), again.data(), storage.size()) != 0)
+        std::printf("FAIL %s: swizzle differs\n", what);
+}
+
+static void test_round_trip() {
+    /* 64x64 RGBA8, then a level whose row is not a multiple of 16 bytes so
+     * the copy's tail path runs. */
+    round_trip("rgba8 64x64", make_desc(0x25, 64, 64, 1), 0, 256, 64);
+    round_trip("r8 40x40 (tail)", make_desc(0x31, 40, 40, 1), 0, 40, 40);
+    /* A block-compressed level: one "pixel" is a 4x4 block, so the same
+     * routine copies block rows. */
+    round_trip("bc1 64x64", make_desc(0x42, 64, 64, 1), 0, 128, 16);
+    round_trip("rgba8 mip 1", make_desc(0x25, 64, 64, 2), 1, 128, 32);
+}
+
+static void test_refusals() {
+    nvngfx_texdesc d = make_desc(0x25, 64, 64, 1);
+    std::vector<unsigned char> a(16384), b(16384);
+    d.samples = 4;
+    CHECK(nvngfx_tex_deswizzle(&d, 0, 0, a.data(), b.data(), 256) == -1);
+    d = make_desc(0x25, 64, 64, 1);
+    d.flags = 0x10;
+    CHECK(nvngfx_tex_deswizzle(&d, 0, 0, a.data(), b.data(), 256) == -1);
+    d = make_desc(0x25, 64, 64, 1);
+    d.target = 10;   /* BUFFER */
+    CHECK(nvngfx_tex_deswizzle(&d, 0, 0, a.data(), b.data(), 256) == -1);
+    /* A pitch smaller than the level's row is not a buffer to write into. */
+    d = make_desc(0x25, 64, 64, 1);
+    CHECK(nvngfx_tex_deswizzle(&d, 0, 0, a.data(), b.data(), 128) == -1);
+    /* An unknown format has no layout at all. */
+    d = make_desc(0x00, 64, 64, 1);
+    nvngfx_texlayout L;
+    CHECK(nvngfx_tex_layout(&d, &L) != 0);
+}
+
+int main() {
+    test_block_shapes();
+    test_sizes();
+    test_bl_offset();
+    test_round_trip();
+    test_refusals();
+    if (g_failures) {
+        std::printf("nvn_texlayout_test: %d failure(s)\n", g_failures);
+        return 1;
+    }
+    std::printf("nvn_texlayout_test: ok (block shapes, sizes, offsets, "
+                "round trip, refusals)\n");
+    return 0;
+}
