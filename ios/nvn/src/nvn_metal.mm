@@ -2254,13 +2254,13 @@ bool has_arguments(const CmdBuf* b) {
 
 /* Builds the pixel stage's argument buffer for this recording.
  *
- * The bytes are produced by an MTLArgumentEncoder made from the fragment
- * function, so the offsets are Metal's layout rather than a guess: a
- * uniform buffer becomes `setBuffer`, and a texture/sampler entry becomes a
- * gpuResourceID at the same [[id(k)]] the shader names.  The id -> slot
- * mapping is Program::args, which a translated shader has to bring from its
- * SPIR-V descriptor order (sidecar); numArgs == 0 keeps the old "buffer i is
- * id(i)" rule.
+ * Each [[id(k)]] is one 64-bit word at byte offset 8*k: a buffer writes its
+ * gpuAddress + offset, a texture or sampler writes gpuResourceID.  This
+ * fixed ABI is what d2r-mobile's translated MSL expects, and it is also the
+ * only option where MTLArgumentEncoder is unusable (the iOS Simulator
+ * reports encodedLength == 0).  The id -> slot mapping is Program::args,
+ * which a translated shader has to bring from its SPIR-V descriptor order
+ * (sidecar); numArgs == 0 keeps the old "buffer i is id(i)" rule.
  *
  * Returns nil when nothing is bound or when a bound resource cannot be
  * resolved; the caller then drops the draw instead of encoding zeros. */
@@ -2360,10 +2360,6 @@ id<MTLBuffer> argument_buffer(Ctx* c, CmdBuf* b) {
     return b->argbuf;
 }
 
-/* Binds the argument buffer before a draw.  True when there is nothing
- * to bind or the binding succeeded; false means the draw must not be
- * encoded, because a shader that reads constants or samples a texture
- * would read the wrong thing. */
 /* Direct texture/sampler bindings for shaders that name resources with
  * [[texture(k)]] / [[sampler(k)]].  This is the non-Metal3 fallback: it
  * never needs gpuResourceID, so the simulator can still exercise the pool,
@@ -2409,6 +2405,10 @@ bool bind_direct_arguments(CmdBuf* b) {
     return bound;
 }
 
+/* Binds the pixel stage's resources before a draw.  True when there is
+ * nothing to bind or the binding succeeded; false means the draw must not be
+ * encoded, because a shader that reads constants or samples a texture would
+ * read the wrong thing. */
 bool bind_arguments(Ctx* c, CmdBuf* b) {
     if (!has_arguments(b)) return true;
     Program* p = find<Program>(b->program);
