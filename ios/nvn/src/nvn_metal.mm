@@ -375,6 +375,20 @@ T* guest_ptr(uint64_t value) {
     return reinterpret_cast<T*>(static_cast<uintptr_t>(value));
 }
 
+/* Zeroes a guest struct through its address.  Guest memory is host memory,
+ * but an address that cannot be mapped must drop the call, not kill the
+ * process: a bad handle in the guest is a bug report, not a crash.  The
+ * first 64 KiB are never mapped on iOS, and an address that wraps is not a
+ * pointer either. */
+bool guest_write(uint64_t addr, size_t n) {
+    if (addr < 0x10000u || n > UINTPTR_MAX - addr) {
+        log_once("nvn.guestPointer.write", static_cast<unsigned>(addr >> 32));
+        return false;
+    }
+    std::memset(reinterpret_cast<void*>(static_cast<uintptr_t>(addr)), 0, n);
+    return true;
+}
+
 /* ------------------------------------------------------------------ */
 /* NVN -> Metal primitives                                             */
 /* ------------------------------------------------------------------ */
@@ -438,7 +452,7 @@ bool present_clear(Ctx* c, CAMetalLayer* layer, float r, float g, float b) {
 
 /* nvnDeviceBuilderSetDefaults(NVNdeviceBuilder*) */
 void dev_builder_set_defaults(nvngfx_ctx*, uint64_t* x) {
-    if (x[0]) std::memset(guest_ptr<void>(x[0]), 0, 0x20);
+    if (x[0]) (void)guest_write(x[0], 0x20);
 }
 
 /* nvnDeviceBuilderSetFlags(NVNdeviceBuilder*, int) */
@@ -487,7 +501,7 @@ void dev_get_proc_address(nvngfx_ctx*, uint64_t* x) {
 
 /* nvnWindowBuilderSetDefaults(NVNwindowBuilder*) */
 void win_builder_set_defaults(nvngfx_ctx*, uint64_t* x) {
-    if (x[0]) std::memset(guest_ptr<void>(x[0]), 0, 0x40);
+    if (x[0]) (void)guest_write(x[0], 0x40);
 }
 
 /* nvnWindowBuilderSetNativeWindow(NVNwindowBuilder*, NVNnativeWindow) */
@@ -605,7 +619,7 @@ void win_finalize(nvngfx_ctx*, uint64_t* x) { forget<Win>(x[0]); }
 
 /* nvnMemoryPoolBuilderSetDefaults(NVNmemoryPoolBuilder*) */
 void pool_builder_set_defaults(nvngfx_ctx*, uint64_t* x) {
-    if (x[0]) std::memset(guest_ptr<void>(x[0]), 0, 0x30);
+    if (x[0]) (void)guest_write(x[0], 0x30);
 }
 
 /* nvnMemoryPoolBuilderSetStorage(NVNmemoryPoolBuilder*, void*, size_t) */
@@ -674,7 +688,7 @@ void pool_get_size(nvngfx_ctx*, uint64_t* x) {
 
 /* nvnTextureBuilderSetDefaults(NVNtextureBuilder*) */
 void tex_builder_set_defaults(nvngfx_ctx*, uint64_t* x) {
-    if (x[0]) std::memset(guest_ptr<void>(x[0]), 0, 0x80);
+    if (x[0]) (void)guest_write(x[0], 0x80);
     nvngfx_texdesc_defaults(&g_tex_specs[x[0]]);
 }
 
@@ -942,7 +956,7 @@ id<MTLSamplerState> create_sampler_state(Ctx* c, const nvngfx_sampler& st) {
 void sampler_builder_set_defaults(nvngfx_ctx*, uint64_t* x) {
     if (!x[0]) return;
     uint64_t device = sampler_spec_or_default(x[0]).device;
-    std::memset(guest_ptr<void>(x[0]), 0, 0x60);
+    (void)guest_write(x[0], 0x60);
     SamplerSpec& spec = sampler_spec(x[0]);
     std::memset(&spec.state, 0, sizeof spec.state);
     nvngfx_sampler_defaults(&spec.state);
@@ -4735,9 +4749,14 @@ extern "C" int nvngfx_metal_selftest(void) {
              * MTLTexture before the pipeline samples it.  The texels are one
              * colour on purpose -- a pixel that is not the clear colour can
              * only come from a table that reached the GPU. */
+            /* nvnTextureBuilderSetDefaults writes 0x80 bytes through the
+             * builder pointer, so draw 9's builder needs real backing store.
+             * The texture, program and command buffer stay table keys. */
+            alignas(16) unsigned char guestTexBuilder[0x80] = {};
             const uint64_t kTexGuest = 0x6400;
             const uint64_t kProg9 = 0x6500;
             const uint64_t kCb9 = 0x6600;
+            const uint64_t kB = reinterpret_cast<uint64_t>(guestTexBuilder);
             const unsigned kGuestOffset = 8192;
             unsigned char* const vpool9 = reinterpret_cast<unsigned char*>(
                 (reinterpret_cast<uintptr_t>(poolRaw) + 16383u) &
@@ -4770,8 +4789,8 @@ extern "C" int nvngfx_metal_selftest(void) {
             }
             {
                 /* tex_initialize reads the builder state, so replay the
-                 * builder calls that describe this texture. */
-                const uint64_t kB = 0x6450;
+                 * builder calls that describe this texture.  kB is real
+                 * storage: SetDefaults memsets through it. */
                 x[0] = kB;
                 tex_builder_set_defaults(ctx, x);
                 x[0] = kB; x[1] = 0;

@@ -197,7 +197,10 @@ jobs:
           fi
           sleep 1
           set -e
-          echo "launch exit status: $LAUNCH_RC"
+          # A crash inside the app can still leave simctl with status 0, so
+          # this number is context only: the rc marker in selftest.txt is what
+          # decides pass/fail.
+          echo "launch exit status: $LAUNCH_RC (not authoritative)"
           tail -20 /tmp/selftest-console.log 2>/dev/null || true
           DATA=$(xcrun simctl get_app_container "$UDID" dev.botw.app data)
           echo "container: $DATA"
@@ -216,6 +219,16 @@ jobs:
             xcrun simctl spawn "$UDID" log show --style compact --last 2m \
               --predicate 'process == "BotW"' 2>/dev/null | tail -40 \
               | while IFS= read -r l; do echo "::error::log| $l"; done
+            # A signal (which a bad guest pointer produces) leaves no line in
+            # the app's own output.  The simulator writes a report next to the
+            # host's DiagnosticReports; its first frames name the faulting
+            # instruction, so print the newest few instead of guessing.
+            ls -t ~/Library/Logs/DiagnosticReports 2>/dev/null | head -4 \
+              | while IFS= read -r r; do
+                  echo "::error::crash| ===== $r ====="
+                  head -60 "$HOME/Library/Logs/DiagnosticReports/$r" 2>/dev/null \
+                    | while IFS= read -r l; do echo "::error::crash| $l"; done
+                done
             exit 1
           fi
           echo "replay-layer self-test: draws encoded, pixels read back, rc=0"
