@@ -68,6 +68,9 @@ def main() -> int:
         "-fobjc-runtime=ios-17.0",
         "-Wall", "-Wextra", "-Werror",
         "-D__APPLE__=1",
+        # Exercise the iOS 26 reductionMode branch against the stubs.  Real
+        # Xcode builds use their SDK's actual __IPHONE_OS_VERSION_MAX_ALLOWED.
+        "-D__IPHONE_OS_VERSION_MAX_ALLOWED=260000",
         "-I", "tests/stubs",
         "-I", "ios/nvn/include",
         "ios/nvn/src/nvn_metal.mm",

@@ -538,9 +538,9 @@ void nvngfx_set_missing_reporter(void (*fn)(const char*)) {
 }
 
 /* Unknown/known-but-unimplemented: log once per name, then stay silent. */
-static void nvngfx_missing(nvngfx_ctx* ctx, uint64_t x[8]) {
+static void nvngfx_missing(nvngfx_ctx* ctx, nvngfx_args* args) {
     (void)ctx;
-    (void)x;
+    (void)args;
 }
 
 static void report_missing(nvn_proc_index idx) {

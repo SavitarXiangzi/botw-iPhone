@@ -2474,7 +2474,7 @@ NVN host-HLE 64/513 (12.5%)   P0 blockers open: 0/6
 | 真实 shader 的 draw | 仍然是 0 条；三条自检都用内置 MSL |
 | 真机 | **没有真机运行记录** |
 
-## M3.81 参数缓冲区接通：BindUniformBuffer -> `[[buffer(0)]]`（本轮）
+## M3.81 参数缓冲区接通：BindUniformBuffer -> `[[buffer(0)]]`
 
 spirv-cross 的 MSL 不读 `setFragmentBytes`，它读一个**参数缓冲区**：
 
@@ -2558,4 +2558,122 @@ NVN host-HLE 66/513 (12.9%)   P0 blockers open: 0/6
 | `[[id(k)]]` 与 NVN 槽位的映射 | 已翻译的两份 MSL 里，id 是**按 binding 排序后的连续编号**（cbuf 在前、纹理随后各带一个 sampler）；运行时还没读 sidecar JSON 去建这张表 |
 | 顶点阶段的参数缓冲区 | 与顶点流 0 号槽冲突，索引偏移约定未定 |
 | 真实 shader 的 draw | 仍然是 0 条 |
+| 真机 | **没有真机运行记录** |
+
+## M3.82 采样器状态对象与 FP 参数块（本轮）
+
+覆盖从 **66 -> 104 / 513（20.3%）**。新增的 38 个已绑定入口里，
+`nvnSamplerBuilder*` 有 24 个，`nvnSampler*` 对象有 14 个。
+`nvnSamplerBuilderGetDevice` 仍没有可依赖的参数形状；`nvnSamplerGetDebugID`
+虽有签名，但返回值应当是什么 debug ID 尚未确定。两者都没有为了凑数硬绑。
+
+### 默认值：照 nxnative 的真实实现，而不是猜 GL
+
+`nvnSamplerBuilderSetDefaults` 的默认值直接对齐
+`nxnative-git/dm/gfx/nvn/hle_nvn.c:546`：
+
+```
+min = NVN_MIN_FILTER_NEAREST_MIPMAP_LINEAR   mag = NVN_MAG_FILTER_LINEAR
+wrap s/t/r = NVN_WRAP_MODE_REPEAT
+compare mode = NONE, compare func = LESS
+lod_min = -1000, lod_max = 1000, max aniso = 1
+border = (0,0,0,0) 透明黑
+```
+
+`SetDefaults` 会清零 builder 的 `0x60` 字节，但保留已设置的 device，
+与 nxnative 的行为一致。
+
+### 便携状态与 Metal 映射
+
+新增 `ios/nvn/include/nvn_sampler.h` / `ios/nvn/src/nvn_sampler.c`，它不包含
+任何 Apple 头文件，所以 Windows 上的 MSVC 测试和 CI 的 clang C 编译都能跑。
+
+| NVN 输入 | 处理 |
+|---|---|
+| `NVNminFilter` 0..5 | 拆成 min filter + mip filter；6 以上拒绝 |
+| `NVNmagFilter` 0..1 | nearest / linear |
+| `NVNwrapMode` 0..7 | 映到 Metal 的四种地址模式；4（mirror-clamp-to-border）没有精确对应，标记 approximate |
+| `NVNcompareMode` / `Func` | mode 1 时把 func 1..8 转成 Metal 0..7；mode NONE 仍保留原 func |
+| `NVNsamplerReduction` 0..2 | 保存 average/min/max；Metal 26 起才设置 `reductionMode` |
+| LOD clamp / bias / anisotropy | 保存 guest 原值；只在 `MTLSamplerDescriptor` 上夹紧并记录 approximate |
+| border RGBA | 保存四个 float；Metal 只有透明黑/不透明黑/不透明白三个常量 |
+
+关键语义是 **getter 返回客体原值**：NVN 的 `CLAMP`（0）和 `CLAMP_TO_EDGE`（7）
+都会映到 Metal 的 clamp-to-edge，但 `nvnSamplerGetWrapMode` 必须分别返回 0 和 7。
+LOD 的 `-1000` 也原样返回，不能把 Metal 描述符夹紧后的 0 写回状态。
+`nvnSamplerCompare` 用原始 NVN 状态比较；border 按 `memcmp` 比字节，连 `-0.0`
+和 `+0.0` 都区分，和 nxnative 一致。
+
+`create_sampler_state()` 真正创建 `MTLSamplerState`，包含 filter、mip、wrap、
+LOD clamp、anisotropy、compare、border 和 `supportArgumentBuffers = YES`。
+`MTLSamplerReductionMode` 是 **iOS 26** 才有的 API，因此有两个门：编译期的
+`__IPHONE_OS_VERSION_MAX_ALLOWED >= 260000`，以及运行期的
+`@available(iOS 26.0, *)`。旧 SDK/旧系统不会引用这个符号，但 guest 的 reduction
+值仍保存在对象里，getter 不受影响。
+
+### 参数块：整数寄存器之外的 s/d 寄存器
+
+`nvngfx_proc` 的参数从 `uint64_t x[8]` 扩展为：
+
+```c
+typedef struct nvngfx_args {
+    uint64_t x[8];   /* x0..x7 / w0 返回值 */
+    uint64_t f[8];   /* s0..s7：float 在低 32 位；d0..d7：完整 64 位 */
+} nvngfx_args;
+```
+
+`nvnSamplerBuilderSetLodClamp` / `SetLodBias` / `SetMaxAnisotropy` 等入口接收
+FP 寄存器，这半块是必需的。生成的头文件提供
+`nvngfx_arg_f32()` / `nvngfx_arg_set_f32()` / `nvngfx_arg_f64()` /
+`nvngfx_arg_set_f64()`；ABI 测试用 `static_assert` 固定了大小、偏移和 float 位型。
+**缺口仍在仓库外**：本仓库没有真正的 guest -> host 调用桥，因此调用端必须自己把
+s/d 寄存器捕获到 `f[]`。不能把“类型和 handler 已支持”说成“端到端 FP 调用已完成”。
+
+### 自检与失败码
+
+除原来的四条 draw 外，`nvngfx_metal_selftest()` 再跑一条 sampler 路径：
+
+1. 用真实入口 `SetDefaults` / filter / wrap / LOD / bias / compare / border /
+   anisotropy / reduction 建 builder；
+2. 逐个读回，确认原始 NVN 值没有在映射中被改写；
+3. `nvnSamplerInitialize()` 创建真实的 `MTLSamplerState`；
+4. 从 sampler 对象读回状态，再建第二个 sampler，`nvnSamplerCompare` 必须相等。
+
+失败码统一是 **16384**。成功时 stderr 出现：
+
+```
+[selftest] sampler state created, compared and read back
+```
+
+### 证据（本地）
+
+```
+nvn_abi_test: ok (513 procs)
+core_smoke_test: ok
+nvn_texture_test: ok (157 formats in table)
+nvn_shader_test: ok
+nvn_vertex_test: ok (packing, 26 formats, layout id)
+nvn_sampler_test: ok (filters, wrap, compare, reduction, clamps)
+syntax_check_metal: ok (clang++.exe)
+build_abi_test: all tests passed
+
+gen_nvn.py --check: generated artifacts up to date (513 procs, 104 implemented)
+extract_nvn_signatures.py --check: ok (470 shapes, max arity 8)
+verify_ios.py: ok
+  metal bindings: 104/513
+```
+
+这些只能证明 Windows 上的状态逻辑、C ABI 和 Metal 源码通过类型检查。
+`MTLSamplerState` 是否真的创建成功、自检 rc 是否为 0，仍要等推送后的
+GitHub Actions `macos-15` 模拟器结论；**CI 尚未确认**。
+
+### 仍然没有的
+
+| 缺口 | 后果 |
+|---|---|
+| sampler pool / texture pool | 还没有资源句柄，无法把 sampler 注册进 NVN 池 |
+| `nvnCommandBufferBindSeparateSampler` / `SetSamplerPool` | 客体的采样器绑定调用仍不会影响 draw |
+| argument buffer 的 texture/sampler 条目 | `[[id(k)]]` 仍只有 UBO；采样器状态对象存在，但 shader 引用不到 |
+| 真实 shader 的 draw | 仍是 0 条；四条自检 draw 都用内置 MSL |
+| 外部 guest 浮点寄存器桥 | `nvngfx_args.f[]` 已定义，仓库外调用端还没填 |
 | 真机 | **没有真机运行记录** |

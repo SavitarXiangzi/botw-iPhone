@@ -9,6 +9,7 @@
 #include "nvn_api.h"
 #include "nvn_backend.h"
 
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 
@@ -28,7 +29,7 @@ static void count_missing(const char* name) {
     ++g_missing;
 }
 
-static void probe(nvngfx_ctx*, uint64_t[8]) {}
+static void probe(nvngfx_ctx*, nvngfx_args*) {}
 
 static nvngfx_proc fake_resolve(void* user, const char* name) {
     const char* const* owned = static_cast<const char* const*>(user);
@@ -58,6 +59,25 @@ int main() {
     const int n = nvngfx_count();
     CHECK(n == NVN_PROC_COUNT);
     CHECK(n > 400); /* the real NVN surface is ~500 entry points */
+
+    /* The argument block carries both integer (x0..x7) and FP (s0..s7 /
+     * d0..d7) registers.  nvnSamplerBuilderSetLodBias is the first bound
+     * entry point that needs the second half. */
+    static_assert(sizeof(nvngfx_args) == 16 * sizeof(uint64_t));
+    static_assert(offsetof(nvngfx_args, x) == 0);
+    static_assert(offsetof(nvngfx_args, f) == 8 * sizeof(uint64_t));
+    {
+        nvngfx_args a{};
+        nvngfx_arg_set_f32(&a, 3, 0.5f);
+        CHECK(nvngfx_arg_f32(&a, 3) == 0.5f);
+        CHECK(a.f[3] == 0x3f000000u);
+        CHECK(nvngfx_arg_f32(&a, 0) == 0.0f);
+
+        nvngfx_arg_set_f64(&a, 5, 1.5);
+        CHECK(nvngfx_arg_f64(&a, 5) == 1.5);
+        CHECK(a.f[5] == 0x3ff8000000000000ull);
+        CHECK(a.f[3] == 0x3f000000u);   /* f64 must not clobber another slot */
+    }
 
     /* Binary search requires strict ordering; verify it end to end. */
     for (int i = 1; i < n; ++i) {

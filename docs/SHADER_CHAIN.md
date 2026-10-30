@@ -156,11 +156,24 @@ C:\Python314\python.exe scripts\shader_chain\gen_blobs.py --msl build\shader-cha
    `buffer(0)` 的 `spvDescriptorSetBuffer0`，槽位约定见 §6。
    **常量已经接上**（M3.81）：`nvnCommandBufferBindUniformBuffer` 记录地址，
    draw 前填一个 16 项的参数缓冲区，每项是 `MTLBuffer.gpuAddress + 偏移`。
-   纹理 / sampler 条目还没填。
+   `MTLSamplerState` 对象也已经能创建（M3.82，见 §5.4），但 **texture / sampler
+   条目仍未填**：它们需要 texture pool / sampler pool 先给出稳定句柄。
 3. 几何路径：`DrawArrays` 与 `DrawElements`（16/32 位索引）都已编码，
    顶点与索引都按 pool 零拷贝绑定（M3.79 / M3.80）。也就是说**画什么形状
-   已经不缺了**，缺的是第 2 条：常量与纹理还没进 argument buffer，
+   已经不缺了**；常量已进 argument buffer，缺的是纹理与 sampler 条目，
    所以仍然没有一条**真实** shader 在 Metal 里执行过。
+
+### 5.4 Sampler 状态对象（M3.82）
+
+`nvnSamplerBuilder*` / `nvnSampler*` 已绑定 38 个入口，默认值按 nxnative
+`hle_nvn.c:546`，可以创建真实 `MTLSamplerState`。getter 保存并返回客体原始
+NVN 值（例如 wrap 0 与 7 不会被 Metal 映射“合并”），`nvnSamplerCompare`
+也按原始状态比较。`MTLSamplerReductionMode` 只在 iOS 26 SDK/系统上设置，
+旧系统保留 guest 值但不假装 Metal 已应用它。
+
+这仍**不是**资源绑定：没有 sampler pool，没有可注册的句柄，也没有
+`BindSeparateSampler` / `SetSamplerPool`，所以 argument buffer 里的
+`[[id(k)]]` sampler 槽位还是空的。
 
 ## 6. 绑定约定（nxnative 的驱动段布局）
 
@@ -184,12 +197,13 @@ C:\Python314\python.exe scripts\shader_chain\gen_blobs.py --msl build\shader-cha
 | `xcrun metal` → `.metallib` | 未做；只能在 macOS/CI 上做，本机没有 |
 | 整作 19,592 个 shader 全量构建 | 未做；只验证了 1 个 pack 的 5,102 个 key 中的 2 个 |
 | 编译期校验（MSL 语法） | 未做；Windows 没有 Metal 前端，MSL 只在 CI 的 macOS 上才能编 |
-| 真机 / 模拟器上跑真实 shader | 未做。自检用的仍是内置 MSL（M3.80 起是**三条** draw：`[[vertex_id]]`、顶点属性、以及 16 位索引的 `DrawElements`；三条均在 run 41008588834 通过） |
+| 真机 / 模拟器上跑真实 shader | 未做。自检用的仍是内置 MSL（四条 draw：`[[vertex_id]]`、顶点属性、16 位索引的 `DrawElements`、`BindUniformBuffer` 参数缓冲区；另加一条 sampler 状态创建/比较路径） |
 | compute / geometry shader | 未做（`extract` 目前跳过 cs） |
 | 运行时按 key 取 MSL | **已接线**（M3.78，见 §5.1） |
 | 顶点描述符 | **已接**（M3.79） |
-| argument buffer（UBO / 纹理） | 未接线，见 §5.3 第 2 条 |
+| argument buffer（UBO / 纹理 / sampler） | UBO 已接（M3.81）；sampler 状态对象已建（M3.82）；texture/sampler 条目未接，见 §5.3 第 2 条与 §5.4 |
 
 一句话：**链的前 2/3 在 Windows 上真的通了，后 1/3（`xcrun metal`）要在 CI 的
 macOS 上补；运行时按 key 取 MSL 已接线（M3.78），顶点与索引都已接（M3.79 / M3.80），
-但资源绑定（argument buffer）还没接，所以还没有任何一条真实 shader 在 Metal 里执行过。**
+UBO 已进 argument buffer（M3.81），sampler 状态对象已能创建（M3.82），但
+texture/sampler 条目还没接，所以还没有任何一条真实 shader 在 Metal 里执行过。**

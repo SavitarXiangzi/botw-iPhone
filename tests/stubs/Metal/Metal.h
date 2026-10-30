@@ -78,6 +78,71 @@ enum {
     MTLStorageModePrivate = 2,
 };
 
+/* Sampler state.  The numbers are Metal's real values; only names used by
+ * nvn_metal.mm need to exist here. */
+typedef enum MTLSamplerMinMagFilter : NSUInteger {
+    MTLSamplerMinMagFilterNearest = 0,
+    MTLSamplerMinMagFilterLinear = 1,
+} MTLSamplerMinMagFilter;
+
+typedef enum MTLSamplerMipFilter : NSUInteger {
+    MTLSamplerMipFilterNotMipmapped = 0,
+    MTLSamplerMipFilterNearest = 1,
+    MTLSamplerMipFilterLinear = 2,
+} MTLSamplerMipFilter;
+
+typedef enum MTLSamplerAddressMode : NSUInteger {
+    MTLSamplerAddressModeClampToEdge = 0,
+    MTLSamplerAddressModeMirrorClampToEdge = 1,
+    MTLSamplerAddressModeRepeat = 2,
+    MTLSamplerAddressModeMirrorRepeat = 3,
+    MTLSamplerAddressModeClampToZero = 4,
+    MTLSamplerAddressModeClampToBorderColor = 5,
+} MTLSamplerAddressMode;
+
+typedef enum MTLSamplerBorderColor : NSUInteger {
+    MTLSamplerBorderColorTransparentBlack = 0,
+    MTLSamplerBorderColorOpaqueBlack = 1,
+    MTLSamplerBorderColorOpaqueWhite = 2,
+} MTLSamplerBorderColor;
+
+typedef enum MTLCompareFunction : NSUInteger {
+    MTLCompareFunctionNever = 0,
+    MTLCompareFunctionLess = 1,
+    MTLCompareFunctionEqual = 2,
+    MTLCompareFunctionLessEqual = 3,
+    MTLCompareFunctionGreater = 4,
+    MTLCompareFunctionNotEqual = 5,
+    MTLCompareFunctionGreaterEqual = 6,
+    MTLCompareFunctionAlways = 7,
+} MTLCompareFunction;
+
+typedef enum MTLSamplerReductionMode : NSUInteger {
+    MTLSamplerReductionModeWeightedAverage = 0,
+    MTLSamplerReductionModeMinimum = 1,
+    MTLSamplerReductionModeMaximum = 2,
+} MTLSamplerReductionMode;
+
+@interface MTLSamplerDescriptor : NSObject
+@property MTLSamplerMinMagFilter minFilter;
+@property MTLSamplerMinMagFilter magFilter;
+@property MTLSamplerMipFilter mipFilter;
+@property NSUInteger maxAnisotropy;
+@property MTLSamplerAddressMode sAddressMode;
+@property MTLSamplerAddressMode tAddressMode;
+@property MTLSamplerAddressMode rAddressMode;
+@property MTLSamplerBorderColor borderColor;
+@property BOOL normalizedCoordinates;
+@property float lodMinClamp;
+@property float lodMaxClamp;
+@property MTLCompareFunction compareFunction;
+@property MTLSamplerReductionMode reductionMode;
+@property BOOL supportArgumentBuffers;
+@end
+
+@protocol MTLSamplerState
+@end
+
 @protocol MTLFunction;
 @protocol MTLLibrary
 - (id<MTLFunction>)newFunctionWithName:(NSString*)name;
@@ -315,6 +380,7 @@ destinationBytesPerImage:(NSUInteger)bpi;
                                  error:(NSError**)error;
 - (id<MTLRenderPipelineState>)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor*)d
                                                              error:(NSError**)error;
+- (id<MTLSamplerState>)newSamplerStateWithDescriptor:(MTLSamplerDescriptor*)descriptor;
 @end
 
 id<MTLDevice> MTLCreateSystemDefaultDevice(void);

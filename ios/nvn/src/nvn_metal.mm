@@ -24,15 +24,16 @@
  *         on a computer, never in the repository.  Everything else on that
  *         path -- pipeline creation with a real vertex descriptor, buffer
  *         binding, draw encoding, pixel readback -- is executed by
- *         nvngfx_metal_selftest() in CI's iOS Simulator (two draws: one from
- *         [[vertex_id]], one from [[attribute(0)]] out of a memory pool).
+ *         nvngfx_metal_selftest() in CI's iOS Simulator (four draws, plus a
+ *         sampler state object that is created, compared and read back).
  *         MRT / depth attachment / texture views
  *         guest-pixel upload (textures are host-owned, not aliased)
  *         texture tiling, BCn -> ASTC/ETC2 transcode, compute, sync/fence
  *
  * Argument ABI: measured, not guessed
  * -----------------------------------
- * Every host proc receives the guest's x0..x7 in x[].  The shapes live in
+ * Every host proc receives the guest's x0..x7 in x[] and s0..s7/d0..d7 in
+ * f[] (see nvngfx_args).  The shapes live in
  * ios/nvn/signatures.json, extracted from the public nxnative prototype list
  * (MIT).  Three consequences decide this whole file:
  *
@@ -40,8 +41,9 @@
  *     takes a pointer to the guest's own object; the host never owns that
  *     storage and never hands one back.  Host state is therefore keyed by the
  *     guest address, which is what x[0] holds on every object entry point.
- *   - Return values go in w0, i.e. x[0].  NVNboolean is 1/0, and getters
- *     overwrite x[0] with their result.
+ *   - Integer/pointer returns go in w0, i.e. x[0]; float returns go in s0,
+ *     i.e. the low 32 bits of f[0].  NVNboolean is 1/0, and getters overwrite
+ *     the return slot with their result.
  *   - Out-parameters are pointers into guest memory.  Unified memory means we
  *     write through them directly, e.g. nvnWindowAcquireTexture(w, sync, &idx).
  *
@@ -69,6 +71,7 @@
 
 #include "nvn_backend.h"
 #include "nvn_metal.h"
+#include "nvn_sampler.h"
 #include "nvn_shader.h"
 #include "nvn_texture.h"
 #include "nvn_vertex.h"
@@ -163,6 +166,13 @@ struct Tex {
     id<MTLTexture> mtl = nil;
 };
 
+struct Sampler {
+    nvngfx_sampler state = {};
+    uint64_t device = 0;
+    std::string label;
+    id<MTLSamplerState> mtl = nil;
+};
+
 struct CmdBuf {
     bool recording = false;
     unsigned draws = 0;
@@ -234,6 +244,12 @@ struct PoolSpec {
     uint32_t flags = 0;
 };
 
+struct SamplerSpec {
+    nvngfx_sampler state = {};
+    uint64_t device = 0;
+    float lodSnap = 0.0f;
+};
+
 Ctx* ctx_of(nvngfx_ctx* ctx) { return reinterpret_cast<Ctx*>(ctx); }
 
 template <class T>
@@ -272,6 +288,7 @@ std::unordered_map<uint64_t, int> g_device_flags;
  * struct and its layout is unverified, but that does not matter: every
  * field we need arrives through a setter we implement ourselves. */
 std::unordered_map<uint64_t, nvngfx_texdesc> g_tex_specs;
+std::unordered_map<uint64_t, SamplerSpec> g_sampler_specs;
 
 /* Guest memory is host-visible, so a pointer argument is just a cast.  This
  * is the one place that assumption is spelled out. */
@@ -711,6 +728,391 @@ void tex_initialize(nvngfx_ctx* ctx, uint64_t* x) {
         t->mtl = [c->device newTextureWithDescriptor:td];
         x[0] = t->mtl ? 1u : 0u;
     }
+}
+
+/* ------------------------------------------------------------------ */
+/* samplers                                                            */
+/* ------------------------------------------------------------------ */
+
+/* The guest argument block starts with x[0..7]; the FP half follows it.  The
+ * dispatcher hands every handler a pointer to the first word, so recovering
+ * the whole block is a cast, not a second ABI. */
+nvngfx_args* sampler_args(uint64_t* x) { return reinterpret_cast<nvngfx_args*>(x); }
+
+const SamplerSpec& sampler_spec_or_default(uint64_t builder) {
+    static const SamplerSpec fallback = [] {
+        SamplerSpec s;
+        nvngfx_sampler_defaults(&s.state);
+        return s;
+    }();
+    auto it = g_sampler_specs.find(builder);
+    return it == g_sampler_specs.end() ? fallback : it->second;
+}
+
+SamplerSpec& sampler_spec(uint64_t builder) {
+    auto it = g_sampler_specs.find(builder);
+    if (it == g_sampler_specs.end()) {
+        /* A builder seen for the first time behaves like one that has already
+         * received SetDefaults.  The guest is still expected to call it, but a
+         * setter must not start from an all-zero filter/wrap enum by accident. */
+        SamplerSpec s;
+        nvngfx_sampler_defaults(&s.state);
+        it = g_sampler_specs.emplace(builder, s).first;
+    }
+    return it->second;
+}
+
+MTLSamplerAddressMode to_metal_address(nvngfx_wrap wrap) {
+    switch (wrap) {
+    case NVNGFX_WRAP_CLAMP_TO_EDGE: return MTLSamplerAddressModeClampToEdge;
+    case NVNGFX_WRAP_REPEAT: return MTLSamplerAddressModeRepeat;
+    case NVNGFX_WRAP_MIRROR_CLAMP_TO_EDGE: return MTLSamplerAddressModeMirrorClampToEdge;
+    case NVNGFX_WRAP_MIRRORED_REPEAT: return MTLSamplerAddressModeMirrorRepeat;
+    case NVNGFX_WRAP_CLAMP_TO_BORDER: return MTLSamplerAddressModeClampToBorderColor;
+    default: return MTLSamplerAddressModeRepeat;
+    }
+}
+
+MTLSamplerBorderColor to_metal_border(const float rgba[4]) {
+    /* Same rule as nxnative: alpha chooses transparent vs opaque, red chooses
+     * black vs white.  Metal has no arbitrary colour border. */
+    if (rgba[3] > 0.5f) return rgba[0] > 0.5f ? MTLSamplerBorderColorOpaqueWhite
+                                               : MTLSamplerBorderColorOpaqueBlack;
+    return MTLSamplerBorderColorTransparentBlack;
+}
+
+#if defined(__IPHONE_OS_VERSION_MAX_ALLOWED) && __IPHONE_OS_VERSION_MAX_ALLOWED >= 260000
+MTLSamplerReductionMode to_metal_reduction(nvngfx_reduction r) {
+    switch (r) {
+    case NVNGFX_REDUCTION_MIN: return MTLSamplerReductionModeMinimum;
+    case NVNGFX_REDUCTION_MAX: return MTLSamplerReductionModeMaximum;
+    default: return MTLSamplerReductionModeWeightedAverage;
+    }
+}
+#endif
+
+id<MTLSamplerState> create_sampler_state(Ctx* c, const nvngfx_sampler& st) {
+    if (!c || !c->ready) return nil;
+    @autoreleasepool {
+        MTLSamplerDescriptor* d = [[MTLSamplerDescriptor alloc] init];
+        d.minFilter = st.min_filter == NVNGFX_TEXFILTER_LINEAR
+                          ? MTLSamplerMinMagFilterLinear
+                          : MTLSamplerMinMagFilterNearest;
+        d.magFilter = st.mag_filter == NVNGFX_TEXFILTER_LINEAR
+                          ? MTLSamplerMinMagFilterLinear
+                          : MTLSamplerMinMagFilterNearest;
+        switch (st.mip_filter) {
+        case NVNGFX_MIPFILTER_NEAREST: d.mipFilter = MTLSamplerMipFilterNearest; break;
+        case NVNGFX_MIPFILTER_LINEAR: d.mipFilter = MTLSamplerMipFilterLinear; break;
+        default: d.mipFilter = MTLSamplerMipFilterNotMipmapped; break;
+        }
+        d.sAddressMode = to_metal_address(static_cast<nvngfx_wrap>(st.wrap_s));
+        d.tAddressMode = to_metal_address(static_cast<nvngfx_wrap>(st.wrap_t));
+        d.rAddressMode = to_metal_address(static_cast<nvngfx_wrap>(st.wrap_r));
+
+        /* GetLodClamp returns the guest's exact values.  Metal needs a
+         * non-negative, ordered range, so only the descriptor is adjusted. */
+        float lo = st.lod_min;
+        float hi = st.lod_max;
+        if (lo < 0.0f) lo = 0.0f;
+        if (hi < lo) hi = lo;
+        d.lodMinClamp = lo;
+        d.lodMaxClamp = hi;
+
+        float aniso = st.max_aniso;
+        if (aniso < 1.0f) aniso = 1.0f;
+        if (aniso > 16.0f) aniso = 16.0f;
+        d.maxAnisotropy = static_cast<NSUInteger>(aniso);
+
+        d.compareFunction = static_cast<MTLCompareFunction>(st.compare);
+        if (st.reduction != NVNGFX_REDUCTION_AVERAGE) {
+            /* MTLSamplerReductionMode is new in iOS 26.  The compile-time
+             * guard keeps Xcode 16/iOS 18 SDKs buildable; the runtime guard
+             * keeps the iOS 17 deployment target from messaging it.  The
+             * guest value is still preserved for the getters on every OS. */
+#if defined(__IPHONE_OS_VERSION_MAX_ALLOWED) && __IPHONE_OS_VERSION_MAX_ALLOWED >= 260000
+            if (@available(iOS 26.0, *)) {
+                d.reductionMode = to_metal_reduction(static_cast<nvngfx_reduction>(st.reduction));
+                /* Metal ignores reduction with nearest/no mip filtering.  The
+                 * nxnative mapping keeps integer-LOD min/max reduction exact
+                 * by forcing linear mip selection and clamping to level 0. */
+                if (d.mipFilter == MTLSamplerMipFilterNotMipmapped) {
+                    d.mipFilter = MTLSamplerMipFilterLinear;
+                    d.lodMinClamp = 0.0f;
+                    d.lodMaxClamp = 0.0f;
+                }
+            } else {
+                log_once("nvnSamplerInitialize.reductionUnavailable", st.reduction);
+            }
+#else
+            log_once("nvnSamplerInitialize.reductionUnavailable", st.reduction);
+#endif
+        }
+        d.borderColor = to_metal_border(st.border);
+        d.normalizedCoordinates = YES;
+        d.supportArgumentBuffers = YES;
+        return [c->device newSamplerStateWithDescriptor:d];
+    }
+}
+
+/* nvnSamplerBuilderSetDefaults(NVNsamplerBuilder*) */
+void sampler_builder_set_defaults(nvngfx_ctx*, uint64_t* x) {
+    if (!x[0]) return;
+    uint64_t device = sampler_spec_or_default(x[0]).device;
+    std::memset(guest_ptr<void>(x[0]), 0, 0x60);
+    SamplerSpec& spec = sampler_spec(x[0]);
+    std::memset(&spec.state, 0, sizeof spec.state);
+    nvngfx_sampler_defaults(&spec.state);
+    spec.device = device;   /* SetDefaults preserves the builder's device */
+    spec.lodSnap = 0.0f;
+}
+
+void sampler_builder_set_device(nvngfx_ctx*, uint64_t* x) {
+    if (x[0]) sampler_spec(x[0]).device = x[1];
+}
+void sampler_builder_set_minmag(nvngfx_ctx*, uint64_t* x) {
+    if (!x[0]) return;
+    if (nvngfx_sampler_set_minmag(&sampler_spec(x[0]).state,
+                                  static_cast<unsigned>(x[1]),
+                                  static_cast<unsigned>(x[2])) != 0) {
+        log_once("nvnSamplerBuilderSetMinMagFilter", static_cast<unsigned>(x[1]));
+    }
+}
+void sampler_builder_set_wrap(nvngfx_ctx*, uint64_t* x) {
+    if (!x[0]) return;
+    if (nvngfx_sampler_set_wrap(&sampler_spec(x[0]).state,
+                                static_cast<unsigned>(x[1]),
+                                static_cast<unsigned>(x[2]),
+                                static_cast<unsigned>(x[3])) != 0) {
+        log_once("nvnSamplerBuilderSetWrapMode", static_cast<unsigned>(x[1]));
+    }
+}
+void sampler_builder_set_lod_clamp(nvngfx_ctx*, uint64_t* x) {
+    if (!x[0]) return;
+    nvngfx_args* a = sampler_args(x);
+    nvngfx_sampler_set_lod_clamp(&sampler_spec(x[0]).state,
+                                 nvngfx_arg_f32(a, 0), nvngfx_arg_f32(a, 1));
+}
+void sampler_builder_set_lod_bias(nvngfx_ctx*, uint64_t* x) {
+    if (!x[0]) return;
+    nvngfx_sampler_set_lod_bias(&sampler_spec(x[0]).state,
+                                nvngfx_arg_f32(sampler_args(x), 0));
+}
+void sampler_builder_set_compare(nvngfx_ctx*, uint64_t* x) {
+    if (!x[0]) return;
+    if (nvngfx_sampler_set_compare(&sampler_spec(x[0]).state,
+                                   static_cast<unsigned>(x[1]),
+                                   static_cast<unsigned>(x[2])) != 0) {
+        log_once("nvnSamplerBuilderSetCompare", static_cast<unsigned>(x[1]));
+    }
+}
+void sampler_builder_set_border(nvngfx_ctx*, uint64_t* x) {
+    if (!x[0]) return;
+    const float* rgba = guest_ptr<const float>(x[1]);
+    if (!rgba) {
+        log_once("nvnSamplerBuilderSetBorderColor", 0);
+        return;
+    }
+    nvngfx_sampler_set_border(&sampler_spec(x[0]).state, rgba);
+}
+void sampler_builder_set_border_i(nvngfx_ctx*, uint64_t* x) {
+    if (!x[0]) return;
+    const int* c = guest_ptr<const int>(x[1]);
+    if (!c) {
+        log_once("nvnSamplerBuilderSetBorderColori", 0);
+        return;
+    }
+    const float rgba[4] = {static_cast<float>(c[0]), static_cast<float>(c[1]),
+                           static_cast<float>(c[2]), static_cast<float>(c[3])};
+    nvngfx_sampler_set_border(&sampler_spec(x[0]).state, rgba);
+}
+void sampler_builder_set_border_ui(nvngfx_ctx*, uint64_t* x) {
+    if (!x[0]) return;
+    const uint32_t* c = guest_ptr<const uint32_t>(x[1]);
+    if (!c) {
+        log_once("nvnSamplerBuilderSetBorderColorui", 0);
+        return;
+    }
+    const float rgba[4] = {static_cast<float>(c[0]), static_cast<float>(c[1]),
+                           static_cast<float>(c[2]), static_cast<float>(c[3])};
+    nvngfx_sampler_set_border(&sampler_spec(x[0]).state, rgba);
+}
+void sampler_builder_set_max_aniso(nvngfx_ctx*, uint64_t* x) {
+    if (!x[0]) return;
+    nvngfx_sampler_set_anisotropy(&sampler_spec(x[0]).state,
+                                  nvngfx_arg_f32(sampler_args(x), 0));
+}
+void sampler_builder_set_reduction(nvngfx_ctx*, uint64_t* x) {
+    if (!x[0]) return;
+    if (nvngfx_sampler_set_reduction(&sampler_spec(x[0]).state,
+                                     static_cast<unsigned>(x[1])) != 0) {
+        log_once("nvnSamplerBuilderSetReductionFilter", static_cast<unsigned>(x[1]));
+    }
+}
+void sampler_builder_set_lod_snap(nvngfx_ctx*, uint64_t* x) {
+    if (!x[0]) return;
+    sampler_spec(x[0]).lodSnap = nvngfx_arg_f32(sampler_args(x), 0);
+}
+
+void sampler_builder_get_minmag(nvngfx_ctx*, uint64_t* x) {
+    const nvngfx_sampler& s = sampler_spec_or_default(x[0]).state;
+    uint32_t* mi = guest_ptr<uint32_t>(x[1]);
+    uint32_t* ma = guest_ptr<uint32_t>(x[2]);
+    if (mi) *mi = s.nvn_min_filter;
+    if (ma) *ma = s.nvn_mag_filter;
+}
+void sampler_builder_get_wrap(nvngfx_ctx*, uint64_t* x) {
+    const nvngfx_sampler& s = sampler_spec_or_default(x[0]).state;
+    uint32_t* ws = guest_ptr<uint32_t>(x[1]);
+    uint32_t* wt = guest_ptr<uint32_t>(x[2]);
+    uint32_t* wr = guest_ptr<uint32_t>(x[3]);
+    if (ws) *ws = s.nvn_wrap_s;
+    if (wt) *wt = s.nvn_wrap_t;
+    if (wr) *wr = s.nvn_wrap_r;
+}
+void sampler_builder_get_lod_clamp(nvngfx_ctx*, uint64_t* x) {
+    const nvngfx_sampler& s = sampler_spec_or_default(x[0]).state;
+    float* lo = guest_ptr<float>(x[1]);
+    float* hi = guest_ptr<float>(x[2]);
+    if (lo) *lo = s.lod_min;
+    if (hi) *hi = s.lod_max;
+}
+void sampler_builder_get_lod_bias(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_arg_set_f32(sampler_args(x), 0, sampler_spec_or_default(x[0]).state.lod_bias);
+}
+void sampler_builder_get_compare(nvngfx_ctx*, uint64_t* x) {
+    const nvngfx_sampler& s = sampler_spec_or_default(x[0]).state;
+    uint32_t* mode = guest_ptr<uint32_t>(x[1]);
+    uint32_t* func = guest_ptr<uint32_t>(x[2]);
+    if (mode) *mode = s.nvn_compare_mode;
+    if (func) *func = s.nvn_compare_func;
+}
+void sampler_builder_get_border(nvngfx_ctx*, uint64_t* x) {
+    const nvngfx_sampler& s = sampler_spec_or_default(x[0]).state;
+    float* c = guest_ptr<float>(x[1]);
+    if (c) std::memcpy(c, s.border, sizeof s.border);
+}
+void sampler_builder_get_border_i(nvngfx_ctx*, uint64_t* x) {
+    const nvngfx_sampler& s = sampler_spec_or_default(x[0]).state;
+    int* c = guest_ptr<int>(x[1]);
+    if (c) for (int i = 0; i < 4; ++i) c[i] = static_cast<int>(s.border[i]);
+}
+void sampler_builder_get_border_ui(nvngfx_ctx*, uint64_t* x) {
+    const nvngfx_sampler& s = sampler_spec_or_default(x[0]).state;
+    uint32_t* c = guest_ptr<uint32_t>(x[1]);
+    if (c) for (int i = 0; i < 4; ++i) c[i] = static_cast<uint32_t>(s.border[i]);
+}
+void sampler_builder_get_max_aniso(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_arg_set_f32(sampler_args(x), 0, sampler_spec_or_default(x[0]).state.max_aniso);
+}
+void sampler_builder_get_reduction(nvngfx_ctx*, uint64_t* x) {
+    x[0] = sampler_spec_or_default(x[0]).state.nvn_reduction;
+}
+void sampler_builder_get_lod_snap(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_arg_set_f32(sampler_args(x), 0, sampler_spec_or_default(x[0]).lodSnap);
+}
+
+/* nvnSamplerInitialize(NVNsampler*, const NVNsamplerBuilder*) -> NVNboolean */
+void sampler_initialize(nvngfx_ctx* ctx, uint64_t* x) {
+    Ctx* c = ctx_of(ctx);
+    if (!c || !c->ready || !x[0]) {
+        x[0] = 0;
+        return;
+    }
+    const SamplerSpec spec = sampler_spec_or_default(x[1]);
+    if (spec.state.approximate) {
+        log_once("nvnSamplerInitialize.approximate", spec.state.approximate);
+    }
+    Sampler* s = find_or_add<Sampler>(x[0]);
+    s->state = spec.state;
+    s->device = spec.device;
+    s->mtl = create_sampler_state(c, s->state);
+    x[0] = s->mtl ? 1u : 0u;
+}
+
+void sampler_finalize(nvngfx_ctx*, uint64_t* x) { forget<Sampler>(x[0]); }
+
+void sampler_set_debug_label(nvngfx_ctx*, uint64_t* x) {
+    Sampler* s = find<Sampler>(x[0]);
+    if (!s) return;
+    const char* label = guest_ptr<const char>(x[1]);
+    s->label = label ? label : "";
+}
+
+const nvngfx_sampler* sampler_object_state(uint64_t guest) {
+    Sampler* s = find<Sampler>(guest);
+    return s ? &s->state : nullptr;
+}
+
+void sampler_get_minmag(nvngfx_ctx*, uint64_t* x) {
+    const nvngfx_sampler* s = sampler_object_state(x[0]);
+    if (!s) return;
+    uint32_t* mi = guest_ptr<uint32_t>(x[1]);
+    uint32_t* ma = guest_ptr<uint32_t>(x[2]);
+    if (mi) *mi = s->nvn_min_filter;
+    if (ma) *ma = s->nvn_mag_filter;
+}
+void sampler_get_wrap(nvngfx_ctx*, uint64_t* x) {
+    const nvngfx_sampler* s = sampler_object_state(x[0]);
+    if (!s) return;
+    uint32_t* ws = guest_ptr<uint32_t>(x[1]);
+    uint32_t* wt = guest_ptr<uint32_t>(x[2]);
+    uint32_t* wr = guest_ptr<uint32_t>(x[3]);
+    if (ws) *ws = s->nvn_wrap_s;
+    if (wt) *wt = s->nvn_wrap_t;
+    if (wr) *wr = s->nvn_wrap_r;
+}
+void sampler_get_lod_clamp(nvngfx_ctx*, uint64_t* x) {
+    const nvngfx_sampler* s = sampler_object_state(x[0]);
+    if (!s) return;
+    float* lo = guest_ptr<float>(x[1]);
+    float* hi = guest_ptr<float>(x[2]);
+    if (lo) *lo = s->lod_min;
+    if (hi) *hi = s->lod_max;
+}
+void sampler_get_lod_bias(nvngfx_ctx*, uint64_t* x) {
+    const nvngfx_sampler* s = sampler_object_state(x[0]);
+    nvngfx_arg_set_f32(sampler_args(x), 0, s ? s->lod_bias : 0.0f);
+}
+void sampler_get_compare(nvngfx_ctx*, uint64_t* x) {
+    const nvngfx_sampler* s = sampler_object_state(x[0]);
+    if (!s) return;
+    uint32_t* mode = guest_ptr<uint32_t>(x[1]);
+    uint32_t* func = guest_ptr<uint32_t>(x[2]);
+    if (mode) *mode = s->nvn_compare_mode;
+    if (func) *func = s->nvn_compare_func;
+}
+void sampler_get_border(nvngfx_ctx*, uint64_t* x) {
+    const nvngfx_sampler* s = sampler_object_state(x[0]);
+    if (!s) return;
+    float* c = guest_ptr<float>(x[1]);
+    if (c) std::memcpy(c, s->border, sizeof s->border);
+}
+void sampler_get_border_i(nvngfx_ctx*, uint64_t* x) {
+    const nvngfx_sampler* s = sampler_object_state(x[0]);
+    if (!s) return;
+    int* c = guest_ptr<int>(x[1]);
+    if (c) for (int i = 0; i < 4; ++i) c[i] = static_cast<int>(s->border[i]);
+}
+void sampler_get_border_ui(nvngfx_ctx*, uint64_t* x) {
+    const nvngfx_sampler* s = sampler_object_state(x[0]);
+    if (!s) return;
+    uint32_t* c = guest_ptr<uint32_t>(x[1]);
+    if (c) for (int i = 0; i < 4; ++i) c[i] = static_cast<uint32_t>(s->border[i]);
+}
+void sampler_get_max_aniso(nvngfx_ctx*, uint64_t* x) {
+    const nvngfx_sampler* s = sampler_object_state(x[0]);
+    nvngfx_arg_set_f32(sampler_args(x), 0, s ? s->max_aniso : 0.0f);
+}
+void sampler_get_reduction(nvngfx_ctx*, uint64_t* x) {
+    const nvngfx_sampler* s = sampler_object_state(x[0]);
+    x[0] = s ? s->nvn_reduction : 0;
+}
+/* nvnSamplerCompare(const NVNsampler*, const NVNsampler*) -> NVNboolean */
+void sampler_compare(nvngfx_ctx*, uint64_t* x) {
+    const nvngfx_sampler* a = sampler_object_state(x[0]);
+    const nvngfx_sampler* b = sampler_object_state(x[1]);
+    x[0] = (a && b && nvngfx_sampler_equals(a, b)) ? 1u : 0u;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1433,8 +1835,8 @@ void cmdbuf_clear_color(nvngfx_ctx* ctx, uint64_t* x) {
     log_once("nvnCommandBufferClearColor.mask", static_cast<unsigned>(b->clearMask));
 }
 
-/* NVNshaderStage, as nxnative observes it: 0 vertex, 1 pixel,
- * 2 geometry, 5 compute (3 and 4 never appear in this title). */
+/* NVNshaderStage from nxnative's nvn.h: VERTEX=0, FRAGMENT=1, GEOMETRY=2,
+ * TESS_CONTROL=3, TESS_EVALUATION=4, COMPUTE=5. */
 
 /* nvnCommandBufferBindUniformBuffer(NVNcommandBuffer*, NVNshaderStage,
  *                                  int index, NVNbufferAddress, size_t) */
@@ -1556,11 +1958,10 @@ void cmdbuf_draw_arrays(nvngfx_ctx* ctx, uint64_t* x) {
 /* nvnCommandBufferDrawElements(NVNcommandBuffer*, NVNdrawPrimitive,
  *                              NVNindexType, int count, NVNbufferAddress)
  *
- * NVNindexType follows nxnative's reading of it: 1 is 16-bit, 2 is 32-bit
- * (its recorder rejects anything outside 1..2).  The values themselves are
- * *not* verified against Nintendo's header -- they are what a working public
- * implementation uses -- so an unknown type drops the draw with a log line
- * instead of guessing. */
+ * NVNindexType from nxnative's nvn.h: UNSIGNED_BYTE=0, UNSIGNED_SHORT=1,
+ * UNSIGNED_INT=2.  That is a reimplementation's header, not Nintendo's SDK.
+ * UNSIGNED_BYTE is not wired yet; this backend accepts only 1/2 and drops an
+ * unknown type with a log line instead of guessing. */
 void cmdbuf_draw_elements(nvngfx_ctx* ctx, uint64_t* x) {
     Ctx* c = ctx_of(ctx);
     CmdBuf* b = find<CmdBuf>(x[0]);
@@ -1732,6 +2133,45 @@ const Binding kBindings[] = {
     BIND("nvnTextureBuilderSetFlags", tex_builder_set_flags),
     BIND("nvnTextureInitialize", tex_initialize),
 
+    BIND("nvnSamplerBuilderSetDefaults", sampler_builder_set_defaults),
+    BIND("nvnSamplerBuilderSetDevice", sampler_builder_set_device),
+    BIND("nvnSamplerBuilderSetMinMagFilter", sampler_builder_set_minmag),
+    BIND("nvnSamplerBuilderSetWrapMode", sampler_builder_set_wrap),
+    BIND("nvnSamplerBuilderSetLodClamp", sampler_builder_set_lod_clamp),
+    BIND("nvnSamplerBuilderSetLodBias", sampler_builder_set_lod_bias),
+    BIND("nvnSamplerBuilderSetCompare", sampler_builder_set_compare),
+    BIND("nvnSamplerBuilderSetBorderColor", sampler_builder_set_border),
+    BIND("nvnSamplerBuilderSetBorderColori", sampler_builder_set_border_i),
+    BIND("nvnSamplerBuilderSetBorderColorui", sampler_builder_set_border_ui),
+    BIND("nvnSamplerBuilderSetMaxAnisotropy", sampler_builder_set_max_aniso),
+    BIND("nvnSamplerBuilderSetReductionFilter", sampler_builder_set_reduction),
+    BIND("nvnSamplerBuilderSetLodSnap", sampler_builder_set_lod_snap),
+    BIND("nvnSamplerBuilderGetMinMagFilter", sampler_builder_get_minmag),
+    BIND("nvnSamplerBuilderGetWrapMode", sampler_builder_get_wrap),
+    BIND("nvnSamplerBuilderGetLodClamp", sampler_builder_get_lod_clamp),
+    BIND("nvnSamplerBuilderGetLodBias", sampler_builder_get_lod_bias),
+    BIND("nvnSamplerBuilderGetCompare", sampler_builder_get_compare),
+    BIND("nvnSamplerBuilderGetBorderColor", sampler_builder_get_border),
+    BIND("nvnSamplerBuilderGetBorderColori", sampler_builder_get_border_i),
+    BIND("nvnSamplerBuilderGetBorderColorui", sampler_builder_get_border_ui),
+    BIND("nvnSamplerBuilderGetMaxAnisotropy", sampler_builder_get_max_aniso),
+    BIND("nvnSamplerBuilderGetReductionFilter", sampler_builder_get_reduction),
+    BIND("nvnSamplerBuilderGetLodSnap", sampler_builder_get_lod_snap),
+    BIND("nvnSamplerInitialize", sampler_initialize),
+    BIND("nvnSamplerFinalize", sampler_finalize),
+    BIND("nvnSamplerSetDebugLabel", sampler_set_debug_label),
+    BIND("nvnSamplerGetMinMagFilter", sampler_get_minmag),
+    BIND("nvnSamplerGetWrapMode", sampler_get_wrap),
+    BIND("nvnSamplerGetLodClamp", sampler_get_lod_clamp),
+    BIND("nvnSamplerGetLodBias", sampler_get_lod_bias),
+    BIND("nvnSamplerGetCompare", sampler_get_compare),
+    BIND("nvnSamplerGetBorderColor", sampler_get_border),
+    BIND("nvnSamplerGetBorderColori", sampler_get_border_i),
+    BIND("nvnSamplerGetBorderColorui", sampler_get_border_ui),
+    BIND("nvnSamplerGetMaxAnisotropy", sampler_get_max_aniso),
+    BIND("nvnSamplerGetReductionFilter", sampler_get_reduction),
+    BIND("nvnSamplerCompare", sampler_compare),
+
     BIND("nvnProgramInitialize", prog_initialize),
     BIND("nvnProgramSetShaders", prog_set_shaders),
     BIND("nvnProgramFinalize", prog_finalize),
@@ -1842,8 +2282,14 @@ extern "C" int nvngfx_metal_selftest(void) {
      * this test crashed: the key looked fine until the memset. */
     alignas(16) unsigned char texObject[0x80] = {};
     alignas(16) unsigned char texBuilder[0x80] = {};
+    alignas(16) unsigned char samplerBuilder[0x60] = {};
+    alignas(16) unsigned char samplerObject[0x30] = {};
+    alignas(16) unsigned char samplerObject2[0x30] = {};
     const uint64_t kTex = reinterpret_cast<uint64_t>(texObject);
     const uint64_t kTexBuilder = reinterpret_cast<uint64_t>(texBuilder);
+    const uint64_t kSamplerBuilder = reinterpret_cast<uint64_t>(samplerBuilder);
+    const uint64_t kSampler = reinterpret_cast<uint64_t>(samplerObject);
+    const uint64_t kSampler2 = reinterpret_cast<uint64_t>(samplerObject2);
     const uint64_t kCb = 0x5200;
     const uint64_t kProg = 0x5300;
     const NSUInteger kSide = 64;
@@ -1889,6 +2335,110 @@ extern "C" int nvngfx_metal_selftest(void) {
             std::fprintf(stderr, "[selftest] nvnTextureInitialize failed\n");
             rc = 4;
             goto done;
+        }
+
+        {
+            /* --- Sampler state, end to end --------------------------------
+             * This is a real MTLSamplerState creation, not just the portable
+             * state test: setters, getters, and the object the argument buffer
+             * will later reference.  No draw is needed for this check. */
+            nvngfx_args a{};
+            const float white[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+            a.x[0] = kSamplerBuilder;
+            sampler_builder_set_defaults(ctx, a.x);
+            a.x[0] = kSamplerBuilder; a.x[1] = 4; a.x[2] = 1;
+            sampler_builder_set_minmag(ctx, a.x);      /* nearest mip-linear, linear */
+            a.x[0] = kSamplerBuilder; a.x[1] = 4; a.x[2] = 5; a.x[3] = 6;
+            sampler_builder_set_wrap(ctx, a.x);        /* mirror-border, border, mirror */
+            a.x[0] = kSamplerBuilder;
+            nvngfx_arg_set_f32(&a, 0, 0.0f);
+            nvngfx_arg_set_f32(&a, 1, 8.0f);
+            sampler_builder_set_lod_clamp(ctx, a.x);
+            nvngfx_arg_set_f32(&a, 0, 0.5f);
+            sampler_builder_set_lod_bias(ctx, a.x);
+            a.x[0] = kSamplerBuilder; a.x[1] = 1; a.x[2] = 4;
+            sampler_builder_set_compare(ctx, a.x);     /* compare R, LEQUAL */
+            a.x[0] = kSamplerBuilder; a.x[1] = reinterpret_cast<uint64_t>(white);
+            sampler_builder_set_border(ctx, a.x);
+            nvngfx_arg_set_f32(&a, 0, 8.0f);
+            sampler_builder_set_max_aniso(ctx, a.x);
+            a.x[0] = kSamplerBuilder; a.x[1] = 1;
+            sampler_builder_set_reduction(ctx, a.x);   /* min */
+
+            uint32_t got_min = 99, got_mag = 99, got_ws = 99, got_wt = 99, got_wr = 99;
+            uint32_t got_cmp_mode = 99, got_cmp_func = 99;
+            float got_lo = 0.0f, got_hi = 0.0f;
+            nvngfx_args g{};
+            g.x[0] = kSamplerBuilder;
+            g.x[1] = reinterpret_cast<uint64_t>(&got_min);
+            g.x[2] = reinterpret_cast<uint64_t>(&got_mag);
+            sampler_builder_get_minmag(ctx, g.x);
+            g.x[1] = reinterpret_cast<uint64_t>(&got_ws);
+            g.x[2] = reinterpret_cast<uint64_t>(&got_wt);
+            g.x[3] = reinterpret_cast<uint64_t>(&got_wr);
+            sampler_builder_get_wrap(ctx, g.x);
+            g.x[1] = reinterpret_cast<uint64_t>(&got_lo);
+            g.x[2] = reinterpret_cast<uint64_t>(&got_hi);
+            sampler_builder_get_lod_clamp(ctx, g.x);
+            g.x[1] = reinterpret_cast<uint64_t>(&got_cmp_mode);
+            g.x[2] = reinterpret_cast<uint64_t>(&got_cmp_func);
+            sampler_builder_get_compare(ctx, g.x);
+            nvngfx_args lb{};
+            lb.x[0] = kSamplerBuilder;
+            sampler_builder_get_lod_bias(ctx, lb.x);
+            nvngfx_args an{};
+            an.x[0] = kSamplerBuilder;
+            sampler_builder_get_max_aniso(ctx, an.x);
+            g.x[0] = kSamplerBuilder;
+            sampler_builder_get_reduction(ctx, g.x);
+            const uint64_t got_reduction = g.x[0];
+            if (got_min != 4 || got_mag != 1 || got_ws != 4 || got_wt != 5 ||
+                got_wr != 6 || got_lo != 0.0f || got_hi != 8.0f ||
+                got_cmp_mode != 1 || got_cmp_func != 4 || got_reduction != 1 ||
+                nvngfx_arg_f32(&lb, 0) != 0.5f ||
+                nvngfx_arg_f32(&an, 0) != 8.0f) {
+                std::fprintf(stderr, "[selftest] sampler builder getters disagree\n");
+                rc = 16384;
+                goto done;
+            }
+
+            a.x[0] = kSampler; a.x[1] = kSamplerBuilder;
+            sampler_initialize(ctx, a.x);
+            Sampler* smp = find<Sampler>(kSampler);
+            if (a.x[0] != 1 || !smp || !smp->mtl) {
+                std::fprintf(stderr, "[selftest] nvnSamplerInitialize failed\n");
+                rc = 16384;
+                goto done;
+            }
+            uint32_t obj_min = 99, obj_mag = 99;
+            g = nvngfx_args{};
+            g.x[0] = kSampler;
+            g.x[1] = reinterpret_cast<uint64_t>(&obj_min);
+            g.x[2] = reinterpret_cast<uint64_t>(&obj_mag);
+            sampler_get_minmag(ctx, g.x);
+            nvngfx_args of{};
+            of.x[0] = kSampler;
+            sampler_get_lod_bias(ctx, of.x);
+            bool same = false;
+            if (smp) same = nvngfx_sampler_equals(&smp->state,
+                                                  &sampler_spec_or_default(kSamplerBuilder).state) != 0;
+            if (obj_min != 4 || obj_mag != 1 || nvngfx_arg_f32(&of, 0) != 0.5f || !same) {
+                std::fprintf(stderr, "[selftest] sampler object getters disagree\n");
+                rc = 16384;
+                goto done;
+            }
+            a.x[0] = kSampler2; a.x[1] = kSamplerBuilder;
+            sampler_initialize(ctx, a.x);
+            g = nvngfx_args{};
+            g.x[0] = kSampler;
+            g.x[1] = kSampler2;
+            sampler_compare(ctx, g.x);
+            if (a.x[0] != 1 || g.x[0] != 1) {
+                std::fprintf(stderr, "[selftest] nvnSamplerCompare disagreed\n");
+                rc = 16384;
+                goto done;
+            }
+            std::fprintf(stderr, "[selftest] sampler state created, compared and read back\n");
         }
 
         {
@@ -2319,6 +2869,8 @@ extern "C" int nvngfx_metal_selftest(void) {
         nvngfx_shader_set_msl_passthrough(0);
         forget<CmdBuf>(kCb);
         forget<Tex>(kTex);
+        forget<Sampler>(kSampler);
+        forget<Sampler>(kSampler2);
         forget<Program>(kProg);
         forget<Program>(0x5600);
         forget<CmdBuf>(0x5700);
@@ -2326,6 +2878,7 @@ extern "C" int nvngfx_metal_selftest(void) {
         g_pool_specs.erase(0x5500);
         std::free(poolRaw);
         g_tex_specs.erase(kTexBuilder);
+        g_sampler_specs.erase(kSamplerBuilder);
         nvngfx_metal_destroy(ctx);
         return rc;
     }

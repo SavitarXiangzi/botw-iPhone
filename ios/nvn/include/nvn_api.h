@@ -3,6 +3,7 @@
 #define NVN_API_H
 
 #include <stdint.h>
+#include <string.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -12,14 +13,45 @@ extern "C" {
 typedef struct nvngfx_ctx nvngfx_ctx;
 
 /*
- * One NVN entry point.
+ * The guest argument block, captured at the guest->host call site.
  *
- * `x` points at the guest argument registers x0..x7 as captured at the
- * guest->host call site.  Handles and pointers are passed straight
- * through: the emulator guarantees that guest memory is host-visible
- * (unified memory), so no marshalling layer is needed here.
+ * `x` is x0..x7: integer/pointer arguments and integer/pointer returns.
+ * `f` is s0..s7 / d0..d7: a float arrives in sN and is stored as 32
+ * bits in the low half of f[N]; a double arrives in dN and fills all
+ * 64 bits.  The second half is not optional:
+ * nvnSamplerBuilderSetLodBias and friends pass values in FP registers,
+ * not in x[].  The helpers below are the
+ * only sanctioned way to move values in and out of f[].
  */
-typedef void (*nvngfx_proc)(nvngfx_ctx* ctx, uint64_t x[8]);
+typedef struct nvngfx_args {
+    uint64_t x[8];
+    uint64_t f[8];
+} nvngfx_args;
+
+static inline float nvngfx_arg_f32(const nvngfx_args* a, unsigned i) {
+    uint32_t bits = (uint32_t)a->f[i];
+    float v;
+    memcpy(&v, &bits, sizeof v);
+    return v;
+}
+static inline void nvngfx_arg_set_f32(nvngfx_args* a, unsigned i, float v) {
+    uint32_t bits;
+    memcpy(&bits, &v, sizeof v);
+    a->f[i] = bits;
+}
+static inline double nvngfx_arg_f64(const nvngfx_args* a, unsigned i) {
+    double v;
+    memcpy(&v, &a->f[i], sizeof v);
+    return v;
+}
+static inline void nvngfx_arg_set_f64(nvngfx_args* a, unsigned i, double v) {
+    memcpy(&a->f[i], &v, sizeof v);
+}
+
+/* One NVN entry point.  Handles and pointers are passed straight
+ * through: guest memory is host-visible (unified memory), so there is
+ * no marshalling layer. */
+typedef void (*nvngfx_proc)(nvngfx_ctx* ctx, nvngfx_args* args);
 
 /* 513 entry points, sorted by name. */
 #define NVN_PROC_LIST(X) \

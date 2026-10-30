@@ -151,13 +151,19 @@ xcodebuild -project BotW.xcodeproj -scheme BotW \
 ## 4. ABI 约定：一个函数指针吃掉 513 个入口
 
 ```c
-typedef void (*nvngfx_proc)(nvngfx_ctx* ctx, uint64_t x[8]);
+typedef struct nvngfx_args {
+    uint64_t x[8];   /* x0..x7：整数/指针参数和整数返回值 */
+    uint64_t f[8];   /* s0..s7/d0..d7：FP 参数和 float 返回值 */
+} nvngfx_args;
+typedef void (*nvngfx_proc)(nvngfx_ctx* ctx, nvngfx_args* args);
 ```
 
 - `x[0..7]` 是 guest 调用点的 x0..x7。ARM64 整数参数寄存器正好 8 个，而
   `ios/nvn/signatures.json` 里 470 个原型中**最大 arity 就是 8**
-  （`nvnCommandBufferDrawElementsInstanced`），所以"8 个字装得下所有参数"
-  这句话是被量出来的，不是假设。
+  （`nvnCommandBufferDrawElementsInstanced`），所以整数/指针参数装得下。
+- `f[0..7]` 是另一组寄存器：float 存在低 32 位，double 用完整 64 位；返回
+  float 的 getter 也把结果写进 `f[0]`。M3.82 加入这半块，是因为
+  `nvnSamplerBuilderSetLodClamp` 等入口的值根本不在 x 里。
 - **NVN 对象是 guest 内存**。`nvnWindowInitialize(NVNwindow*, builder)` 的
   `x[0]` 是 guest 自己的对象地址，宿主既不该拥有那块存储，也不该把自己的
   指针写回去。宿主状态一律以 guest 地址为键存在侧表里
@@ -185,10 +191,11 @@ typedef void (*nvngfx_proc)(nvngfx_ctx* ctx, uint64_t x[8]);
 `verify_ios.py` 分开计数，不会被悄悄算进已验证的一类。
 
 **浮点参数**（`float`/`double`）走 s0..s7/d0..d7，不在 `x[]` 里。
-好消息是真正需要的颜色/深度参数多是**指针**（`nvnCommandBufferClearColor`
-的 `const float*`），可以直接从 guest 内存读；暂时不需要 FP 寄存器搬运。
-真遇到 FP 传值的入口，在实现前必须先扩展参数块，否则就属于"没有形状"，
-门禁不会允许它被绑定。
+M3.82 已把参数块扩展为 `nvngfx_args { uint64_t x[8]; uint64_t f[8]; }`：
+float 存在 `f[N]` 的低 32 位，double 使用完整 64 位，生成头文件提供 f32/f64
+的位型安全读写 helper。颜色/深度参数仍然大量使用指针，因此 UBO 和 clear 路径
+不依赖 FP 搬运。**但仓库外真正的 guest -> host 调用桥还没实现**：调用端必须把
+s/d 寄存器捕获进 `f[]`，否则 `nvnSamplerBuilderSetLodBias` 一类入口拿不到值。
 
 ---
 ## 5. 内存：不复制，但必须对齐
@@ -315,19 +322,22 @@ NVN 窗口另建一个**没人能看见**的 `CAMetalLayer`——客体的帧全
 - ✅ `nvnCommandBufferBindVertexAttribState` / `BindVertexStreamState`（M3.79，
   客体 4 / 8 字节记录 -> `MTLVertexDescriptor`）
 - ✅ draw 真的编码：`setRenderPipelineState` + `drawPrimitives` / `drawIndexedPrimitives`
-- ✅ `nvnCommandBufferDrawElements`（M3.80；16/32 位索引 **数值仍是推断**：
-  1=uint16、2=uint32，来自 nxnative，不是 Nintendo 头文件）
+- ✅ `nvnCommandBufferDrawElements`（M3.80；索引值已按 nxnative 的 `nvn.h`
+  核对为 0=u8 / 1=u16 / 2=u32；后端目前只接 1/2，u8 仍丢弃，且那是
+  reimplementation 头文件而不是 Nintendo SDK）
 - ❌ `nvngfx_shader_to_msl()` 没有翻译器 -> 客体的 program 永远建不出管线
 
 **已经能证明的部分**：`nvngfx_metal_selftest()` 用内置 MSL 走完
 texture -> render target -> clear -> program -> pipeline -> draw -> 回读，
-CI 在 iOS 模拟器里用 `simctl` 启动 App（`--selftest`），App 在 `init()` 里跑它、
-把 `BOTW_SELFTEST rc=<n>` 写进容器的 `Documents/selftest.txt` 并 `exit(rc)`；
-现在跑**三条** draw（`[[vertex_id]]` / `[[attribute(0)]]` / 16 位索引的
-`DrawElements`），每条断言中心像素、全部通过才 rc=0。M3.76 的 run
-40997940031 证明了第一条；run 41008588834 证明**三条全部通过**
-（`portable` 与 `ios` 双绿，设备构建也 success）。所以“Metal 这半边是通的”是可执行的结论，不是声称；
-“客体的 shader 能跑”仍然完全没验证。
+并额外创建、比较和读回 `MTLSamplerState`。CI 在 iOS 模拟器里用 `simctl`
+启动 App（`--selftest`），App 在 `init()` 里跑它、把
+`BOTW_SELFTEST rc=<n>` 写进容器的 `Documents/selftest.txt` 并 `exit(rc)`；
+现在跑**四条** draw（`[[vertex_id]]` / `[[attribute(0)]]` / 16 位索引的
+`DrawElements` / `BindUniformBuffer` 参数缓冲区）加一条 sampler 状态路径，
+全部通过才 rc=0。M3.76 的 run 40997940031 证明了第一条；run 41008588834
+证明当时的三条（`portable` 与 `ios` 双绿，设备构建也 success）。第四条 draw 和
+sampler 检查的模拟器结果仍要看 M3.82 推送后的 CI。所以“Metal 这半边是通的”
+是已经执行过的结论；“客体的 shader 能跑”仍然完全没验证。
 
 **阶段 C：纹理正确**
 
@@ -338,9 +348,11 @@ CI 在 iOS 模拟器里用 `simctl` 启动 App（`--selftest`），App 在 `init
 
 **阶段 D：状态完整**
 
-- Blend / DepthStencil / Multisample / Sampler / Polygon / ChannelMask 的
-  默认值表（`*SetDefaults` 可以先给出全零/安全默认，让 guest 至少在
-  不依赖具体值的情况下跑通）
+- Blend / DepthStencil / Multisample / Polygon / ChannelMask 的默认值表
+  （`*SetDefaults` 可以先给出全零/安全默认，让 guest 至少在依赖具体值之前跑通）
+- ✅ Sampler：M3.82 已完成 builder、object、getter 和真实的
+  `MTLSamplerState`；sampler pool、`BindSeparateSampler` 和 argument buffer
+  里的 sampler 条目仍未做
 - `nvnCommandBufferBarrier`、fence/sync、events
 
 ---
@@ -427,10 +439,10 @@ constexpr int kEnumsVerified = 0;
 | P0 | ~~`nvnCommandBufferSetRenderTargets`~~ | ✅ 本轮已实现；只剩 MRT / 深度 / view |
 | P0 | ~~`nvnCommandBufferBindProgram` / `nvnProgramInitialize`~~ | ✅ 本轮已实现（管线建到 `nvngfx_shader_to_msl` 为止） |
 | P0 | ~~`nvnCommandBufferBindVertexAttribState`~~ | ✅ 本轮已实现（含 `nvnVertexAttribState*` / `nvnVertexStreamState*` 与 `BindVertexStreamState`） |
-| P0 | 真实 shader 的第一次 draw | 锚点已通；现在缺的是 argument buffer（UBO / 纹理） |
+| P0 | 真实 shader 的第一次 draw | 锚点已通，UBO 锚点也通了；现在缺的是 argument buffer 的 texture / sampler 条目，以及真正的 Maxwell -> MSL |
 | P1 | `nvnTextureBuilder*` 剩余 29 个 | 已做 14 个；剩余主要是 getter 与 pool/offset 细节 |
-| P1 | `nvnSamplerBuilder*`（25）+ `nvnSamplerInitialize` | 采样状态 |
-| P1 | `NVNindexType` 枚举值核对 | 实现按 1=uint16 / 2=uint32（nxnative 的读法）；没有 Nintendo 头文件佐证，未知值不画 |
+| P1 | ~~`nvnSamplerBuilder*` + `nvnSampler*`~~ | ✅ M3.82 已绑定 38 个入口，能建 `MTLSamplerState`；`SamplerBuilderGetDevice` 无已知形状、`SamplerGetDebugID` 的返回值语义未定，sampler pool 未做 |
+| P1 | `NVNindexType` 枚举值核对 | nxnative 的 `nvn.h` 给出 0=u8 / 1=u16 / 2=u32；后端只接 1/2，u8 未知值不画，且该头文件是 reimplementation 而非 Nintendo SDK |
 | P0 | Maxwell SASS -> MSL 翻译器 | 不是入口点，是整条链的墙 |
 | P2 | 各 `*StateSetDefaults` / `*StateGet*` | 让 guest 的查询路径不崩 |
 | P2 | `nvnCommandBufferBarrier` / `nvnSync*` / `nvnEvent*` | 正确性，不是画面 |
@@ -449,9 +461,10 @@ constexpr int kEnumsVerified = 0;
 | 渲染目标绑定 | 只挂 `color[0]`，深度/view 只记录 | MRT 与深度测试不可用 |
 | 着色器翻译 | 只留了接口，没有实现 | 客体的 draw 全部停在 `noPipeline` |
 | 纹理创建 | 建 host `MTLTexture`，不与 guest alias | 当目标可用；采样 guest 像素仍全黑 |
-| draw 执行 | 有 pipeline 就真的编码 draw；没有就丢弃 | 客体仍是 0 条；自检的 1 条在 CI 上被执行并回读 |
+| draw 执行 | 有 pipeline 就真的编码 draw；没有就丢弃 | 客体仍是 0 条；自检四条 draw 加 sampler 状态检查由 CI 执行 |
 | 顶点输入 | attrib/stream 已接，缓冲从 pool 零拷贝绑到 `MTLBuffer` | 自检的第二条 draw 就是这条路；客体尚未跑到 |
-| 浮点参数 | 不在 `x[8]` 里 | 少数入口需要单独签名 |
+| 浮点参数 | `nvngfx_args.f[8]` 已扩展，float 在低 32 位 | 本仓库外 guest 调用端仍需实现 s/d 寄存器桥 |
+| 采样器资源 | builder/object 与 `MTLSamplerState` 已建，sampler pool 未做 | 还不能给 argument buffer 一个可引用句柄 |
 | 同步/fence | 未实现 | 长时间跑可能撕裂 |
 | compute | 未实现 | 后处理不可用 |
 | 多线程 | 单队列 | 与真机行为有差异 |

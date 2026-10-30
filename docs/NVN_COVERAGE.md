@@ -7,8 +7,8 @@
 `nvn*` 字符串（运行时按名解析，所以名字本身就暴露了完整接口面）。
 
 - 接口总数：**513**
-- Metal 后端已实现：**66**（12.9%）
-- 仍未实现：**447**
+- Metal 后端已实现：**104**（20.3%）
+- 仍未实现：**409**
 
 > 只有出现在 `ios/nvn/implemented_metal.txt` 里、且确实在
 > `ios/nvn/src/nvn_metal.mm` 中定义过的名字才算“已实现”。
@@ -22,12 +22,12 @@
 | Texture | 1 | 45 | `          ` |
 | TextureBuilder | 14 | 43 | `###       ` |
 | Device | 2 | 27 | `#         ` |
-| SamplerBuilder | 0 | 25 | `          ` |
+| SamplerBuilder | 24 | 25 | `##########` |
 | MultisampleState | 0 | 23 | `          ` |
 | QueueBuilder | 0 | 19 | `          ` |
 | BlendState | 0 | 15 | `          ` |
 | Queue | 1 | 15 | `#         ` |
-| Sampler | 0 | 15 | `          ` |
+| Sampler | 14 | 15 | `######### ` |
 | DepthStencilState | 0 | 13 | `          ` |
 | Window | 6 | 12 | `#####     ` |
 | WindowBuilder | 5 | 12 | `####      ` |
@@ -433,51 +433,51 @@
 - [ ] `nvnQueueBuilderSetQueueMemory`
 - [ ] `nvnQueueBuilderSetQueuePriority`
 
-### Sampler (0/15)
+### Sampler (14/15)
 
-- [ ] `nvnSamplerCompare`
-- [ ] `nvnSamplerFinalize`
-- [ ] `nvnSamplerGetBorderColor`
-- [ ] `nvnSamplerGetBorderColori`
-- [ ] `nvnSamplerGetBorderColorui`
-- [ ] `nvnSamplerGetCompare`
+- [x] `nvnSamplerCompare`
+- [x] `nvnSamplerFinalize`
+- [x] `nvnSamplerGetBorderColor`
+- [x] `nvnSamplerGetBorderColori`
+- [x] `nvnSamplerGetBorderColorui`
+- [x] `nvnSamplerGetCompare`
 - [ ] `nvnSamplerGetDebugID`
-- [ ] `nvnSamplerGetLodBias`
-- [ ] `nvnSamplerGetLodClamp`
-- [ ] `nvnSamplerGetMaxAnisotropy`
-- [ ] `nvnSamplerGetMinMagFilter`
-- [ ] `nvnSamplerGetReductionFilter`
-- [ ] `nvnSamplerGetWrapMode`
-- [ ] `nvnSamplerInitialize`
-- [ ] `nvnSamplerSetDebugLabel`
+- [x] `nvnSamplerGetLodBias`
+- [x] `nvnSamplerGetLodClamp`
+- [x] `nvnSamplerGetMaxAnisotropy`
+- [x] `nvnSamplerGetMinMagFilter`
+- [x] `nvnSamplerGetReductionFilter`
+- [x] `nvnSamplerGetWrapMode`
+- [x] `nvnSamplerInitialize`
+- [x] `nvnSamplerSetDebugLabel`
 
-### SamplerBuilder (0/25)
+### SamplerBuilder (24/25)
 
-- [ ] `nvnSamplerBuilderGetBorderColor`
-- [ ] `nvnSamplerBuilderGetBorderColori`
-- [ ] `nvnSamplerBuilderGetBorderColorui`
-- [ ] `nvnSamplerBuilderGetCompare`
+- [x] `nvnSamplerBuilderGetBorderColor`
+- [x] `nvnSamplerBuilderGetBorderColori`
+- [x] `nvnSamplerBuilderGetBorderColorui`
+- [x] `nvnSamplerBuilderGetCompare`
 - [ ] `nvnSamplerBuilderGetDevice`
-- [ ] `nvnSamplerBuilderGetLodBias`
-- [ ] `nvnSamplerBuilderGetLodClamp`
-- [ ] `nvnSamplerBuilderGetLodSnap`
-- [ ] `nvnSamplerBuilderGetMaxAnisotropy`
-- [ ] `nvnSamplerBuilderGetMinMagFilter`
-- [ ] `nvnSamplerBuilderGetReductionFilter`
-- [ ] `nvnSamplerBuilderGetWrapMode`
-- [ ] `nvnSamplerBuilderSetBorderColor`
-- [ ] `nvnSamplerBuilderSetBorderColori`
-- [ ] `nvnSamplerBuilderSetBorderColorui`
-- [ ] `nvnSamplerBuilderSetCompare`
-- [ ] `nvnSamplerBuilderSetDefaults`
-- [ ] `nvnSamplerBuilderSetDevice`
-- [ ] `nvnSamplerBuilderSetLodBias`
-- [ ] `nvnSamplerBuilderSetLodClamp`
-- [ ] `nvnSamplerBuilderSetLodSnap`
-- [ ] `nvnSamplerBuilderSetMaxAnisotropy`
-- [ ] `nvnSamplerBuilderSetMinMagFilter`
-- [ ] `nvnSamplerBuilderSetReductionFilter`
-- [ ] `nvnSamplerBuilderSetWrapMode`
+- [x] `nvnSamplerBuilderGetLodBias`
+- [x] `nvnSamplerBuilderGetLodClamp`
+- [x] `nvnSamplerBuilderGetLodSnap`
+- [x] `nvnSamplerBuilderGetMaxAnisotropy`
+- [x] `nvnSamplerBuilderGetMinMagFilter`
+- [x] `nvnSamplerBuilderGetReductionFilter`
+- [x] `nvnSamplerBuilderGetWrapMode`
+- [x] `nvnSamplerBuilderSetBorderColor`
+- [x] `nvnSamplerBuilderSetBorderColori`
+- [x] `nvnSamplerBuilderSetBorderColorui`
+- [x] `nvnSamplerBuilderSetCompare`
+- [x] `nvnSamplerBuilderSetDefaults`
+- [x] `nvnSamplerBuilderSetDevice`
+- [x] `nvnSamplerBuilderSetLodBias`
+- [x] `nvnSamplerBuilderSetLodClamp`
+- [x] `nvnSamplerBuilderSetLodSnap`
+- [x] `nvnSamplerBuilderSetMaxAnisotropy`
+- [x] `nvnSamplerBuilderSetMinMagFilter`
+- [x] `nvnSamplerBuilderSetReductionFilter`
+- [x] `nvnSamplerBuilderSetWrapMode`
 
 ### SamplerPool (0/8)
 
