@@ -3,9 +3,10 @@
 本文是 `ios/` 目录的操作手册。它描述的是**已经写进仓库的东西**和
 **机器能验证的事实**，不是你付钱就能玩到游戏的承诺。当前状态一句话：
 
-> iOS 侧的壳、C ABI、513 个 NVN 入口点的分发表、32 个 Metal 后端入口，
-> 都能在非 Apple 主机上编译并跑通自测；**真正的画面还没有**，因为
-> 渲染目标绑定和着色器翻译都还没做。
+> iOS 侧的壳、C ABI、513 个 NVN 入口点的分发表、46 个 Metal 后端入口，
+> 都能在非 Apple 主机上编译并跑通自测；纹理对象已经能真的建出
+> `MTLTexture`，渲染目标能绑上，encoder 能开。**但仍然没有一条 draw 真正
+> 执行**：着色器翻译和管线状态都还没做。
 
 ---
 
@@ -26,13 +27,16 @@ ios/nvn/include/nvn_api.h     生成：名字表 + 函数指针 ABI
 ios/nvn/src/nvn_dispatch.cpp  生成：二分查找 + 缺失上报
 ios/nvn/include/nvn_backend.h 后端接口（null / metal 二选一）
 ios/nvn/src/nvn_null.cpp      空后端，任何主机都能编译
-ios/nvn/src/nvn_metal.mm      Metal 后端（32 个入口，含大量 TODO）
-ios/nvn/implemented_metal.txt 32 行，和 BIND(...) 列表由门禁强制相等
+ios/nvn/src/nvn_metal.mm      Metal 后端（46 个入口，含大量 TODO）
+ios/nvn/src/nvn_texture.c     157 项 NVNformat -> MTLPixelFormat 表（附 lossy 标记）
+ios/nvn/include/nvn_texture.h 纹理描述结构 + 表查询接口
+ios/nvn/implemented_metal.txt 46 行，和 BIND(...) 列表由门禁强制相等
 ios/nvn/shaders/              空目录 + 路线说明（见该目录 README）
 docs/NVN_COVERAGE.md          生成的逐域覆盖表
 scripts/                      提取、生成、校验、编译脚本
 tests/nvn_abi_test.cpp        513 个入口点的名字/顺序/查找一致性
 tests/core_smoke_test.cpp     C ABI 冒烟：创建、查覆盖数、跑帧、销毁
+tests/nvn_texture_test.cpp    157 项格式表的抽查：精确项、替代项、越界、重复
 ```
 
 `.xcodeproj` 不入库是刻意的：它是生成物，入库只会制造冲突，且在没有 Mac 的
@@ -63,8 +67,9 @@ C:\Python314\python.exe scripts\syntax_check_metal.py
 ```
 nvn_abi_test: ok (513 procs)                 exit=0
 core_smoke_test: ok (nvn 0/513 on null)      exit=0
+nvn_texture_test: ok (157 formats in table)  exit=0
 syntax_check_metal: ok (clang++.exe)
-verify_ios: ok
+verify_ios: ok (metal bindings: 46/513)
 build_abi_test: all tests passed
 ```
 
@@ -201,7 +206,7 @@ iOS 是统一内存，guest 堆本来就是宿主可读的，所以
 
 ---
 
-## 6. 已经实现的 32 个入口点
+## 6. 已经实现的 46 个入口点
 
 按域分布（完整明细见 `docs/NVN_COVERAGE.md`）：
 
@@ -209,33 +214,41 @@ iOS 是统一内存，guest 堆本来就是宿主可读的，所以
 |---|---:|---|
 | Window | 6/12 | 创建 CAMetalLayer、acquire、present interval、active textures |
 | WindowBuilder | 5/12 | native window、textures、interval、active count |
-| CommandBuffer | 7/144 | begin/end recording、drawArrays、viewport、scissor、clearColor(丢弃) |
+| CommandBuffer | 8/144 | begin/end recording(+commit)、drawArrays、viewport、scissor、clearColor、setRenderTargets |
 | MemoryPool | 3/10 | builder storage/flags、initialize(零拷贝)、getSize |
 | MemoryPoolBuilder | 3/8 | defaults、storage、flags |
 | Device | 2/27 | initialize（建 queue）、getProcAddress |
 | DeviceBuilder | 3/3 | defaults、set/get flags |
 | Queue | 1/15 | presentTexture（blit 快路径） |
-| Texture | 1/45 | initialize 只分配句柄 |
-| TextureBuilder | 1/43 | defaults 清零 |
+| Texture | 1/45 | initialize 用 builder 记录的值真建 `MTLTexture`（host 分配） |
+| TextureBuilder | 14/43 | defaults + 13 个 setter：target/format/size1D/2D/3D/宽高深/levels/samples/storage/stride/flags |
 
-**必须说清楚的四件事**，否则这张表会误导人：
+**必须说清楚的五件事**，否则这张表会误导人：
 
-0. 这 32 个的参数解码在本轮按 `signatures.json` **全部重写过一遍**。
-   `SetViewport`/`SetScissor` 是 4 个 `int`（原来当成 double 读），
+0. 所有入口的参数解码都按 `signatures.json` 的真实原型写，不是猜的。
+   `SetViewport`/`SetScissor` 是 4 个 `int`（曾被当成 double 读），
    `DrawArrays` 是 `(primitive, first, count)`（原来顺序错），
    `DrawElements` 是 `(primitive, indexType, count, indexAddress)`
    （原来把 `x[6]` 当 indexType），`WindowBuilderSetTextures` 是
    `(builder, n, array)`（原来看反），`WindowAcquireTexture` 把索引写进
-   `x[2]` 指向的 `int`（原来从 `x[0]` 返回句柄）。
-
-1. `nvnTextureInitialize` 只 `new Tex()`，**不建 MTLTexture**。因为
-   `NVNtextureBuilder` 的字段偏移还没验证过，猜偏移会得到一个“看起来能跑、
-   实际采样全黑”的后端。这是有意留的洞。
-2. `nvnCommandBufferClearColor` 记录参数后丢弃，因为还没有绑定渲染目标。
-3. `MTLRenderCommandEncoder` 从来没有被创建过，所以 `drawArrays` 里的
-   `if (!b->enc) return;` 会直接返回。**当前不会产生任何 draw call。**
-   要让这个数字变成真的，需要先做 `nvnCommandBufferBindTexture` +
-   `nvnCommandBufferSetRenderTargets` 之类的目标绑定，再建 encoder。
+   `x[2]` 指向的 `int`（原来从 `x[0]` 返回句柄），
+   `CommandBufferSetRenderTargets` 是
+   `(cb, numColor, colorArray, depth, depthStencil, ...)`。
+   本轮新增的 14 个 `nvnTextureBuilderSet*` 也来自同一份原型表。
+1. `nvnTextureInitialize` 现在**真的建 `MTLTexture`**：尺寸、格式、级别、
+   采样数全部来自 builder 的 setter 记录值，**不去猜 `NVNtextureBuilder`
+   的字段偏移**。代价是像素由宿主分配（`MTLStorageModePrivate`），和 guest
+   内存**没有 alias**。它当渲染目标够用，当“采样 guest 上传的纹理”还不够。
+2. `nvnCommandBufferClearColor` 不再丢弃：它先关掉当前 encoder，把颜色记成
+   `pendingClear`，下一次 draw 前的 `ensure_encoder()` 把它变成
+   `loadAction = .clear`。mask 仍只记录（那是未验证的枚举）。
+3. `MTLRenderCommandEncoder` 现在**会**在绑了渲染目标之后由
+   `ensure_encoder()` 创建，draw 也确实走到 encoder——但 `DrawArrays`
+   只打一条 `noPipeline` 日志就返回，因为还没有 program、管线、顶点缓冲。
+   **当前仍然不会产生任何 draw call。**
+4. 只挂 `colorAttachments[0]`：`numColor > 1` 的 MRT、以及 `setRenderTargets`
+   的 texture view 参数都只记日志。`EndRecording` 直接 `[cb commit]`，
+   `nvnQueueSubmitCommands` 还没实现，所以“提交”这件事目前不等队列。
 
 ---
 
@@ -268,16 +281,20 @@ NVN 窗口另建一个**没人能看见**的 `CAMetalLayer`——客体的帧全
 > 证据边界：这段代码通过了 CI 的模拟器 Debug 构建和真机 Debug 构建
 > （`xcodebuild -sdk iphoneos`），**没有**真机运行记录——本机没有设备。
 
-**阶段 A：清屏能出颜色**（不依赖任何 shader）
+**阶段 A：清屏能出颜色**（不依赖任何 shader）——代码已完成，未上真机
 
-- 实现 `nvnCommandBufferSetRenderTargets`（拿到颜色纹理）
-- `beginRecording` 时如果有目标就建 `MTLRenderCommandEncoder`，
-  `loadAction = .clear`，`clearColor` 用 `nvnCommandBufferClearColor` 记下的值
-- 结束时 `presentTexture` 走 blit（已有）
+- `nvnCommandBufferSetRenderTargets` 已实现：记录 `numColor` / 颜色纹理数组
+  / 深度纹理，关掉旧 encoder（一次 pass 换目标就必须重开）。
+- `ensure_encoder()` 在**第一次** draw / viewport / scissor 之前懒开
+  `MTLRenderCommandEncoder`，只挂 `colorAttachments[0]`；
+  `pendingClear` 为真时 `loadAction = .clear` 并用
+  `nvnCommandBufferClearColor` 记下的 RGBA。
+- `EndRecording` 直接 `[cb commit]`；`presentTexture` 的 blit 路径是旧的。
 
-做完 A，**客体提交的** clear 才会真正被执行（现在上屏的是宿主自己的 clear，
-见 6b）。区别在于：A 完成后 `nvnCommandBufferClearColor` 记下的颜色才有意义，
-`presents` 才由客体命令驱动而不是由 `botw_core_frame` 代劳。
+没做的：真机上没跑过（本机无设备），深度目标只记录不挂载，
+`clearColor` 的 mask 语义未验证。所以“客体 clear 现在会真的执行”这句话
+只对“绑了 `color[0]` 且该纹理确实建成功”的路径成立——在真机上看到之前，
+这只是**代码路径**，不是现象。
 
 **阶段 B：几何能出来**（需要 program + vertex state）
 
@@ -303,7 +320,22 @@ NVN 窗口另建一个**没人能看见**的 `CAMetalLayer`——客体的帧全
 
 ## 8. 纹理和着色器的现实约束
 
-**纹理**：BCn 在 iOS 上没有等价格式。可行路线有两条，都要离线或预计算：
+**纹理路径现状（本轮）**：`nvnTextureBuilder*` 的 13 个 setter 只记录值，
+`nvnTextureInitialize` 拿这些值建 `MTLTextureDescriptor` + `newTextureWithDescriptor:`。
+
+| 项 | 现状 |
+|---|---|
+| 描述来源 | builder setter 的记录值；**不读 guest builder 内存**，所以没有字段偏移风险 |
+| 像素归属 | 宿主所有，`MTLStorageModePrivate`，**不与 guest 内存 alias** |
+| 能干的事 | 当 render target（本轮 `setRenderTargets` 就是这么用的） |
+| 干不了的事 | 采样 guest 写进内存的像素；本轮没有任何 `replaceRegion`/blit 上传路径 |
+| 格式 | 157 项表（见 `nvn_texture.c`），exact / substitute 分开标记，替代项返回 `lossy=1` |
+| 未支持 | texture view（initialize 的 view 参数）、tiled/swizzled 布局、BCn 解码 |
+
+所以别把“`nvnTextureInitialize` 返回 1”理解成“纹理能用了”。它只证明
+**描述符合法、Metal 分配成功**。
+
+**BCn**：在 iOS 上没有等价格式。可行路线有两条，都要离线或预计算：
 
 1. 打包时把 BCn 转 ASTC（画质和行为都稳定，代价是包体变大、需要额外工具）；
 2. 运行第一个场景时用 compute shader 解成 RGBA8 缓存起来（省包体，首帧卡顿）。
@@ -343,16 +375,16 @@ constexpr int kEnumsVerified = 0;
 
 ---
 
-## 10. 剩余 481 个入口点的优先级
+## 10. 剩余 467 个入口点的优先级
 
 不要按字母序做。按“挡住第一个 draw call 的”排序：
 
 | 优先级 | 入口 | 理由 |
 |---|---|---|
-| P0 | `nvnCommandBufferSetRenderTargets` | 没有它就没有 encoder，A 阶段做不了 |
+| P0 | ~~`nvnCommandBufferSetRenderTargets`~~ | ✅ 本轮已实现；只剩 MRT / 深度 / view |
 | P0 | `nvnCommandBufferBindProgram` / `nvnProgramInitialize` | B 阶段的前提 |
 | P0 | `nvnCommandBufferBindVertexBuffer(s)` / `BindVertexAttribState` | 同上 |
-| P1 | `nvnTextureBuilder*` 全套（43 个） | C 阶段，字段偏移要先验证 |
+| P1 | `nvnTextureBuilder*` 剩余 29 个 | 已做 14 个；剩余主要是 getter 与 pool/offset 细节 |
 | P1 | `nvnSamplerBuilder*`（25）+ `nvnSamplerInitialize` | 采样状态 |
 | P1 | `nvnCommandBufferDrawElements` 的真实 index type | 现在只计数 |
 | P2 | 各 `*StateSetDefaults` / `*StateGet*` | 让 guest 的查询路径不崩 |
@@ -369,9 +401,10 @@ constexpr int kEnumsVerified = 0;
 
 | 缺口 | 现状 | 影响 |
 |---|---|---|
-| 渲染目标绑定 | 未实现 | 没有 encoder，draw 不执行 |
+| 渲染目标绑定 | 只挂 `color[0]`，深度/view 只记录 | MRT 与深度测试不可用 |
 | 着色器翻译 | 未开始 | 无法出任何几何 |
-| 纹理创建 | 只分配句柄 | 采样全黑 |
+| 纹理创建 | 建 host `MTLTexture`，不与 guest alias | 当目标可用；采样 guest 像素仍全黑 |
+| draw 执行 | encoder 会开，但没有 pipeline | 仍然是 0 条 draw，只打一次 `noPipeline` 日志 |
 | 浮点参数 | 不在 `x[8]` 里 | 少数入口需要单独签名 |
 | 同步/fence | 未实现 | 长时间跑可能撕裂 |
 | compute | 未实现 | 后处理不可用 |
@@ -398,7 +431,7 @@ Swift 侧同理：`Renderer.swift` / `GameView.swift` 只做了括号与结构�
 | `verify_ios` 说 generated artifacts are stale | 跑了 `gen_nvn.py --repo .` 但没提交生成物 |
 | `verify_ios` 说 bound but not declared implemented | 加了 `BIND(...)` 但没加进 `implemented_metal.txt` |
 | `pool wrap failed` | guest 存储没按 4 KiB 对齐，或长度不是页整数倍 |
-| 屏幕全黑但 `frame` 在涨 | 正常：encoder 从没创建过（第 6 节第 3 条） |
+| 屏幕全黑但 `frame` 在涨 | 正常：没有 pipeline，draw 被丢掉（第 6 节第 3 条） |
 | 屏幕全黑且 `frame` 不动 | `MTKView.delegate` 是 weak，Pump 必须被 Coordinator 强引用（已在 `GameView.swift` 修过一次） |
 | `[nvn] UNVERIFIED xxx = 0x...` | 正常，那是诚实闸门在报未验证的枚举 |
-| `[nvn] not implemented: nvnYyy` | 该入口不在 32 个里，按第 10 节排期 |
+| `[nvn] not implemented: nvnYyy` | 该入口不在 46 个里，按第 10 节排期 |

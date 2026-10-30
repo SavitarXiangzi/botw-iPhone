@@ -10,15 +10,16 @@ SDK/NVN 调用整层接管（HLE）**，而不是跑一个通用模拟器。
 ## 目录
 
 ```
-ios/BotW/       SwiftUI + Metal 壳（MTKView 渲染循环 + NVN 覆盖数 HUD）
+ios/BotW/       SwiftUI + Metal 壳（CAMetalLayer 视图、CADisplayLink 驱动、NVN 覆盖数 HUD）
 ios/nvn/        NVN host-HLE：513 入口点注册表、生成的分发表、Metal 后端
   registry.json   从标题自己的 getproc 字符串提取，29 个域
-  src/nvn_metal.mm 32 个入口点的 Metal 实现（其余是日志桩）
+  src/nvn_metal.mm 46 个入口点的 Metal 实现（其余是日志桩）
+  src/nvn_texture.c 157 项 NVNformat -> MTLPixelFormat 映射表（带 lossy 标记）
   src/nvn_null.cpp 空后端：任何主机都能编译、跑 ABI 测试
   shaders/        空目录，路线说明在里面的 README
 core/           与 iOS 对接的 C ABI（Swift 只能看到 botw_core.h）
 scripts/        注册表提取、代码生成、门禁校验、MSVC 编译脚本
-tests/          513 入口点一致性 + C ABI 冒烟测试
+tests/          513 入口点一致性 + C ABI 冒烟 + 157 项纹理格式表测试
 docs/           路线图、HLE 边界、NVN 覆盖表、iOS 移植手册
 .github/        GitHub Actions：无 Mac 也能编译验证
 ```
@@ -54,7 +55,7 @@ docs/           路线图、HLE 边界、NVN 覆盖表、iOS 移植手册
 | M3.27 | `GetSystemTick` 的 HLE 往返 35 µs × 几十万次 = 30 s 死窗口；改成入口一条 `b` + 内联计数器 | ✅ 死窗口消失 |
 | M3.28 | 178 帧后静止的全量快照：主线程无限等 LightEvent，32 线程 idle，唯一活动是 250 µs 轮询 worker | 🔴 缺完成通知 |
 | M3.65–M3.71 | 12 MB 缓冲区是包尾 `0x49E000` 的逐字节拷贝；真正卡点是 58.2 MiB 分配返回 0；最小跳过让字节序转换器返回 | ✅ 结论已定，draws 仍为 0 |
-| iOS 骨架 | 513 入口点注册表 + 生成分发表 + Metal 后端 32 项 + 三重门禁 | 🟢 可编译可验证，无画面 |
+| iOS 骨架 | 513 入口点注册表 + 生成分发表 + Metal 后端 46 项 + 三重门禁 | 🟢 可编译可验证，无画面 |
 | M4 | NVN → Metal 回放（管线/纹理/命令缓冲） | ⬜ |
 | M5 | 音频（nn::audio → AVAudioEngine）、输入 | ⬜ |
 | M6 | 真机性能与内存（6 GB 机型起步） | ⬜ |
@@ -212,8 +213,8 @@ guest 业务代码
 |---|---:|---|
 | NVN 入口点 | **513** | 扫 `main.reloc.bin` 里会被 `nvnDeviceGetProcAddress` 按名解析的字符串 |
 | 域 | 29 | 按前缀归类（CommandBuffer 144、Texture 45、TextureBuilder 43…） |
-| Metal 后端已实现 | **32**（6.2%） | 真实 `BIND(...)`，不是靠注释声称 |
-| 未实现 | 481 | 按"挡住第一个 draw call"排序，见 `docs/IOS_PORTING.md` |
+| Metal 后端已实现 | **46**（9.0%） | 真实 `BIND(...)`，不是靠注释声称 |
+| 未实现 | 467 | 按"挡住第一个 draw call"排序，见 `docs/IOS_PORTING.md` |
 | 生成的代码 | 2 个文件 | `gen_nvn.py` 生成 `nvn_api.h` / `nvn_dispatch.cpp`，`--check` 防手改 |
 | 参数形状 | 470 个 | `signatures.json`，解析公开 nxnative 原型表（MIT），最大 arity 8 |
 
@@ -223,9 +224,11 @@ guest 业务代码
    `botw_core_desc.native_layer` 交给核心；还没有标题代码可跑，所以
    `botw_core_frame()` 用宿主 clear + present 驱动交换链，HUD 的 `presents`
    就是这条路的计数。它证明层/绘制/上屏通了，不代表渲染通了。
-2. **现在不会产生 draw call**：`MTLRenderCommandEncoder` 从未创建（渲染目标绑定未实现），
-   所有 `drawArrays` 直接返回。
-3. **纹理只分配句柄**：`NVNtextureBuilder` 字段偏移未验证，猜偏移会得到"跑得正常、采样全黑"。
+2. **现在不会产生 draw call**：渲染目标能绑、`MTLRenderCommandEncoder` 能开，
+   但没有 program/管线/顶点缓冲，所有 draw 只打一条 `noPipeline` 日志就返回。
+3. **纹理只是宿主分配的 `MTLTexture`**：描述来自 builder setter 的记录值
+   （不猜字段偏移），但**不与 guest 内存 alias**，所以当渲染目标可用、
+   采样 guest 上传的像素还不行。
 4. **Release 编不过**：`kEnumsVerified = 0`，`nvn_metal.mm` 用 `#error` 拒绝 NDEBUG 构建。
    把没验证的 NVN 枚举值带上船，等于发一个颜色全错的版本。
 
@@ -244,10 +247,11 @@ powershell -ExecutionPolicy Bypass -File scripts\build_abi_test.ps1   # 真编�
 最近一次实测：
 
 ```
-nvn_abi_test: ok (513 procs)              exit=0
-core_smoke_test: ok (nvn 0/513 on null)   exit=0
+nvn_abi_test: ok (513 procs)                 exit=0
+core_smoke_test: ok (nvn 0/513 on null)      exit=0
+nvn_texture_test: ok (157 formats in table)  exit=0
 syntax_check_metal: ok (clang++.exe)
-verify_ios: ok
+verify_ios: ok (metal bindings: 46/513)
 build_abi_test: all tests passed
 ```
 

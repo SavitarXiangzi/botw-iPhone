@@ -43,6 +43,26 @@ enum {
 typedef NSUInteger MTLResourceOptions;
 enum { MTLResourceStorageModeShared = 0 };
 
+typedef NSUInteger MTLTextureType;
+enum {
+    MTLTextureType1D = 0,
+    MTLTextureType2D = 2,
+    MTLTextureType3D = 3,
+};
+
+typedef NSUInteger MTLTextureUsage;
+enum {
+    MTLTextureUsageShaderRead = 0x01,
+    MTLTextureUsageShaderWrite = 0x02,
+    MTLTextureUsageRenderTarget = 0x04,
+};
+
+typedef NSUInteger MTLStorageMode;
+enum {
+    MTLStorageModeShared = 0,
+    MTLStorageModePrivate = 2,
+};
+
 typedef NSUInteger MTLPrimitiveType;
 enum {
     MTLPrimitiveTypePoint = 0,
@@ -137,9 +157,22 @@ typedef void (^MTLDeallocator)(void* pointer, NSUInteger length);
 @protocol MTLBuffer
 @end
 
+@interface MTLTextureDescriptor : NSObject
+@property MTLPixelFormat pixelFormat;
+@property NSUInteger width;
+@property NSUInteger height;
+@property NSUInteger depth;
+@property NSUInteger mipmapLevelCount;
+@property NSUInteger sampleCount;
+@property MTLTextureType textureType;
+@property MTLTextureUsage usage;
+@property MTLStorageMode storageMode;
+@end
+
 @protocol MTLDevice
 @property (readonly) NSString* name;
 - (id<MTLCommandQueue>)newCommandQueue;
+- (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor*)descriptor;
 - (id<MTLBuffer>)newBufferWithBytesNoCopy:(void*)pointer
                                    length:(NSUInteger)length
                                   options:(MTLResourceOptions)options

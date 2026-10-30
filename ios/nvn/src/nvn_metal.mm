@@ -54,6 +54,7 @@
 
 #include "nvn_backend.h"
 #include "nvn_metal.h"
+#include "nvn_texture.h"
 
 #include <cmath>
 #include <cstdio>
@@ -138,7 +139,12 @@ struct CmdBuf {
     unsigned draws = 0;
     id<MTLCommandBuffer> cb = nil;
     id<MTLRenderCommandEncoder> enc = nil;
-    /* Recorded but not applied: there is no render target to apply them to. */
+    /* Render targets of the current pass, as guest NVNtexture addresses. */
+    unsigned numColor = 0;
+    uint64_t color[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    uint64_t depth = 0;
+    /* A ClearColor that has not been turned into a load action yet. */
+    bool pendingClear = false;
     int clearIndex = 0;
     int clearMask = 0;
     float clear[4] = {0, 0, 0, 0};
@@ -196,6 +202,10 @@ void forget(uint64_t guest) {
 std::unordered_map<uint64_t, WinSpec> g_win_specs;
 std::unordered_map<uint64_t, PoolSpec> g_pool_specs;
 std::unordered_map<uint64_t, int> g_device_flags;
+/* Builder state, keyed by the guest builder address.  The guest owns the
+ * struct and its layout is unverified, but that does not matter: every
+ * field we need arrives through a setter we implement ourselves. */
+std::unordered_map<uint64_t, nvngfx_texdesc> g_tex_specs;
 
 /* Guest memory is host-visible, so a pointer argument is just a cast.  This
  * is the one place that assumption is spelled out. */
@@ -208,7 +218,7 @@ T* guest_ptr(uint64_t value) {
 /* NVN -> Metal primitives                                             */
 /* ------------------------------------------------------------------ */
 
-MTLPrimitiveType to_metal_primitive(uint32_t nvn) {
+[[maybe_unused]] MTLPrimitiveType to_metal_primitive(uint32_t nvn) {
     if (!kEnumsVerified) {
         log_once("NVNdrawPrimitive", nvn);
         return MTLPrimitiveTypeTriangle;
@@ -504,24 +514,178 @@ void pool_get_size(nvngfx_ctx*, uint64_t* x) {
 /* nvnTextureBuilderSetDefaults(NVNtextureBuilder*) */
 void tex_builder_set_defaults(nvngfx_ctx*, uint64_t* x) {
     if (x[0]) std::memset(guest_ptr<void>(x[0]), 0, 0x80);
+    nvngfx_texdesc_defaults(&g_tex_specs[x[0]]);
+}
+
+/* The rest of the builder setters only record what the guest told us.  Their
+ * shapes come from ios/nvn/signatures.json, so there is no offset guessing:
+ * after nvnTextureBuilderSetSize2D(b, w, h) the state *is* w x h. */
+void tex_builder_set_target(nvngfx_ctx*, uint64_t* x) {
+    g_tex_specs[x[0]].target = static_cast<int>(x[1]);
+}
+void tex_builder_set_format(nvngfx_ctx*, uint64_t* x) {
+    g_tex_specs[x[0]].format = static_cast<int>(x[1]);
+}
+void tex_builder_set_size1d(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_texdesc& d = g_tex_specs[x[0]];
+    d.rank = 1;
+    d.width = static_cast<int>(x[1]);
+    d.height = 1;
+    d.depth = 1;
+}
+void tex_builder_set_size2d(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_texdesc& d = g_tex_specs[x[0]];
+    d.rank = 2;
+    d.width = static_cast<int>(x[1]);
+    d.height = static_cast<int>(x[2]);
+    d.depth = 1;
+}
+void tex_builder_set_size3d(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_texdesc& d = g_tex_specs[x[0]];
+    d.rank = 3;
+    d.width = static_cast<int>(x[1]);
+    d.height = static_cast<int>(x[2]);
+    d.depth = static_cast<int>(x[3]);
+}
+void tex_builder_set_width(nvngfx_ctx*, uint64_t* x) {
+    g_tex_specs[x[0]].width = static_cast<int>(x[1]);
+}
+void tex_builder_set_height(nvngfx_ctx*, uint64_t* x) {
+    g_tex_specs[x[0]].height = static_cast<int>(x[1]);
+}
+void tex_builder_set_depth(nvngfx_ctx*, uint64_t* x) {
+    g_tex_specs[x[0]].depth = static_cast<int>(x[1]);
+}
+void tex_builder_set_levels(nvngfx_ctx*, uint64_t* x) {
+    g_tex_specs[x[0]].levels = static_cast<int>(x[1]);
+}
+void tex_builder_set_samples(nvngfx_ctx*, uint64_t* x) {
+    g_tex_specs[x[0]].samples = static_cast<int>(x[1]);
+}
+void tex_builder_set_storage(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_texdesc& d = g_tex_specs[x[0]];
+    d.pool = x[1];
+    d.offset = static_cast<long long>(x[2]);
+}
+void tex_builder_set_stride(nvngfx_ctx*, uint64_t* x) {
+    g_tex_specs[x[0]].stride = static_cast<long long>(x[1]);
+}
+void tex_builder_set_flags(nvngfx_ctx*, uint64_t* x) {
+    g_tex_specs[x[0]].flags = static_cast<int>(x[1]);
+}
+
+MTLTextureType to_metal_texture_type(int rank) {
+    if (rank == 1) return MTLTextureType1D;
+    if (rank == 3) return MTLTextureType3D;
+    return MTLTextureType2D;
 }
 
 /* nvnTextureInitialize(NVNtexture*, const NVNtextureBuilder*) -> NVNboolean
  *
- * The NVNtextureBuilder field offsets are not verified yet, so this records
- * the guest object and stops.  Turning it on means reading width/height/
- * format/target/storage out of the builder -- guessing them would produce a
- * backend that runs and samples black.  See docs/IOS_PORTING.md, texture path.
+ * Builds a real MTLTexture from what the builder setters recorded.  Important
+ * limitation, stated here and in the docs: the texture is HOST allocated and
+ * does not alias the guest's storage.  That is harmless for a render target
+ * (we are the only writer and the pixels only leave through present), and it
+ * is wrong for a sampled texture (the guest's pixels would not be seen).
+ * Until the block-linear deswizzle path exists, only render targets are
+ * meaningful -- see docs/IOS_PORTING.md, texture path.
  */
-void tex_initialize(nvngfx_ctx*, uint64_t* x) {
-    log_once("nvnTextureInitialize.builderOffsets", 1);
-    find_or_add<Tex>(x[0]);
-    x[0] = 1;
+void tex_initialize(nvngfx_ctx* ctx, uint64_t* x) {
+    Ctx* c = ctx_of(ctx);
+    if (!c || !c->ready) {
+        x[0] = 0;
+        return;
+    }
+
+    nvngfx_texdesc d;
+    auto it = g_tex_specs.find(x[1]);
+    if (it != g_tex_specs.end()) {
+        d = it->second;
+    } else {
+        nvngfx_texdesc_defaults(&d);
+    }
+
+    int lossy = 0;
+    const unsigned pf = nvngfx_format_to_mtl(d.format, &lossy);
+    if (!pf) {
+        log_once("nvnTextureInitialize.formatWithoutMetalEquivalent",
+                 static_cast<unsigned>(d.format));
+        x[0] = 0;
+        return;
+    }
+    if (lossy) log_once("nvnTextureInitialize.substitutedFormat", static_cast<unsigned>(d.format));
+    if (d.width <= 0 || d.height <= 0 || d.depth <= 0) {
+        log_once("nvnTextureInitialize.badSize", static_cast<unsigned>(d.width));
+        x[0] = 0;
+        return;
+    }
+
+    @autoreleasepool {
+        MTLTextureDescriptor* td = [[MTLTextureDescriptor alloc] init];
+        td.pixelFormat = static_cast<MTLPixelFormat>(pf);
+        td.width = static_cast<NSUInteger>(d.width);
+        td.height = static_cast<NSUInteger>(d.height);
+        td.depth = d.depth > 1 ? static_cast<NSUInteger>(d.depth) : 1;
+        td.mipmapLevelCount = d.levels > 1 ? static_cast<NSUInteger>(d.levels) : 1;
+        td.sampleCount = d.samples > 1 ? static_cast<NSUInteger>(d.samples) : 1;
+        td.textureType = to_metal_texture_type(d.rank);
+        td.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite |
+                   MTLTextureUsageRenderTarget;
+        td.storageMode = MTLStorageModePrivate;
+
+        Tex* t = find_or_add<Tex>(x[0]);
+        t->width = static_cast<unsigned>(d.width);
+        t->height = static_cast<unsigned>(d.height);
+        t->depth = static_cast<unsigned>(d.depth);
+        t->levels = static_cast<unsigned>(d.levels);
+        t->format = static_cast<uint32_t>(d.format);
+        t->target = static_cast<uint32_t>(d.target);
+        t->pool = d.pool;
+        t->offset = static_cast<ptrdiff_t>(d.offset);
+        t->mtl = [c->device newTextureWithDescriptor:td];
+        x[0] = t->mtl ? 1u : 0u;
+    }
 }
 
 /* ------------------------------------------------------------------ */
 /* command buffer                                                      */
 /* ------------------------------------------------------------------ */
+
+/* An open encoder is a render pass.  Closing it is how a new load action
+ * (ClearColor) or a new set of render targets takes effect. */
+void end_encoder(CmdBuf* b) {
+    if (b && b->enc) {
+        [b->enc endEncoding];
+        b->enc = nil;
+    }
+}
+
+/* Opens the render pass for the targets recorded by SetRenderTargets.
+ * Returns false while there is nothing to render into -- which is the normal
+ * case until a texture exists for color[0]. */
+bool ensure_encoder(Ctx* c, CmdBuf* b) {
+    if (!b) return false;
+    if (b->enc) return true;
+    if (!c || !c->ready || !b->cb || b->numColor < 1) return false;
+
+    Tex* t0 = find<Tex>(b->color[0]);
+    if (!t0 || !t0->mtl) return false;
+
+    @autoreleasepool {
+        MTLRenderPassDescriptor* rpd = [MTLRenderPassDescriptor renderPassDescriptor];
+        rpd.colorAttachments[0].texture = t0->mtl;
+        rpd.colorAttachments[0].loadAction =
+            b->pendingClear ? MTLLoadActionClear : MTLLoadActionLoad;
+        if (b->pendingClear) {
+            rpd.colorAttachments[0].clearColor = MTLClearColorMake(
+                b->clear[0], b->clear[1], b->clear[2], b->clear[3]);
+        }
+        rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
+        b->enc = [b->cb renderCommandEncoderWithDescriptor:rpd];
+    }
+    b->pendingClear = false;
+    return b->enc != nil;
+}
 
 /* nvnCommandBufferBeginRecording(NVNcommandBuffer*) */
 void cmdbuf_begin_recording(nvngfx_ctx* ctx, uint64_t* x) {
@@ -531,68 +695,110 @@ void cmdbuf_begin_recording(nvngfx_ctx* ctx, uint64_t* x) {
     b->cb = [c->queue commandBuffer];
     b->recording = true;
     b->draws = 0;
+    b->numColor = 0;
+    b->depth = 0;
+    b->pendingClear = false;
 }
 
 /* nvnCommandBufferEndRecording(NVNcommandBuffer*) -> NVNcommandHandle
  * The handle is what the guest submits through nvnQueueSubmitCommands.  We do
- * not record a command stream, so 0 ("nothing to submit") is the honest value. */
+ * not record a command stream, so 0 ("nothing to submit") is the honest value;
+ * the Metal work is already committed here, in queue order. */
 void cmdbuf_end_recording(nvngfx_ctx*, uint64_t* x) {
     CmdBuf* b = find<CmdBuf>(x[0]);
     if (!b || !b->recording) {
         x[0] = 0;
         return;
     }
-    if (b->enc) {
-        [b->enc endEncoding];
-        b->enc = nil;
+    end_encoder(b);
+    if (b->cb) {
+        [b->cb commit];
+        b->cb = nil;
     }
     b->recording = false;
     x[0] = 0;
 }
 
+/* nvnCommandBufferSetRenderTargets(NVNcommandBuffer*, int n,
+ *     const NVNtexture* const* colors, const NVNtextureView* const* views,
+ *     const NVNtexture* depth, const NVNtextureView* depthView) */
+void cmdbuf_set_render_targets(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    if (!b) return;
+    const int n = static_cast<int>(x[1]);
+    if (n < 0 || n > 8) {
+        log_once("nvnCommandBufferSetRenderTargets.count", static_cast<unsigned>(n));
+    }
+    end_encoder(b);
+    b->numColor = n <= 0 ? 0u : (n > 8 ? 8u : static_cast<unsigned>(n));
+    const uint64_t* list = guest_ptr<const uint64_t>(x[2]);
+    for (unsigned i = 0; i < 8; ++i) {
+        b->color[i] = (list && i < b->numColor) ? list[i] : 0u;
+    }
+    b->depth = x[4];
+    /* Texture views are not supported yet; passing a view is legal but the
+     * base texture format is what gets attached. */
+    if (x[3] || x[5]) log_once("nvnCommandBufferSetRenderTargets.views", 1);
+    b->pendingClear = false;
+}
+
 /* nvnCommandBufferClearColor(NVNcommandBuffer*, int index, const float* rgba, int mask) */
-void cmdbuf_clear_color(nvngfx_ctx*, uint64_t* x) {
+void cmdbuf_clear_color(nvngfx_ctx* ctx, uint64_t* x) {
+    Ctx* c = ctx_of(ctx);
     CmdBuf* b = find_or_add<CmdBuf>(x[0]);
     const float* rgba = guest_ptr<const float>(x[2]);
     if (!b || !rgba) return;
     b->clearIndex = static_cast<int>(x[1]);
     b->clearMask = static_cast<int>(x[3]);
     for (int i = 0; i < 4; ++i) b->clear[i] = rgba[i];
-    /* Applied when a render target exists; without one there is nothing to
-     * clear, so this is recorded and dropped. */
+    b->pendingClear = true;
+    /* A clear mid-pass cannot be expressed as a load action, so close the pass;
+     * the next draw (or EndRecording) opens one that clears. */
+    end_encoder(b);
+    (void)c;
+    /* ClearColori / ClearColorui use integer masks; this path only has floats.
+     * The mask semantics are an unverified enum, so it is recorded, not acted on. */
     log_once("nvnCommandBufferClearColor.mask", static_cast<unsigned>(b->clearMask));
 }
 
 /* nvnCommandBufferDrawArrays(NVNcommandBuffer*, NVNdrawPrimitive, int first, int count) */
-void cmdbuf_draw_arrays(nvngfx_ctx*, uint64_t* x) {
+void cmdbuf_draw_arrays(nvngfx_ctx* ctx, uint64_t* x) {
+    Ctx* c = ctx_of(ctx);
     CmdBuf* b = find<CmdBuf>(x[0]);
     if (!b) return;
+    b->draws++;
+    /* Opening the pass is what makes the recorded clear happen; the draw
+     * itself still needs a pipeline, and nvnCommandBufferBindProgram is not
+     * implemented, so there is nothing to draw with. */
+    if (!ensure_encoder(c, b)) return;
     const uint32_t primitive = static_cast<uint32_t>(x[1]);
     const unsigned first = static_cast<unsigned>(x[2]);
     const unsigned count = static_cast<unsigned>(x[3]);
-    b->draws++;
-    if (!b->enc) return;
-    [b->enc drawPrimitives:to_metal_primitive(primitive)
-               vertexStart:first
-               vertexCount:count];
+    (void)primitive;
+    (void)first;
+    (void)count;
+    log_once("nvnCommandBufferDrawArrays.noPipeline", 1);
 }
 
 /* nvnCommandBufferDrawElements(NVNcommandBuffer*, NVNdrawPrimitive,
  *                              NVNindexType, int count, NVNbufferAddress) */
-void cmdbuf_draw_elements(nvngfx_ctx*, uint64_t* x) {
+void cmdbuf_draw_elements(nvngfx_ctx* ctx, uint64_t* x) {
+    Ctx* c = ctx_of(ctx);
     CmdBuf* b = find<CmdBuf>(x[0]);
     if (!b) return;
+    b->draws++;
+    if (!ensure_encoder(c, b)) return;
     const uint32_t indexType = static_cast<uint32_t>(x[2]);
     log_once("nvnCommandBufferDrawElements.indexType", indexType);
-    b->draws++;
     /* An indexed draw needs the bound index buffer and the real NVNindexType
      * values; neither is verified, so this counts and stops. */
 }
 
 /* nvnCommandBufferSetViewport(NVNcommandBuffer*, int x, int y, int w, int h) */
-void cmdbuf_set_viewport(nvngfx_ctx*, uint64_t* x) {
+void cmdbuf_set_viewport(nvngfx_ctx* ctx, uint64_t* x) {
+    Ctx* c = ctx_of(ctx);
     CmdBuf* b = find<CmdBuf>(x[0]);
-    if (!b || !b->enc) return;
+    if (!c || !b || !ensure_encoder(c, b)) return;
     MTLViewport vp = {static_cast<double>(static_cast<int>(x[1])),
                       static_cast<double>(static_cast<int>(x[2])),
                       static_cast<double>(static_cast<int>(x[3])),
@@ -601,9 +807,10 @@ void cmdbuf_set_viewport(nvngfx_ctx*, uint64_t* x) {
 }
 
 /* nvnCommandBufferSetScissor(NVNcommandBuffer*, int x, int y, int w, int h) */
-void cmdbuf_set_scissor(nvngfx_ctx*, uint64_t* x) {
+void cmdbuf_set_scissor(nvngfx_ctx* ctx, uint64_t* x) {
+    Ctx* c = ctx_of(ctx);
     CmdBuf* b = find<CmdBuf>(x[0]);
-    if (!b || !b->enc) return;
+    if (!c || !b || !ensure_encoder(c, b)) return;
     MTLScissorRect r = {static_cast<NSUInteger>(static_cast<int>(x[1])),
                         static_cast<NSUInteger>(static_cast<int>(x[2])),
                         static_cast<NSUInteger>(static_cast<int>(x[3])),
@@ -708,10 +915,24 @@ const Binding kBindings[] = {
     BIND("nvnMemoryPoolGetSize", pool_get_size),
 
     BIND("nvnTextureBuilderSetDefaults", tex_builder_set_defaults),
+    BIND("nvnTextureBuilderSetTarget", tex_builder_set_target),
+    BIND("nvnTextureBuilderSetFormat", tex_builder_set_format),
+    BIND("nvnTextureBuilderSetSize1D", tex_builder_set_size1d),
+    BIND("nvnTextureBuilderSetSize2D", tex_builder_set_size2d),
+    BIND("nvnTextureBuilderSetSize3D", tex_builder_set_size3d),
+    BIND("nvnTextureBuilderSetWidth", tex_builder_set_width),
+    BIND("nvnTextureBuilderSetHeight", tex_builder_set_height),
+    BIND("nvnTextureBuilderSetDepth", tex_builder_set_depth),
+    BIND("nvnTextureBuilderSetLevels", tex_builder_set_levels),
+    BIND("nvnTextureBuilderSetSamples", tex_builder_set_samples),
+    BIND("nvnTextureBuilderSetStorage", tex_builder_set_storage),
+    BIND("nvnTextureBuilderSetStride", tex_builder_set_stride),
+    BIND("nvnTextureBuilderSetFlags", tex_builder_set_flags),
     BIND("nvnTextureInitialize", tex_initialize),
 
     BIND("nvnCommandBufferBeginRecording", cmdbuf_begin_recording),
     BIND("nvnCommandBufferEndRecording", cmdbuf_end_recording),
+    BIND("nvnCommandBufferSetRenderTargets", cmdbuf_set_render_targets),
     BIND("nvnCommandBufferClearColor", cmdbuf_clear_color),
     BIND("nvnCommandBufferDrawArrays", cmdbuf_draw_arrays),
     BIND("nvnCommandBufferDrawElements", cmdbuf_draw_elements),

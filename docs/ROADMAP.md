@@ -1996,3 +1996,98 @@ core_smoke_test: ok (nvn 0/513 on null)
 仍然**没有** `nvnCommandBufferSetRenderTargets`：它的签名已经有了
 （6 个参数），但目标纹理必须先由 `nvnTextureInitialize` 造出 `MTLTexture`，
 而那需要 `NVNtextureBuilder` 的字段偏移。下一步是 `nvn_obj.h` 里的 `tex_t`。
+
+## M3.75 纹理与渲染目标：从“只有句柄”到“能开 pass”
+
+上一轮结尾的判断是：`nvnCommandBufferSetRenderTargets` 的签名已经有了，
+但目标纹理必须先由 `nvnTextureInitialize` 造出 `MTLTexture`，而那需要
+`NVNtextureBuilder` 的字段偏移。这一轮没有去猜偏移，换了一条路。
+
+### 不猜偏移：让 setter 自己交底
+
+`NVNtextureBuilder` 是不透明结构。与其从公开的 `nv_obj.h` 抄 `tex_builder_t`
+的字段偏移（版本一变就错，且错了是静默错），不如把 13 个 setter 的实参
+自己记下来：
+
+| setter | 记录的字段 |
+|---|---|
+| `nvnTextureBuilderSetTarget` | `NVNtextureTarget`（1D/2D/3D/cube/array） |
+| `nvnTextureBuilderSetFormat` | `NVNformat` |
+| `nvnTextureBuilderSetSize1D/2D/3D` | 宽 / 高 / 深 |
+| `nvnTextureBuilderSetWidth/Height/Depth` | 同上（两种建法都接） |
+| `nvnTextureBuilderSetLevels` | mip 级数 |
+| `nvnTextureBuilderSetSamples` | MSAA 采样数 |
+| `nvnTextureBuilderSetStorage` | `NVNstorage`，先只映射 Private |
+| `nvnTextureBuilderSetStride` | 行跨距（只记录） |
+| `nvnTextureBuilderSetFlags` | 只记录 |
+
+`nvnTextureInitialize` 用这份记录建 `MTLTextureDescriptor`。**没有任何一次
+读取 guest builder 内部**，所以本轮不存在“偏移猜错”的失败模式。
+
+代价写在明处：像素由宿主分配（`MTLStorageModePrivate`），和 guest 内存
+**不 alias**。当渲染目标够用；要采样 guest 上传的像素，还得另做一条
+上传或别名路径。
+
+### 157 项格式表
+
+`ios/nvn/src/nvn_texture.c` 里有 `NVNformat -> MTLPixelFormat` 的全表，
+派生自公开 nxnative（MIT）的 `dm/gfx/tex/nvn_fmt_mtl.c`。每项带一个
+exact/substitute 标记；映射到替代格式时 `lossy` 出参置 1，后端只打一次
+`nvnTextureInitialize.substitutedFormat` 日志。
+
+`tests/nvn_texture_test.cpp` 抽查三类：已知精确项、替代项、越界值。
+**表里有 157 个非零项。**
+
+> 这里踩过一个坑，值得记：测试第一次失败是**测试期望错**，不是表错。
+> `0x49` 不是 BC7 而是 BC4_U(140)，BC7 是 `0x4D`；`0x30` 也不是空洞，
+> 是 RGBA32Sint(124)。
+
+### 渲染目标与 encoder
+
+- `nvnCommandBufferSetRenderTargets(cb, numColor, colorArray, depth, depthStencil, ...)`：
+  记录 `numColor`（上限 8）、`color[8]`、`depth`；换目标前先 `endEncoding`。
+- `ensure_encoder()`：第一次 draw / viewport / scissor 时懒开 pass，
+  只挂 `colorAttachments[0]`，`loadAction` 由 `pendingClear` 决定。
+- `nvnCommandBufferClearColor`：不再丢弃；关掉当前 pass，记下 RGBA 与 mask，
+  下一次开 pass 时变成 clear。mask 语义属于未验证枚举，只记日志。
+- `nvnCommandBufferEndRecording`：`[cb commit]`。
+
+### 量化结论
+
+- 覆盖：32 -> **46 / 513（9.0%）**；TextureBuilder 1 -> 14 / 43，
+  CommandBuffer 7 -> 8 / 144。
+- `P0 blockers open: 5/6`，`nvnCommandBufferSetRenderTargets` 已 done。
+
+### 证据
+
+```
+generated artifacts up to date (513 procs, 46 implemented)
+verify_ios: ok   metal bindings: 46/513
+nvn_abi_test: ok (513 procs)
+core_smoke_test: ok (nvn 0/513 on null)
+nvn_texture_test: ok (157 formats in table)
+syntax_check_metal: ok (clang++.exe)
+build_abi_test: all tests passed
+```
+
+CI：`portable` 与 `ios`（xcodegen / 模拟器 Debug / 真机 Debug / Release 必须失败）
+在本轮推送后确认。**没有真机运行记录**，本机无设备。
+
+### 仍然没有的东西（别把 46 读成“快能玩了”）
+
+| 缺口 | 后果 |
+|---|---|
+| program / pipeline | draw 只打一次 `noPipeline` 就返回，**0 条 draw** |
+| 顶点缓冲 / attrib state | 同上 |
+| MRT / 深度 attachment | 只挂 `color[0]`，深度测试不可用 |
+| texture view | 只记日志，实际挂 base texture |
+| guest 像素 alias / 上传 | 纹理只适合当 render target |
+| `nvnQueueSubmitCommands` | 命令在 `EndRecording` 就 commit，不等队列 |
+| Maxwell SASS -> MSL | 整个移植最大的墙，一行没动 |
+
+### 下一步
+
+`nvnProgramInitialize` + `nvnCommandBufferBindProgram` + 顶点状态，让
+`ensure_encoder()` 开出的 pass 里第一次出现**真正的** pipeline。但在着色器
+翻译有结论之前，这一步只能验证“Metal 侧把管线建起来了”，不能验证
+“客体的 shader 跑起来了”。

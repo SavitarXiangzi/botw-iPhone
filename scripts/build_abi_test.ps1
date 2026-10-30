@@ -23,15 +23,16 @@ try {
     if (-not (Test-Path $VcVars)) {
         Write-Error "vcvars64.bat not found at '$VcVars'. Pass -VcVars <path>."
     }
-    New-Item -ItemType Directory -Force -Path build\nvn\abi, build\nvn\core | Out-Null
+    New-Item -ItemType Directory -Force -Path build\nvn\abi, build\nvn\core, build\nvn\tex | Out-Null
 
     $inc = "/I core\include /I ios\nvn\include"
-    $lib = "ios\nvn\src\nvn_dispatch.cpp ios\nvn\src\nvn_null.cpp core\src\botw_core.cpp"
+    $lib = "ios\nvn\src\nvn_dispatch.cpp ios\nvn\src\nvn_null.cpp ios\nvn\src\nvn_texture.c core\src\botw_core.cpp"
     $flags = "/nologo /std:c++20 /EHsc /W4 /WX"
 
     $jobs = @(
         @{ name = "nvn_abi_test";    src = "tests\nvn_abi_test.cpp";    obj = "build\nvn\abi\" },
-        @{ name = "core_smoke_test"; src = "tests\core_smoke_test.cpp"; obj = "build\nvn\core\" }
+        @{ name = "core_smoke_test"; src = "tests\core_smoke_test.cpp"; obj = "build\nvn\core\" },
+        @{ name = "nvn_texture_test"; src = "tests\nvn_texture_test.cpp"; obj = "build\nvn\tex\" }
     )
 
     foreach ($j in $jobs) {
