@@ -170,14 +170,21 @@ static const char* const kFsTextureBlob =
     "}\n";
 
 /* Variant 6: a c1-only fragment shader.  The argument buffer has one pointer
- * at [[id(2)]], and the bytes behind it come from the sidecar, not from any
+ * at [[id(0)]], and the bytes behind it come from the sidecar, not from any
  * command-buffer binding.  The self-test fills them with a known colour so a
- * readback proves the c1 buffer was created and its address was written. */
+ * readback proves the c1 buffer was created and its address was written.
+ *
+ * The id must be 0 here, not 2: Metal lays an argument buffer out in member
+ * declaration order (8 bytes per scalar resource), while [[id(k)]] only names
+ * the encoder binding.  A lone member declared as [[id(2)]] still lives at
+ * byte 0, so a raw id*8 table would read zeros.  Real translated shaders have
+ * contiguous ids (0..41 in the measured BOTW fragment shader), where the two
+ * orders coincide. */
 static const char* const kFsC1 =
     "#include <metal_stdlib>\n"
     "using namespace metal;\n"
     "\n"
-    "struct spvDescriptorSetBuffer0 { constant float4* c1 [[id(2)]]; };\n"
+    "struct spvDescriptorSetBuffer0 { constant float4* c1 [[id(0)]]; };\n"
     "\n"
     "fragment float4 nvngfx_main_fs(constant spvDescriptorSetBuffer0& s0 [[buffer(0)]]) {\n"
     "    return *s0.c1;\n"

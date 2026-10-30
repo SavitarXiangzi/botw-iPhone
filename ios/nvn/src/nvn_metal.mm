@@ -3900,7 +3900,7 @@ extern "C" int nvngfx_metal_selftest(void) {
         {
             /* --- Sixth draw: a c1-only fragment shader -------------------
              * The sidecar carries the raw c1 bytes; the MSL names them with
-             * one [[id(2)]] pointer.  There is no UBO/texture/sampler binding,
+             * one [[id(0)]] pointer.  There is no UBO/texture/sampler binding,
              * so this also proves the backend binds buffer(0) for c1 alone.
              * The local bytes are overwritten after SetShaders: a readback of
              * the original colour proves the Program copied them rather than
@@ -3929,7 +3929,7 @@ extern "C" int nvngfx_metal_selftest(void) {
             const float c1Colour[4] = {0.25f, 0.5f, 0.75f, 1.0f};
             std::memcpy(c1Bytes, c1Colour, sizeof c1Colour);
             const nvngfx_shader_arg c1Args[] = {
-                {2, NVNGFX_ARG_C1, -1},
+                {0, NVNGFX_ARG_C1, -1},
             };
             const nvngfx_shader_blob c1Blob[] = {
                 {"00000000000000a6", NVNGFX_STAGE_FRAGMENT,
@@ -3999,6 +3999,10 @@ extern "C" int nvngfx_metal_selftest(void) {
                 rc = 16391;
                 goto done;
             }
+            std::fprintf(stderr,
+                         "[selftest] c1 buffer: gpuAddress=0x%llx bytes=%zu\n",
+                         static_cast<unsigned long long>([p6->c1Buffer gpuAddress]),
+                         p6->c1.size());
             [b6->last waitUntilCompleted];
             if (b6->last.status == MTLCommandBufferStatusError) {
                 std::fprintf(stderr, "[selftest] c1 draw command buffer error: %s\n",
