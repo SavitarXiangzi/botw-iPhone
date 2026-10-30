@@ -5360,9 +5360,10 @@ extern "C" int nvngfx_metal_selftest(void) {
             const uint64_t kB12 =
                 reinterpret_cast<uint64_t>(guestCubeBuilder);
             const unsigned kCubeOffset = 0;
-            unsigned char* const vpool12 = reinterpret_cast<unsigned char*>(
-                (reinterpret_cast<uintptr_t>(poolRaw2) + 16383u) &
-                ~static_cast<uintptr_t>(16383u));
+            /* Filled in after the malloc below: computing it from the still
+             * null poolRaw2 produced a null page and memset() crashed the
+             * app, which is what run 41077027673 hit right after draw 11. */
+            unsigned char* vpool12 = nullptr;
 
             nvngfx_texdesc cd;
             nvngfx_texdesc_defaults(&cd);
@@ -5381,6 +5382,9 @@ extern "C" int nvngfx_metal_selftest(void) {
                 rc = 16401;
                 goto done;
             }
+            vpool12 = reinterpret_cast<unsigned char*>(
+                (reinterpret_cast<uintptr_t>(poolRaw2) + 16383u) &
+                ~static_cast<uintptr_t>(16383u));
             std::memset(vpool12, 0, 16384);
             {
                 alignas(16) unsigned char cubePoolBuilder[0x40] = {};
@@ -5402,6 +5406,8 @@ extern "C" int nvngfx_metal_selftest(void) {
                     goto done;
                 }
             }
+            std::fprintf(stderr, "[selftest] trace: draw 12 pool ready\n");
+            std::fflush(stderr);
             cd.pool = kCubePool;
             cd.offset = kCubeOffset;
             {
@@ -5455,6 +5461,8 @@ extern "C" int nvngfx_metal_selftest(void) {
                 x[0] = kTexGuestCube; x[1] = kB12;
                 tex_initialize(ctx, x);
             }
+            std::fprintf(stderr, "[selftest] trace: draw 12 texture initialized\n");
+            std::fflush(stderr);
             Tex* cubeTex = find<Tex>(kTexGuestCube);
             if (x[0] != 1 || !cubeTex || !cubeTex->mtl ||
                 cubeTex->mtl.textureType != MTLTextureTypeCube ||
@@ -5494,6 +5502,8 @@ extern "C" int nvngfx_metal_selftest(void) {
                 rc = 16401;
                 goto done;
             }
+            std::fprintf(stderr, "[selftest] trace: draw 12 program ready\n");
+            std::fflush(stderr);
             x[0] = kTexPool; x[1] = 6; x[2] = kTexGuestCube; x[3] = 0;
             tex_pool_register_texture(ctx, x);
 
@@ -5525,6 +5535,8 @@ extern "C" int nvngfx_metal_selftest(void) {
             x[0] = kCb12;
             cmdbuf_end_recording(ctx, x);
 
+            std::fprintf(stderr, "[selftest] trace: draw 12 recorded\n");
+            std::fflush(stderr);
             CmdBuf* b12 = find<CmdBuf>(kCb12);
             if (!b12 || !b12->last) {
                 std::fprintf(stderr,
@@ -5532,7 +5544,11 @@ extern "C" int nvngfx_metal_selftest(void) {
                 rc = 16401;
                 goto done;
             }
+            std::fprintf(stderr, "[selftest] trace: draw 12 waiting\n");
+            std::fflush(stderr);
             [b12->last waitUntilCompleted];
+            std::fprintf(stderr, "[selftest] trace: draw 12 completed\n");
+            std::fflush(stderr);
             if (b12->last.status == MTLCommandBufferStatusError) {
                 std::fprintf(stderr,
                              "[selftest] draw 12 command buffer error: %s\n",
@@ -5601,7 +5617,14 @@ extern "C" int nvngfx_metal_selftest(void) {
             const uint64_t kB13 =
                 reinterpret_cast<uint64_t>(guestCubeArrayBuilder);
             const unsigned kCubeArrayOffset = 4096;
-            unsigned char* const vpool13 = reinterpret_cast<unsigned char*>(
+            unsigned char* vpool13 = nullptr;
+            if (!poolRaw2) {
+                std::fprintf(stderr,
+                             "[selftest] draw 13: the cube pool is missing\n");
+                rc = 16403;
+                goto done;
+            }
+            vpool13 = reinterpret_cast<unsigned char*>(
                 (reinterpret_cast<uintptr_t>(poolRaw2) + 16383u) &
                 ~static_cast<uintptr_t>(16383u));
 
@@ -5666,6 +5689,8 @@ extern "C" int nvngfx_metal_selftest(void) {
                 x[0] = kTexGuestCubeArray; x[1] = kB13;
                 tex_initialize(ctx, x);
             }
+            std::fprintf(stderr, "[selftest] trace: draw 13 texture initialized\n");
+            std::fflush(stderr);
             Tex* cubeArrayTex = find<Tex>(kTexGuestCubeArray);
             if (x[0] != 1 || !cubeArrayTex || !cubeArrayTex->mtl ||
                 cubeArrayTex->mtl.textureType != MTLTextureTypeCubeArray ||
@@ -5706,6 +5731,8 @@ extern "C" int nvngfx_metal_selftest(void) {
                 rc = 16403;
                 goto done;
             }
+            std::fprintf(stderr, "[selftest] trace: draw 13 program ready\n");
+            std::fflush(stderr);
             x[0] = kTexPool; x[1] = 8; x[2] = kTexGuestCubeArray; x[3] = 0;
             tex_pool_register_texture(ctx, x);
 
@@ -5744,7 +5771,11 @@ extern "C" int nvngfx_metal_selftest(void) {
                 rc = 16403;
                 goto done;
             }
+            std::fprintf(stderr, "[selftest] trace: draw 13 waiting\n");
+            std::fflush(stderr);
             [b13->last waitUntilCompleted];
+            std::fprintf(stderr, "[selftest] trace: draw 13 completed\n");
+            std::fflush(stderr);
             if (b13->last.status == MTLCommandBufferStatusError) {
                 std::fprintf(stderr,
                              "[selftest] draw 13 command buffer error: %s\n",
