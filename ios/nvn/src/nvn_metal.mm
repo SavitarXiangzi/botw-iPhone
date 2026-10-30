@@ -2814,6 +2814,14 @@ extern "C" int nvngfx_metal_selftest(void) {
             std::fprintf(stderr, "[selftest] no Metal device\n");
             return 1;
         }
+        std::fprintf(stderr,
+                     "[selftest] metal device: argumentBuffersTier=%lu "
+                     "apple7=%d metal3=%d unifiedMemory=%d\n",
+                     static_cast<unsigned long>(dev.argumentBuffersTier),
+                     [dev supportsFamily:MTLGPUFamilyApple7] ? 1 : 0,
+                     [dev supportsFamily:MTLGPUFamilyMetal3] ? 1 : 0,
+                     dev.hasUnifiedMemory ? 1 : 0);
+        std::fflush(stderr);
 
         nvngfx_ctx* ctx = nvngfx_metal_create();
         nvngfx_metal_set_device(ctx, (__bridge void*)dev, nullptr);
@@ -3431,6 +3439,30 @@ extern "C" int nvngfx_metal_selftest(void) {
                     rc = 16385;
                     goto done;
                 }
+                /* The upload and the draw use the same queue, so a readback
+                 * here proves the source texels are in the private texture
+                 * before the sampler is involved. */
+                const struct {
+                    NSUInteger x, y;
+                    const char* corner;
+                } srcChecks[4] = {
+                    {0, 0, "top-left"}, {1, 0, "top-right"},
+                    {0, 1, "bottom-left"}, {1, 1, "bottom-right"}};
+                std::fprintf(stderr, "[selftest] source texture readback:");
+                for (int i = 0; i < 4; ++i) {
+                    unsigned char px[4] = {0, 0, 0, 0};
+                    if (!read_pixel_at(dev, c->queue, src->mtl, 2,
+                                       srcChecks[i].x, srcChecks[i].y, px)) {
+                        std::fprintf(stderr, " %s=read-failed",
+                                     srcChecks[i].corner);
+                    } else {
+                        std::fprintf(stderr, " %s=(%u,%u,%u,%u)",
+                                     srcChecks[i].corner, px[0], px[1], px[2],
+                                     px[3]);
+                    }
+                }
+                std::fprintf(stderr, "\n");
+                std::fflush(stderr);
             }
             /* Nearest filtering and clamp-to-edge, so each corner pixel of
              * the target reads exactly one texel of the 2x2 source. */
@@ -3545,25 +3577,50 @@ extern "C" int nvngfx_metal_selftest(void) {
                 cmdbuf_end_recording(ctx, x);
             }
             CmdBuf* b5 = find<CmdBuf>(kCb5);
-            if (b5 && b5->argbuf) {
-                Tex* src5 = find<Tex>(kTexSrc);
-                const PooledSampler* ps5 = bound_sampler(b5, b5->texHandle[0]);
-                const uint64_t* words =
-                    static_cast<const uint64_t*>([b5->argbuf contents]);
-                std::fprintf(stderr,
-                             "[selftest] textured draw ids: tex=0x%llx samp=0x%llx "
-                             "table=0x%llx,0x%llx,0x%llx\n",
-                             src5 ? static_cast<unsigned long long>(
-                                        src5->mtl.gpuResourceID._impl)
-                                  : 0ull,
-                             ps5 ? static_cast<unsigned long long>(
-                                       ps5->mtl.gpuResourceID._impl)
-                                 : 0ull,
-                             static_cast<unsigned long long>(words[0]),
-                             static_cast<unsigned long long>(words[1]),
-                             static_cast<unsigned long long>(words[2]));
-                std::fflush(stderr);
+            Program* p5 = find<Program>(kProg5);
+            Tex* src5 = find<Tex>(kTexSrc);
+            const PooledSampler* ps5 =
+                b5 ? bound_sampler(b5, b5->texHandle[0]) : nullptr;
+            uint64_t words[3] = {0, 0, 0};
+            const bool haveTable = b5 && b5->argbuf;
+            if (haveTable) {
+                std::memcpy(words, [b5->argbuf contents], sizeof words);
             }
+            std::fprintf(stderr,
+                         "[selftest] textured draw state: pso=%d argbuf=%d "
+                         "hasArgs=%d encoded=%u draws=%u hasArgBuffer=%d "
+                         "numArgs=%u ubo0=0x%llx tex0=0x%llx\n",
+                         b5 && b5->pso ? 1 : 0, haveTable ? 1 : 0,
+                         b5 && has_arguments(b5) ? 1 : 0,
+                         b5 ? b5->encoded : 0u, b5 ? b5->draws : 0u,
+                         p5 && p5->hasArgBuffer ? 1 : 0,
+                         p5 ? p5->numArgs : 0u,
+                         b5 ? static_cast<unsigned long long>(b5->ubo[0]) : 0ull,
+                         b5 ? static_cast<unsigned long long>(b5->texHandle[0])
+                            : 0ull);
+            std::fprintf(stderr,
+                         "[selftest] textured draw ids: tex=0x%llx samp=0x%llx "
+                         "table=%s0x%llx,0x%llx,0x%llx\n",
+                         src5 ? static_cast<unsigned long long>(
+                                    src5->mtl.gpuResourceID._impl)
+                              : 0ull,
+                         ps5 ? static_cast<unsigned long long>(
+                                   ps5->mtl.gpuResourceID._impl)
+                             : 0ull,
+                         haveTable ? "" : "(none) ",
+                         static_cast<unsigned long long>(words[0]),
+                         static_cast<unsigned long long>(words[1]),
+                         static_cast<unsigned long long>(words[2]));
+            if (p5) {
+                std::fprintf(stderr, "[selftest] textured draw args:");
+                for (unsigned i = 0; i < p5->numArgs && i < 8; ++i) {
+                    std::fprintf(stderr, " [id=%u kind=%u slot=%u]",
+                                 p5->args[i].id, p5->args[i].kind,
+                                 p5->args[i].slot);
+                }
+                std::fprintf(stderr, "\n");
+            }
+            std::fflush(stderr);
             if (!b5 || !b5->last || b5->encoded != 1) {
                 std::fprintf(stderr,
                              "[selftest] textured draw was not encoded (asked %u, "
