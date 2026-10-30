@@ -1479,13 +1479,9 @@ struct Program {
     ArgEntry args[8];
     unsigned numArgs = 0;
     /* Whether the fragment function declares an argument buffer at
-     * buffer(0).  Constant-colour programs do not, and asking Metal for an
-     * encoder on those can terminate the process.  The encoder itself is
-     * built while the function is in hand, before the pipeline state, which
-     * is also the order the working d2r-mobile backend uses. */
+     * buffer(0).  Constant-colour programs do not, and binding the table to
+     * those would feed them the wrong bytes. */
     bool hasArgBuffer = false;
-    id<MTLArgumentEncoder> argEnc = nil;
-    NSUInteger argLen = 0;
 };
 
 /* The cached pipeline for (format, layout), or nil.  Also records the hit in
@@ -1699,15 +1695,12 @@ id<MTLRenderPipelineState> program_pipeline(Ctx* c, Program* p, MTLPixelFormat f
             return nil;
         }
 
-        /* The fragment function knows where each [[id(k)]] sits in the
-         * argument buffer.  Only create an encoder for a function that
-         * actually declares buffer(0): the constant-colour self-test
-         * programs have no argument buffer and must skip this call. */
+        /* The shader text is the only dependable signal here: Apple's
+         * simulator runtime can return a non-nil argument encoder whose
+         * encodedLength is still zero.  The actual table is therefore
+         * written with the fixed 8-byte-entry ABI below, matching the
+         * working d2r-mobile backend. */
         p->hasArgBuffer = std::strstr(fs, "[[buffer(0)]]") != nullptr;
-        if (p->hasArgBuffer && !p->argEnc) {
-            p->argEnc = [ffn newArgumentEncoderWithBufferIndex:0];
-            p->argLen = p->argEnc ? [p->argEnc encodedLength] : 0;
-        }
 
         MTLRenderPipelineDescriptor* pd = [[MTLRenderPipelineDescriptor alloc] init];
         pd.vertexFunction = vfn;
@@ -2264,21 +2257,24 @@ id<MTLBuffer> argument_buffer(Ctx* c, CmdBuf* b) {
     if (b->argbuf) return b->argbuf;
     Program* p = find<Program>(b->program);
     if (!has_arguments(b)) return nil;
-    if (!p || !p->argEnc || p->argLen == 0) {
+    if (!p || !p->hasArgBuffer) {
         log_once("nvnCommandBufferDraw.argumentLayout", p ? 1u : 0u);
         return nil;
     }
-    id<MTLBuffer> ab = [c->device newBufferWithLength:p->argLen
-                                              options:MTLResourceStorageModeShared];
-    if (!ab) {
-        log_once("nvnCommandBufferDraw.argumentBuffer", 1);
-        return nil;
-    }
-    [p->argEnc setArgumentBuffer:ab offset:0];
 
+    /* Metal argument buffers lay out each pointer, texture and sampler
+     * [[id(k)]] as one 64-bit word.  The simulator's runtime compiler does
+     * not expose that layout through MTLArgumentEncoder (it reports an
+     * encodedLength of 0), so write the documented resource values here:
+     * a GPU address for a buffer, and gpuResourceID for a texture/sampler.
+     * This is the same fixed ABI d2r-mobile uses for its translated MSL. */
+    Program::ArgEntry entries[16];
+    unsigned numEntries = 0;
+    unsigned highestId = 0;
     if (p->numArgs == 0) {
-        /* Without a layout a texture cannot be placed, and binding a buffer
-         * with an unset entry would sample garbage: drop the draw instead. */
+        /* Without a sidecar only uniform buffers have an id: buffer i is
+         * id(i).  A texture cannot be placed, so drop that draw instead of
+         * sampling an unset entry. */
         for (unsigned i = 0; i < 16; ++i) {
             if (b->texHandle[i] || b->sepTexHandle[i] || b->sepSampHandle[i]) {
                 log_once("nvnCommandBufferDraw.textureLayout", i);
@@ -2287,25 +2283,35 @@ id<MTLBuffer> argument_buffer(Ctx* c, CmdBuf* b) {
         }
         for (unsigned i = 0; i < 16; ++i) {
             if (!b->ubo[i]) continue;
-            id<MTLBuffer> src = nil;
-            size_t off = 0;
-            const size_t len = static_cast<size_t>(b->uboSize[i] ? b->uboSize[i] : 1);
-            if (!pool_span(b->ubo[i], len, &src, &off)) {
-                log_once("nvnCommandBufferDraw.uniformBuffer", i);
+            entries[numEntries++] = Program::ArgEntry{i, 0, i};
+            if (i > highestId) highestId = i;
+        }
+    } else {
+        const unsigned n = p->numArgs < 8 ? p->numArgs : 8;
+        for (unsigned k = 0; k < n; ++k) {
+            const Program::ArgEntry& e = p->args[k];
+            if (e.id >= 16 || e.slot >= 16) {
+                log_once("nvnCommandBufferDraw.argSlot", e.slot);
                 return nil;
             }
-            [p->argEnc setBuffer:src offset:off atIndex:i];
+            entries[numEntries++] = e;
+            if (e.id > highestId) highestId = e.id;
         }
-        b->argbuf = ab;
-        return b->argbuf;
     }
+    if (numEntries == 0) return nil;
 
-    for (unsigned k = 0; k < p->numArgs && k < 8; ++k) {
-        const Program::ArgEntry& e = p->args[k];
-        if (e.slot >= 16) {
-            log_once("nvnCommandBufferDraw.argSlot", e.slot);
-            return nil;
-        }
+    const size_t bytes = (static_cast<size_t>(highestId) + 1u) * sizeof(uint64_t);
+    id<MTLBuffer> ab = [c->device newBufferWithLength:bytes
+                                              options:MTLResourceStorageModeShared];
+    if (!ab) {
+        log_once("nvnCommandBufferDraw.argumentBuffer", 1);
+        return nil;
+    }
+    uint64_t* slots = static_cast<uint64_t*>([ab contents]);
+    std::memset(slots, 0, bytes);
+
+    for (unsigned k = 0; k < numEntries; ++k) {
+        const Program::ArgEntry& e = entries[k];
         if (e.kind == 0) {
             if (!b->ubo[e.slot]) continue;
             id<MTLBuffer> src = nil;
@@ -2315,7 +2321,8 @@ id<MTLBuffer> argument_buffer(Ctx* c, CmdBuf* b) {
                 log_once("nvnCommandBufferDraw.uniformBuffer", e.slot);
                 return nil;
             }
-            [p->argEnc setBuffer:src offset:off atIndex:e.id];
+            slots[e.id] = static_cast<uint64_t>([src gpuAddress]) + off;
+            [b->enc useResource:src usage:MTLResourceUsageRead];
         } else if (e.kind == 1) {
             const uint64_t h = b->texHandle[e.slot] ? b->texHandle[e.slot]
                                                    : b->sepTexHandle[e.slot];
@@ -2324,7 +2331,8 @@ id<MTLBuffer> argument_buffer(Ctx* c, CmdBuf* b) {
                 log_once("nvnCommandBufferDraw.texture", e.slot);
                 return nil;
             }
-            [p->argEnc setTexture:t->mtl atIndex:e.id];
+            slots[e.id] = static_cast<uint64_t>(t->mtl.gpuResourceID._impl);
+            [b->enc useResource:t->mtl usage:MTLResourceUsageRead];
         } else {
             const PooledSampler* s = bound_sampler(b, b->texHandle[e.slot] ? b->texHandle[e.slot]
                                                                             : b->sepSampHandle[e.slot]);
@@ -2332,7 +2340,7 @@ id<MTLBuffer> argument_buffer(Ctx* c, CmdBuf* b) {
                 log_once("nvnCommandBufferDraw.sampler", e.slot);
                 return nil;
             }
-            [p->argEnc setSamplerState:s->mtl atIndex:e.id];
+            slots[e.id] = static_cast<uint64_t>(s->mtl.gpuResourceID._impl);
         }
     }
     b->argbuf = ab;
@@ -3343,11 +3351,10 @@ extern "C" int nvngfx_metal_selftest(void) {
                 Program* p4 = find<Program>(kProg4);
                 std::fprintf(stderr,
                              "[selftest] draw 4 not encoded: pso=%d argbuf=%d "
-                             "hasArgBuffer=%d argEnc=%d argLen=%lu ubo0=0x%llx\n",
+                             "hasArgBuffer=%d numArgs=%u ubo0=0x%llx\n",
                              b4->pso ? 1 : 0, b4->argbuf ? 1 : 0,
                              p4 && p4->hasArgBuffer ? 1 : 0,
-                             p4 && p4->argEnc ? 1 : 0,
-                             p4 ? static_cast<unsigned long>(p4->argLen) : 0ul,
+                             p4 ? p4->numArgs : 0u,
                              static_cast<unsigned long long>(b4->ubo[0]));
             }
             [b4->last waitUntilCompleted];

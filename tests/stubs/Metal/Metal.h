@@ -36,6 +36,19 @@ __attribute__((objc_root_class))
 - (NSString*)localizedDescription;
 @end
 
+/* iOS 16+: resource and sampler-table entries in an argument buffer are
+ * 64-bit MTLResourceID values.  The public struct's only field is the
+ * implementation handle, which is exactly what the table stores. */
+typedef struct { uint64_t _impl; } MTLResourceID;
+typedef NSUInteger MTLResourceUsage;
+enum {
+    MTLResourceUsageRead = 1u << 0,
+    MTLResourceUsageWrite = 1u << 1,
+    MTLResourceUsageSample = 1u << 2,
+};
+@protocol MTLResource
+@end
+
 typedef NSUInteger MTLCommandBufferStatus;
 enum {
     MTLCommandBufferStatusCompleted = 4,
@@ -141,10 +154,11 @@ typedef enum MTLSamplerReductionMode : NSUInteger {
 @end
 
 @protocol MTLSamplerState
+@property (readonly) MTLResourceID gpuResourceID;
 @end
 
-/* Metal argument buffers: the encoder owns the [[id(k)]] layout, which is
- * why nvn_metal.mm asks the function for one instead of computing offsets. */
+/* Metal argument buffers: the encoder's reflection is unavailable on some
+ * simulator runtimes, so nvn_metal.mm writes the 8-byte entry ABI directly. */
 @protocol MTLTexture;
 @protocol MTLSamplerState;
 
@@ -282,10 +296,11 @@ static inline MTLSize MTLSizeMake(NSUInteger w, NSUInteger h, NSUInteger d) {
 
 typedef void (^MTLDeallocator)(void* pointer, NSUInteger length);
 
-@protocol MTLTexture
+@protocol MTLTexture <MTLResource>
 @property (readonly) NSUInteger width;
 @property (readonly) NSUInteger height;
 @property (readonly) MTLPixelFormat pixelFormat;
+@property (readonly) MTLResourceID gpuResourceID;
 @end
 
 @protocol MTLBlitCommandEncoder
@@ -338,6 +353,7 @@ destinationBytesPerImage:(NSUInteger)bpi;
 - (void)setFragmentBuffer:(id<MTLBuffer>)buffer
                    offset:(NSUInteger)offset
                   atIndex:(NSUInteger)index;
+- (void)useResource:(id<MTLResource>)resource usage:(MTLResourceUsage)usage;
 @end
 
 @class MTLRenderPassDescriptor;
@@ -372,7 +388,7 @@ destinationBytesPerImage:(NSUInteger)bpi;
 - (id<MTLCommandBuffer>)commandBuffer;
 @end
 
-@protocol MTLBuffer
+@protocol MTLBuffer <MTLResource>
 - (void*)contents;
 /* Metal 3 / iOS 16+: the GPU address an argument buffer entry stores. */
 @property (readonly) unsigned long long gpuAddress;
