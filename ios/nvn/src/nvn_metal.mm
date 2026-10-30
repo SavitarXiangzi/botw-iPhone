@@ -83,6 +83,7 @@
 #import <QuartzCore/CAMetalLayer.h>
 
 #include "nvn_backend.h"
+#include "nvn_bcn.h"
 #include "nvn_metal.h"
 #include "nvn_pool.h"
 #include "nvn_sampler.h"
@@ -177,6 +178,10 @@ struct Tex {
     unsigned width = 0, height = 0, depth = 1, levels = 1, layers = 1;
     uint32_t format = 0;
     uint32_t target = 0;
+    /* The guest stores a BCn format that iOS Metal cannot create.  This
+     * texture's MTLTexture is therefore RGBA8 and tex_upload() decodes every
+     * block while it copies the guest image. */
+    bool transcoded = false;
     uint64_t pool = 0;
     ptrdiff_t offset = 0;
     id<MTLTexture> mtl = nil;
@@ -818,8 +823,22 @@ void tex_initialize(nvngfx_ctx* ctx, uint64_t* x) {
         nvngfx_texdesc_defaults(&d);
     }
 
+    /* iOS Metal has no BCn pixel formats.  Decode to RGBA8 instead of asking
+     * for a descriptor the device will reject (or, on a Mac host, silently
+     * use a format the iOS build cannot ship).  sRGB variants keep their
+     * transfer function so sampling is not double-converted. */
+    const bool bcn = nvngfx_bcn_supported(d.format) != 0;
     int lossy = 0;
-    const unsigned pf = nvngfx_format_to_mtl(d.format, &lossy);
+    unsigned pf = 0;
+    if (bcn) {
+        pf = nvngfx_bcn_is_srgb(d.format)
+                 ? static_cast<unsigned>(MTLPixelFormatRGBA8Unorm_sRGB)
+                 : static_cast<unsigned>(MTLPixelFormatRGBA8Unorm);
+        log_once("nvnTextureInitialize.bcnTranscode",
+                 static_cast<unsigned>(d.format));
+    } else {
+        pf = nvngfx_format_to_mtl(d.format, &lossy);
+    }
     if (!pf) {
         log_once("nvnTextureInitialize.formatWithoutMetalEquivalent",
                  static_cast<unsigned>(d.format));
@@ -875,6 +894,7 @@ void tex_initialize(nvngfx_ctx* ctx, uint64_t* x) {
         t->levels = static_cast<unsigned>(d.levels);
         t->format = static_cast<uint32_t>(d.format);
         t->target = static_cast<uint32_t>(d.target);
+        t->transcoded = bcn;
         t->pool = d.pool;
         t->offset = static_cast<ptrdiff_t>(d.offset);
         t->desc = d;
@@ -2546,13 +2566,33 @@ bool tex_upload(Ctx* c, CmdBuf* b, Tex* t) {
 
     const unsigned levels = t->desc.levels ? static_cast<unsigned>(t->desc.levels) : 1u;
     const unsigned layers = L.layers ? L.layers : 1u;
+    const bool transcoded = t->transcoded;
+    const unsigned format = static_cast<unsigned>(t->desc.format);
+
+    /* Mip dimensions are floor halved with a floor of one texel.  They are
+     * only needed for BCn, whose guest image is block aligned but destination
+     * RGBA8 texture is not. */
+    auto mip_extent = [](unsigned base, unsigned level) {
+        unsigned v = base ? base : 1u;
+        for (unsigned i = 0; i < level && v > 1u; ++i) v >>= 1;
+        return v;
+    };
+    auto size3 = [](size_t a, size_t b, size_t c, size_t* out) {
+        if (a != 0 && b > SIZE_MAX / a) return false;
+        const size_t ab = a * b;
+        if (c != 0 && ab > SIZE_MAX / c) return false;
+        *out = ab * c;
+        return true;
+    };
+
     /* Every (level, layer) needs its own staging region.  The GPU reads these
      * bytes when the command buffer executes, so reusing one region would make
      * every mip/slice observe whichever copy wrote it last.  The price is a
      * full CPU-side copy of this texture for the lifetime of the command
      * buffer; a GPU deswizzle path is future work, not an optimisation to
-     * hide here. */
-    size_t stagingTotal = 0, stagingLargest = 0;
+     * hide here.  A BCn texture stages RGBA8, not its smaller compressed
+     * guest bytes, because that is what the blit destination holds. */
+    size_t stagingTotal = 0, stagingLargest = 0, bcnPackedLargest = 0;
     for (unsigned l = 0; l < levels; ++l) {
         unsigned rb = 0, rows = 0, slices = 0;
         if (nvngfx_tex_level_geometry(&t->desc, l, 0, &rb, &rows, &slices,
@@ -2561,16 +2601,40 @@ bool tex_upload(Ctx* c, CmdBuf* b, Tex* t) {
             stagingTotal = 0;
             break;
         }
-        const size_t need = static_cast<size_t>(rb) * rows * slices;
-        if (need > stagingLargest) stagingLargest = need;
-        if (layers != 0 &&
-            (need > SIZE_MAX / layers ||
-             need * layers > SIZE_MAX - stagingTotal)) {
+        size_t srcLevelBytes = 0, dstLevelBytes = 0;
+        if (!size3(rb, rows, slices, &srcLevelBytes)) {
             log_once("nvnTextureUpload.stagingOverflow", l);
             stagingTotal = 0;
             break;
         }
-        stagingTotal += need * layers;
+        if (transcoded) {
+            const unsigned w = mip_extent(static_cast<unsigned>(t->desc.width), l);
+            const unsigned h = mip_extent(static_cast<unsigned>(t->desc.height), l);
+            size_t rowBytes = 0;
+            if (w == 0 || h == 0 ||
+                !size3(static_cast<size_t>(w), 4u, 1u, &rowBytes) ||
+                !size3(rowBytes, h, slices, &dstLevelBytes)) {
+                log_once("nvnTextureUpload.stagingOverflow", l);
+                stagingTotal = 0;
+                break;
+            }
+            if (srcLevelBytes > bcnPackedLargest) bcnPackedLargest = srcLevelBytes;
+        } else {
+            dstLevelBytes = srcLevelBytes;
+        }
+        if (dstLevelBytes > stagingLargest) stagingLargest = dstLevelBytes;
+        if (dstLevelBytes > SIZE_MAX / layers) {
+            log_once("nvnTextureUpload.stagingOverflow", l);
+            stagingTotal = 0;
+            break;
+        }
+        const size_t layerTotal = dstLevelBytes * layers;
+        if (layerTotal > SIZE_MAX - stagingTotal) {
+            log_once("nvnTextureUpload.stagingOverflow", l);
+            stagingTotal = 0;
+            break;
+        }
+        stagingTotal += layerTotal;
     }
     if (stagingTotal == 0) return false;
     std::fprintf(stderr,
@@ -2578,12 +2642,25 @@ bool tex_upload(Ctx* c, CmdBuf* b, Tex* t) {
                  "layers=%u staging=%zu bytes (largest slice=%zu)\n",
                  static_cast<unsigned long long>(t->desc.pool),
                  t->desc.offset, levels, layers, stagingTotal, stagingLargest);
+    if (transcoded) {
+        std::fprintf(stderr,
+                     "[nvn] texture upload transcode: NVNformat 0x%X BCn -> "
+                     "RGBA8%d\n",
+                     format, nvngfx_bcn_is_srgb(t->desc.format) ? 1 : 0);
+    }
     std::fflush(stderr);
     id<MTLBuffer> stg = [c->device newBufferWithLength:stagingTotal
                                                options:MTLResourceStorageModeShared];
     if (!stg) {
         log_once("nvnTextureUpload.staging", 1);
         return false;
+    }
+    /* The deswizzle still produces the guest's packed BCn rows; decode into
+     * the shared staging buffer afterwards.  One scratch region is enough
+     * because levels and layers are processed sequentially. */
+    std::vector<unsigned char> bcnPacked;
+    if (transcoded) {
+        bcnPacked.resize(bcnPackedLargest);
     }
     if (b->enc) {
         end_encoder(b);
@@ -2606,36 +2683,80 @@ bool tex_upload(Ctx* c, CmdBuf* b, Tex* t) {
             log_once("nvnTextureUpload.geometry", l);
             break;
         }
-        /* Derive the copy extent from the layout, not from the raw NVN
-         * width/height.  For a 1D array the raw height is the layer count;
-         * for BCn/ASTC the texel extent must be block aligned; and a cube
-         * array has six times as many slices as its depth.  Row/block counts
-         * already include all three rules. */
         const unsigned bpb = L.bytes_per_block ? L.bytes_per_block : 1u;
         const unsigned bw = L.block_width ? L.block_width : 1u;
         const unsigned bh = L.block_height ? L.block_height : 1u;
-        const unsigned lw = (rb / bpb) * bw;
-        const unsigned lh = rows * bh;
+        unsigned lw = 0, lh = 0;
+        size_t rowBytes = 0, dstLevelBytes = 0, srcLevelBytes = 0;
+        if (!size3(rb, rows, slices, &srcLevelBytes)) {
+            log_once("nvnTextureUpload.stagingOverflow", l);
+            break;
+        }
+        if (transcoded) {
+            lw = mip_extent(static_cast<unsigned>(t->desc.width), l);
+            lh = mip_extent(static_cast<unsigned>(t->desc.height), l);
+            if (lw == 0 || lh == 0 ||
+                !size3(static_cast<size_t>(lw), 4u, 1u, &rowBytes) ||
+                !size3(rowBytes, lh, slices, &dstLevelBytes)) {
+                log_once("nvnTextureUpload.blockEdge", l);
+                break;
+            }
+            if (srcLevelBytes > bcnPacked.size()) {
+                log_once("nvnTextureUpload.bcnScratch", l);
+                break;
+            }
+        } else {
+            /* Derive the copy extent from the layout, not from the raw NVN
+             * width/height.  For a 1D array the raw height is the layer count;
+             * for ASTC the texel extent must be block aligned; and a cube
+             * array has six times as many slices as its depth.  Row/block
+             * counts already include all three rules. */
+            lw = (rb / bpb) * bw;
+            lh = rows * bh;
+            rowBytes = rb;
+            dstLevelBytes = srcLevelBytes;
+        }
         if (lw == 0 || lh == 0) {
             log_once("nvnTextureUpload.blockEdge", l);
             break;
         }
-        const size_t levelBytes = static_cast<size_t>(rb) * rows * slices;
         bool levelComplete = true;
         for (unsigned layer = 0; layer < layers; ++layer) {
-            const size_t at = levelStage + static_cast<size_t>(layer) * levelBytes;
+            const size_t at = levelStage + static_cast<size_t>(layer) * dstLevelBytes;
             unsigned char* const layerBytes =
                 static_cast<unsigned char*>([stg contents]) + at;
-            if (nvngfx_tex_deswizzle(&t->desc, l, layer, base, layerBytes,
-                                     rb) != 0) {
+            if (transcoded) {
+                if (nvngfx_tex_deswizzle(&t->desc, l, layer, base,
+                                         bcnPacked.data(), rb) != 0) {
+                    log_once("nvnTextureUpload.deswizzle", l);
+                    levelComplete = false;
+                    break;
+                }
+                const size_t srcSlice = static_cast<size_t>(rb) * rows;
+                const size_t dstSlice = rowBytes * lh;
+                for (unsigned z = 0; z < slices; ++z) {
+                    if (nvngfx_bcn_decode_image(
+                            t->desc.format, bcnPacked.data() +
+                                                 static_cast<size_t>(z) * srcSlice,
+                            rb, lw, lh,
+                            layerBytes + static_cast<size_t>(z) * dstSlice,
+                            rowBytes) != 0) {
+                        log_once("nvnTextureUpload.bcnDecode", l);
+                        levelComplete = false;
+                        break;
+                    }
+                }
+                if (!levelComplete) break;
+            } else if (nvngfx_tex_deswizzle(&t->desc, l, layer, base,
+                                            layerBytes, rb) != 0) {
                 log_once("nvnTextureUpload.deswizzle", l);
                 levelComplete = false;
                 break;
             }
             [blit copyFromBuffer:stg
                     sourceOffset:static_cast<NSUInteger>(at)
-               sourceBytesPerRow:rb
-             sourceBytesPerImage:static_cast<NSUInteger>(rb) * rows
+               sourceBytesPerRow:rowBytes
+             sourceBytesPerImage:rowBytes * lh
                       sourceSize:MTLSizeMake(lw, lh, slices)
                        toTexture:t->mtl
                 destinationSlice:layer
@@ -2643,7 +2764,7 @@ bool tex_upload(Ctx* c, CmdBuf* b, Tex* t) {
                destinationOrigin:MTLOriginMake(0, 0, 0)];
         }
         if (!levelComplete) break;
-        levelStage += levelBytes * layers;
+        levelStage += dstLevelBytes * layers;
         ++done;
     }
     [blit endEncoding];
@@ -3419,6 +3540,10 @@ extern "C" int nvngfx_metal_selftest(void) {
      * a texture pool, a sampler pool and a builder-registered sampler. */
     alignas(16) unsigned char texSrcObject[0x80] = {};
     alignas(16) unsigned char texSrcBuilder[0x80] = {};
+    /* The BCn draw's guest texture and builder.  The builder must be real
+     * memory because tex_builder_set_defaults() writes it. */
+    alignas(16) unsigned char texBcnObject[0x80] = {};
+    alignas(16) unsigned char texBcnBuilder[0x80] = {};
     alignas(16) unsigned char texPoolObject[0x20] = {};
     alignas(16) unsigned char sampPoolObject[0x20] = {};
     alignas(16) unsigned char samplerBuilder5[0x60] = {};
@@ -3430,6 +3555,8 @@ extern "C" int nvngfx_metal_selftest(void) {
     const uint64_t kSampler2 = reinterpret_cast<uint64_t>(samplerObject2);
     const uint64_t kTexSrc = reinterpret_cast<uint64_t>(texSrcObject);
     const uint64_t kTexSrcBuilder = reinterpret_cast<uint64_t>(texSrcBuilder);
+    const uint64_t kTexBcn = reinterpret_cast<uint64_t>(texBcnObject);
+    const uint64_t kTexBcnBuilder = reinterpret_cast<uint64_t>(texBcnBuilder);
     const uint64_t kTexPool = reinterpret_cast<uint64_t>(texPoolObject);
     const uint64_t kSampPool = reinterpret_cast<uint64_t>(sampPoolObject);
     const uint64_t kSamplerBuilder5 = reinterpret_cast<uint64_t>(samplerBuilder5);
@@ -6089,6 +6216,212 @@ extern "C" int nvngfx_metal_selftest(void) {
             }
         }
 
+        {
+            /* --- Draw 15: a BCn texture from guest memory -----------------
+             * iOS Metal has no BC1 pixel format.  tex_initialize() must create
+             * an RGBA8 texture instead, and tex_upload() must decode the
+             * block before blitting.  A 4x4 BC1 block holds red in its left
+             * half and blue in its right half; the shader then samples the
+             * two halves.  If the block is copied as if it were RGBA8, or the
+             * decoder is skipped, the sampling coordinates no longer address
+             * the same colours. */
+            const uint64_t kProg15 = 0x7900;
+            const uint64_t kCb15 = 0x7A00;
+            const unsigned kBcnOffset = 14336;
+            unsigned char* const vpool15 =
+                poolRaw2 ? reinterpret_cast<unsigned char*>(
+                               (reinterpret_cast<uintptr_t>(poolRaw2) + 16383u) &
+                               ~static_cast<uintptr_t>(16383u))
+                         : nullptr;
+            if (!vpool15) {
+                std::fprintf(stderr,
+                             "[selftest] draw 15: the cube pool is missing\n");
+                rc = 16407;
+                goto done;
+            }
+
+            nvngfx_texdesc bd;
+            nvngfx_texdesc_defaults(&bd);
+            bd.target = 0;                    /* plain 2D */
+            bd.format = 0x42;                 /* RGBA_DXT1 / BC1 */
+            bd.width = 4;
+            bd.height = 4;
+            bd.depth = 1;
+            bd.levels = 1;
+            bd.samples = 1;
+            bd.pool = kCubePool;
+            bd.offset = kBcnOffset;
+            {
+                /* c0=red > c1=blue selects BC1's four-colour mode.  The
+                 * 2-bit indices are 0,0,1,1 on every row. */
+                const unsigned char block[8] = {
+                    0x00, 0xF8, 0x1F, 0x00, 0x44, 0x44, 0x44, 0x44};
+                nvngfx_texlayout bl = {};
+                bool ok = nvngfx_tex_layout(&bd, &bl) == 0 &&
+                          bl.size <= 16384u - kBcnOffset;
+                if (ok) {
+                    unsigned char* const guest = vpool15 + kBcnOffset;
+                    std::memset(guest, 0, static_cast<size_t>(bl.size));
+                    ok = nvngfx_tex_swizzle(&bd, 0, 0, block, 8, guest) == 0;
+                }
+                if (!ok) {
+                    std::fprintf(stderr,
+                                 "[selftest] draw 15: BC1 layout failed "
+                                 "(layers=%u size=%llu)\n",
+                                 bl.layers,
+                                 static_cast<unsigned long long>(bl.size));
+                    rc = 16407;
+                    goto done;
+                }
+            }
+            {
+                x[0] = kTexBcnBuilder;
+                tex_builder_set_defaults(ctx, x);
+                x[0] = kTexBcnBuilder; x[1] = 4; x[2] = 4;
+                tex_builder_set_size2d(ctx, x);
+                x[0] = kTexBcnBuilder; x[1] = 0x42;
+                tex_builder_set_format(ctx, x);
+                x[0] = kTexBcnBuilder; x[1] = 1;
+                tex_builder_set_levels(ctx, x);
+                x[0] = kTexBcnBuilder; x[1] = 1;
+                tex_builder_set_samples(ctx, x);
+                x[0] = kTexBcnBuilder; x[1] = kCubePool; x[2] = kBcnOffset;
+                tex_builder_set_storage(ctx, x);
+                x[0] = kTexBcn; x[1] = kTexBcnBuilder;
+                tex_initialize(ctx, x);
+            }
+            Tex* bcnTex = find<Tex>(kTexBcn);
+            if (x[0] != 1 || !bcnTex || !bcnTex->mtl ||
+                bcnTex->mtl.textureType != MTLTextureType2D ||
+                bcnTex->mtl.pixelFormat != MTLPixelFormatRGBA8Unorm ||
+                !bcnTex->transcoded) {
+                std::fprintf(stderr,
+                             "[selftest] draw 15: BC1 texture was not "
+                             "transcoded to RGBA8 (ok=%llu type=%lu fmt=%lu)\n",
+                             static_cast<unsigned long long>(x[0]),
+                             bcnTex
+                                 ? static_cast<unsigned long>(
+                                       bcnTex->mtl.textureType)
+                                 : 0ul,
+                             bcnTex
+                                 ? static_cast<unsigned long>(
+                                       bcnTex->mtl.pixelFormat)
+                                 : 0ul);
+                rc = 16407;
+                goto done;
+            }
+
+            {
+                struct { uint64_t data; uint64_t control; } sd15[2];
+                sd15[0].data = reinterpret_cast<uint64_t>(const_cast<char*>(
+                    nvngfx_shader_selftest_msl_variant(NVNGFX_STAGE_VERTEX,
+                                                       4)));
+                sd15[0].control = 0;
+                sd15[1].data = reinterpret_cast<uint64_t>(const_cast<char*>(
+                    nvngfx_shader_selftest_msl_variant(NVNGFX_STAGE_FRAGMENT,
+                                                       4)));
+                sd15[1].control = 0;
+                x[0] = kProg15; x[1] = 0;
+                prog_initialize(ctx, x);
+                x[0] = kProg15; x[1] = 2;
+                x[2] = reinterpret_cast<uint64_t>(&sd15[0]);
+                prog_set_shaders(ctx, x);
+                if (x[0] != 1) {
+                    std::fprintf(stderr,
+                                 "[selftest] draw 15: SetShaders failed\n");
+                    rc = 16407;
+                    goto done;
+                }
+            }
+            x[0] = kTexPool; x[1] = 12; x[2] = kTexBcn; x[3] = 0;
+            tex_pool_register_texture(ctx, x);
+
+            const uint64_t target15 = kTex;
+            const float clear15[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+            x[0] = kCb15;
+            cmdbuf_begin_recording(ctx, x);
+            x[0] = kCb15; x[1] = 1;
+            x[2] = reinterpret_cast<uint64_t>(&target15);
+            x[3] = 0; x[4] = 0; x[5] = 0;
+            cmdbuf_set_render_targets(ctx, x);
+            x[0] = kCb15; x[1] = 0;
+            x[2] = reinterpret_cast<uint64_t>(clear15);
+            x[3] = 0xF;
+            cmdbuf_clear_color(ctx, x);
+            x[0] = kCb15; x[1] = kTexPool;
+            cmdbuf_set_texture_pool(ctx, x);
+            x[0] = kCb15; x[1] = kSampPool;
+            cmdbuf_set_sampler_pool(ctx, x);
+            x[0] = 0; x[1] = 12; x[2] = 9;
+            dev_get_texture_handle(ctx, x);
+            const uint64_t bhandle = x[0];
+            x[0] = kCb15; x[1] = 1; x[2] = 0; x[3] = bhandle;
+            cmdbuf_bind_texture(ctx, x);
+            x[0] = kCb15; x[1] = kProg15; x[2] = 0;
+            cmdbuf_bind_program(ctx, x);
+            x[0] = kCb15; x[1] = 0; x[2] = 0; x[3] = 3;
+            cmdbuf_draw_arrays(ctx, x);
+            x[0] = kCb15;
+            cmdbuf_end_recording(ctx, x);
+
+            CmdBuf* b15 = find<CmdBuf>(kCb15);
+            if (!b15 || !b15->last) {
+                std::fprintf(stderr,
+                             "[selftest] draw 15: nothing committed\n");
+                rc = 16407;
+                goto done;
+            }
+            [b15->last waitUntilCompleted];
+            if (b15->last.status == MTLCommandBufferStatusError) {
+                std::fprintf(stderr,
+                             "[selftest] draw 15 command buffer error: %s\n",
+                             b15->last.error
+                                 ? [[b15->last.error localizedDescription]
+                                       UTF8String]
+                                 : "(no description)");
+                rc = 16407;
+                goto done;
+            }
+            if (!bcnTex->uploaded || bcnTex->uploadedLevels != 1 ||
+                b15->encoded != 1) {
+                std::fprintf(stderr,
+                             "[selftest] draw 15: BC1 texture not used "
+                             "(uploaded=%d levels=%u encoded=%u)\n",
+                             bcnTex->uploaded ? 1 : 0,
+                             bcnTex->uploadedLevels, b15->encoded);
+                rc = 16407;
+                goto done;
+            }
+            {
+                unsigned char left[4] = {0, 0, 0, 0};
+                unsigned char right[4] = {0, 0, 0, 0};
+                const int wantRed[4] = {255, 0, 0, 255};
+                const int wantBlue[4] = {0, 0, 255, 255};
+                if (!read_pixel_at(dev, c->queue, t->mtl, kSide,
+                                   kSide / 8, kSide / 2, left) ||
+                    !read_pixel_at(dev, c->queue, t->mtl, kSide,
+                                   (7 * kSide) / 8, kSide / 2, right) ||
+                    !pixels_near(left, wantRed, 2) ||
+                    !pixels_near(right, wantBlue, 2)) {
+                    std::fprintf(stderr,
+                                 "[selftest] draw 15 halves are "
+                                 "(%u,%u,%u,%u) / (%u,%u,%u,%u), want "
+                                 "(%d,%d,%d,%d) / (%d,%d,%d,%d); BC1 "
+                                 "decoding did not reach the sampler\n",
+                                 left[0], left[1], left[2], left[3],
+                                 right[0], right[1], right[2], right[3],
+                                 wantRed[0], wantRed[1], wantRed[2],
+                                 wantRed[3], wantBlue[0], wantBlue[1],
+                                 wantBlue[2], wantBlue[3]);
+                    rc = 16408;
+                    goto done;
+                }
+                std::fprintf(stderr,
+                             "[selftest] draw 15: BC1 texture decoded to RGBA8 "
+                             "and sampled from guest memory\n");
+            }
+        }
+
     done:
         nvngfx_shader_set_msl_passthrough(0);
         forget<CmdBuf>(kCb);
@@ -6130,10 +6463,14 @@ extern "C" int nvngfx_metal_selftest(void) {
         forget<Tex>(0x7500);
         forget<Program>(0x7600);
         forget<CmdBuf>(0x7700);
+        forget<Tex>(kTexBcn);
+        forget<Program>(0x7900);
+        forget<CmdBuf>(0x7A00);
         forget<Pool>(0x7300);
         g_pool_specs.erase(0x7400);
         std::free(poolRaw2);
         g_tex_specs.erase(kTexSrcBuilder);
+        g_tex_specs.erase(kTexBcnBuilder);
         g_tex_specs.erase(0x6450);
         g_sampler_specs.erase(kSamplerBuilder5);
         nvngfx_metal_destroy(ctx);

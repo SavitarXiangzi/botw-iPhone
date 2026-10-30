@@ -93,6 +93,7 @@ enum {
  * that an integer typedef had hidden. */
 typedef enum MTLPixelFormat : NSUInteger {
     MTLPixelFormatRGBA8Unorm = 70,
+    MTLPixelFormatRGBA8Unorm_sRGB = 71,
     MTLPixelFormatBGRA8Unorm = 80,
 } MTLPixelFormat;
 
