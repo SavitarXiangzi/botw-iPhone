@@ -75,6 +75,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <set>
 #include <string>
@@ -1704,6 +1705,8 @@ extern "C" int nvngfx_metal_selftest(void) {
     const uint64_t kCb = 0x5200;
     const uint64_t kProg = 0x5300;
     const NSUInteger kSide = 64;
+    /* Backing store for the second draw's memory pool; freed at `done`. */
+    void* poolRaw = nullptr;
 
     @autoreleasepool {
         id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
@@ -1840,16 +1843,29 @@ extern "C" int nvngfx_metal_selftest(void) {
             const uint64_t kPool = 0x5400;
             const uint64_t kProg2 = 0x5600;
             const uint64_t kCb2 = 0x5700;
-            /* The pool wraps all 4096 bytes (Metal requires the range to be
-             * a page), and the triangle lives at offset 0. */
-            alignas(4096) static unsigned char vertexPool[4096] = {};
-            static bool pool_filled = false;
-            if (!pool_filled) {
+            /* The pool wraps one page, and the triangle lives at offset 0.
+             * 16 KiB because that is the page size on Apple silicon: Metal
+             * returns nil from newBufferWithBytesNoCopy when the pointer or
+             * the length is not a page multiple, and 4 KiB is only right on
+             * Intel Macs.  Allocated at run time because a static array
+             * cannot ask for more than 8 KiB of alignment portably. */
+            /* malloc + manual rounding: std::aligned_alloc is not declared by
+             * MSVC's C library, and this file also has to type-check there. */
+            poolRaw = std::malloc(16384 + 16384);
+            if (!poolRaw) {
+                std::fprintf(stderr, "[selftest] could not allocate the pool page\n");
+                rc = 256;
+                goto done;
+            }
+            const uintptr_t poolBase = reinterpret_cast<uintptr_t>(poolRaw);
+            const uintptr_t poolAligned = (poolBase + 16383u) & ~static_cast<uintptr_t>(16383u);
+            unsigned char* const vertexPool = reinterpret_cast<unsigned char*>(poolAligned);
+            std::memset(vertexPool, 0, 16384);
+            {
                 float* v = reinterpret_cast<float*>(vertexPool);
                 v[0] = -1.0f; v[1] = -1.0f;
                 v[2] = 3.0f;  v[3] = -1.0f;
                 v[4] = -1.0f; v[5] = 3.0f;
-                pool_filled = true;
             }
             alignas(16) unsigned char poolBuilder[0x40] = {};
             const uint64_t kPoolBuilder = reinterpret_cast<uint64_t>(poolBuilder);
@@ -1862,7 +1878,7 @@ extern "C" int nvngfx_metal_selftest(void) {
             pool_builder_set_defaults(ctx, x);
             x[0] = kPoolBuilder;
             x[1] = reinterpret_cast<uint64_t>(vertexPool);
-            x[2] = 4096;
+            x[2] = sizeof vertexPool;
             pool_builder_set_storage(ctx, x);
             x[0] = kPool;
             x[1] = kPoolBuilder;
@@ -1993,8 +2009,9 @@ extern "C" int nvngfx_metal_selftest(void) {
         forget<Program>(kProg);
         forget<Program>(0x5600);
         forget<CmdBuf>(0x5700);
-        forget<Pool>(0x5400);
+        forget<Pool>(0x5400);   /* releases the MTLBuffer wrapping the page */
         g_pool_specs.erase(0x5500);
+        std::free(poolRaw);
         g_tex_specs.erase(kTexBuilder);
         nvngfx_metal_destroy(ctx);
         return rc;
