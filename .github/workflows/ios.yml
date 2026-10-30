@@ -146,11 +146,14 @@ jobs:
             # Annotations are the only part of a step log that is visible
             # without repo admin rights, so the interesting lines go there.
             echo "::error::test-sim.log has $(wc -l < test-sim.log) lines"
-            grep -n -i -E "error|failed|fatal|could not|unable to|not supported|no host|not configured" test-sim.log | head -40 | while IFS= read -r line; do
+            # Strict on purpose: -Werror in the compiler flags would match a
+            # loose "error" pattern hundreds of times.
+            grep -n -A4 -E "(: error:|^error:|Testing failed|TEST FAILED|Test Case .*failed)" test-sim.log | head -60 | while IFS= read -r line; do
               echo "::error::$line"
             done
-            head -30 test-sim.log | while IFS= read -r line; do
-              echo "::error::head| $line"
+            echo "::error::last lines:"
+            tail -15 test-sim.log | while IFS= read -r line; do
+              echo "::error::tail| $line"
             done
             echo "::error::simulators available:"
             xcrun simctl list devices available | head -30 | while read -r line; do
