@@ -90,6 +90,21 @@ int nvngfx_tex_deswizzle(const nvngfx_texdesc* d, unsigned level,
 int nvngfx_tex_swizzle(const nvngfx_texdesc* d, unsigned level, unsigned layer,
                        const void* linear, size_t pitch, void* storage);
 
+/* Writes one rectangular region of one level/layer/slice into the guest's
+ * block-linear (or LINEAR) storage.  `x`/`y`/`width`/`height` are texels;
+ * for a compressed format they must be multiples of the format's block
+ * dimensions, because a BCn block cannot be partially updated without
+ * re-encoding it.  `z` selects a slice of a 3D level and must be zero for a
+ * 2D/array layer.  `src_row` and `src_image` are byte strides, with zero
+ * meaning tightly packed.  The usual read-modify-write is used: the level is
+ * deswizzled, the region copied in, and the level swizzled back, so the
+ * bytes outside the region (including LINEAR row padding) are preserved.
+ * Returns 0, or -1 for a region/format/stride this path refuses. */
+int nvngfx_tex_write_region(const nvngfx_texdesc* d, unsigned level,
+                            unsigned layer, int x, int y, int z,
+                            int width, int height, const void* src,
+                            size_t src_row, size_t src_image, void* storage);
+
 #ifdef __cplusplus
 }
 #endif

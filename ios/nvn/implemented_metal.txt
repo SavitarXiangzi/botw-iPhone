@@ -101,6 +101,9 @@ nvnTextureBuilderSetStride
 nvnTextureBuilderSetTarget
 nvnTextureBuilderSetWidth
 nvnTextureInitialize
+nvnTextureWriteTexels
+nvnTextureWriteTexelsStrided
+nvnTextureFlushTexels
 nvnTexturePoolFinalize
 nvnTexturePoolGetMemoryOffset
 nvnTexturePoolGetSize

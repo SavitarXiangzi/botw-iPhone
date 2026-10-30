@@ -199,6 +199,10 @@ struct Tex {
     bool rendered = false;
     /* How many mip levels the guest storage actually provided. */
     unsigned uploadedLevels = 0;
+    /* Set when the guest rewrote this texture's storage after the first
+     * upload (nvnTextureWriteTexels) or said its CPU writes are visible
+     * (nvnTextureFlushTexels).  The next draw re-runs tex_upload(). */
+    bool dirty = false;
 };
 
 struct Sampler {
@@ -207,6 +211,31 @@ struct Sampler {
     std::string label;
     id<MTLSamplerState> mtl = nil;
 };
+
+/* NVNcopyRegion is six int32 fields, at offsets 0, 4, ... 20. */
+struct CopyRegion {
+    int32_t xoffset, yoffset, zoffset, width, height, depth;
+};
+static_assert(sizeof(CopyRegion) == 24, "NVNcopyRegion measured as 24 bytes");
+
+/* NVNtextureView is 16 bytes in the newer SDK.  This is nxnative's measured
+ * layout (dm/gfx/nvn/nvn_obj.h, MIT): bit 0 set_levels, bit 1 set_layers,
+ * bit 2 set_format, bit 3 set_target, bit 4 set_swizzle, bit 5 set_dsmode.
+ * The base level and min layer fields follow the first four bytes.  Only the
+ * level/layer selection and the format/target consistency checks are used
+ * here; swizzle and depth-stencil mode do not move storage bytes. */
+struct TexView16 {
+    uint8_t bits;
+    uint8_t target;
+    uint8_t baseLevel;
+    uint8_t numLevels;
+    uint16_t format;
+    uint16_t minLayer;
+    uint16_t numLayers;
+    uint8_t swizzle[4];
+    uint16_t reserved;
+};
+static_assert(sizeof(TexView16) == 16, "NVNtextureView measured as 16 bytes");
 
 struct CmdBuf {
     bool recording = false;
@@ -387,6 +416,14 @@ nvngfx_pool_map g_samp_pool_map;
 template <class T>
 T* guest_ptr(uint64_t value) {
     return reinterpret_cast<T*>(static_cast<uintptr_t>(value));
+}
+
+/* Same "guest memory is host memory" assumption, with the two checks that
+ * keep a corrupt pointer from wrapping or reading the unmapped first 64 KiB.
+ * Used for the NVNcopyRegion / NVNtextureView structs and the source buffer
+ * of WriteTexels; the length of the source is the guest's responsibility. */
+bool guest_range(uint64_t addr, size_t n) {
+    return addr >= 0x10000u && n <= UINTPTR_MAX - addr;
 }
 
 /* Zeroes a guest struct through its address.  Guest memory is host memory,
@@ -903,6 +940,7 @@ void tex_initialize(nvngfx_ctx* ctx, uint64_t* x) {
         t->uploaded = false;
         t->rendered = false;
         t->uploadedLevels = 0;
+        t->dirty = false;
         /* A descriptor Metal rejects throws an NSException rather than
          * returning nil; uncaught, that aborts the process with no clue in
          * the self-test log (which is exactly how draw 13 died).  Turn it
@@ -918,6 +956,205 @@ void tex_initialize(nvngfx_ctx* ctx, uint64_t* x) {
         }
         x[0] = t->mtl ? 1u : 0u;
     }
+}
+
+/* nvnTextureWriteTexels(NVNtexture*, const NVNtextureView*, const
+ * NVNcopyRegion*, const void*) and its Strided variant.
+ *
+ * The guest is allowed to rewrite a texture after it was first sampled (the
+ * boot trace calls this 27 times).  Our MTLTexture is private and a one-shot
+ * copy, so the bytes are written into the guest's own storage with the same
+ * block-linear/LINEAR layout the upload path reads, and the texture is marked
+ * dirty.  The next draw's prepare_textures() re-runs tex_upload(). */
+void tex_write_texels_common(nvngfx_ctx* ctx, uint64_t* x, bool strided) {
+    (void)ctx;
+    Tex* t = find<Tex>(x[0]);
+    if (!t || !t->desc.pool) {
+        log_once_str("nvnTextureWriteTexels",
+                     "texture has no guest storage (or is not initialized)");
+        return;
+    }
+    if (!guest_range(x[2], sizeof(CopyRegion)) || !guest_range(x[3], 1)) {
+        log_once_str("nvnTextureWriteTexels",
+                     "region or source pointer is not guest memory");
+        return;
+    }
+    CopyRegion r = {};
+    std::memcpy(&r, guest_ptr<const void>(x[2]), sizeof r);
+    if (r.xoffset < 0 || r.yoffset < 0 || r.zoffset < 0 ||
+        r.width <= 0 || r.height <= 0 || r.depth < 0) {
+        log_once_str("nvnTextureWriteTexels", "region is empty or negative");
+        return;
+    }
+
+    unsigned baseLevel = 0, minLayer = 0;
+    if (x[1]) {
+        if (!guest_range(x[1], sizeof(TexView16))) {
+            log_once_str("nvnTextureWriteTexels",
+                         "texture view pointer is not guest memory");
+            return;
+        }
+        TexView16 v = {};
+        std::memcpy(&v, guest_ptr<const void>(x[1]), sizeof v);
+        /* A view may reinterpret the pixels in another format or as another
+         * target.  The storage layout would no longer be the one this
+         * descriptor describes, so refuse instead of writing the wrong
+         * bytes; swizzle and depth-stencil mode do not move storage. */
+        if ((v.bits & 0x04u) && v.format != t->desc.format) {
+            log_once_str("nvnTextureWriteTexels",
+                         "texture view changes the format; region write refused");
+            return;
+        }
+        if ((v.bits & 0x08u) && v.target != t->desc.target) {
+            log_once_str("nvnTextureWriteTexels",
+                         "texture view changes the target; region write refused");
+            return;
+        }
+        if (v.bits & 0x01u) baseLevel = v.baseLevel;
+        if (v.bits & 0x02u) minLayer = v.minLayer;
+    }
+    const unsigned levels =
+        t->desc.levels ? static_cast<unsigned>(t->desc.levels) : 1u;
+    if (baseLevel >= levels) {
+        log_once_str("nvnTextureWriteTexels",
+                     "texture view names a level past the descriptor");
+        return;
+    }
+
+    Pool* p = find<Pool>(t->desc.pool);
+    if (!p || !p->storage || !p->size) {
+        log_once_str("nvnTextureWriteTexels", "texture pool is not initialized");
+        return;
+    }
+    nvngfx_texlayout L = {};
+    if (nvngfx_tex_layout(&t->desc, &L) != 0) {
+        log_once_str("nvnTextureWriteTexels", "texture layout is unknown");
+        return;
+    }
+    const unsigned long long off =
+        static_cast<unsigned long long>(t->desc.offset);
+    if (t->desc.offset < 0 || off > p->size || L.size > p->size - off) {
+        log_once_str("nvnTextureWriteTexels",
+                     "texture storage is outside its pool");
+        return;
+    }
+    unsigned char* const storage =
+        static_cast<unsigned char*>(p->storage) + off;
+
+    unsigned bpb = 0, bw = 1, bh = 1;
+    if (!nvngfx_tex_format_block(t->desc.format, &bpb, &bw, &bh) || !bpb) {
+        log_once_str("nvnTextureWriteTexels", "texture format has no block shape");
+        return;
+    }
+    const unsigned wblocks = (static_cast<unsigned>(r.width) + bw - 1u) / bw;
+    const unsigned hblocks = (static_cast<unsigned>(r.height) + bh - 1u) / bh;
+    const size_t tightRow = static_cast<size_t>(wblocks) * bpb;
+    if (hblocks && tightRow > SIZE_MAX / hblocks) {
+        log_once_str("nvnTextureWriteTexels", "region size overflows");
+        return;
+    }
+    const size_t tightImage = tightRow * hblocks;
+
+    const int64_t rowArg = strided ? static_cast<int64_t>(x[4]) : 0;
+    const int64_t imgArg = strided ? static_cast<int64_t>(x[5]) : 0;
+    if (rowArg < 0 || imgArg < 0) {
+        log_once_str("nvnTextureWriteTexels", "negative source stride");
+        return;
+    }
+    const size_t row = rowArg ? static_cast<size_t>(rowArg) : tightRow;
+    const size_t image = imgArg ? static_cast<size_t>(imgArg) : tightImage;
+    if (row < tightRow || image < tightImage) {
+        log_once_str("nvnTextureWriteTexels",
+                     "source stride is narrower than a tightly packed region");
+        return;
+    }
+
+    const unsigned depth = r.depth ? static_cast<unsigned>(r.depth) : 1u;
+    const unsigned zoff = static_cast<unsigned>(r.zoffset);
+    if (zoff > 0x7FFFFFFFu - depth) {
+        log_once_str("nvnTextureWriteTexels", "region depth overflows");
+        return;
+    }
+    const bool is3d = t->desc.target == 2 || t->desc.rank == 3;
+    unsigned slices = 1;
+    if (is3d &&
+        nvngfx_tex_level_geometry(&t->desc, baseLevel, 0, nullptr, nullptr,
+                                  &slices, nullptr, nullptr, nullptr) != 0) {
+        log_once_str("nvnTextureWriteTexels", "3D level geometry is unknown");
+        return;
+    }
+    if (is3d) {
+        if (static_cast<unsigned long long>(zoff) + depth > slices) {
+            log_once_str("nvnTextureWriteTexels",
+                         "region runs past the 3D slices");
+            return;
+        }
+    } else if (static_cast<unsigned long long>(minLayer) + zoff + depth >
+               L.layers) {
+        log_once_str("nvnTextureWriteTexels",
+                     "region runs past the array layers");
+        return;
+    }
+    if (depth > 1 &&
+        image > (UINTPTR_MAX - x[3]) / static_cast<size_t>(depth - 1u)) {
+        log_once_str("nvnTextureWriteTexels", "source range overflows");
+        return;
+    }
+
+    bool wrote = false;
+    for (unsigned i = 0; i < depth; ++i) {
+        const unsigned layer = is3d ? 0u : minLayer + zoff + i;
+        const int z = is3d ? static_cast<int>(zoff + i) : 0;
+        const unsigned char* const src =
+            guest_ptr<const unsigned char>(x[3]) +
+            static_cast<size_t>(i) * image;
+        if (nvngfx_tex_write_region(&t->desc, baseLevel, layer,
+                                    r.xoffset, r.yoffset, z,
+                                    r.width, r.height, src, row, image,
+                                    storage) != 0) {
+            log_once_str("nvnTextureWriteTexels",
+                         "region refused (level, layer, block alignment or bounds)");
+            break;
+        }
+        wrote = true;
+    }
+    if (!wrote) return;
+
+    t->dirty = true;
+    t->uploaded = false;
+    t->uploadTried = false;
+    if (t->rendered) {
+        log_once_str("nvnTextureWriteTexels",
+                     "guest write to a host-rendered texture is stored but not re-uploaded");
+    } else {
+        log_once_str("nvnTextureWriteTexels",
+                     "guest region write will be re-uploaded on the next sample");
+    }
+}
+
+void tex_write_texels(nvngfx_ctx* ctx, uint64_t* x) {
+    tex_write_texels_common(ctx, x, false);
+}
+
+void tex_write_texels_strided(nvngfx_ctx* ctx, uint64_t* x) {
+    tex_write_texels_common(ctx, x, true);
+}
+
+/* nvnTextureFlushTexels(NVNtexture*, const NVNtextureView*,
+ * const NVNcopyRegion*).  The guest uses this to publish CPU writes made
+ * directly into mapped texture storage.  We have no dirty-page tracking, so
+ * invalidate the one-shot upload and let the next draw copy the whole level
+ * chain again.  That is deliberately conservative: a missed update samples
+ * stale pixels, a needless update only costs bandwidth. */
+void tex_flush_texels(nvngfx_ctx*, uint64_t* x) {
+    Tex* t = find<Tex>(x[0]);
+    if (!t || !t->desc.pool) return;
+    if (t->rendered) return;
+    t->dirty = true;
+    t->uploaded = false;
+    t->uploadTried = false;
+    log_once_str("nvnTextureFlushTexels",
+                 "guest-visible texture writes will be re-uploaded on the next sample");
 }
 
 /* ------------------------------------------------------------------ */
@@ -2533,7 +2770,11 @@ bool read_ubo_u32(const CmdBuf* b, int si, unsigned slot, unsigned offset,
 bool tex_upload(Ctx* c, CmdBuf* b, Tex* t) {
     if (!b || !b->cb) return false;
     if (!t || !t->mtl) return false;
-    if (t->uploaded || t->uploadTried) return t->uploaded;
+    /* A dirty texture ignores the one-shot flags: the guest rewrote it after
+     * the previous upload.  Clear dirty before attempting the copy so a
+     * failure is retried only after the next guest write, not on every draw. */
+    if (!t->dirty && (t->uploaded || t->uploadTried)) return t->uploaded;
+    t->dirty = false;
     t->uploadTried = true;
     if (t->rendered) {
         t->uploaded = true;
@@ -3324,6 +3565,9 @@ const Binding kBindings[] = {
     BIND("nvnTextureBuilderSetStride", tex_builder_set_stride),
     BIND("nvnTextureBuilderSetFlags", tex_builder_set_flags),
     BIND("nvnTextureInitialize", tex_initialize),
+    BIND("nvnTextureWriteTexels", tex_write_texels),
+    BIND("nvnTextureWriteTexelsStrided", tex_write_texels_strided),
+    BIND("nvnTextureFlushTexels", tex_flush_texels),
 
     BIND("nvnTexturePoolInitialize", tex_pool_initialize),
     BIND("nvnTexturePoolFinalize", tex_pool_finalize),
@@ -6422,6 +6666,286 @@ extern "C" int nvngfx_metal_selftest(void) {
             }
         }
 
+        {
+            /* --- Draw 16: guest writes after the first sample -------------
+             * nvnTextureWriteTexels writes into the guest's storage and marks
+             * the texture dirty; the next draw must re-upload.  Then a direct
+             * CPU write into the same storage plus nvnTextureFlushTexels must
+             * do the same.  Both paths sample a 2x2 RGBA8 texture and check
+             * all four quadrants, so a one-shot upload that ignores the
+             * second write fails visibly. */
+            alignas(16) unsigned char guestStreamBuilder[0x80] = {};
+            const uint64_t kTexStream = 0x7B00;
+            const uint64_t kProg16 = 0x7C00;
+            const uint64_t kCb16 = 0x7D00;
+            const uint64_t kCb16b = 0x7E00;
+            const uint64_t kCb16c = 0x7F00;
+            const uint64_t kB16 =
+                reinterpret_cast<uint64_t>(guestStreamBuilder);
+            const unsigned kStreamOffset = 15360;
+            unsigned char* const vpool16 =
+                poolRaw2 ? reinterpret_cast<unsigned char*>(
+                               (reinterpret_cast<uintptr_t>(poolRaw2) + 16383u) &
+                               ~static_cast<uintptr_t>(16383u))
+                         : nullptr;
+            if (!vpool16) {
+                std::fprintf(stderr,
+                             "[selftest] draw 16: the cube pool is missing\n");
+                rc = 16409;
+                goto done;
+            }
+            nvngfx_texdesc sd;
+            nvngfx_texdesc_defaults(&sd);
+            sd.target = 0;                    /* plain 2D */
+            sd.format = 0x25;                 /* RGBA8_UNORM */
+            sd.width = 2;
+            sd.height = 2;
+            sd.depth = 1;
+            sd.levels = 1;
+            sd.samples = 1;
+            sd.pool = kCubePool;
+            sd.offset = kStreamOffset;
+            nvngfx_texlayout L16 = {};
+            if (nvngfx_tex_layout(&sd, &L16) != 0 ||
+                L16.size > 16384u - kStreamOffset) {
+                std::fprintf(stderr,
+                             "[selftest] draw 16: stream layout failed "
+                             "(size=%llu)\n",
+                             static_cast<unsigned long long>(L16.size));
+                rc = 16409;
+                goto done;
+            }
+            const unsigned char initial[16] = {
+                255, 0, 0, 255, 0, 255, 0, 255,
+                0, 0, 255, 255, 255, 255, 255, 255};
+            std::memset(vpool16 + kStreamOffset, 0, 1024);
+            if (nvngfx_tex_swizzle(&sd, 0, 0, initial, 8,
+                                   vpool16 + kStreamOffset) != 0) {
+                std::fprintf(stderr,
+                             "[selftest] draw 16: initial swizzle failed\n");
+                rc = 16409;
+                goto done;
+            }
+            x[0] = kB16;
+            tex_builder_set_defaults(ctx, x);
+            x[0] = kB16; x[1] = 2; x[2] = 2;
+            tex_builder_set_size2d(ctx, x);
+            x[0] = kB16; x[1] = 0x25;
+            tex_builder_set_format(ctx, x);
+            x[0] = kB16; x[1] = 1;
+            tex_builder_set_levels(ctx, x);
+            x[0] = kB16; x[1] = 1;
+            tex_builder_set_samples(ctx, x);
+            x[0] = kB16; x[1] = kCubePool; x[2] = kStreamOffset;
+            tex_builder_set_storage(ctx, x);
+            x[0] = kTexStream; x[1] = kB16;
+            tex_initialize(ctx, x);
+            Tex* streamTex = find<Tex>(kTexStream);
+            if (x[0] != 1 || !streamTex || !streamTex->mtl ||
+                streamTex->mtl.textureType != MTLTextureType2D ||
+                streamTex->transcoded) {
+                std::fprintf(stderr,
+                             "[selftest] draw 16: stream texture was not "
+                             "created (ok=%llu type=%lu)\n",
+                             static_cast<unsigned long long>(x[0]),
+                             streamTex
+                                 ? static_cast<unsigned long>(
+                                       streamTex->mtl.textureType)
+                                 : 0ul);
+                rc = 16409;
+                goto done;
+            }
+
+            {
+                struct { uint64_t data; uint64_t control; } sd16[2];
+                sd16[0].data = reinterpret_cast<uint64_t>(const_cast<char*>(
+                    nvngfx_shader_selftest_msl_variant(NVNGFX_STAGE_VERTEX,
+                                                       4)));
+                sd16[0].control = 0;
+                sd16[1].data = reinterpret_cast<uint64_t>(const_cast<char*>(
+                    nvngfx_shader_selftest_msl_variant(NVNGFX_STAGE_FRAGMENT,
+                                                       4)));
+                sd16[1].control = 0;
+                x[0] = kProg16; x[1] = 0;
+                prog_initialize(ctx, x);
+                x[0] = kProg16; x[1] = 2;
+                x[2] = reinterpret_cast<uint64_t>(&sd16[0]);
+                prog_set_shaders(ctx, x);
+                if (x[0] != 1) {
+                    std::fprintf(stderr,
+                                 "[selftest] draw 16: SetShaders failed\n");
+                    rc = 16409;
+                    goto done;
+                }
+            }
+            x[0] = kTexPool; x[1] = 13; x[2] = kTexStream; x[3] = 0;
+            tex_pool_register_texture(ctx, x);
+
+            auto run16 = [&](uint64_t cbId) -> CmdBuf* {
+                const uint64_t target16 = kTex;
+                const float clear16[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+                x[0] = cbId;
+                cmdbuf_begin_recording(ctx, x);
+                x[0] = cbId; x[1] = 1;
+                x[2] = reinterpret_cast<uint64_t>(&target16);
+                x[3] = 0; x[4] = 0; x[5] = 0;
+                cmdbuf_set_render_targets(ctx, x);
+                x[0] = cbId; x[1] = 0;
+                x[2] = reinterpret_cast<uint64_t>(clear16);
+                x[3] = 0xF;
+                cmdbuf_clear_color(ctx, x);
+                x[0] = cbId; x[1] = kTexPool;
+                cmdbuf_set_texture_pool(ctx, x);
+                x[0] = cbId; x[1] = kSampPool;
+                cmdbuf_set_sampler_pool(ctx, x);
+                x[0] = 0; x[1] = 13; x[2] = 9;
+                dev_get_texture_handle(ctx, x);
+                const uint64_t streamHandle = x[0];
+                x[0] = cbId; x[1] = 1; x[2] = 0; x[3] = streamHandle;
+                cmdbuf_bind_texture(ctx, x);
+                x[0] = cbId; x[1] = kProg16; x[2] = 0;
+                cmdbuf_bind_program(ctx, x);
+                x[0] = cbId; x[1] = 0; x[2] = 0; x[3] = 3;
+                cmdbuf_draw_arrays(ctx, x);
+                x[0] = cbId;
+                cmdbuf_end_recording(ctx, x);
+                CmdBuf* b = find<CmdBuf>(cbId);
+                if (!b || !b->last) return nullptr;
+                [b->last waitUntilCompleted];
+                if (b->last.status == MTLCommandBufferStatusError)
+                    return nullptr;
+                return b;
+            };
+
+            struct Check16 {
+                int x, y;
+                int want[4];
+                const char* name;
+            };
+            auto check16 = [&](const char* what, const Check16* checks,
+                               unsigned fail) -> bool {
+                for (int i = 0; i < 4; ++i) {
+                    unsigned char px[4] = {0, 0, 0, 0};
+                    if (!read_pixel_at(dev, c->queue, t->mtl, kSide,
+                                       checks[i].x, checks[i].y, px) ||
+                        !pixels_near(px, checks[i].want, 2)) {
+                        std::fprintf(stderr,
+                                     "[selftest] draw 16 %s %s is "
+                                     "(%u,%u,%u,%u), want (%d,%d,%d,%d)\n",
+                                     what, checks[i].name,
+                                     px[0], px[1], px[2], px[3],
+                                     checks[i].want[0], checks[i].want[1],
+                                     checks[i].want[2], checks[i].want[3]);
+                        rc = fail;
+                        return false;
+                    }
+                }
+                return true;
+            };
+
+            const Check16 initialChecks[4] = {
+                {kSide / 4, kSide / 4, {255, 0, 0, 255}, "top-left red"},
+                {3 * kSide / 4, kSide / 4, {0, 255, 0, 255}, "top-right green"},
+                {kSide / 4, 3 * kSide / 4, {0, 0, 255, 255}, "bottom-left blue"},
+                {3 * kSide / 4, 3 * kSide / 4, {255, 255, 255, 255},
+                 "bottom-right white"}};
+            CmdBuf* b16 = run16(kCb16);
+            if (!b16 || b16->encoded != 1 || !streamTex->uploaded) {
+                std::fprintf(stderr,
+                             "[selftest] draw 16: initial draw failed "
+                             "(encoded=%u uploaded=%d)\n",
+                             b16 ? b16->encoded : 0u,
+                             streamTex->uploaded ? 1 : 0);
+                rc = 16409;
+                goto done;
+            }
+            if (!check16("initial", initialChecks, 16409)) goto done;
+
+            const unsigned char updated[16] = {
+                255, 255, 0, 255, 0, 255, 255, 255,
+                255, 0, 255, 255, 0, 0, 0, 255};
+            struct {
+                int32_t xoffset, yoffset, zoffset, width, height, depth;
+            } region16 = {0, 0, 0, 2, 2, 1};
+            x[0] = kTexStream; x[1] = 0;
+            x[2] = reinterpret_cast<uint64_t>(&region16);
+            x[3] = reinterpret_cast<uint64_t>(updated);
+            tex_write_texels(ctx, x);
+            if (!streamTex->dirty) {
+                std::fprintf(stderr,
+                             "[selftest] draw 16: WriteTexels did not mark "
+                             "the texture dirty\n");
+                rc = 16410;
+                goto done;
+            }
+            const Check16 updatedChecks[4] = {
+                {kSide / 4, kSide / 4, {255, 255, 0, 255}, "top-left yellow"},
+                {3 * kSide / 4, kSide / 4, {0, 255, 255, 255}, "top-right cyan"},
+                {kSide / 4, 3 * kSide / 4, {255, 0, 255, 255},
+                 "bottom-left magenta"},
+                {3 * kSide / 4, 3 * kSide / 4, {0, 0, 0, 255},
+                 "bottom-right black"}};
+            CmdBuf* b16b = run16(kCb16b);
+            if (!b16b || b16b->encoded != 1 || !streamTex->uploaded ||
+                streamTex->dirty) {
+                std::fprintf(stderr,
+                             "[selftest] draw 16: WriteTexels redraw failed "
+                             "(encoded=%u uploaded=%d dirty=%d)\n",
+                             b16b ? b16b->encoded : 0u,
+                             streamTex->uploaded ? 1 : 0,
+                             streamTex->dirty ? 1 : 0);
+                rc = 16410;
+                goto done;
+            }
+            if (!check16("WriteTexels", updatedChecks, 16410)) goto done;
+
+            const unsigned char flushed[16] = {
+                128, 64, 32, 255, 32, 64, 128, 255,
+                255, 128, 0, 255, 0, 128, 255, 255};
+            if (nvngfx_tex_swizzle(&sd, 0, 0, flushed, 8,
+                                   vpool16 + kStreamOffset) != 0) {
+                std::fprintf(stderr,
+                             "[selftest] draw 16: flush image swizzle failed\n");
+                rc = 16411;
+                goto done;
+            }
+            x[0] = kTexStream; x[1] = 0; x[2] = 0;
+            tex_flush_texels(ctx, x);
+            if (!streamTex->dirty) {
+                std::fprintf(stderr,
+                             "[selftest] draw 16: FlushTexels did not mark "
+                             "the texture dirty\n");
+                rc = 16411;
+                goto done;
+            }
+            const Check16 flushedChecks[4] = {
+                {kSide / 4, kSide / 4, {128, 64, 32, 255},
+                 "top-left brown"},
+                {3 * kSide / 4, kSide / 4, {32, 64, 128, 255},
+                 "top-right steel"},
+                {kSide / 4, 3 * kSide / 4, {255, 128, 0, 255},
+                 "bottom-left orange"},
+                {3 * kSide / 4, 3 * kSide / 4, {0, 128, 255, 255},
+                 "bottom-right azure"}};
+            CmdBuf* b16c = run16(kCb16c);
+            if (!b16c || b16c->encoded != 1 || !streamTex->uploaded ||
+                streamTex->dirty) {
+                std::fprintf(stderr,
+                             "[selftest] draw 16: FlushTexels redraw failed "
+                             "(encoded=%u uploaded=%d dirty=%d)\n",
+                             b16c ? b16c->encoded : 0u,
+                             streamTex->uploaded ? 1 : 0,
+                             streamTex->dirty ? 1 : 0);
+                rc = 16411;
+                goto done;
+            }
+            if (!check16("FlushTexels", flushedChecks, 16411)) goto done;
+            std::fprintf(stderr,
+                         "[selftest] draw 16: WriteTexels and FlushTexels "
+                         "both re-uploaded a sampled texture\n");
+        }
+
+
     done:
         nvngfx_shader_set_msl_passthrough(0);
         forget<CmdBuf>(kCb);
@@ -6466,6 +6990,11 @@ extern "C" int nvngfx_metal_selftest(void) {
         forget<Tex>(kTexBcn);
         forget<Program>(0x7900);
         forget<CmdBuf>(0x7A00);
+        forget<Tex>(0x7B00);
+        forget<Program>(0x7C00);
+        forget<CmdBuf>(0x7D00);
+        forget<CmdBuf>(0x7E00);
+        forget<CmdBuf>(0x7F00);
         forget<Pool>(0x7300);
         g_pool_specs.erase(0x7400);
         std::free(poolRaw2);

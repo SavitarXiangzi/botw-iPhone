@@ -335,6 +335,164 @@ static void test_linear() {
     }
 }
 
+/* Writes a sub-rectangle through the same storage the Metal upload path
+ * reads.  This is the CPU-side half of nvnTextureWriteTexels: the guest may
+ * rewrite any mip/layer/slice after the first sample, and the bytes outside
+ * the region must survive. */
+static void test_write_region() {
+    unsigned char patch[16];
+    for (int i = 0; i < 4; ++i) {
+        patch[i * 4 + 0] = 0;
+        patch[i * 4 + 1] = 0;
+        patch[i * 4 + 2] = 255;
+        patch[i * 4 + 3] = 255;
+    }
+
+    {
+        /* 4x4 RGBA8 block-linear: overwrite the inner 2x2 and leave the
+         * border exactly as swizzled. */
+        const nvngfx_texdesc d = make_desc(0x25, 4, 4, 1);
+        nvngfx_texlayout L;
+        CHECK(nvngfx_tex_layout(&d, &L) == 0);
+        std::vector<unsigned char> storage(static_cast<size_t>(L.size), 0);
+        std::vector<unsigned char> src(64), out(64, 0);
+        for (size_t i = 0; i < src.size(); ++i)
+            src[i] = static_cast<unsigned char>(i * 3u + 1u);
+        CHECK(nvngfx_tex_swizzle(&d, 0, 0, src.data(), 16, storage.data()) == 0);
+        CHECK(nvngfx_tex_write_region(&d, 0, 0, 1, 1, 0, 2, 2, patch, 8, 0,
+                                      storage.data()) == 0);
+        CHECK(nvngfx_tex_deswizzle(&d, 0, 0, storage.data(), out.data(), 16) == 0);
+        bool ok = true;
+        for (unsigned y = 0; y < 4; ++y)
+            for (unsigned x = 0; x < 4; ++x) {
+                const bool inside = x >= 1 && x <= 2 && y >= 1 && y <= 2;
+                const unsigned char* const p = out.data() + (y * 4 + x) * 4;
+                if (inside)
+                    ok = ok && p[0] == 0 && p[1] == 0 && p[2] == 255 &&
+                         p[3] == 255;
+                else
+                    ok = ok && std::memcmp(p, src.data() + (y * 4 + x) * 4, 4) == 0;
+            }
+        CHECK(ok);
+        /* A 2D level has no z slice 1. */
+        CHECK(nvngfx_tex_write_region(&d, 0, 0, 0, 0, 1, 4, 4, patch, 8, 0,
+                                      storage.data()) == -1);
+    }
+
+    {
+        /* LINEAR rows at stride 32: the 2x2 patch must not disturb the
+         * padding after either row. */
+        nvngfx_texdesc d = make_desc(0x25, 4, 4, 1);
+        d.flags = 0x10;
+        d.stride = 32;
+        nvngfx_texlayout L;
+        CHECK(nvngfx_tex_layout(&d, &L) == 0);
+        std::vector<unsigned char> storage(static_cast<size_t>(L.size), 0xEE);
+        std::vector<unsigned char> packed(64, 0), out(64, 0);
+        for (unsigned y = 0; y < 4; ++y)
+            for (unsigned x = 0; x < 4; ++x) {
+                unsigned char* const p = storage.data() + y * 32 + x * 4;
+                p[0] = static_cast<unsigned char>(y * 16 + x * 4);
+                p[1] = 7;
+                p[2] = 9;
+                p[3] = 255;
+            }
+        CHECK(nvngfx_tex_write_region(&d, 0, 0, 1, 1, 0, 2, 2, patch, 8, 0,
+                                      storage.data()) == 0);
+        CHECK(nvngfx_tex_deswizzle(&d, 0, 0, storage.data(), out.data(), 16) == 0);
+        bool ok = true;
+        for (unsigned y = 0; y < 4; ++y)
+            for (unsigned x = 0; x < 4; ++x) {
+                const bool inside = x >= 1 && x <= 2 && y >= 1 && y <= 2;
+                const unsigned char* const p = out.data() + (y * 4 + x) * 4;
+                if (inside)
+                    ok = ok && p[0] == 0 && p[1] == 0 && p[2] == 255;
+                else
+                    ok = ok && p[0] == static_cast<unsigned char>(y * 16 + x * 4) &&
+                         p[1] == 7 && p[2] == 9;
+            }
+        CHECK(ok);
+        CHECK(storage[16] == 0xEE && storage[31] == 0xEE);
+        CHECK(storage[48] == 0xEE && storage[63] == 0xEE);
+        /* A stride that cannot hold one tight row is refused. */
+        CHECK(nvngfx_tex_write_region(&d, 0, 0, 0, 0, 0, 2, 2, patch, 4, 0,
+                                      storage.data()) == -1);
+    }
+
+    {
+        /* BC1 8x8: two block rows of two 8-byte blocks.  Rewrite only the
+         * top-right block; the other three blocks must be untouched. */
+        const nvngfx_texdesc d = make_desc(0x42, 8, 8, 1);
+        nvngfx_texlayout L;
+        CHECK(nvngfx_tex_layout(&d, &L) == 0);
+        std::vector<unsigned char> storage(static_cast<size_t>(L.size), 0);
+        unsigned char blocks[32];
+        for (int i = 0; i < 4; ++i)
+            for (int j = 0; j < 8; ++j)
+                blocks[i * 8 + j] = static_cast<unsigned char>(0x10 * i + j);
+        std::vector<unsigned char> out(32, 0);
+        CHECK(nvngfx_tex_swizzle(&d, 0, 0, blocks, 16, storage.data()) == 0);
+        const unsigned char newBlock[8] = {0xAA, 0xBB, 0xCC, 0xDD,
+                                           0x11, 0x22, 0x33, 0x44};
+        CHECK(nvngfx_tex_write_region(&d, 0, 0, 4, 0, 0, 4, 4, newBlock, 8, 0,
+                                      storage.data()) == 0);
+        CHECK(nvngfx_tex_deswizzle(&d, 0, 0, storage.data(), out.data(), 16) == 0);
+        CHECK(std::memcmp(out.data() + 8, newBlock, 8) == 0);
+        CHECK(std::memcmp(out.data() + 0, blocks, 8) == 0);
+        CHECK(std::memcmp(out.data() + 16, blocks + 16, 16) == 0);
+        /* A compressed region cannot start or end inside a block. */
+        CHECK(nvngfx_tex_write_region(&d, 0, 0, 1, 0, 0, 4, 4, newBlock, 8, 0,
+                                      storage.data()) == -1);
+        CHECK(nvngfx_tex_write_region(&d, 0, 0, 8, 0, 0, 4, 4, newBlock, 8, 0,
+                                      storage.data()) == -1);
+    }
+
+    {
+        /* 3D: z=1 addresses the second slice, and slice 0 must not move. */
+        nvngfx_texdesc d = make_desc(0x25, 4, 4, 1);
+        d.target = 2;
+        d.rank = 3;
+        d.depth = 2;
+        nvngfx_texlayout L;
+        CHECK(nvngfx_tex_layout(&d, &L) == 0);
+        std::vector<unsigned char> storage(static_cast<size_t>(L.size), 0);
+        std::vector<unsigned char> src(128), out(128, 0);
+        for (size_t i = 0; i < src.size(); ++i)
+            src[i] = static_cast<unsigned char>(i + 1);
+        CHECK(nvngfx_tex_swizzle(&d, 0, 0, src.data(), 16, storage.data()) == 0);
+        unsigned char green[64];
+        for (int i = 0; i < 16; ++i) {
+            green[i * 4 + 0] = 0;
+            green[i * 4 + 1] = 255;
+            green[i * 4 + 2] = 0;
+            green[i * 4 + 3] = 255;
+        }
+        CHECK(nvngfx_tex_write_region(&d, 0, 0, 0, 0, 1, 4, 4, green, 16, 0,
+                                      storage.data()) == 0);
+        CHECK(nvngfx_tex_deswizzle(&d, 0, 0, storage.data(), out.data(), 16) == 0);
+        CHECK(std::memcmp(out.data(), src.data(), 64) == 0);
+        CHECK(std::memcmp(out.data() + 64, green, 64) == 0);
+        /* 3D has one layer; layer 1 is not a thing. */
+        CHECK(nvngfx_tex_write_region(&d, 0, 1, 0, 0, 0, 4, 4, green, 16, 0,
+                                      storage.data()) == -1);
+    }
+
+    {
+        const nvngfx_texdesc d = make_desc(0x25, 4, 4, 1);
+        std::vector<unsigned char> storage(512, 0);
+        CHECK(nvngfx_tex_write_region(nullptr, 0, 0, 0, 0, 0, 4, 4, patch, 16,
+                                      0, storage.data()) == -1);
+        CHECK(nvngfx_tex_write_region(&d, 0, 0, 0, 0, 0, 4, 4, nullptr, 16, 0,
+                                      storage.data()) == -1);
+        CHECK(nvngfx_tex_write_region(&d, 0, 0, 0, 0, 0, 4, 4, patch, 16, 0,
+                                      nullptr) == -1);
+        CHECK(nvngfx_tex_write_region(&d, 1, 0, 0, 0, 0, 4, 4, patch, 16, 0,
+                                      storage.data()) == -1);
+        CHECK(nvngfx_tex_write_region(&d, 0, 0, 0, 0, 0, 4, 4, patch, 0, 12,
+                                      storage.data()) == -1);
+    }
+}
+
 static void test_refusals() {
     nvngfx_texdesc d = make_desc(0x25, 64, 64, 1);
     std::vector<unsigned char> a(16384), b(16384);
@@ -368,12 +526,13 @@ int main() {
     test_bl_offset();
     test_round_trip();
     test_linear();
+    test_write_region();
     test_refusals();
     if (g_failures) {
         std::printf("nvn_texlayout_test: %d failure(s)\n", g_failures);
         return 1;
     }
     std::printf("nvn_texlayout_test: ok (block shapes, sizes, offsets, "
-                "round trip, linear, refusals)\n");
+                "round trip, linear, write region, refusals)\n");
     return 0;
 }
