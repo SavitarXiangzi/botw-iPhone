@@ -120,6 +120,65 @@ def check_triset(reg: dict) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# 3b. argument shapes
+# --------------------------------------------------------------------------- #
+
+SIG = "ios/nvn/signatures.json"
+INFERRED = "ios/nvn/inferred_signatures.json"
+
+
+def load_signatures(rel: str) -> dict[str, dict]:
+    if not rel_exists(rel):
+        fail(f"missing {rel}")
+        return {}
+    doc = json.loads(read(rel))
+    procs = doc.get("procs") or []
+    out = {}
+    for p in procs:
+        name = p.get("name", "")
+        if name in out:
+            fail(f"{rel}: duplicate signature for {name}")
+        if p.get("arity") != len(p.get("params") or []):
+            fail(f"{rel}: {name}: arity disagrees with params")
+        out[name] = p
+    if doc.get("count") != len(procs):
+        fail(f"{rel}: count={doc.get('count')} but {len(procs)} entries")
+    return out
+
+
+def check_signatures(reg: dict) -> None:
+    known = load_signatures(SIG)
+    inferred = load_signatures(INFERRED)
+    if not known:
+        return
+
+    # The x[8] argument block holds exactly 8 integer words.  Anything with
+    # more arguments would need stack arguments, which the dispatcher does not
+    # marshall -- so such an entry point must never be bound.
+    over = [n for n, p in list(known.items()) + list(inferred.items()) if p["arity"] > 8]
+    if over:
+        fail(f"arity > 8 cannot use the x[8] ABI: {sorted(over)[:5]}")
+
+    impl = set()
+    if rel_exists("ios/nvn/implemented_metal.txt"):
+        for line in read("ios/nvn/implemented_metal.txt").splitlines():
+            line = line.split("#", 1)[0].strip()
+            if line:
+                impl.add(line)
+    undocumented = sorted(impl - set(known) - set(inferred))
+    if undocumented:
+        fail("implemented without a known argument shape: " + ", ".join(undocumented[:5])
+             + " (add it to signatures.json or inferred_signatures.json)")
+
+    unknown_names = sorted(set(known) - reg.get("names", set()))
+    if unknown_names:
+        fail(f"{SIG}: shapes for procs that are not in the registry: {unknown_names[:5]}")
+
+    notes.append(f"argument shapes: {len(known)} measured, {len(inferred)} inferred, "
+                 f"max arity {max((p['arity'] for p in known.values()), default=0)}")
+
+
+# --------------------------------------------------------------------------- #
 # 4. delimiter balance
 # --------------------------------------------------------------------------- #
 
@@ -342,6 +401,7 @@ def main(argv: list[str] | None = None) -> int:
     if reg:
         check_codegen()
         check_triset(reg)
+        check_signatures(reg)
     check_sources()
     check_swift()
     check_plist()

@@ -1,0 +1,11 @@
+{
+ "source": "hand-written: derived from the Set/Get naming symmetry, NOT from a header",
+ "note": "These four entry points are absent from the public nvn_protos.h. Their shapes are inferred from their siblings (WindowGetNumTextures mirroring WindowSetNumActiveTextures, DeviceBuilderGetFlags mirroring DeviceBuilderSetFlags). verify_ios.py counts them separately so the guess is never silently folded into the verified set.",
+ "count": 4,
+ "procs": [
+  {"name": "nvnDeviceBuilderGetFlags", "ret": "int", "params": ["const NVNdeviceBuilder*"], "arity": 1, "inferred": true},
+  {"name": "nvnWindowBuilderSetNumActiveTextures", "ret": "void", "params": ["NVNwindowBuilder*", "int"], "arity": 2, "inferred": true},
+  {"name": "nvnWindowGetNumTextures", "ret": "int", "params": ["const NVNwindow*"], "arity": 1, "inferred": true},
+  {"name": "nvnWindowSetNumActiveTextures", "ret": "void", "params": ["NVNwindow*", "int"], "arity": 2, "inferred": true}
+ ]
+}

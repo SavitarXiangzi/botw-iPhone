@@ -1945,3 +1945,54 @@ CI（本机无 Mac，全靠 runner）：`portable` 全绿；`ios` job 的
 `nvnCommandBufferSetRenderTargets`：拿到客体的颜色目标后，`beginRecording`
 时就能建 `MTLRenderCommandEncoder`，`nvnCommandBufferClearColor` 才会真的
 生效，draw 才有机会执行。这是阶段 A 的剩余部分。
+## M3.74 参数形状：把 32 个实现按真实签名重写
+
+上一轮那 32 个"已实现"的入口，参数解码全是猜的。这一轮拿到公开项目的
+原型表一比，**几乎每一个都错**：
+
+| 入口 | 原来的读法 | 真实签名 |
+|---|---|---|
+| `nvnCommandBufferSetViewport` | `x[1..4]` 当 double | `int x, y, w, h` |
+| `nvnCommandBufferSetScissor` | 同上 | `int x, y, w, h` |
+| `nvnCommandBufferDrawArrays` | `(first, count, primitive)` | `(primitive, first, count)` |
+| `nvnCommandBufferDrawElements` | 把 `x[6]` 当 indexType | `(primitive, indexType, count, indexAddress)` |
+| `nvnWindowBuilderSetTextures` | `(builder, array, count)` | `(builder, count, array)` |
+| `nvnWindowAcquireTexture` | 从 `x[0]` 返回句柄 | 索引写进 `x[2]` 指向的 `int`，返回 result 枚举 |
+| `nvnWindowInitialize` 等 | 把宿主指针写回 `x[0]` | `x[0]` 是 guest 的对象地址，返回 boolean |
+
+最后一条是结构性的：**NVN 对象住在 guest 内存里**，宿主只能以 guest 地址
+为键存侧表。原来那版会把宿主 `new` 出来的 `Win*`/`Pool*` 交给 guest，
+guest 下次调用传回自己的地址，宿主再当指针解引用——能编译、能过冒烟测试，
+真机第一次调用就崩。
+
+### 做了什么
+
+* `scripts/extract_nvn_signatures.py`：解析公开项目 nxnative 的
+  `dm/gfx/nvn/nvn_protos.h`（MIT），只保留名字/返回类型/参数类型，
+  产出 `ios/nvn/signatures.json`（470 条）。头文件本身不入库。
+* `ios/nvn/inferred_signatures.json`：4 个原型表里没有的入口，按命名对称性
+  推断，单独标注、单独计数。
+* `nvn_metal.mm` 整体重写：以 guest 地址为键的对象表、返回值写 `w0`、
+  出参写穿 guest 指针、builder 侧表。
+* `verify_ios.py` 新增：已实现入口必须有已知形状；arity > 8 直接判失败
+  （`x[8]` 装不下栈参数）；形状里的名字必须在注册表里。
+
+### 量化结论
+
+* 470 个原型里最大 arity = **8**，正好等于 `x0..x7` 的容量。
+  之前"8 个字够用"是假设，现在是测量。
+* 覆盖表仍然是 **32/513**，数字没变——变的是这 32 个现在真的对。
+
+### 证据
+
+```
+extract_nvn_signatures: ok (470 shapes, max arity 8)
+verify_ios: ok    argument shapes: 470 measured, 4 inferred, max arity 8
+syntax_check_metal: ok
+nvn_abi_test: ok (513 procs)
+core_smoke_test: ok (nvn 0/513 on null)
+```
+
+仍然**没有** `nvnCommandBufferSetRenderTargets`：它的签名已经有了
+（6 个参数），但目标纹理必须先由 `nvnTextureInitialize` 造出 `MTLTexture`，
+而那需要 `NVNtextureBuilder` 的字段偏移。下一步是 `nvn_obj.h` 里的 `tex_t`。

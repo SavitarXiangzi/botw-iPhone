@@ -1,0 +1,4404 @@
+{
+ "source": "seedds/nxnative dm/gfx/nvn/nvn_protos.h, MIT License (Copyright (c) 2026 seedds)",
+ "note": "NVN entry-point shapes only: return type and parameter types. The header itself is not redistributed.",
+ "count": 470,
+ "max_arity": 8,
+ "procs": [
+  {
+   "name": "nvnBlendStateGetAdvancedMode",
+   "ret": "NVNblendAdvancedMode",
+   "params": [
+    "const NVNblendState*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnBlendStateGetAdvancedNormalizedDst",
+   "ret": "NVNboolean",
+   "params": [
+    "const NVNblendState*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnBlendStateGetAdvancedOverlap",
+   "ret": "NVNblendAdvancedOverlap",
+   "params": [
+    "const NVNblendState*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnBlendStateGetAdvancedPremultipliedSrc",
+   "ret": "NVNboolean",
+   "params": [
+    "const NVNblendState*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnBlendStateGetBlendEquation",
+   "ret": "void",
+   "params": [
+    "const NVNblendState*",
+    "NVNblendEquation*",
+    "NVNblendEquation*"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnBlendStateGetBlendFunc",
+   "ret": "void",
+   "params": [
+    "const NVNblendState*",
+    "NVNblendFunc*",
+    "NVNblendFunc*",
+    "NVNblendFunc*",
+    "NVNblendFunc*"
+   ],
+   "arity": 5
+  },
+  {
+   "name": "nvnBlendStateGetBlendTarget",
+   "ret": "int",
+   "params": [
+    "const NVNblendState*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnBlendStateSetAdvancedMode",
+   "ret": "void",
+   "params": [
+    "NVNblendState*",
+    "NVNblendAdvancedMode"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnBlendStateSetAdvancedNormalizedDst",
+   "ret": "void",
+   "params": [
+    "NVNblendState*",
+    "uint32_t"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnBlendStateSetAdvancedOverlap",
+   "ret": "void",
+   "params": [
+    "NVNblendState*",
+    "NVNblendAdvancedOverlap"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnBlendStateSetAdvancedPremultipliedSrc",
+   "ret": "void",
+   "params": [
+    "NVNblendState*",
+    "uint32_t"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnBlendStateSetBlendEquation",
+   "ret": "void",
+   "params": [
+    "NVNblendState*",
+    "NVNblendEquation",
+    "NVNblendEquation"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnBlendStateSetBlendFunc",
+   "ret": "void",
+   "params": [
+    "NVNblendState*",
+    "NVNblendFunc",
+    "NVNblendFunc",
+    "NVNblendFunc",
+    "NVNblendFunc"
+   ],
+   "arity": 5
+  },
+  {
+   "name": "nvnBlendStateSetBlendTarget",
+   "ret": "void",
+   "params": [
+    "NVNblendState*",
+    "int"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnBlendStateSetDefaults",
+   "ret": "void",
+   "params": [
+    "NVNblendState*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnBufferBuilderGetMemoryOffset",
+   "ret": "ptrdiff_t",
+   "params": [
+    "const NVNbufferBuilder*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnBufferBuilderGetMemoryPool",
+   "ret": "NVNmemoryPool",
+   "params": [
+    "const NVNbufferBuilder*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnBufferBuilderGetSize",
+   "ret": "size_t",
+   "params": [
+    "const NVNbufferBuilder*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnBufferBuilderSetDefaults",
+   "ret": "void",
+   "params": [
+    "NVNbufferBuilder*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnBufferBuilderSetDevice",
+   "ret": "void",
+   "params": [
+    "NVNbufferBuilder*",
+    "NVNdevice*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnBufferBuilderSetStorage",
+   "ret": "void",
+   "params": [
+    "NVNbufferBuilder*",
+    "NVNmemoryPool*",
+    "ptrdiff_t",
+    "size_t"
+   ],
+   "arity": 4
+  },
+  {
+   "name": "nvnBufferFinalize",
+   "ret": "void",
+   "params": [
+    "NVNbuffer*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnBufferFlushMappedRange",
+   "ret": "void",
+   "params": [
+    "const NVNbuffer*",
+    "ptrdiff_t",
+    "size_t"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnBufferGetAddress",
+   "ret": "NVNbufferAddress",
+   "params": [
+    "const NVNbuffer*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnBufferGetDebugID",
+   "ret": "uint64_t",
+   "params": [
+    "const NVNbuffer*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnBufferGetMemoryOffset",
+   "ret": "ptrdiff_t",
+   "params": [
+    "const NVNbuffer*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnBufferGetSize",
+   "ret": "size_t",
+   "params": [
+    "const NVNbuffer*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnBufferInitialize",
+   "ret": "NVNboolean",
+   "params": [
+    "NVNbuffer*",
+    "const NVNbufferBuilder*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnBufferInvalidateMappedRange",
+   "ret": "void",
+   "params": [
+    "const NVNbuffer*",
+    "ptrdiff_t",
+    "size_t"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnBufferSetDebugLabel",
+   "ret": "void",
+   "params": [
+    "NVNbuffer*",
+    "const char*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnChannelMaskStateGetChannelMask",
+   "ret": "void",
+   "params": [
+    "const NVNchannelMaskState*",
+    "int",
+    "NVNboolean*",
+    "NVNboolean*",
+    "NVNboolean*",
+    "NVNboolean*"
+   ],
+   "arity": 6
+  },
+  {
+   "name": "nvnChannelMaskStateSetChannelMask",
+   "ret": "void",
+   "params": [
+    "NVNchannelMaskState*",
+    "int",
+    "uint32_t",
+    "uint32_t",
+    "uint32_t",
+    "uint32_t"
+   ],
+   "arity": 6
+  },
+  {
+   "name": "nvnChannelMaskStateSetDefaults",
+   "ret": "void",
+   "params": [
+    "NVNchannelMaskState*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnColorStateGetAlphaTest",
+   "ret": "NVNalphaFunc",
+   "params": [
+    "const NVNcolorState*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnColorStateGetBlendEnable",
+   "ret": "NVNboolean",
+   "params": [
+    "const NVNcolorState*",
+    "int"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnColorStateGetLogicOp",
+   "ret": "NVNlogicOp",
+   "params": [
+    "const NVNcolorState*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnColorStateSetAlphaTest",
+   "ret": "void",
+   "params": [
+    "NVNcolorState*",
+    "NVNalphaFunc"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnColorStateSetBlendEnable",
+   "ret": "void",
+   "params": [
+    "NVNcolorState*",
+    "int",
+    "uint32_t"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnColorStateSetDefaults",
+   "ret": "void",
+   "params": [
+    "NVNcolorState*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnColorStateSetLogicOp",
+   "ret": "void",
+   "params": [
+    "NVNcolorState*",
+    "NVNlogicOp"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnCommandBufferAddCommandMemory",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "const NVNmemoryPool*",
+    "ptrdiff_t",
+    "size_t"
+   ],
+   "arity": 4
+  },
+  {
+   "name": "nvnCommandBufferAddControlMemory",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "void*",
+    "size_t"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnCommandBufferBarrier",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "int"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnCommandBufferBeginRecording",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnCommandBufferBeginTransformFeedback",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "NVNbufferAddress"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnCommandBufferBindBlendState",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "const NVNblendState*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnCommandBufferBindChannelMaskState",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "const NVNchannelMaskState*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnCommandBufferBindColorState",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "const NVNcolorState*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnCommandBufferBindCoverageModulationTable",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "const float*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnCommandBufferBindDepthStencilState",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "const NVNdepthStencilState*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnCommandBufferBindImage",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "NVNshaderStage",
+    "int",
+    "NVNimageHandle"
+   ],
+   "arity": 4
+  },
+  {
+   "name": "nvnCommandBufferBindImages",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "NVNshaderStage",
+    "int",
+    "int",
+    "const NVNimageHandle*"
+   ],
+   "arity": 5
+  },
+  {
+   "name": "nvnCommandBufferBindMultisampleState",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "const NVNmultisampleState*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnCommandBufferBindPolygonState",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "const NVNpolygonState*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnCommandBufferBindProgram",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "const NVNprogram*",
+    "int"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnCommandBufferBindSeparateSampler",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "NVNshaderStage",
+    "int",
+    "NVNseparateSamplerHandle"
+   ],
+   "arity": 4
+  },
+  {
+   "name": "nvnCommandBufferBindSeparateSamplers",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "NVNshaderStage",
+    "int",
+    "int",
+    "const NVNseparateSamplerHandle*"
+   ],
+   "arity": 5
+  },
+  {
+   "name": "nvnCommandBufferBindSeparateTexture",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "NVNshaderStage",
+    "int",
+    "NVNseparateTextureHandle"
+   ],
+   "arity": 4
+  },
+  {
+   "name": "nvnCommandBufferBindSeparateTextures",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "NVNshaderStage",
+    "int",
+    "int",
+    "const NVNseparateTextureHandle*"
+   ],
+   "arity": 5
+  },
+  {
+   "name": "nvnCommandBufferBindStorageBuffer",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "NVNshaderStage",
+    "int",
+    "NVNbufferAddress",
+    "size_t"
+   ],
+   "arity": 5
+  },
+  {
+   "name": "nvnCommandBufferBindStorageBuffers",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "NVNshaderStage",
+    "int",
+    "int",
+    "const NVNbufferRange*"
+   ],
+   "arity": 5
+  },
+  {
+   "name": "nvnCommandBufferBindTexture",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "NVNshaderStage",
+    "int",
+    "NVNtextureHandle"
+   ],
+   "arity": 4
+  },
+  {
+   "name": "nvnCommandBufferBindTextures",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "NVNshaderStage",
+    "int",
+    "int",
+    "const NVNtextureHandle*"
+   ],
+   "arity": 5
+  },
+  {
+   "name": "nvnCommandBufferBindTransformFeedbackBuffer",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "int",
+    "NVNbufferAddress",
+    "size_t"
+   ],
+   "arity": 4
+  },
+  {
+   "name": "nvnCommandBufferBindTransformFeedbackBuffers",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "int",
+    "int",
+    "const NVNbufferRange*"
+   ],
+   "arity": 4
+  },
+  {
+   "name": "nvnCommandBufferBindUniformBuffer",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "NVNshaderStage",
+    "int",
+    "NVNbufferAddress",
+    "size_t"
+   ],
+   "arity": 5
+  },
+  {
+   "name": "nvnCommandBufferBindUniformBuffers",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "NVNshaderStage",
+    "int",
+    "int",
+    "const NVNbufferRange*"
+   ],
+   "arity": 5
+  },
+  {
+   "name": "nvnCommandBufferBindVertexAttribState",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "int",
+    "const NVNvertexAttribState*"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnCommandBufferBindVertexBuffer",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "int",
+    "NVNbufferAddress",
+    "size_t"
+   ],
+   "arity": 4
+  },
+  {
+   "name": "nvnCommandBufferBindVertexBuffers",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "int",
+    "int",
+    "const NVNbufferRange*"
+   ],
+   "arity": 4
+  },
+  {
+   "name": "nvnCommandBufferBindVertexStreamState",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "int",
+    "const NVNvertexStreamState*"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnCommandBufferCallCommands",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "int",
+    "const NVNcommandHandle*"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnCommandBufferClearBuffer",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "NVNbufferAddress",
+    "size_t",
+    "uint32_t"
+   ],
+   "arity": 4
+  },
+  {
+   "name": "nvnCommandBufferClearColor",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "int",
+    "const float*",
+    "int"
+   ],
+   "arity": 4
+  },
+  {
+   "name": "nvnCommandBufferClearColori",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "int",
+    "const int*",
+    "int"
+   ],
+   "arity": 4
+  },
+  {
+   "name": "nvnCommandBufferClearColorui",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "int",
+    "const uint32_t*",
+    "int"
+   ],
+   "arity": 4
+  },
+  {
+   "name": "nvnCommandBufferClearDepthStencil",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "float",
+    "uint32_t",
+    "int",
+    "int"
+   ],
+   "arity": 5
+  },
+  {
+   "name": "nvnCommandBufferClearTexture",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "const NVNtexture*",
+    "const NVNtextureView*",
+    "const NVNcopyRegion*",
+    "const float*",
+    "int"
+   ],
+   "arity": 6
+  },
+  {
+   "name": "nvnCommandBufferClearTexturei",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "const NVNtexture*",
+    "const NVNtextureView*",
+    "const NVNcopyRegion*",
+    "const int*",
+    "int"
+   ],
+   "arity": 6
+  },
+  {
+   "name": "nvnCommandBufferClearTextureui",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "const NVNtexture*",
+    "const NVNtextureView*",
+    "const NVNcopyRegion*",
+    "const uint32_t*",
+    "int"
+   ],
+   "arity": 6
+  },
+  {
+   "name": "nvnCommandBufferCopyBufferToBuffer",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "NVNbufferAddress",
+    "NVNbufferAddress",
+    "size_t",
+    "int"
+   ],
+   "arity": 5
+  },
+  {
+   "name": "nvnCommandBufferCopyBufferToTexture",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "NVNbufferAddress",
+    "const NVNtexture*",
+    "const NVNtextureView*",
+    "const NVNcopyRegion*",
+    "int"
+   ],
+   "arity": 6
+  },
+  {
+   "name": "nvnCommandBufferCopyCommands",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "int",
+    "const NVNcommandHandle*"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnCommandBufferCopyTextureToBuffer",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "const NVNtexture*",
+    "const NVNtextureView*",
+    "const NVNcopyRegion*",
+    "NVNbufferAddress",
+    "int"
+   ],
+   "arity": 6
+  },
+  {
+   "name": "nvnCommandBufferCopyTextureToTexture",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "const NVNtexture*",
+    "const NVNtextureView*",
+    "const NVNcopyRegion*",
+    "const NVNtexture*",
+    "const NVNtextureView*",
+    "const NVNcopyRegion*",
+    "int"
+   ],
+   "arity": 8
+  },
+  {
+   "name": "nvnCommandBufferDiscardColor",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "int"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnCommandBufferDiscardDepthStencil",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnCommandBufferDispatchCompute",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "int",
+    "int",
+    "int"
+   ],
+   "arity": 4
+  },
+  {
+   "name": "nvnCommandBufferDispatchComputeIndirect",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "NVNbufferAddress"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnCommandBufferDownsample",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "const NVNtexture*",
+    "const NVNtexture*"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnCommandBufferDownsampleTextureView",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "const NVNtexture*",
+    "const NVNtextureView*",
+    "const NVNtexture*",
+    "const NVNtextureView*"
+   ],
+   "arity": 5
+  },
+  {
+   "name": "nvnCommandBufferDrawArrays",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "NVNdrawPrimitive",
+    "int",
+    "int"
+   ],
+   "arity": 4
+  },
+  {
+   "name": "nvnCommandBufferDrawArraysIndirect",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "NVNdrawPrimitive",
+    "NVNbufferAddress"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnCommandBufferDrawArraysInstanced",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "NVNdrawPrimitive",
+    "int",
+    "int",
+    "int",
+    "int"
+   ],
+   "arity": 6
+  },
+  {
+   "name": "nvnCommandBufferDrawElements",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "NVNdrawPrimitive",
+    "NVNindexType",
+    "int",
+    "NVNbufferAddress"
+   ],
+   "arity": 5
+  },
+  {
+   "name": "nvnCommandBufferDrawElementsBaseVertex",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "NVNdrawPrimitive",
+    "NVNindexType",
+    "int",
+    "NVNbufferAddress",
+    "int"
+   ],
+   "arity": 6
+  },
+  {
+   "name": "nvnCommandBufferDrawElementsIndirect",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "NVNdrawPrimitive",
+    "NVNindexType",
+    "NVNbufferAddress",
+    "NVNbufferAddress"
+   ],
+   "arity": 5
+  },
+  {
+   "name": "nvnCommandBufferDrawElementsInstanced",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "NVNdrawPrimitive",
+    "NVNindexType",
+    "int",
+    "NVNbufferAddress",
+    "int",
+    "int",
+    "int"
+   ],
+   "arity": 8
+  },
+  {
+   "name": "nvnCommandBufferDrawTexture",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "NVNtextureHandle",
+    "const NVNdrawTextureRegion*",
+    "const NVNdrawTextureRegion*"
+   ],
+   "arity": 4
+  },
+  {
+   "name": "nvnCommandBufferDrawTransformFeedback",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "NVNdrawPrimitive",
+    "NVNbufferAddress"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnCommandBufferEndRecording",
+   "ret": "NVNcommandHandle",
+   "params": [
+    "NVNcommandBuffer*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnCommandBufferEndTransformFeedback",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "NVNbufferAddress"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnCommandBufferFenceSync",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "NVNsync*",
+    "NVNsyncCondition",
+    "int"
+   ],
+   "arity": 4
+  },
+  {
+   "name": "nvnCommandBufferFinalize",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnCommandBufferGetCommandMemoryFree",
+   "ret": "size_t",
+   "params": [
+    "const NVNcommandBuffer*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnCommandBufferGetCommandMemorySize",
+   "ret": "size_t",
+   "params": [
+    "const NVNcommandBuffer*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnCommandBufferGetCommandMemoryUsed",
+   "ret": "size_t",
+   "params": [
+    "const NVNcommandBuffer*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnCommandBufferGetControlMemoryFree",
+   "ret": "size_t",
+   "params": [
+    "const NVNcommandBuffer*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnCommandBufferGetControlMemorySize",
+   "ret": "size_t",
+   "params": [
+    "const NVNcommandBuffer*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnCommandBufferGetControlMemoryUsed",
+   "ret": "size_t",
+   "params": [
+    "const NVNcommandBuffer*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnCommandBufferGetCopyImageStride",
+   "ret": "ptrdiff_t",
+   "params": [
+    "const NVNcommandBuffer*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnCommandBufferGetCopyRowStride",
+   "ret": "ptrdiff_t",
+   "params": [
+    "const NVNcommandBuffer*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnCommandBufferGetMemoryCallback",
+   "ret": "PFNNVNCOMMANDBUFFERMEMORYCALLBACKPROC",
+   "params": [
+    "const NVNcommandBuffer*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnCommandBufferGetMemoryCallbackData",
+   "ret": "void",
+   "params": [
+    "const NVNcommandBuffer*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnCommandBufferInitialize",
+   "ret": "NVNboolean",
+   "params": [
+    "NVNcommandBuffer*",
+    "NVNdevice*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnCommandBufferInsertDebugMarker",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "const char*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnCommandBufferInsertDebugMarkerDynamic",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "uint32_t",
+    "const char*"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnCommandBufferInsertDebugMarkerStatic",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "uint32_t",
+    "const char*"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnCommandBufferIsRecording",
+   "ret": "NVNboolean",
+   "params": [
+    "const NVNcommandBuffer*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnCommandBufferMultiDrawArraysIndirectCount",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "NVNdrawPrimitive",
+    "NVNbufferAddress",
+    "NVNbufferAddress",
+    "int",
+    "ptrdiff_t"
+   ],
+   "arity": 6
+  },
+  {
+   "name": "nvnCommandBufferMultiDrawElementsIndirectCount",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "NVNdrawPrimitive",
+    "NVNindexType",
+    "NVNbufferAddress",
+    "NVNbufferAddress",
+    "NVNbufferAddress",
+    "int",
+    "ptrdiff_t"
+   ],
+   "arity": 8
+  },
+  {
+   "name": "nvnCommandBufferPauseTransformFeedback",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "NVNbufferAddress"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnCommandBufferPopDebugGroup",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnCommandBufferPopDebugGroupId",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "uint32_t"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnCommandBufferPushDebugGroup",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "uint32_t",
+    "const char*"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnCommandBufferPushDebugGroupDynamic",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "uint32_t",
+    "const char*"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnCommandBufferPushDebugGroupStatic",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "uint32_t",
+    "const char*"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnCommandBufferReportCounter",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "NVNcounterType",
+    "NVNbufferAddress"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnCommandBufferReportValue",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "uint32_t",
+    "NVNbufferAddress"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnCommandBufferResetCounter",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "NVNcounterType"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnCommandBufferResolveDepthBuffer",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnCommandBufferRestoreZCullData",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "NVNbufferAddress",
+    "size_t"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnCommandBufferResumeTransformFeedback",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "NVNbufferAddress"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnCommandBufferSaveZCullData",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "NVNbufferAddress",
+    "size_t"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnCommandBufferSetAlphaRef",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "float"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnCommandBufferSetBlendColor",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "const float*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnCommandBufferSetConservativeRasterDilate",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "float"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnCommandBufferSetConservativeRasterEnable",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "uint32_t"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnCommandBufferSetCopyImageStride",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "ptrdiff_t"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnCommandBufferSetCopyRowStride",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "ptrdiff_t"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnCommandBufferSetDebugLabel",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "const char*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnCommandBufferSetDepthBounds",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "uint32_t",
+    "float",
+    "float"
+   ],
+   "arity": 4
+  },
+  {
+   "name": "nvnCommandBufferSetDepthClamp",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "uint32_t"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnCommandBufferSetDepthRange",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "float",
+    "float"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnCommandBufferSetDepthRanges",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "int",
+    "int",
+    "const float*"
+   ],
+   "arity": 4
+  },
+  {
+   "name": "nvnCommandBufferSetInnerTessellationLevels",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "const float*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnCommandBufferSetLineWidth",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "float"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnCommandBufferSetMemoryCallback",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "PFNNVNCOMMANDBUFFERMEMORYCALLBACKPROC"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnCommandBufferSetMemoryCallbackData",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "void*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnCommandBufferSetOuterTessellationLevels",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "const float*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnCommandBufferSetPatchSize",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "int"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnCommandBufferSetPointSize",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "float"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnCommandBufferSetPolygonOffsetClamp",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "float",
+    "float",
+    "float"
+   ],
+   "arity": 4
+  },
+  {
+   "name": "nvnCommandBufferSetPrimitiveRestart",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "uint32_t",
+    "int"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnCommandBufferSetProgramSubroutines",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "NVNprogram*",
+    "NVNshaderStage",
+    "const int",
+    "const int",
+    "const int*"
+   ],
+   "arity": 6
+  },
+  {
+   "name": "nvnCommandBufferSetRasterizerDiscard",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "uint32_t"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnCommandBufferSetRenderEnable",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "uint32_t"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnCommandBufferSetRenderEnableConditional",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "NVNconditionalRenderMode",
+    "NVNbufferAddress"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnCommandBufferSetRenderTargets",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "int",
+    "const NVNtexture* const*",
+    "const NVNtextureView* const*",
+    "const NVNtexture*",
+    "const NVNtextureView*"
+   ],
+   "arity": 6
+  },
+  {
+   "name": "nvnCommandBufferSetSampleMask",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "int"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnCommandBufferSetSamplerPool",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "const NVNsamplerPool*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnCommandBufferSetScissor",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "int",
+    "int",
+    "int",
+    "int"
+   ],
+   "arity": 5
+  },
+  {
+   "name": "nvnCommandBufferSetScissors",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "int",
+    "int",
+    "const int*"
+   ],
+   "arity": 4
+  },
+  {
+   "name": "nvnCommandBufferSetShaderScratchMemory",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "const NVNmemoryPool*",
+    "ptrdiff_t",
+    "size_t"
+   ],
+   "arity": 4
+  },
+  {
+   "name": "nvnCommandBufferSetStencilMask",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "NVNface",
+    "int"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnCommandBufferSetStencilRef",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "NVNface",
+    "int"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnCommandBufferSetStencilValueMask",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "NVNface",
+    "int"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnCommandBufferSetSubpixelPrecisionBias",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "int",
+    "int"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnCommandBufferSetTexturePool",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "const NVNtexturePool*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnCommandBufferSetTiledCacheAction",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "NVNtiledCacheAction"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnCommandBufferSetTiledCacheTileSize",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "int",
+    "int"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnCommandBufferSetViewport",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "int",
+    "int",
+    "int",
+    "int"
+   ],
+   "arity": 5
+  },
+  {
+   "name": "nvnCommandBufferSetViewportSwizzles",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "int",
+    "int",
+    "const NVNviewportSwizzle*"
+   ],
+   "arity": 4
+  },
+  {
+   "name": "nvnCommandBufferSetViewports",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "int",
+    "int",
+    "const float*"
+   ],
+   "arity": 4
+  },
+  {
+   "name": "nvnCommandBufferSignalEvent",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "const NVNevent*",
+    "NVNeventSignalMode",
+    "NVNeventSignalLocation",
+    "int",
+    "uint32_t"
+   ],
+   "arity": 6
+  },
+  {
+   "name": "nvnCommandBufferTiledDownsample",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "const NVNtexture*",
+    "const NVNtexture*"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnCommandBufferTiledDownsampleTextureView",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "const NVNtexture*",
+    "const NVNtextureView*",
+    "const NVNtexture*",
+    "const NVNtextureView*"
+   ],
+   "arity": 5
+  },
+  {
+   "name": "nvnCommandBufferUpdateUniformBuffer",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "NVNbufferAddress",
+    "size_t",
+    "ptrdiff_t",
+    "size_t",
+    "const void*"
+   ],
+   "arity": 6
+  },
+  {
+   "name": "nvnCommandBufferWaitEvent",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "const NVNevent*",
+    "NVNeventWaitMode",
+    "uint32_t"
+   ],
+   "arity": 4
+  },
+  {
+   "name": "nvnCommandBufferWaitSync",
+   "ret": "void",
+   "params": [
+    "NVNcommandBuffer*",
+    "const NVNsync*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnDepthStencilStateGetDepthFunc",
+   "ret": "NVNdepthFunc",
+   "params": [
+    "const NVNdepthStencilState*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnDepthStencilStateGetDepthTestEnable",
+   "ret": "NVNboolean",
+   "params": [
+    "const NVNdepthStencilState*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnDepthStencilStateGetDepthWriteEnable",
+   "ret": "NVNboolean",
+   "params": [
+    "const NVNdepthStencilState*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnDepthStencilStateGetStencilFunc",
+   "ret": "NVNstencilFunc",
+   "params": [
+    "const NVNdepthStencilState*",
+    "NVNface"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnDepthStencilStateGetStencilOp",
+   "ret": "void",
+   "params": [
+    "const NVNdepthStencilState*",
+    "NVNface",
+    "NVNstencilOp*",
+    "NVNstencilOp*",
+    "NVNstencilOp*"
+   ],
+   "arity": 5
+  },
+  {
+   "name": "nvnDepthStencilStateGetStencilTestEnable",
+   "ret": "NVNboolean",
+   "params": [
+    "const NVNdepthStencilState*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnDepthStencilStateSetDefaults",
+   "ret": "void",
+   "params": [
+    "NVNdepthStencilState*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnDepthStencilStateSetDepthFunc",
+   "ret": "void",
+   "params": [
+    "NVNdepthStencilState*",
+    "NVNdepthFunc"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnDepthStencilStateSetDepthTestEnable",
+   "ret": "void",
+   "params": [
+    "NVNdepthStencilState*",
+    "uint32_t"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnDepthStencilStateSetDepthWriteEnable",
+   "ret": "void",
+   "params": [
+    "NVNdepthStencilState*",
+    "uint32_t"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnDepthStencilStateSetStencilFunc",
+   "ret": "void",
+   "params": [
+    "NVNdepthStencilState*",
+    "NVNface",
+    "NVNstencilFunc"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnDepthStencilStateSetStencilOp",
+   "ret": "void",
+   "params": [
+    "NVNdepthStencilState*",
+    "NVNface",
+    "NVNstencilOp",
+    "NVNstencilOp",
+    "NVNstencilOp"
+   ],
+   "arity": 5
+  },
+  {
+   "name": "nvnDepthStencilStateSetStencilTestEnable",
+   "ret": "void",
+   "params": [
+    "NVNdepthStencilState*",
+    "uint32_t"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnDeviceApplyDeferredFinalizes",
+   "ret": "void",
+   "params": [
+    "NVNdevice*",
+    "int"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnDeviceBuilderSetDefaults",
+   "ret": "void",
+   "params": [
+    "NVNdeviceBuilder*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnDeviceBuilderSetFlags",
+   "ret": "void",
+   "params": [
+    "NVNdeviceBuilder*",
+    "int"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnDeviceFinalize",
+   "ret": "void",
+   "params": [
+    "NVNdevice*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnDeviceFinalizeCommandHandle",
+   "ret": "void",
+   "params": [
+    "NVNdevice*",
+    "NVNcommandHandle"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnDeviceGenerateDebugDomainId",
+   "ret": "NVNdebugDomainId",
+   "params": [
+    "const NVNdevice*",
+    "const char*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnDeviceGetCurrentTimestampInNanoseconds",
+   "ret": "uint64_t",
+   "params": [
+    "const NVNdevice*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnDeviceGetDepthMode",
+   "ret": "NVNdepthMode",
+   "params": [
+    "const NVNdevice*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnDeviceGetImageHandle",
+   "ret": "NVNimageHandle",
+   "params": [
+    "const NVNdevice*",
+    "int"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnDeviceGetInteger",
+   "ret": "void",
+   "params": [
+    "const NVNdevice*",
+    "NVNdeviceInfo",
+    "int*"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnDeviceGetProcAddress",
+   "ret": "PFNNVNGENERICFUNCPTRPROC",
+   "params": [
+    "const NVNdevice*",
+    "const char*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnDeviceGetSeparateSamplerHandle",
+   "ret": "NVNseparateSamplerHandle",
+   "params": [
+    "const NVNdevice*",
+    "int"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnDeviceGetSeparateTextureHandle",
+   "ret": "NVNseparateTextureHandle",
+   "params": [
+    "const NVNdevice*",
+    "int"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnDeviceGetTexelFetchHandle",
+   "ret": "NVNtextureHandle",
+   "params": [
+    "const NVNdevice*",
+    "int"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnDeviceGetTextureHandle",
+   "ret": "NVNtextureHandle",
+   "params": [
+    "const NVNdevice*",
+    "int",
+    "int"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnDeviceGetTimestampInNanoseconds",
+   "ret": "uint64_t",
+   "params": [
+    "const NVNdevice*",
+    "const NVNcounterData*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnDeviceGetWindowOriginMode",
+   "ret": "NVNwindowOriginMode",
+   "params": [
+    "const NVNdevice*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnDeviceInitialize",
+   "ret": "NVNboolean",
+   "params": [
+    "NVNdevice*",
+    "const NVNdeviceBuilder*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnDeviceInstallDebugCallback",
+   "ret": "void",
+   "params": [
+    "NVNdevice*",
+    "const PFNNVNDEBUGCALLBACKPROC",
+    "void*",
+    "uint32_t"
+   ],
+   "arity": 4
+  },
+  {
+   "name": "nvnDeviceIsExternalDebuggerAttached",
+   "ret": "NVNboolean",
+   "params": [
+    "const NVNdevice*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnDeviceRegisterFastClearColor",
+   "ret": "NVNboolean",
+   "params": [
+    "NVNdevice*",
+    "const float*",
+    "NVNformat"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnDeviceRegisterFastClearColori",
+   "ret": "NVNboolean",
+   "params": [
+    "NVNdevice*",
+    "const int*",
+    "NVNformat"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnDeviceRegisterFastClearColorui",
+   "ret": "NVNboolean",
+   "params": [
+    "NVNdevice*",
+    "const uint32_t*",
+    "NVNformat"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnDeviceRegisterFastClearDepth",
+   "ret": "NVNboolean",
+   "params": [
+    "NVNdevice*",
+    "float"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnDeviceSetDebugLabel",
+   "ret": "void",
+   "params": [
+    "NVNdevice*",
+    "const char*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnDeviceSetDepthMode",
+   "ret": "void",
+   "params": [
+    "NVNdevice*",
+    "NVNdepthMode"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnDeviceSetIntermediateShaderCache",
+   "ret": "void",
+   "params": [
+    "NVNdevice*",
+    "int"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnDeviceSetWindowOriginMode",
+   "ret": "void",
+   "params": [
+    "NVNdevice*",
+    "NVNwindowOriginMode"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnDeviceWalkDebugDatabase",
+   "ret": "void",
+   "params": [
+    "const NVNdevice*",
+    "NVNdebugObjectType",
+    "PFNNVNWALKDEBUGDATABASECALLBACKPROC",
+    "void*"
+   ],
+   "arity": 4
+  },
+  {
+   "name": "nvnEventBuilderSetDefaults",
+   "ret": "void",
+   "params": [
+    "NVNeventBuilder*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnEventBuilderSetStorage",
+   "ret": "void",
+   "params": [
+    "NVNeventBuilder*",
+    "const NVNmemoryPool*",
+    "int64_t"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnEventFinalize",
+   "ret": "void",
+   "params": [
+    "NVNevent*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnEventGetValue",
+   "ret": "uint32_t",
+   "params": [
+    "const NVNevent*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnEventInitialize",
+   "ret": "NVNboolean",
+   "params": [
+    "NVNevent*",
+    "const NVNeventBuilder*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnEventSignal",
+   "ret": "void",
+   "params": [
+    "NVNevent*",
+    "NVNeventSignalMode",
+    "uint32_t"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnMemoryPoolBuilderGetFlags",
+   "ret": "NVNmemoryPoolFlags",
+   "params": [
+    "const NVNmemoryPoolBuilder*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnMemoryPoolBuilderGetMemory",
+   "ret": "void",
+   "params": [
+    "const NVNmemoryPoolBuilder*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnMemoryPoolBuilderGetSize",
+   "ret": "size_t",
+   "params": [
+    "const NVNmemoryPoolBuilder*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnMemoryPoolBuilderSetDefaults",
+   "ret": "void",
+   "params": [
+    "NVNmemoryPoolBuilder*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnMemoryPoolBuilderSetDevice",
+   "ret": "void",
+   "params": [
+    "NVNmemoryPoolBuilder*",
+    "NVNdevice*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnMemoryPoolBuilderSetFlags",
+   "ret": "void",
+   "params": [
+    "NVNmemoryPoolBuilder*",
+    "int"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnMemoryPoolBuilderSetStorage",
+   "ret": "void",
+   "params": [
+    "NVNmemoryPoolBuilder*",
+    "void*",
+    "size_t"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnMemoryPoolFinalize",
+   "ret": "void",
+   "params": [
+    "NVNmemoryPool*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnMemoryPoolFlushMappedRange",
+   "ret": "void",
+   "params": [
+    "const NVNmemoryPool*",
+    "ptrdiff_t",
+    "size_t"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnMemoryPoolGetBufferAddress",
+   "ret": "NVNbufferAddress",
+   "params": [
+    "const NVNmemoryPool*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnMemoryPoolGetFlags",
+   "ret": "NVNmemoryPoolFlags",
+   "params": [
+    "const NVNmemoryPool*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnMemoryPoolGetSize",
+   "ret": "size_t",
+   "params": [
+    "const NVNmemoryPool*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnMemoryPoolInitialize",
+   "ret": "NVNboolean",
+   "params": [
+    "NVNmemoryPool*",
+    "const NVNmemoryPoolBuilder*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnMemoryPoolInvalidateMappedRange",
+   "ret": "void",
+   "params": [
+    "const NVNmemoryPool*",
+    "ptrdiff_t",
+    "size_t"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnMemoryPoolMapVirtual",
+   "ret": "NVNboolean",
+   "params": [
+    "NVNmemoryPool*",
+    "int",
+    "const NVNmappingRequest*"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnMemoryPoolSetDebugLabel",
+   "ret": "void",
+   "params": [
+    "NVNmemoryPool*",
+    "const char*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnMultisampleStateGetAlphaToCoverageDither",
+   "ret": "NVNboolean",
+   "params": [
+    "const NVNmultisampleState*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnMultisampleStateGetAlphaToCoverageEnable",
+   "ret": "NVNboolean",
+   "params": [
+    "const NVNmultisampleState*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnMultisampleStateGetCoverageModulationMode",
+   "ret": "NVNcoverageModulationMode",
+   "params": [
+    "const NVNmultisampleState*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnMultisampleStateGetCoverageToColorEnable",
+   "ret": "NVNboolean",
+   "params": [
+    "const NVNmultisampleState*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnMultisampleStateGetCoverageToColorOutput",
+   "ret": "int",
+   "params": [
+    "const NVNmultisampleState*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnMultisampleStateGetMultisampleEnable",
+   "ret": "NVNboolean",
+   "params": [
+    "const NVNmultisampleState*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnMultisampleStateGetRasterSamples",
+   "ret": "int",
+   "params": [
+    "NVNmultisampleState*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnMultisampleStateGetSampleLocationsEnable",
+   "ret": "NVNboolean",
+   "params": [
+    "const NVNmultisampleState*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnMultisampleStateGetSampleLocationsGrid",
+   "ret": "void",
+   "params": [
+    "NVNmultisampleState*",
+    "int*",
+    "int*"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnMultisampleStateGetSampleLocationsGridEnable",
+   "ret": "NVNboolean",
+   "params": [
+    "const NVNmultisampleState*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnMultisampleStateGetSamples",
+   "ret": "int",
+   "params": [
+    "const NVNmultisampleState*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnMultisampleStateSetAlphaToCoverageDither",
+   "ret": "void",
+   "params": [
+    "NVNmultisampleState*",
+    "uint32_t"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnMultisampleStateSetAlphaToCoverageEnable",
+   "ret": "void",
+   "params": [
+    "NVNmultisampleState*",
+    "uint32_t"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnMultisampleStateSetCoverageModulationMode",
+   "ret": "void",
+   "params": [
+    "NVNmultisampleState*",
+    "NVNcoverageModulationMode"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnMultisampleStateSetCoverageToColorEnable",
+   "ret": "void",
+   "params": [
+    "NVNmultisampleState*",
+    "uint32_t"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnMultisampleStateSetCoverageToColorOutput",
+   "ret": "void",
+   "params": [
+    "NVNmultisampleState*",
+    "int"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnMultisampleStateSetDefaults",
+   "ret": "void",
+   "params": [
+    "NVNmultisampleState*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnMultisampleStateSetMultisampleEnable",
+   "ret": "void",
+   "params": [
+    "NVNmultisampleState*",
+    "uint32_t"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnMultisampleStateSetRasterSamples",
+   "ret": "void",
+   "params": [
+    "NVNmultisampleState*",
+    "int"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnMultisampleStateSetSampleLocations",
+   "ret": "void",
+   "params": [
+    "NVNmultisampleState*",
+    "int",
+    "int",
+    "const float*"
+   ],
+   "arity": 4
+  },
+  {
+   "name": "nvnMultisampleStateSetSampleLocationsEnable",
+   "ret": "void",
+   "params": [
+    "NVNmultisampleState*",
+    "uint32_t"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnMultisampleStateSetSampleLocationsGridEnable",
+   "ret": "void",
+   "params": [
+    "NVNmultisampleState*",
+    "uint32_t"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnMultisampleStateSetSamples",
+   "ret": "void",
+   "params": [
+    "NVNmultisampleState*",
+    "int"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnPolygonStateGetCullFace",
+   "ret": "NVNface",
+   "params": [
+    "const NVNpolygonState*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnPolygonStateGetFrontFace",
+   "ret": "NVNfrontFace",
+   "params": [
+    "const NVNpolygonState*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnPolygonStateGetPolygonMode",
+   "ret": "NVNpolygonMode",
+   "params": [
+    "const NVNpolygonState*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnPolygonStateGetPolygonOffsetEnables",
+   "ret": "NVNpolygonOffsetEnable",
+   "params": [
+    "const NVNpolygonState*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnPolygonStateSetCullFace",
+   "ret": "void",
+   "params": [
+    "NVNpolygonState*",
+    "NVNface"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnPolygonStateSetDefaults",
+   "ret": "void",
+   "params": [
+    "NVNpolygonState*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnPolygonStateSetFrontFace",
+   "ret": "void",
+   "params": [
+    "NVNpolygonState*",
+    "NVNfrontFace"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnPolygonStateSetPolygonMode",
+   "ret": "void",
+   "params": [
+    "NVNpolygonState*",
+    "NVNpolygonMode"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnPolygonStateSetPolygonOffsetEnables",
+   "ret": "void",
+   "params": [
+    "NVNpolygonState*",
+    "int"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnProgramFinalize",
+   "ret": "void",
+   "params": [
+    "NVNprogram*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnProgramInitialize",
+   "ret": "NVNboolean",
+   "params": [
+    "NVNprogram*",
+    "NVNdevice*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnProgramSetDebugLabel",
+   "ret": "void",
+   "params": [
+    "NVNprogram*",
+    "const char*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnProgramSetShaders",
+   "ret": "NVNboolean",
+   "params": [
+    "NVNprogram*",
+    "int",
+    "const NVNshaderData*"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnProgramSetSubroutineLinkage",
+   "ret": "NVNboolean",
+   "params": [
+    "NVNprogram*",
+    "int",
+    "const NVNsubroutineLinkageMapPtr*"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnQueueAcquireTexture",
+   "ret": "NVNqueueAcquireTextureResult",
+   "params": [
+    "NVNqueue*",
+    "NVNwindow*",
+    "int*"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnQueueBuilderGetQueueMemorySize",
+   "ret": "size_t",
+   "params": [
+    "const NVNqueueBuilder*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnQueueBuilderSetCommandFlushThreshold",
+   "ret": "void",
+   "params": [
+    "NVNqueueBuilder*",
+    "size_t"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnQueueBuilderSetCommandMemorySize",
+   "ret": "void",
+   "params": [
+    "NVNqueueBuilder*",
+    "size_t"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnQueueBuilderSetComputeMemorySize",
+   "ret": "void",
+   "params": [
+    "NVNqueueBuilder*",
+    "size_t"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnQueueBuilderSetControlMemorySize",
+   "ret": "void",
+   "params": [
+    "NVNqueueBuilder*",
+    "size_t"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnQueueBuilderSetDefaults",
+   "ret": "void",
+   "params": [
+    "NVNqueueBuilder*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnQueueBuilderSetDevice",
+   "ret": "void",
+   "params": [
+    "NVNqueueBuilder*",
+    "NVNdevice*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnQueueBuilderSetFlags",
+   "ret": "void",
+   "params": [
+    "NVNqueueBuilder*",
+    "int"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnQueueBuilderSetQueueMemory",
+   "ret": "void",
+   "params": [
+    "NVNqueueBuilder*",
+    "void*",
+    "size_t"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnQueueFenceSync",
+   "ret": "void",
+   "params": [
+    "NVNqueue*",
+    "NVNsync*",
+    "NVNsyncCondition",
+    "int"
+   ],
+   "arity": 4
+  },
+  {
+   "name": "nvnQueueFinalize",
+   "ret": "void",
+   "params": [
+    "NVNqueue*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnQueueFinish",
+   "ret": "void",
+   "params": [
+    "NVNqueue*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnQueueFlush",
+   "ret": "void",
+   "params": [
+    "NVNqueue*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnQueueGetError",
+   "ret": "NVNqueueGetErrorResult",
+   "params": [
+    "NVNqueue*",
+    "NVNqueueErrorInfo*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnQueueGetTotalCommandMemoryUsed",
+   "ret": "size_t",
+   "params": [
+    "NVNqueue*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnQueueGetTotalComputeMemoryUsed",
+   "ret": "size_t",
+   "params": [
+    "NVNqueue*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnQueueGetTotalControlMemoryUsed",
+   "ret": "size_t",
+   "params": [
+    "NVNqueue*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnQueueInitialize",
+   "ret": "NVNboolean",
+   "params": [
+    "NVNqueue*",
+    "const NVNqueueBuilder*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnQueuePresentTexture",
+   "ret": "void",
+   "params": [
+    "NVNqueue*",
+    "NVNwindow*",
+    "int"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnQueueResetMemoryUsageCounts",
+   "ret": "void",
+   "params": [
+    "NVNqueue*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnQueueSetDebugLabel",
+   "ret": "void",
+   "params": [
+    "NVNqueue*",
+    "const char*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnQueueSubmitCommands",
+   "ret": "void",
+   "params": [
+    "NVNqueue*",
+    "int",
+    "const NVNcommandHandle*"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnQueueWaitSync",
+   "ret": "NVNboolean",
+   "params": [
+    "NVNqueue*",
+    "const NVNsync*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnSamplerBuilderGetBorderColor",
+   "ret": "void",
+   "params": [
+    "const NVNsamplerBuilder*",
+    "float*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnSamplerBuilderGetBorderColori",
+   "ret": "void",
+   "params": [
+    "const NVNsamplerBuilder*",
+    "int*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnSamplerBuilderGetBorderColorui",
+   "ret": "void",
+   "params": [
+    "const NVNsamplerBuilder*",
+    "uint32_t*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnSamplerBuilderGetCompare",
+   "ret": "void",
+   "params": [
+    "const NVNsamplerBuilder*",
+    "NVNcompareMode*",
+    "NVNcompareFunc*"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnSamplerBuilderGetLodBias",
+   "ret": "float",
+   "params": [
+    "const NVNsamplerBuilder*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnSamplerBuilderGetLodClamp",
+   "ret": "void",
+   "params": [
+    "const NVNsamplerBuilder*",
+    "float*",
+    "float*"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnSamplerBuilderGetLodSnap",
+   "ret": "float",
+   "params": [
+    "const NVNsamplerBuilder*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnSamplerBuilderGetMaxAnisotropy",
+   "ret": "float",
+   "params": [
+    "const NVNsamplerBuilder*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnSamplerBuilderGetMinMagFilter",
+   "ret": "void",
+   "params": [
+    "const NVNsamplerBuilder*",
+    "NVNminFilter*",
+    "NVNmagFilter*"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnSamplerBuilderGetReductionFilter",
+   "ret": "NVNsamplerReduction",
+   "params": [
+    "const NVNsamplerBuilder*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnSamplerBuilderGetWrapMode",
+   "ret": "void",
+   "params": [
+    "const NVNsamplerBuilder*",
+    "NVNwrapMode*",
+    "NVNwrapMode*",
+    "NVNwrapMode*"
+   ],
+   "arity": 4
+  },
+  {
+   "name": "nvnSamplerBuilderSetBorderColor",
+   "ret": "void",
+   "params": [
+    "NVNsamplerBuilder*",
+    "const float*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnSamplerBuilderSetBorderColori",
+   "ret": "void",
+   "params": [
+    "NVNsamplerBuilder*",
+    "const int*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnSamplerBuilderSetBorderColorui",
+   "ret": "void",
+   "params": [
+    "NVNsamplerBuilder*",
+    "const uint32_t*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnSamplerBuilderSetCompare",
+   "ret": "void",
+   "params": [
+    "NVNsamplerBuilder*",
+    "NVNcompareMode",
+    "NVNcompareFunc"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnSamplerBuilderSetDefaults",
+   "ret": "void",
+   "params": [
+    "NVNsamplerBuilder*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnSamplerBuilderSetDevice",
+   "ret": "void",
+   "params": [
+    "NVNsamplerBuilder*",
+    "NVNdevice*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnSamplerBuilderSetLodBias",
+   "ret": "void",
+   "params": [
+    "NVNsamplerBuilder*",
+    "float"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnSamplerBuilderSetLodClamp",
+   "ret": "void",
+   "params": [
+    "NVNsamplerBuilder*",
+    "float",
+    "float"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnSamplerBuilderSetLodSnap",
+   "ret": "void",
+   "params": [
+    "NVNsamplerBuilder*",
+    "float"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnSamplerBuilderSetMaxAnisotropy",
+   "ret": "void",
+   "params": [
+    "NVNsamplerBuilder*",
+    "float"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnSamplerBuilderSetMinMagFilter",
+   "ret": "void",
+   "params": [
+    "NVNsamplerBuilder*",
+    "NVNminFilter",
+    "NVNmagFilter"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnSamplerBuilderSetReductionFilter",
+   "ret": "void",
+   "params": [
+    "NVNsamplerBuilder*",
+    "NVNsamplerReduction"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnSamplerBuilderSetWrapMode",
+   "ret": "void",
+   "params": [
+    "NVNsamplerBuilder*",
+    "NVNwrapMode",
+    "NVNwrapMode",
+    "NVNwrapMode"
+   ],
+   "arity": 4
+  },
+  {
+   "name": "nvnSamplerCompare",
+   "ret": "NVNboolean",
+   "params": [
+    "const NVNsampler*",
+    "const NVNsampler*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnSamplerFinalize",
+   "ret": "void",
+   "params": [
+    "NVNsampler*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnSamplerGetBorderColor",
+   "ret": "void",
+   "params": [
+    "const NVNsampler*",
+    "float*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnSamplerGetBorderColori",
+   "ret": "void",
+   "params": [
+    "const NVNsampler*",
+    "int*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnSamplerGetBorderColorui",
+   "ret": "void",
+   "params": [
+    "const NVNsampler*",
+    "uint32_t*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnSamplerGetCompare",
+   "ret": "void",
+   "params": [
+    "const NVNsampler*",
+    "NVNcompareMode*",
+    "NVNcompareFunc*"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnSamplerGetDebugID",
+   "ret": "uint64_t",
+   "params": [
+    "const NVNsampler*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnSamplerGetLodBias",
+   "ret": "float",
+   "params": [
+    "const NVNsampler*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnSamplerGetLodClamp",
+   "ret": "void",
+   "params": [
+    "const NVNsampler*",
+    "float*",
+    "float*"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnSamplerGetMaxAnisotropy",
+   "ret": "float",
+   "params": [
+    "const NVNsampler*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnSamplerGetMinMagFilter",
+   "ret": "void",
+   "params": [
+    "const NVNsampler*",
+    "NVNminFilter*",
+    "NVNmagFilter*"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnSamplerGetReductionFilter",
+   "ret": "NVNsamplerReduction",
+   "params": [
+    "const NVNsampler*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnSamplerGetWrapMode",
+   "ret": "void",
+   "params": [
+    "const NVNsampler*",
+    "NVNwrapMode*",
+    "NVNwrapMode*",
+    "NVNwrapMode*"
+   ],
+   "arity": 4
+  },
+  {
+   "name": "nvnSamplerInitialize",
+   "ret": "NVNboolean",
+   "params": [
+    "NVNsampler*",
+    "const NVNsamplerBuilder*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnSamplerPoolFinalize",
+   "ret": "void",
+   "params": [
+    "NVNsamplerPool*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnSamplerPoolGetMemoryOffset",
+   "ret": "ptrdiff_t",
+   "params": [
+    "const NVNsamplerPool*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnSamplerPoolGetSize",
+   "ret": "int",
+   "params": [
+    "const NVNsamplerPool*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnSamplerPoolInitialize",
+   "ret": "NVNboolean",
+   "params": [
+    "NVNsamplerPool*",
+    "const NVNmemoryPool*",
+    "ptrdiff_t",
+    "int"
+   ],
+   "arity": 4
+  },
+  {
+   "name": "nvnSamplerPoolRegisterSampler",
+   "ret": "void",
+   "params": [
+    "const NVNsamplerPool*",
+    "int",
+    "const NVNsampler*"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnSamplerPoolRegisterSamplerBuilder",
+   "ret": "void",
+   "params": [
+    "const NVNsamplerPool*",
+    "int",
+    "const NVNsamplerBuilder*"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnSamplerPoolSetDebugLabel",
+   "ret": "void",
+   "params": [
+    "NVNsamplerPool*",
+    "const char*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnSamplerSetDebugLabel",
+   "ret": "void",
+   "params": [
+    "NVNsampler*",
+    "const char*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnSyncFinalize",
+   "ret": "void",
+   "params": [
+    "NVNsync*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnSyncInitialize",
+   "ret": "NVNboolean",
+   "params": [
+    "NVNsync*",
+    "NVNdevice*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnSyncSetDebugLabel",
+   "ret": "void",
+   "params": [
+    "NVNsync*",
+    "const char*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnSyncWait",
+   "ret": "NVNsyncWaitResult",
+   "params": [
+    "const NVNsync*",
+    "uint64_t"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnTextureBuilderGetDepth",
+   "ret": "int",
+   "params": [
+    "const NVNtextureBuilder*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnTextureBuilderGetDepthStencilMode",
+   "ret": "NVNtextureDepthStencilMode",
+   "params": [
+    "const NVNtextureBuilder*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnTextureBuilderGetFlags",
+   "ret": "NVNtextureFlags",
+   "params": [
+    "const NVNtextureBuilder*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnTextureBuilderGetFormat",
+   "ret": "NVNformat",
+   "params": [
+    "const NVNtextureBuilder*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnTextureBuilderGetGLTextureName",
+   "ret": "uint32_t",
+   "params": [
+    "const NVNtextureBuilder*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnTextureBuilderGetHeight",
+   "ret": "int",
+   "params": [
+    "const NVNtextureBuilder*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnTextureBuilderGetLevels",
+   "ret": "int",
+   "params": [
+    "const NVNtextureBuilder*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnTextureBuilderGetMemoryOffset",
+   "ret": "ptrdiff_t",
+   "params": [
+    "const NVNtextureBuilder*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnTextureBuilderGetMemoryPool",
+   "ret": "NVNmemoryPool",
+   "params": [
+    "const NVNtextureBuilder*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnTextureBuilderGetSamples",
+   "ret": "int",
+   "params": [
+    "const NVNtextureBuilder*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnTextureBuilderGetSparseTileLayout",
+   "ret": "void",
+   "params": [
+    "const NVNtextureBuilder*",
+    "NVNtextureSparseTileLayout*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnTextureBuilderGetStorageAlignment",
+   "ret": "size_t",
+   "params": [
+    "const NVNtextureBuilder*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnTextureBuilderGetStorageClass",
+   "ret": "NVNstorageClass",
+   "params": [
+    "const NVNtextureBuilder*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnTextureBuilderGetStorageSize",
+   "ret": "size_t",
+   "params": [
+    "const NVNtextureBuilder*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnTextureBuilderGetStride",
+   "ret": "ptrdiff_t",
+   "params": [
+    "const NVNtextureBuilder*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnTextureBuilderGetSwizzle",
+   "ret": "void",
+   "params": [
+    "const NVNtextureBuilder*",
+    "NVNtextureSwizzle*",
+    "NVNtextureSwizzle*",
+    "NVNtextureSwizzle*",
+    "NVNtextureSwizzle*"
+   ],
+   "arity": 5
+  },
+  {
+   "name": "nvnTextureBuilderGetTarget",
+   "ret": "NVNtextureTarget",
+   "params": [
+    "const NVNtextureBuilder*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnTextureBuilderGetWidth",
+   "ret": "int",
+   "params": [
+    "const NVNtextureBuilder*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnTextureBuilderGetZCullStorageSize",
+   "ret": "size_t",
+   "params": [
+    "const NVNtextureBuilder*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnTextureBuilderSetDefaults",
+   "ret": "void",
+   "params": [
+    "NVNtextureBuilder*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnTextureBuilderSetDepth",
+   "ret": "void",
+   "params": [
+    "NVNtextureBuilder*",
+    "int"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnTextureBuilderSetDepthStencilMode",
+   "ret": "void",
+   "params": [
+    "NVNtextureBuilder*",
+    "NVNtextureDepthStencilMode"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnTextureBuilderSetDevice",
+   "ret": "void",
+   "params": [
+    "NVNtextureBuilder*",
+    "NVNdevice*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnTextureBuilderSetFlags",
+   "ret": "void",
+   "params": [
+    "NVNtextureBuilder*",
+    "int"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnTextureBuilderSetFormat",
+   "ret": "void",
+   "params": [
+    "NVNtextureBuilder*",
+    "NVNformat"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnTextureBuilderSetGLTextureName",
+   "ret": "void",
+   "params": [
+    "NVNtextureBuilder*",
+    "uint32_t"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnTextureBuilderSetHeight",
+   "ret": "void",
+   "params": [
+    "NVNtextureBuilder*",
+    "int"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnTextureBuilderSetLevels",
+   "ret": "void",
+   "params": [
+    "NVNtextureBuilder*",
+    "int"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnTextureBuilderSetPackagedTextureData",
+   "ret": "void",
+   "params": [
+    "NVNtextureBuilder*",
+    "const void*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnTextureBuilderSetPackagedTextureLayout",
+   "ret": "void",
+   "params": [
+    "NVNtextureBuilder*",
+    "const NVNpackagedTextureLayout*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnTextureBuilderSetSamples",
+   "ret": "void",
+   "params": [
+    "NVNtextureBuilder*",
+    "int"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnTextureBuilderSetSize1D",
+   "ret": "void",
+   "params": [
+    "NVNtextureBuilder*",
+    "int"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnTextureBuilderSetSize2D",
+   "ret": "void",
+   "params": [
+    "NVNtextureBuilder*",
+    "int",
+    "int"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnTextureBuilderSetSize3D",
+   "ret": "void",
+   "params": [
+    "NVNtextureBuilder*",
+    "int",
+    "int",
+    "int"
+   ],
+   "arity": 4
+  },
+  {
+   "name": "nvnTextureBuilderSetStorage",
+   "ret": "void",
+   "params": [
+    "NVNtextureBuilder*",
+    "NVNmemoryPool*",
+    "ptrdiff_t"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnTextureBuilderSetStride",
+   "ret": "void",
+   "params": [
+    "NVNtextureBuilder*",
+    "ptrdiff_t"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnTextureBuilderSetSwizzle",
+   "ret": "void",
+   "params": [
+    "NVNtextureBuilder*",
+    "NVNtextureSwizzle",
+    "NVNtextureSwizzle",
+    "NVNtextureSwizzle",
+    "NVNtextureSwizzle"
+   ],
+   "arity": 5
+  },
+  {
+   "name": "nvnTextureBuilderSetTarget",
+   "ret": "void",
+   "params": [
+    "NVNtextureBuilder*",
+    "NVNtextureTarget"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnTextureBuilderSetWidth",
+   "ret": "void",
+   "params": [
+    "NVNtextureBuilder*",
+    "int"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnTextureCompare",
+   "ret": "NVNboolean",
+   "params": [
+    "const NVNtexture*",
+    "const NVNtexture*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnTextureFinalize",
+   "ret": "void",
+   "params": [
+    "NVNtexture*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnTextureFlushTexels",
+   "ret": "void",
+   "params": [
+    "const NVNtexture*",
+    "const NVNtextureView*",
+    "const NVNcopyRegion*"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnTextureGetDebugID",
+   "ret": "uint64_t",
+   "params": [
+    "const NVNtexture*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnTextureGetDepth",
+   "ret": "int",
+   "params": [
+    "const NVNtexture*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnTextureGetDepthStencilMode",
+   "ret": "NVNtextureDepthStencilMode",
+   "params": [
+    "const NVNtexture*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnTextureGetFlags",
+   "ret": "NVNtextureFlags",
+   "params": [
+    "const NVNtexture*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnTextureGetFormat",
+   "ret": "NVNformat",
+   "params": [
+    "const NVNtexture*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnTextureGetHeight",
+   "ret": "int",
+   "params": [
+    "const NVNtexture*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnTextureGetLevels",
+   "ret": "int",
+   "params": [
+    "const NVNtexture*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnTextureGetMemoryOffset",
+   "ret": "ptrdiff_t",
+   "params": [
+    "const NVNtexture*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnTextureGetSamples",
+   "ret": "int",
+   "params": [
+    "const NVNtexture*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnTextureGetSparseTileLayout",
+   "ret": "void",
+   "params": [
+    "const NVNtexture*",
+    "NVNtextureSparseTileLayout*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnTextureGetStorageClass",
+   "ret": "NVNstorageClass",
+   "params": [
+    "const NVNtexture*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnTextureGetStorageSize",
+   "ret": "int",
+   "params": [
+    "const NVNtexture*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnTextureGetStride",
+   "ret": "ptrdiff_t",
+   "params": [
+    "const NVNtexture*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnTextureGetSwizzle",
+   "ret": "void",
+   "params": [
+    "const NVNtexture*",
+    "NVNtextureSwizzle*",
+    "NVNtextureSwizzle*",
+    "NVNtextureSwizzle*",
+    "NVNtextureSwizzle*"
+   ],
+   "arity": 5
+  },
+  {
+   "name": "nvnTextureGetTarget",
+   "ret": "NVNtextureTarget",
+   "params": [
+    "const NVNtexture*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnTextureGetTextureAddress",
+   "ret": "NVNtextureAddress",
+   "params": [
+    "const NVNtexture*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnTextureGetViewOffset",
+   "ret": "ptrdiff_t",
+   "params": [
+    "const NVNtexture*",
+    "const NVNtextureView*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnTextureGetWidth",
+   "ret": "int",
+   "params": [
+    "const NVNtexture*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnTextureGetZCullStorageSize",
+   "ret": "size_t",
+   "params": [
+    "const NVNtexture*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnTextureInitialize",
+   "ret": "NVNboolean",
+   "params": [
+    "NVNtexture*",
+    "const NVNtextureBuilder*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnTextureInvalidateTexels",
+   "ret": "void",
+   "params": [
+    "const NVNtexture*",
+    "const NVNtextureView*",
+    "const NVNcopyRegion*"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnTexturePoolFinalize",
+   "ret": "void",
+   "params": [
+    "NVNtexturePool*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnTexturePoolGetMemoryOffset",
+   "ret": "ptrdiff_t",
+   "params": [
+    "const NVNtexturePool*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnTexturePoolGetSize",
+   "ret": "int",
+   "params": [
+    "const NVNtexturePool*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnTexturePoolInitialize",
+   "ret": "NVNboolean",
+   "params": [
+    "NVNtexturePool*",
+    "const NVNmemoryPool*",
+    "ptrdiff_t",
+    "int"
+   ],
+   "arity": 4
+  },
+  {
+   "name": "nvnTexturePoolRegisterImage",
+   "ret": "void",
+   "params": [
+    "const NVNtexturePool*",
+    "int",
+    "const NVNtexture*",
+    "const NVNtextureView*"
+   ],
+   "arity": 4
+  },
+  {
+   "name": "nvnTexturePoolRegisterTexture",
+   "ret": "void",
+   "params": [
+    "const NVNtexturePool*",
+    "int",
+    "const NVNtexture*",
+    "const NVNtextureView*"
+   ],
+   "arity": 4
+  },
+  {
+   "name": "nvnTexturePoolSetDebugLabel",
+   "ret": "void",
+   "params": [
+    "NVNtexturePool*",
+    "const char*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnTextureReadTexels",
+   "ret": "void",
+   "params": [
+    "const NVNtexture*",
+    "const NVNtextureView*",
+    "const NVNcopyRegion*",
+    "void*"
+   ],
+   "arity": 4
+  },
+  {
+   "name": "nvnTextureReadTexelsStrided",
+   "ret": "void",
+   "params": [
+    "const NVNtexture*",
+    "const NVNtextureView*",
+    "const NVNcopyRegion*",
+    "void*",
+    "ptrdiff_t",
+    "ptrdiff_t"
+   ],
+   "arity": 6
+  },
+  {
+   "name": "nvnTextureSetDebugLabel",
+   "ret": "void",
+   "params": [
+    "NVNtexture*",
+    "const char*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnTextureViewCompare",
+   "ret": "NVNboolean",
+   "params": [
+    "const NVNtextureView*",
+    "const NVNtextureView*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnTextureViewGetDepthStencilMode",
+   "ret": "NVNboolean",
+   "params": [
+    "const NVNtextureView*",
+    "NVNtextureDepthStencilMode*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnTextureViewGetFormat",
+   "ret": "NVNboolean",
+   "params": [
+    "const NVNtextureView*",
+    "NVNformat*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnTextureViewGetLayers",
+   "ret": "NVNboolean",
+   "params": [
+    "const NVNtextureView*",
+    "int*",
+    "int*"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnTextureViewGetLevels",
+   "ret": "NVNboolean",
+   "params": [
+    "const NVNtextureView*",
+    "int*",
+    "int*"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnTextureViewGetSwizzle",
+   "ret": "NVNboolean",
+   "params": [
+    "const NVNtextureView*",
+    "NVNtextureSwizzle*",
+    "NVNtextureSwizzle*",
+    "NVNtextureSwizzle*",
+    "NVNtextureSwizzle*"
+   ],
+   "arity": 5
+  },
+  {
+   "name": "nvnTextureViewGetTarget",
+   "ret": "NVNboolean",
+   "params": [
+    "const NVNtextureView*",
+    "NVNtextureTarget*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnTextureViewSetDefaults",
+   "ret": "void",
+   "params": [
+    "NVNtextureView*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnTextureViewSetDepthStencilMode",
+   "ret": "void",
+   "params": [
+    "NVNtextureView*",
+    "NVNtextureDepthStencilMode"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnTextureViewSetFormat",
+   "ret": "void",
+   "params": [
+    "NVNtextureView*",
+    "NVNformat"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnTextureViewSetLayers",
+   "ret": "void",
+   "params": [
+    "NVNtextureView*",
+    "int",
+    "int"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnTextureViewSetLevels",
+   "ret": "void",
+   "params": [
+    "NVNtextureView*",
+    "int",
+    "int"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnTextureViewSetSwizzle",
+   "ret": "void",
+   "params": [
+    "NVNtextureView*",
+    "NVNtextureSwizzle",
+    "NVNtextureSwizzle",
+    "NVNtextureSwizzle",
+    "NVNtextureSwizzle"
+   ],
+   "arity": 5
+  },
+  {
+   "name": "nvnTextureViewSetTarget",
+   "ret": "void",
+   "params": [
+    "NVNtextureView*",
+    "NVNtextureTarget"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnTextureWriteTexels",
+   "ret": "void",
+   "params": [
+    "const NVNtexture*",
+    "const NVNtextureView*",
+    "const NVNcopyRegion*",
+    "const void*"
+   ],
+   "arity": 4
+  },
+  {
+   "name": "nvnTextureWriteTexelsStrided",
+   "ret": "void",
+   "params": [
+    "const NVNtexture*",
+    "const NVNtextureView*",
+    "const NVNcopyRegion*",
+    "const void*",
+    "ptrdiff_t",
+    "ptrdiff_t"
+   ],
+   "arity": 6
+  },
+  {
+   "name": "nvnVertexAttribStateGetFormat",
+   "ret": "void",
+   "params": [
+    "const NVNvertexAttribState*",
+    "NVNformat*",
+    "ptrdiff_t*"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnVertexAttribStateGetStreamIndex",
+   "ret": "int",
+   "params": [
+    "const NVNvertexAttribState*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnVertexAttribStateSetDefaults",
+   "ret": "void",
+   "params": [
+    "NVNvertexAttribState*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnVertexAttribStateSetFormat",
+   "ret": "void",
+   "params": [
+    "NVNvertexAttribState*",
+    "NVNformat",
+    "ptrdiff_t"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnVertexAttribStateSetStreamIndex",
+   "ret": "void",
+   "params": [
+    "NVNvertexAttribState*",
+    "int"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnVertexStreamStateGetDivisor",
+   "ret": "int",
+   "params": [
+    "const NVNvertexStreamState*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnVertexStreamStateGetStride",
+   "ret": "ptrdiff_t",
+   "params": [
+    "const NVNvertexStreamState*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnVertexStreamStateSetDefaults",
+   "ret": "void",
+   "params": [
+    "NVNvertexStreamState*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnVertexStreamStateSetDivisor",
+   "ret": "void",
+   "params": [
+    "NVNvertexStreamState*",
+    "int"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnVertexStreamStateSetStride",
+   "ret": "void",
+   "params": [
+    "NVNvertexStreamState*",
+    "ptrdiff_t"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnWindowAcquireTexture",
+   "ret": "NVNwindowAcquireTextureResult",
+   "params": [
+    "NVNwindow*",
+    "NVNsync*",
+    "int*"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnWindowBuilderGetNativeWindow",
+   "ret": "NVNnativeWindow",
+   "params": [
+    "const NVNwindowBuilder*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnWindowBuilderGetPresentInterval",
+   "ret": "int",
+   "params": [
+    "const NVNwindowBuilder*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnWindowBuilderSetDefaults",
+   "ret": "void",
+   "params": [
+    "NVNwindowBuilder*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnWindowBuilderSetDevice",
+   "ret": "void",
+   "params": [
+    "NVNwindowBuilder*",
+    "NVNdevice*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnWindowBuilderSetNativeWindow",
+   "ret": "void",
+   "params": [
+    "NVNwindowBuilder*",
+    "NVNnativeWindow"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnWindowBuilderSetPresentInterval",
+   "ret": "void",
+   "params": [
+    "NVNwindowBuilder*",
+    "int"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnWindowBuilderSetTextures",
+   "ret": "void",
+   "params": [
+    "NVNwindowBuilder*",
+    "int",
+    "NVNtexture* const*"
+   ],
+   "arity": 3
+  },
+  {
+   "name": "nvnWindowFinalize",
+   "ret": "void",
+   "params": [
+    "NVNwindow*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnWindowGetCrop",
+   "ret": "void",
+   "params": [
+    "const NVNwindow*",
+    "NVNrectangle*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnWindowGetNativeWindow",
+   "ret": "NVNnativeWindow",
+   "params": [
+    "const NVNwindow*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnWindowGetPresentInterval",
+   "ret": "int",
+   "params": [
+    "const NVNwindow*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnWindowInitialize",
+   "ret": "NVNboolean",
+   "params": [
+    "NVNwindow*",
+    "const NVNwindowBuilder*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnWindowSetCrop",
+   "ret": "void",
+   "params": [
+    "NVNwindow*",
+    "int",
+    "int",
+    "int",
+    "int"
+   ],
+   "arity": 5
+  },
+  {
+   "name": "nvnWindowSetDebugLabel",
+   "ret": "void",
+   "params": [
+    "NVNwindow*",
+    "const char*"
+   ],
+   "arity": 2
+  },
+  {
+   "name": "nvnWindowSetPresentInterval",
+   "ret": "void",
+   "params": [
+    "NVNwindow*",
+    "int"
+   ],
+   "arity": 2
+  }
+ ]
+}

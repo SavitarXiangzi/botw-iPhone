@@ -5,32 +5,47 @@
  *
  *   DONE  device / queue / window / swapchain lifecycle
  *         memory pool -> zero-copy MTLBuffer over guest memory
- *         command buffer -> MTLCommandBuffer + render encoder
- *         viewport / scissor / drawArrays / present(blit fast path)
+ *         command buffer -> MTLCommandBuffer, viewport / scissor / drawArrays
+ *         present (blit fast path, cleared-drawable fallback)
  *
- *   TODO  shader translation (NVN ships prebuilt GPU ISA, not source)
- *         texture tiling, BCn -> ASTC/ETC2 transcode, format-mismatch present
- *         state objects beyond defaults, sync/fence, events, compute
+ *   TODO  render-target binding (nvnCommandBufferSetRenderTargets): until it
+ *         exists no MTLRenderCommandEncoder is ever created, so guest draws
+ *         are counted but not executed
+ *         texture objects (builder field offsets unverified) -> no MTLTexture
+ *         shader translation (NVN ships prebuilt Maxwell SASS, not source)
+ *         texture tiling, BCn -> ASTC/ETC2 transcode, compute, sync/fence
+ *
+ * Argument ABI: measured, not guessed
+ * -----------------------------------
+ * Every host proc receives the guest's x0..x7 in x[].  The shapes live in
+ * ios/nvn/signatures.json, extracted from the public nxnative prototype list
+ * (MIT).  Three consequences decide this whole file:
+ *
+ *   - NVN objects are GUEST memory.  nvnWindowInitialize(NVNwindow*, builder)
+ *     takes a pointer to the guest's own object; the host never owns that
+ *     storage and never hands one back.  Host state is therefore keyed by the
+ *     guest address, which is what x[0] holds on every object entry point.
+ *   - Return values go in w0, i.e. x[0].  NVNboolean is 1/0, and getters
+ *     overwrite x[0] with their result.
+ *   - Out-parameters are pointers into guest memory.  Unified memory means we
+ *     write through them directly, e.g. nvnWindowAcquireTexture(w, sync, &idx).
+ *
+ * The first version of this file got all three wrong (it treated x[0] as an
+ * out-parameter and returned host pointers to the guest), which compiles fine
+ * and would have made every later call dereference guest memory as a host
+ * object.  ios/nvn/signatures.json exists so that cannot happen quietly again.
  *
  * Two things this file deliberately does NOT do:
  *
  *   1. It never invents NVN enum values.  Formats, primitive types and index
- *      types are numbers whose real values live in Nintendo's nvn.h.  Guessing
- *      them would yield a backend that looks complete and is silently wrong.
- *      Until kEnumsVerified is flipped, every enum goes through log_once()
- *      and the call is dropped -- loudly, once per value.
+ *      types are numbers whose real values live in nvn.h.  Until
+ *      kEnumsVerified is flipped, every enum goes through log_once() and the
+ *      call is dropped -- loudly, once per value.
  *
  *   2. It never copies guest GPU memory "just in case".  iOS lives on unified
  *      memory, so the guest heap is already host-readable and Metal can wrap
  *      it with newBufferWithBytesNoCopy.  The requirement is that the guest
  *      allocator hands out page-aligned storage; see docs/IOS_PORTING.md.
- *
- * Handle convention
- * -----------------
- * NVN handles are opaque to the guest.  Here a handle is the 64-bit address of
- * a host object, and a "return a handle" is written into x[0] of the argument
- * block.  The emulator's handle registry turns that back into something the
- * guest can pass around.  Nothing in the guest ever dereferences it.
  */
 #if defined(__APPLE__)
 
@@ -80,7 +95,7 @@ void log_once(const char* what, unsigned value) {
 }
 
 /* ------------------------------------------------------------------ */
-/* objects                                                             */
+/* host state, keyed by the guest object address                       */
 /* ------------------------------------------------------------------ */
 
 struct Ctx {
@@ -91,6 +106,15 @@ struct Ctx {
     unsigned presents = 0;
     unsigned dropped = 0;
     bool ready = false;
+};
+
+struct Win {
+    CAMetalLayer* layer = nil;
+    unsigned numTextures = 0;
+    unsigned numActive = 0;
+    unsigned presentInterval = 1;
+    unsigned cursor = 0;
+    uint64_t textures[4] = {0, 0, 0, 0};   /* guest NVNtexture addresses */
 };
 
 struct Pool {
@@ -104,8 +128,8 @@ struct Tex {
     unsigned width = 0, height = 0, depth = 1, levels = 1, layers = 1;
     uint32_t format = 0;
     uint32_t target = 0;
-    Pool* pool = nullptr;
-    size_t offset = 0;
+    uint64_t pool = 0;
+    ptrdiff_t offset = 0;
     id<MTLTexture> mtl = nil;
 };
 
@@ -114,44 +138,71 @@ struct CmdBuf {
     unsigned draws = 0;
     id<MTLCommandBuffer> cb = nil;
     id<MTLRenderCommandEncoder> enc = nil;
-};
-
-struct Win {
-    CAMetalLayer* layer = nil;
-    unsigned numTextures = 0;
-    unsigned numActive = 0;
-    unsigned presentInterval = 1;
-    unsigned cursor = 0;
-    Tex* textures[4] = {nullptr, nullptr, nullptr, nullptr};
+    /* Recorded but not applied: there is no render target to apply them to. */
+    int clearIndex = 0;
+    int clearMask = 0;
+    float clear[4] = {0, 0, 0, 0};
 };
 
 /* Builder specs are gathered in a side table keyed by the guest's builder
  * pointer, because the guest owns that struct and its layout is not verified
  * yet.  Keeping the mapping here means only one place has to change once the
  * real offsets are known. */
+struct WinSpec {
+    uint64_t nativeWindow = 0;
+    unsigned presentInterval = 1;
+    unsigned numActive = 0;
+    unsigned numTextures = 0;
+    uint64_t textures[4] = {0, 0, 0, 0};
+};
+
 struct PoolSpec {
     void* storage = nullptr;
     size_t size = 0;
     uint32_t flags = 0;
 };
 
-struct WinSpec {
-    void* nativeWindow = nullptr;
-    unsigned presentInterval = 1;
-    unsigned numActive = 0;
-    unsigned numTextures = 0;
-    Tex* textures[4] = {nullptr, nullptr, nullptr, nullptr};
-};
-
 Ctx* ctx_of(nvngfx_ctx* ctx) { return reinterpret_cast<Ctx*>(ctx); }
 
 template <class T>
-T* obj(uint64_t h) { return reinterpret_cast<T*>(static_cast<uintptr_t>(h)); }
-template <class T>
-uint64_t handle(T* p) { return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(p)); }
+std::unordered_map<uint64_t, T*>& table() {
+    static std::unordered_map<uint64_t, T*> instance;
+    return instance;
+}
 
-std::unordered_map<const void*, PoolSpec> g_pool_specs;
-std::unordered_map<const void*, WinSpec> g_win_specs;
+template <class T>
+T* find(uint64_t guest) {
+    auto& m = table<T>();
+    auto it = m.find(guest);
+    return it == m.end() ? nullptr : it->second;
+}
+
+template <class T>
+T* find_or_add(uint64_t guest) {
+    T*& slot = table<T>()[guest];
+    if (!slot) slot = new T();
+    return slot;
+}
+
+template <class T>
+void forget(uint64_t guest) {
+    auto& m = table<T>();
+    auto it = m.find(guest);
+    if (it == m.end()) return;
+    delete it->second;
+    m.erase(it);
+}
+
+std::unordered_map<uint64_t, WinSpec> g_win_specs;
+std::unordered_map<uint64_t, PoolSpec> g_pool_specs;
+std::unordered_map<uint64_t, int> g_device_flags;
+
+/* Guest memory is host-visible, so a pointer argument is just a cast.  This
+ * is the one place that assumption is spelled out. */
+template <class T>
+T* guest_ptr(uint64_t value) {
+    return reinterpret_cast<T*>(static_cast<uintptr_t>(value));
+}
 
 /* ------------------------------------------------------------------ */
 /* NVN -> Metal primitives                                             */
@@ -180,73 +231,8 @@ MTLPrimitiveType to_metal_primitive(uint32_t nvn) {
 }
 
 /* ------------------------------------------------------------------ */
-/* device                                                              */
+/* present                                                             */
 /* ------------------------------------------------------------------ */
-
-void dev_builder_set_defaults(nvngfx_ctx*, uint64_t* x) {
-    if (x[0]) std::memset(reinterpret_cast<void*>(x[0]), 0, 0x20);
-}
-
-void dev_builder_set_flags(nvngfx_ctx*, uint64_t* x) { log_once("NVNdeviceFlags", (unsigned)x[1]); }
-void dev_builder_get_flags(nvngfx_ctx*, uint64_t*) {}
-
-void dev_initialize(nvngfx_ctx* ctx, uint64_t* x) {
-    Ctx* c = ctx_of(ctx);
-    if (!c) return;
-    (void)x;
-    /* The app normally already handed us its device (nvngfx_metal_set_device);
-     * only fall back to the system default when the backend is used headless. */
-    if (!c->device) c->device = MTLCreateSystemDefaultDevice();
-    if (!c->device) {
-        std::fprintf(stderr, "[nvn] no Metal device\n");
-        return;
-    }
-    if (!c->queue) c->queue = [c->device newCommandQueue];
-    c->ready = (c->queue != nil);
-    std::fprintf(stderr, "[nvn] metal device: %s\n", [[c->device name] UTF8String]);
-}
-
-void dev_get_proc_address(nvngfx_ctx*, uint64_t* x) {
-    const char* name = reinterpret_cast<const char*>(static_cast<uintptr_t>(x[1]));
-    nvngfx_proc p = nvngfx_lookup(name);
-    x[0] = p ? static_cast<uint64_t>(reinterpret_cast<uintptr_t>(p)) : 0;
-}
-
-/* ------------------------------------------------------------------ */
-/* window                                                              */
-/* ------------------------------------------------------------------ */
-
-void win_builder_set_defaults(nvngfx_ctx*, uint64_t* x) {
-    if (x[0]) std::memset(reinterpret_cast<void*>(x[0]), 0, 0x40);
-}
-
-void win_builder_set_native_window(nvngfx_ctx*, uint64_t* x) {
-    if (!x[0]) return;
-    g_win_specs[reinterpret_cast<const void*>(static_cast<uintptr_t>(x[0]))].nativeWindow =
-        reinterpret_cast<void*>(static_cast<uintptr_t>(x[1]));
-}
-
-void win_builder_set_textures(nvngfx_ctx*, uint64_t* x) {
-    if (!x[0]) return;
-    WinSpec& s = g_win_specs[reinterpret_cast<const void*>(static_cast<uintptr_t>(x[0]))];
-    /* x[1] points at an array of Tex handles, not at a Tex. */
-    Tex** list = reinterpret_cast<Tex**>(static_cast<uintptr_t>(x[1]));
-    const unsigned n = static_cast<unsigned>(x[2]);
-    s.numTextures = n > 4 ? 4 : n;
-    for (unsigned i = 0; i < s.numTextures; ++i) s.textures[i] = list ? list[i] : nullptr;
-}
-
-void win_builder_set_present_interval(nvngfx_ctx*, uint64_t* x) {
-    if (!x[0]) return;
-    g_win_specs[reinterpret_cast<const void*>(static_cast<uintptr_t>(x[0]))].presentInterval =
-        static_cast<unsigned>(x[1]);
-}
-
-void win_builder_set_num_active_textures(nvngfx_ctx*, uint64_t* x) {
-    if (!x[0]) return;
-    g_win_specs[reinterpret_cast<const void*>(static_cast<uintptr_t>(x[0]))].numActive =
-        static_cast<unsigned>(x[1]);
-}
 
 /* Clears `layer` to one colour and presents it.  Returns true if the frame
  * reached the display.  Shared by the host self-test and by
@@ -275,17 +261,102 @@ bool present_clear(Ctx* c, CAMetalLayer* layer, float r, float g, float b) {
     return true;
 }
 
+/* ------------------------------------------------------------------ */
+/* device                                                              */
+/* ------------------------------------------------------------------ */
+
+/* nvnDeviceBuilderSetDefaults(NVNdeviceBuilder*) */
+void dev_builder_set_defaults(nvngfx_ctx*, uint64_t* x) {
+    if (x[0]) std::memset(guest_ptr<void>(x[0]), 0, 0x20);
+}
+
+/* nvnDeviceBuilderSetFlags(NVNdeviceBuilder*, int) */
+void dev_builder_set_flags(nvngfx_ctx*, uint64_t* x) {
+    g_device_flags[x[0]] = static_cast<int>(x[1]);
+}
+
+/* nvnDeviceBuilderGetFlags(const NVNdeviceBuilder*) -> int
+ * NOTE: inferred shape, see ios/nvn/inferred_signatures.json. */
+void dev_builder_get_flags(nvngfx_ctx*, uint64_t* x) {
+    auto it = g_device_flags.find(x[0]);
+    x[0] = it == g_device_flags.end() ? 0u : static_cast<uint64_t>(static_cast<uint32_t>(it->second));
+}
+
+/* nvnDeviceInitialize(NVNdevice*, const NVNdeviceBuilder*) -> NVNboolean */
+void dev_initialize(nvngfx_ctx* ctx, uint64_t* x) {
+    Ctx* c = ctx_of(ctx);
+    if (!c) {
+        x[0] = 0;
+        return;
+    }
+    /* The app normally already handed us its device (nvngfx_metal_set_device);
+     * only fall back to the system default when the backend is used headless. */
+    if (!c->device) c->device = MTLCreateSystemDefaultDevice();
+    if (!c->device) {
+        std::fprintf(stderr, "[nvn] no Metal device\n");
+        x[0] = 0;
+        return;
+    }
+    if (!c->queue) c->queue = [c->device newCommandQueue];
+    c->ready = (c->queue != nil);
+    std::fprintf(stderr, "[nvn] metal device: %s\n", [[c->device name] UTF8String]);
+    x[0] = c->ready ? 1u : 0u;
+}
+
+/* nvnDeviceGetProcAddress(const NVNdevice*, const char*) -> proc */
+void dev_get_proc_address(nvngfx_ctx*, uint64_t* x) {
+    const char* name = guest_ptr<const char>(x[1]);
+    nvngfx_proc p = nvngfx_lookup(name);
+    x[0] = p ? static_cast<uint64_t>(reinterpret_cast<uintptr_t>(p)) : 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* window                                                              */
+/* ------------------------------------------------------------------ */
+
+/* nvnWindowBuilderSetDefaults(NVNwindowBuilder*) */
+void win_builder_set_defaults(nvngfx_ctx*, uint64_t* x) {
+    if (x[0]) std::memset(guest_ptr<void>(x[0]), 0, 0x40);
+}
+
+/* nvnWindowBuilderSetNativeWindow(NVNwindowBuilder*, NVNnativeWindow) */
+void win_builder_set_native_window(nvngfx_ctx*, uint64_t* x) {
+    g_win_specs[x[0]].nativeWindow = x[1];
+}
+
+/* nvnWindowBuilderSetTextures(NVNwindowBuilder*, int n, NVNtexture* const*) */
+void win_builder_set_textures(nvngfx_ctx*, uint64_t* x) {
+    WinSpec& s = g_win_specs[x[0]];
+    const int n = static_cast<int>(x[1]);
+    s.numTextures = n <= 0 ? 0u : (n > 4 ? 4u : static_cast<unsigned>(n));
+    const uint64_t* list = guest_ptr<const uint64_t>(x[2]);
+    for (unsigned i = 0; i < 4; ++i) s.textures[i] = (list && i < s.numTextures) ? list[i] : 0u;
+}
+
+/* nvnWindowBuilderSetPresentInterval(NVNwindowBuilder*, int) */
+void win_builder_set_present_interval(nvngfx_ctx*, uint64_t* x) {
+    g_win_specs[x[0]].presentInterval = static_cast<unsigned>(x[1]);
+}
+
+/* nvnWindowBuilderSetNumActiveTextures(NVNwindowBuilder*, int)
+ * NOTE: inferred shape, see ios/nvn/inferred_signatures.json. */
+void win_builder_set_num_active_textures(nvngfx_ctx*, uint64_t* x) {
+    g_win_specs[x[0]].numActive = static_cast<unsigned>(x[1]);
+}
+
+/* nvnWindowInitialize(NVNwindow*, const NVNwindowBuilder*) -> NVNboolean */
 void win_initialize(nvngfx_ctx* ctx, uint64_t* x) {
     Ctx* c = ctx_of(ctx);
-    if (!c || !c->ready) return;
+    if (!c || !c->ready) {
+        x[0] = 0;
+        return;
+    }
 
-    /* x[0] = guest window slot, x[1] = builder pointer. */
-    const void* key = reinterpret_cast<const void*>(static_cast<uintptr_t>(x[1]));
     WinSpec spec;
-    auto it = g_win_specs.find(key);
+    auto it = g_win_specs.find(x[1]);
     if (it != g_win_specs.end()) spec = it->second;
 
-    Win* w = new Win();
+    Win* w = find_or_add<Win>(x[0]);
     /* spec.nativeWindow is the guest's nn::vi handle, which is NOT a
      * CAMetalLayer -- casting it here would message a random pointer.  Until
      * vi layer handles are mapped onto host layers, the only safe surface is
@@ -305,78 +376,89 @@ void win_initialize(nvngfx_ctx* ctx, uint64_t* x) {
     w->presentInterval = spec.presentInterval;
     for (unsigned i = 0; i < 4; ++i) w->textures[i] = spec.textures[i];
 
-    /* Metal exposes one switch, not an interval: 0 == uncapped, else v-sync.
-     * Keep the drawable count to the active texture count so the CPU can run
+    /* Keep the drawable count to the active texture count so the CPU can run
      * ahead exactly as far as the guest's own swapchain allows. */
     unsigned n = w->numActive;
     if (n < 2) n = 2;
     if (n > 3) n = 3;
     w->layer.maximumDrawableCount = n;
 
-    x[0] = handle(w);
+    x[0] = 1;  /* NVNboolean true */
 }
 
+/* nvnWindowAcquireTexture(NVNwindow*, NVNsync*, int* index)
+ * -> NVNwindowAcquireTextureResult (0 = success; the enum itself is unverified) */
 void win_acquire_texture(nvngfx_ctx*, uint64_t* x) {
-    Win* w = obj<Win>(x[0]);
+    Win* w = find<Win>(x[0]);
+    int* outIndex = guest_ptr<int>(x[2]);
     if (!w || w->numTextures == 0) {
-        x[0] = 0;
+        log_once("nvnWindowAcquireTextureResult.error", 1);
+        x[0] = 1;  /* not SUCCESS; exact value unverified */
         return;
     }
-    Tex* t = w->textures[w->cursor % w->numTextures];
+    const unsigned index = w->cursor % w->numTextures;
     w->cursor = (w->cursor + 1) % w->numTextures;
-    x[0] = handle(t);
+    if (outIndex) *outIndex = static_cast<int>(index);
+    x[0] = 0;  /* SUCCESS */
 }
 
+/* nvnWindowGetNumTextures(const NVNwindow*) -> int
+ * NOTE: inferred shape, see ios/nvn/inferred_signatures.json. */
 void win_get_num_textures(nvngfx_ctx*, uint64_t* x) {
-    Win* w = obj<Win>(x[0]);
-    x[0] = w ? w->numTextures : 0;
+    Win* w = find<Win>(x[0]);
+    x[0] = w ? w->numTextures : 0u;
 }
 
+/* nvnWindowSetPresentInterval(NVNwindow*, int) */
 void win_set_present_interval(nvngfx_ctx*, uint64_t* x) {
-    Win* w = obj<Win>(x[0]);
+    Win* w = find<Win>(x[0]);
     if (!w) return;
-    /* Recorded only.  See win_initialize: iOS has no displaySyncEnabled and the
-     * interval is enforced by the guest's own swapchain, not by Metal. */
+    /* Recorded only.  iOS has no displaySyncEnabled and the interval is
+     * enforced by the guest's own swapchain, not by Metal. */
     w->presentInterval = static_cast<unsigned>(x[1]);
 }
 
+/* nvnWindowSetNumActiveTextures(NVNwindow*, int)
+ * NOTE: inferred shape, see ios/nvn/inferred_signatures.json. */
 void win_set_num_active_textures(nvngfx_ctx*, uint64_t* x) {
-    Win* w = obj<Win>(x[0]);
+    Win* w = find<Win>(x[0]);
     if (w) w->numActive = static_cast<unsigned>(x[1]);
 }
 
-void win_finalize(nvngfx_ctx*, uint64_t* x) { delete obj<Win>(x[0]); }
+/* nvnWindowFinalize(NVNwindow*) */
+void win_finalize(nvngfx_ctx*, uint64_t* x) { forget<Win>(x[0]); }
 
 /* ------------------------------------------------------------------ */
 /* memory pools                                                        */
 /* ------------------------------------------------------------------ */
 
+/* nvnMemoryPoolBuilderSetDefaults(NVNmemoryPoolBuilder*) */
 void pool_builder_set_defaults(nvngfx_ctx*, uint64_t* x) {
-    if (x[0]) std::memset(reinterpret_cast<void*>(x[0]), 0, 0x30);
+    if (x[0]) std::memset(guest_ptr<void>(x[0]), 0, 0x30);
 }
 
+/* nvnMemoryPoolBuilderSetStorage(NVNmemoryPoolBuilder*, void*, size_t) */
 void pool_builder_set_storage(nvngfx_ctx*, uint64_t* x) {
-    if (!x[0]) return;
-    /* NVNmemoryPoolBuilderSetStorage(builder, storage, size). */
-    PoolSpec& s = g_pool_specs[reinterpret_cast<const void*>(static_cast<uintptr_t>(x[0]))];
-    s.storage = reinterpret_cast<void*>(static_cast<uintptr_t>(x[1]));
+    PoolSpec& s = g_pool_specs[x[0]];
+    s.storage = guest_ptr<void>(x[1]);
     s.size = static_cast<size_t>(x[2]);
 }
 
+/* nvnMemoryPoolBuilderSetFlags(NVNmemoryPoolBuilder*, int) */
 void pool_builder_set_flags(nvngfx_ctx*, uint64_t* x) {
-    if (!x[0]) return;
-    g_pool_specs[reinterpret_cast<const void*>(static_cast<uintptr_t>(x[0]))].flags =
-        static_cast<uint32_t>(x[1]);
+    g_pool_specs[x[0]].flags = static_cast<uint32_t>(x[1]);
 }
 
+/* nvnMemoryPoolInitialize(NVNmemoryPool*, const NVNmemoryPoolBuilder*) -> NVNboolean */
 void pool_initialize(nvngfx_ctx* ctx, uint64_t* x) {
     Ctx* c = ctx_of(ctx);
-    if (!c || !c->ready) return;
+    if (!c || !c->ready) {
+        x[0] = 0;
+        return;
+    }
 
-    /* x[0] = guest pool slot, x[1] = builder pointer. */
-    const void* key = reinterpret_cast<const void*>(static_cast<uintptr_t>(x[1]));
     PoolSpec spec;
-    auto it = g_pool_specs.find(key);
+    auto it = g_pool_specs.find(x[1]);
     if (it != g_pool_specs.end()) spec = it->second;
     if (!spec.storage || !spec.size) {
         std::fprintf(stderr, "[nvn] nvnMemoryPoolInitialize without storage\n");
@@ -384,7 +466,7 @@ void pool_initialize(nvngfx_ctx* ctx, uint64_t* x) {
         return;
     }
 
-    Pool* p = new Pool();
+    Pool* p = find_or_add<Pool>(x[0]);
     p->storage = spec.storage;
     p->size = spec.size;
     p->flags = spec.flags;
@@ -399,18 +481,19 @@ void pool_initialize(nvngfx_ctx* ctx, uint64_t* x) {
                                         deallocator:nil];
     if (!p->buffer) {
         std::fprintf(stderr, "[nvn] pool wrap failed (%zu bytes)\n", p->size);
-        delete p;
+        forget<Pool>(x[0]);
         x[0] = 0;
         return;
     }
-    x[0] = handle(p);
+    x[0] = 1;
 }
 
-void pool_finalize(nvngfx_ctx*, uint64_t* x) { delete obj<Pool>(x[0]); }
+/* nvnMemoryPoolFinalize(NVNmemoryPool*) */
+void pool_finalize(nvngfx_ctx*, uint64_t* x) { forget<Pool>(x[0]); }
 
-
+/* nvnMemoryPoolGetSize(const NVNmemoryPool*) -> size_t */
 void pool_get_size(nvngfx_ctx*, uint64_t* x) {
-    Pool* p = obj<Pool>(x[0]);
+    Pool* p = find<Pool>(x[0]);
     x[0] = p ? static_cast<uint64_t>(p->size) : 0;
 }
 
@@ -418,90 +501,129 @@ void pool_get_size(nvngfx_ctx*, uint64_t* x) {
 /* textures                                                            */
 /* ------------------------------------------------------------------ */
 
+/* nvnTextureBuilderSetDefaults(NVNtextureBuilder*) */
 void tex_builder_set_defaults(nvngfx_ctx*, uint64_t* x) {
-    if (x[0]) std::memset(reinterpret_cast<void*>(x[0]), 0, 0x80);
+    if (x[0]) std::memset(guest_ptr<void>(x[0]), 0, 0x80);
 }
 
+/* nvnTextureInitialize(NVNtexture*, const NVNtextureBuilder*) -> NVNboolean
+ *
+ * The NVNtextureBuilder field offsets are not verified yet, so this records
+ * the guest object and stops.  Turning it on means reading width/height/
+ * format/target/storage out of the builder -- guessing them would produce a
+ * backend that runs and samples black.  See docs/IOS_PORTING.md, texture path.
+ */
 void tex_initialize(nvngfx_ctx*, uint64_t* x) {
-    /* The NVNtextureBuilder field offsets are not verified yet, so this
-     * allocates the handle and stops.  Turning it on is the first item in
-     * docs/IOS_PORTING.md's "texture path" section. */
-    log_once("nvnTextureInitialize", 1);
-    x[0] = handle(new Tex());
+    log_once("nvnTextureInitialize.builderOffsets", 1);
+    find_or_add<Tex>(x[0]);
+    x[0] = 1;
 }
 
 /* ------------------------------------------------------------------ */
 /* command buffer                                                      */
 /* ------------------------------------------------------------------ */
 
+/* nvnCommandBufferBeginRecording(NVNcommandBuffer*) */
 void cmdbuf_begin_recording(nvngfx_ctx* ctx, uint64_t* x) {
     Ctx* c = ctx_of(ctx);
-    CmdBuf* b = obj<CmdBuf>(x[0]);
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
     if (!c || !c->ready || !b || b->recording) return;
     b->cb = [c->queue commandBuffer];
     b->recording = true;
     b->draws = 0;
 }
 
+/* nvnCommandBufferEndRecording(NVNcommandBuffer*) -> NVNcommandHandle
+ * The handle is what the guest submits through nvnQueueSubmitCommands.  We do
+ * not record a command stream, so 0 ("nothing to submit") is the honest value. */
 void cmdbuf_end_recording(nvngfx_ctx*, uint64_t* x) {
-    CmdBuf* b = obj<CmdBuf>(x[0]);
-    if (!b || !b->recording) return;
+    CmdBuf* b = find<CmdBuf>(x[0]);
+    if (!b || !b->recording) {
+        x[0] = 0;
+        return;
+    }
     if (b->enc) {
         [b->enc endEncoding];
         b->enc = nil;
     }
     b->recording = false;
+    x[0] = 0;
 }
 
+/* nvnCommandBufferClearColor(NVNcommandBuffer*, int index, const float* rgba, int mask) */
 void cmdbuf_clear_color(nvngfx_ctx*, uint64_t* x) {
-    /* Needs the bound render target to become a real clear; until render-target
-     * binding exists the values are recorded and dropped. */
-    log_once("nvnCommandBufferClearColor", static_cast<unsigned>(x[5]));
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    const float* rgba = guest_ptr<const float>(x[2]);
+    if (!b || !rgba) return;
+    b->clearIndex = static_cast<int>(x[1]);
+    b->clearMask = static_cast<int>(x[3]);
+    for (int i = 0; i < 4; ++i) b->clear[i] = rgba[i];
+    /* Applied when a render target exists; without one there is nothing to
+     * clear, so this is recorded and dropped. */
+    log_once("nvnCommandBufferClearColor.mask", static_cast<unsigned>(b->clearMask));
 }
 
+/* nvnCommandBufferDrawArrays(NVNcommandBuffer*, NVNdrawPrimitive, int first, int count) */
 void cmdbuf_draw_arrays(nvngfx_ctx*, uint64_t* x) {
-    CmdBuf* b = obj<CmdBuf>(x[0]);
-    if (!b || !b->enc) return;
-    const unsigned first = static_cast<unsigned>(x[1]);
-    const unsigned count = static_cast<unsigned>(x[2]);
-    [b->enc drawPrimitives:to_metal_primitive(static_cast<uint32_t>(x[3]))
+    CmdBuf* b = find<CmdBuf>(x[0]);
+    if (!b) return;
+    const uint32_t primitive = static_cast<uint32_t>(x[1]);
+    const unsigned first = static_cast<unsigned>(x[2]);
+    const unsigned count = static_cast<unsigned>(x[3]);
+    b->draws++;
+    if (!b->enc) return;
+    [b->enc drawPrimitives:to_metal_primitive(primitive)
                vertexStart:first
                vertexCount:count];
-    b->draws++;
 }
 
+/* nvnCommandBufferDrawElements(NVNcommandBuffer*, NVNdrawPrimitive,
+ *                              NVNindexType, int count, NVNbufferAddress) */
 void cmdbuf_draw_elements(nvngfx_ctx*, uint64_t* x) {
-    CmdBuf* b = obj<CmdBuf>(x[0]);
-    if (!b || !b->enc) return;
-    log_once("nvnCommandBufferDrawElements.indexType", static_cast<unsigned>(x[6]));
+    CmdBuf* b = find<CmdBuf>(x[0]);
+    if (!b) return;
+    const uint32_t indexType = static_cast<uint32_t>(x[2]);
+    log_once("nvnCommandBufferDrawElements.indexType", indexType);
     b->draws++;
+    /* An indexed draw needs the bound index buffer and the real NVNindexType
+     * values; neither is verified, so this counts and stops. */
 }
 
+/* nvnCommandBufferSetViewport(NVNcommandBuffer*, int x, int y, int w, int h) */
 void cmdbuf_set_viewport(nvngfx_ctx*, uint64_t* x) {
-    CmdBuf* b = obj<CmdBuf>(x[0]);
+    CmdBuf* b = find<CmdBuf>(x[0]);
     if (!b || !b->enc) return;
-    MTLViewport vp = {static_cast<double>(x[1]), static_cast<double>(x[2]),
-                      static_cast<double>(x[3]), static_cast<double>(x[4]), 0.0, 1.0};
+    MTLViewport vp = {static_cast<double>(static_cast<int>(x[1])),
+                      static_cast<double>(static_cast<int>(x[2])),
+                      static_cast<double>(static_cast<int>(x[3])),
+                      static_cast<double>(static_cast<int>(x[4])), 0.0, 1.0};
     [b->enc setViewport:vp];
 }
 
+/* nvnCommandBufferSetScissor(NVNcommandBuffer*, int x, int y, int w, int h) */
 void cmdbuf_set_scissor(nvngfx_ctx*, uint64_t* x) {
-    CmdBuf* b = obj<CmdBuf>(x[0]);
+    CmdBuf* b = find<CmdBuf>(x[0]);
     if (!b || !b->enc) return;
-    MTLScissorRect r = {static_cast<NSUInteger>(x[1]), static_cast<NSUInteger>(x[2]),
-                        static_cast<NSUInteger>(x[3]), static_cast<NSUInteger>(x[4])};
+    MTLScissorRect r = {static_cast<NSUInteger>(static_cast<int>(x[1])),
+                        static_cast<NSUInteger>(static_cast<int>(x[2])),
+                        static_cast<NSUInteger>(static_cast<int>(x[3])),
+                        static_cast<NSUInteger>(static_cast<int>(x[4]))};
     [b->enc setScissorRect:r];
 }
 
 /* ------------------------------------------------------------------ */
-/* present                                                             */
+/* queue                                                               */
 /* ------------------------------------------------------------------ */
 
+/* nvnQueuePresentTexture(NVNqueue*, NVNwindow*, int index) */
 void queue_present_texture(nvngfx_ctx* ctx, uint64_t* x) {
     Ctx* c = ctx_of(ctx);
-    Win* w = obj<Win>(x[1]);
-    Tex* t = obj<Tex>(x[2]);
+    Win* w = find<Win>(x[1]);
+    const unsigned index = static_cast<unsigned>(static_cast<int>(x[2]));
     if (!c || !c->ready || !w || !w->layer) return;
+
+    const uint64_t guestTex = index < w->numTextures ? w->textures[index] : 0;
+    Tex* t = guestTex ? find<Tex>(guestTex) : nullptr;
 
     if (!t || !t->mtl) {
         /* The guest asked to present a texture the host never materialised
@@ -649,5 +771,3 @@ extern "C" void nvngfx_metal_destroy(nvngfx_ctx* ctx) {
 }
 
 #endif /* __APPLE__ */
-
-

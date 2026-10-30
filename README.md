@@ -215,6 +215,7 @@ guest 业务代码
 | Metal 后端已实现 | **32**（6.2%） | 真实 `BIND(...)`，不是靠注释声称 |
 | 未实现 | 481 | 按"挡住第一个 draw call"排序，见 `docs/IOS_PORTING.md` |
 | 生成的代码 | 2 个文件 | `gen_nvn.py` 生成 `nvn_api.h` / `nvn_dispatch.cpp`，`--check` 防手改 |
+| 参数形状 | 470 个 | `signatures.json`，解析公开 nxnative 原型表（MIT），最大 arity 8 |
 
 四条诚实说明：
 

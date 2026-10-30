@@ -20,6 +20,8 @@ ios/BotW/Renderer.swift       CADisplayLink 驱动 botw_core_frame，把视图�
 ios/BotW/BotWBridge.h         Swift/ObjC 桥接头，只 #import botw_core.h
 ios/project.yml               XcodeGen 工程描述（不提交 .xcodeproj）
 ios/nvn/registry.json         513 个入口点，从标题自己的 getproc 字符串提取
+ios/nvn/signatures.json       470 个参数形状（公开 nxnative 原型表，MIT）
+ios/nvn/inferred_signatures.json  4 个按命名对称性推断的形状，单独标注
 ios/nvn/include/nvn_api.h     生成：名字表 + 函数指针 ABI
 ios/nvn/src/nvn_dispatch.cpp  生成：二分查找 + 缺失上报
 ios/nvn/include/nvn_backend.h 后端接口（null / metal 二选一）
@@ -143,25 +145,43 @@ xcodebuild -project BotW.xcodeproj -scheme BotW \
 typedef void (*nvngfx_proc)(nvngfx_ctx* ctx, uint64_t x[8]);
 ```
 
-- `x[0..7]` 是 guest 调用点的 x0..x7。ARM64 的整数参数寄存器正好 8 个，
-  NVN 的入口点没有一个需要更多（第 9 个及以后的参数走栈，目前注册表里
-  没有这种签名）。
-- 返回值写回 `x[0]`。这跟 ARM64 的返回值寄存器一致，所以 dispatcher
-  不需要知道返回类型。
-- 浮点参数（`float`/`double`）走的是 s0..s7/d0..d7，**不在 `x[]` 里**。
-  目前受影响的只有 `nvnWindowSetCrop` 之类；接的时候要把 FP 寄存器也
-  一起拍平进参数块，或者给这些入口单独开签名。这是一个已知缺口，
-  在 `implemented_metal.txt` 里没有对应条目，所以门禁不会允许它被“实现”。
+- `x[0..7]` 是 guest 调用点的 x0..x7。ARM64 整数参数寄存器正好 8 个，而
+  `ios/nvn/signatures.json` 里 470 个原型中**最大 arity 就是 8**
+  （`nvnCommandBufferDrawElementsInstanced`），所以"8 个字装得下所有参数"
+  这句话是被量出来的，不是假设。
+- **NVN 对象是 guest 内存**。`nvnWindowInitialize(NVNwindow*, builder)` 的
+  `x[0]` 是 guest 自己的对象地址，宿主既不该拥有那块存储，也不该把自己的
+  指针写回去。宿主状态一律以 guest 地址为键存在侧表里
+  （`table<T>()` + `find/find_or_add/forget`）。
+- **返回值写进 w0，也就是 `x[0]`**。`NVNboolean` 是 1/0；getter 直接用结果
+  覆盖 `x[0]`。
+- **出参是 guest 内存里的指针**，统一内存下直接写穿：
+  `nvnWindowAcquireTexture(window, sync, &index)` 的 `x[2]` 就是那个 `int*`。
+- **builder 是不透明 guest 结构**，字段偏移未验证。所以
+  `*BuilderSetXxx` 把值记在以 builder 地址为键的侧表里，
+  `*Initialize` 再从侧表取回来——只在一个地方需要改。
 
-这个设计的好处是：**签名无关**。Windows 侧 Unicorn 原型（`C:\botw-work`）
-读的也是同一组寄存器，所以两边记录的 NVN 调用流可以逐字节比对，HLE 行为
-不容易在两个平台上悄悄跑偏。
+> 这一节是被事故改写的。最初的 32 个实现把 `x[0]` 当成"写回句柄"的出参，
+> 把自己 new 出来的宿主指针交给 guest。它能编译、能通过冒烟测试，
+> 但 guest 下一次调用就会把**它自己的对象地址**传进来，宿主却拿它当
+> `Win*`/`Pool*` 解引用——第一次真机运行就会崩，而且是难以定位的那种崩。
+> 现在 `verify_ios.py` 会拒绝"已实现但没有已知参数形状"的入口，
+> 并把 arity > 8 的入口直接判失败。
 
-句柄约定：NVN 句柄对 guest 是不透明的。这里一个句柄就是宿主对象的 64 位
-地址，`x[0]` 写回即可；guest 从不 dereference 它。
+参数形状从哪来：`scripts/extract_nvn_signatures.py` 解析公开项目
+[nxnative](https://github.com/seedds/nxnative) 的 `dm/gfx/nvn/nvn_protos.h`
+（MIT），只保留**名字 / 返回类型 / 参数类型**，头文件本身不入库。470 个入口有
+源码可依；剩下 4 个（`nvnDeviceBuilderGetFlags` 等）在
+`ios/nvn/inferred_signatures.json` 里单独标注为"按命名对称性推断"，
+`verify_ios.py` 分开计数，不会被悄悄算进已验证的一类。
+
+**浮点参数**（`float`/`double`）走 s0..s7/d0..d7，不在 `x[]` 里。
+好消息是真正需要的颜色/深度参数多是**指针**（`nvnCommandBufferClearColor`
+的 `const float*`），可以直接从 guest 内存读；暂时不需要 FP 寄存器搬运。
+真遇到 FP 传值的入口，在实现前必须先扩展参数块，否则就属于"没有形状"，
+门禁不会允许它被绑定。
 
 ---
-
 ## 5. 内存：不复制，但必须对齐
 
 iOS 是统一内存，guest 堆本来就是宿主可读的，所以
@@ -198,7 +218,15 @@ iOS 是统一内存，guest 堆本来就是宿主可读的，所以
 | Texture | 1/45 | initialize 只分配句柄 |
 | TextureBuilder | 1/43 | defaults 清零 |
 
-**必须说清楚的三件事**，否则这张表会误导人：
+**必须说清楚的四件事**，否则这张表会误导人：
+
+0. 这 32 个的参数解码在本轮按 `signatures.json` **全部重写过一遍**。
+   `SetViewport`/`SetScissor` 是 4 个 `int`（原来当成 double 读），
+   `DrawArrays` 是 `(primitive, first, count)`（原来顺序错），
+   `DrawElements` 是 `(primitive, indexType, count, indexAddress)`
+   （原来把 `x[6]` 当 indexType），`WindowBuilderSetTextures` 是
+   `(builder, n, array)`（原来看反），`WindowAcquireTexture` 把索引写进
+   `x[2]` 指向的 `int`（原来从 `x[0]` 返回句柄）。
 
 1. `nvnTextureInitialize` 只 `new Tex()`，**不建 MTLTexture**。因为
    `NVNtextureBuilder` 的字段偏移还没验证过，猜偏移会得到一个“看起来能跑、

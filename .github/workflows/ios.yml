@@ -21,6 +21,8 @@ jobs:
       - name: Generated NVN artefacts are up to date
         run: python scripts/gen_nvn.py --repo . --check
 
+      - name: NVN argument shapes are consistent
+        run: python scripts/extract_nvn_signatures.py --check
       - name: Repository invariants (registry / bindings / no title data)
         run: python scripts/verify_ios.py
 
