@@ -191,6 +191,40 @@ static const char* const kFsBindless =
     "    return s0.tex.sample(s0.smp, in.uv);\n"
     "}\n";
 
+/* Variant 8: the vertex stage's own argument buffer.  The constants live at
+ * buffer(0) -- the same index the translator gives spvDescriptorSetBuffer0 --
+ * while the positions arrive through [[stage_in]] from a vertex stream the
+ * backend binds at NVNGFX_VERTEX_STREAM_BASE.  The fragment stage is a
+ * constant colour, so a wrong index shows up as a triangle in the wrong
+ * place rather than as a compile error. */
+static const char* const kVsVertexUbo =
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "\n"
+    "struct spvDescriptorSetBuffer0 { constant float4* shift [[id(0)]]; };\n"
+    "\n"
+    "struct NvngfxVertexIn {\n"
+    "    float2 position [[attribute(0)]];\n"
+    "};\n"
+    "\n"
+    "struct NvngfxVaryings { float4 position [[position]]; };\n"
+    "\n"
+    "vertex NvngfxVaryings nvngfx_main_vs(\n"
+    "    NvngfxVertexIn in [[stage_in]],\n"
+    "    constant spvDescriptorSetBuffer0& s0 [[buffer(0)]]) {\n"
+    "    NvngfxVaryings v;\n"
+    "    v.position = float4(in.position + (*s0.shift).xy, 0.0, 1.0);\n"
+    "    return v;\n"
+    "}\n";
+
+static const char* const kFsMagenta =
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "\n"
+    "fragment float4 nvngfx_main_fs() {\n"
+    "    return float4(1.0, 0.0, 1.0, 1.0);\n"
+    "}\n";
+
 /* Variant 6: a c1-only fragment shader.  The argument buffer has one pointer
  * at [[id(0)]], and the bytes behind it come from the sidecar, not from any
  * command-buffer binding.  The self-test fills them with a known colour so a
@@ -422,6 +456,11 @@ const char* nvngfx_shader_selftest_msl_variant(nvngfx_stage stage, int variant) 
     if (variant == 7) {
         if (stage == NVNGFX_STAGE_VERTEX) return kVsUv;
         if (stage == NVNGFX_STAGE_FRAGMENT) return kFsBindless;
+        return NULL;
+    }
+    if (variant == 8) {
+        if (stage == NVNGFX_STAGE_VERTEX) return kVsVertexUbo;
+        if (stage == NVNGFX_STAGE_FRAGMENT) return kFsMagenta;
         return NULL;
     }
     if (stage == NVNGFX_STAGE_VERTEX) return kVs;

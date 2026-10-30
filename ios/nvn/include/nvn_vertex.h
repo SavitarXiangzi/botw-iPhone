@@ -39,6 +39,18 @@ extern "C" {
 #define NVNGFX_MAX_VERTEX_ATTRIBS 16
 #define NVNGFX_MAX_VERTEX_STREAMS 16
 
+/* Metal vertex-buffer index of NVN stream 0.
+ *
+ * A translated vertex shader keeps its constants in an argument buffer at
+ * buffer(0) and names its vertex attributes through a vertex descriptor, so
+ * both use the same `setVertexBuffer:atIndex:` table: a stream bound at its
+ * NVN index would land on the argument buffer.  nxnative resolves this the
+ * same way -- buffer 0 is the table, 16..29 are the streams, 30 is a zero
+ * buffer -- so the shift is their measured convention, not an invention.
+ * Metal's table holds indices 0..30, which leaves room for 14 streams. */
+#define NVNGFX_VERTEX_STREAM_BASE 16
+#define NVNGFX_VERTEX_STREAM_MAX 14
+
 /* What an NVNformat means as a vertex attribute, without naming Metal. */
 typedef enum {
     NVNGFX_VF_NONE = 0,      /* NVN_FORMAT_NONE: the attribute is not used */

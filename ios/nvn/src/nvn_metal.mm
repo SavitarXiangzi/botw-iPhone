@@ -24,10 +24,11 @@
  *         on a computer, never in the repository.  Everything else on that
  *         path -- pipeline creation with a real vertex descriptor, buffer
  *         binding, draw encoding, pixel readback -- is executed by
- *         nvngfx_metal_selftest() in CI's iOS Simulator (five draws: the
- *         fifth samples a 2x2 texture through a texture pool, a sampler pool
- *         and an argument buffer; a sampler state object is also created,
- *         compared and read back).
+ *         nvngfx_metal_selftest() in CI's iOS Simulator: six draws, a
+ *         bindless table probe, and a vertex-stage argument-buffer draw whose
+ *         shifted pixels are read back.  One draw samples a 2x2 texture
+ *         through a texture pool, a sampler pool and an argument buffer; a
+ *         sampler state object is also created, compared and read back.
  *         MRT / depth attachment / texture views
  *         guest-pixel upload (the self-test's texture is filled by a host
  *         blit; a texture's storage is not read from guest memory yet)
@@ -214,14 +215,17 @@ struct CmdBuf {
     nvngfx_vattr attrib[NVNGFX_MAX_VERTEX_ATTRIBS] = {};
     unsigned numAttrib = 0;
     nvngfx_vstream stream[NVNGFX_MAX_VERTEX_STREAMS] = {};
-    /* Uniform buffers bound for the pixel stage, as guest addresses.
-     * These are what the argument buffer is built from: a
-     * spirv-cross shader reads its constants through it, not through
-     * setFragmentBytes. */
-    uint64_t ubo[16] = {};
-    uint64_t uboSize[16] = {};
+    /* Uniform buffers as guest addresses, per shader stage.  Every NVN
+     * Bind* call carries an NVNshaderStage, and the vertex and pixel stages
+     * may bind different buffers to the same index, so one shared table
+     * would silently let the last binding win.  Index 0 is vertex and 1 is
+     * fragment -- NVN's own enum order.  These are what an argument buffer
+     * is built from: a spirv-cross shader reads its constants through it,
+     * not through setFragmentBytes. */
+    uint64_t ubo[2][16] = {};
+    uint64_t uboSize[2][16] = {};
     /* The descriptor pools the guest bound, and the handles it bound for
-     * the pixel stage.  A handle is a pool ID (texture in the low 20 bits,
+     * each stage.  A handle is a pool ID (texture in the low 20 bits,
      * sampler in the next 20), not a host pointer: the bound pool's base is
      * added when the handle is resolved, so the pool has to be bound before
      * the draw that uses it. */
@@ -229,13 +233,13 @@ struct CmdBuf {
     uint64_t sampPool = 0;
     /* NVN's driver table has 32 combined texture slots (c2 0x20..0x120), so
      * these are sized to the API rather than to the self-test's one slot. */
-    uint64_t texHandle[NVNGFX_MAX_TEXTURE_SLOTS] = {};
-    uint64_t sepTexHandle[NVNGFX_MAX_TEXTURE_SLOTS] = {};
-    uint64_t sepSampHandle[NVNGFX_MAX_SAMPLER_SLOTS] = {};
-    /* The argument buffer, rebuilt whenever a binding changes and dropped
-     * when a new recording starts (the previous one may still be in
-     * flight). */
-    id<MTLBuffer> argbuf = nil;
+    uint64_t texHandle[2][NVNGFX_MAX_TEXTURE_SLOTS] = {};
+    uint64_t sepTexHandle[2][NVNGFX_MAX_TEXTURE_SLOTS] = {};
+    uint64_t sepSampHandle[2][NVNGFX_MAX_SAMPLER_SLOTS] = {};
+    /* The argument buffers, one per stage, rebuilt whenever a binding
+     * changes and dropped when a new recording starts (the previous one may
+     * still be in flight). */
+    id<MTLBuffer> argbuf[2] = {nil, nil};
     /* The last committed buffer.  nvnQueueSubmitCommands is not implemented,
      * so a frame is committed at EndRecording; keeping the handle lets a
      * caller (the self-test) wait for it and keeps the door open for real
@@ -1307,13 +1311,13 @@ void cmdbuf_set_texture_pool(nvngfx_ctx*, uint64_t* x) {
     CmdBuf* b = find<CmdBuf>(x[0]);
     if (!b) return;
     b->texPool = x[1];
-    b->argbuf = nil;
+    b->argbuf[0] = b->argbuf[1] = nil;
 }
 void cmdbuf_set_sampler_pool(nvngfx_ctx*, uint64_t* x) {
     CmdBuf* b = find<CmdBuf>(x[0]);
     if (!b) return;
     b->sampPool = x[1];
-    b->argbuf = nil;
+    b->argbuf[0] = b->argbuf[1] = nil;
 }
 
 /* nvnDeviceGetTextureHandle(device, tex, samp): tex is the low 20 bits and
@@ -1336,25 +1340,34 @@ void dev_get_image_handle(nvngfx_ctx*, uint64_t* x) {
     x[0] = static_cast<uint32_t>(x[1]);
 }
 
-bool pixel_stage(uint64_t stage) { return stage == NVNGFX_STAGE_FRAGMENT; }
+/* NVN's NVNshaderStage as 0 / 1, or -1 for a stage this backend does not
+ * run (geometry, tessellation, compute).  The two live stages get their own
+ * binding tables because a vertex and a pixel shader may bind different
+ * resources to the same index. */
+int stage_index(uint64_t stage) {
+    if (stage == NVNGFX_STAGE_VERTEX) return 0;
+    if (stage == NVNGFX_STAGE_FRAGMENT) return 1;
+    return -1;
+}
 
 /* nvnCommandBufferBindTexture(cb, stage, slot, handle) and the plural form.
- * Only the pixel stage is consumed: the argument buffer this backend builds
- * is the fragment one.  Other stages are recorded as ignored so the reason is
- * visible instead of silent. */
+ * Vertex and pixel bindings are kept apart; any other stage is reported as
+ * ignored instead of silently landing in a table nothing reads. */
 void cmdbuf_bind_texture(nvngfx_ctx*, uint64_t* x) {
     CmdBuf* b = find<CmdBuf>(x[0]);
     if (!b) return;
-    if (!pixel_stage(x[1])) { log_once("nvnCommandBufferBindTexture.stage", static_cast<unsigned>(x[1])); return; }
+    const int si = stage_index(x[1]);
+    if (si < 0) { log_once("nvnCommandBufferBindTexture.stage", static_cast<unsigned>(x[1])); return; }
     const unsigned slot = static_cast<unsigned>(x[2]);
     if (slot >= NVNGFX_MAX_TEXTURE_SLOTS) { log_once("nvnCommandBufferBindTexture.slot", slot); return; }
-    b->texHandle[slot] = x[3];
-    b->argbuf = nil;
+    b->texHandle[si][slot] = x[3];
+    b->argbuf[si] = nil;
 }
 void cmdbuf_bind_textures(nvngfx_ctx*, uint64_t* x) {
     CmdBuf* b = find<CmdBuf>(x[0]);
     if (!b) return;
-    if (!pixel_stage(x[1])) { log_once("nvnCommandBufferBindTextures.stage", static_cast<unsigned>(x[1])); return; }
+    const int si = stage_index(x[1]);
+    if (si < 0) { log_once("nvnCommandBufferBindTextures.stage", static_cast<unsigned>(x[1])); return; }
     const unsigned first = static_cast<unsigned>(x[2]);
     const unsigned n = static_cast<unsigned>(x[3]);
     const uint64_t* handles = guest_ptr<const uint64_t>(x[4]);
@@ -1362,23 +1375,25 @@ void cmdbuf_bind_textures(nvngfx_ctx*, uint64_t* x) {
     for (unsigned i = 0; i < n; ++i) {
         const unsigned slot = first + i;
         if (slot >= NVNGFX_MAX_TEXTURE_SLOTS) { log_once("nvnCommandBufferBindTextures.slot", slot); break; }
-        b->texHandle[slot] = handles[i];
+        b->texHandle[si][slot] = handles[i];
     }
-    b->argbuf = nil;
+    b->argbuf[si] = nil;
 }
 void cmdbuf_bind_separate_texture(nvngfx_ctx*, uint64_t* x) {
     CmdBuf* b = find<CmdBuf>(x[0]);
     if (!b) return;
-    if (!pixel_stage(x[1])) { log_once("nvnCommandBufferBindSeparateTexture.stage", static_cast<unsigned>(x[1])); return; }
+    const int si = stage_index(x[1]);
+    if (si < 0) { log_once("nvnCommandBufferBindSeparateTexture.stage", static_cast<unsigned>(x[1])); return; }
     const unsigned slot = static_cast<unsigned>(x[2]);
     if (slot >= NVNGFX_MAX_TEXTURE_SLOTS) { log_once("nvnCommandBufferBindSeparateTexture.slot", slot); return; }
-    b->sepTexHandle[slot] = x[3];
-    b->argbuf = nil;
+    b->sepTexHandle[si][slot] = x[3];
+    b->argbuf[si] = nil;
 }
 void cmdbuf_bind_separate_textures(nvngfx_ctx*, uint64_t* x) {
     CmdBuf* b = find<CmdBuf>(x[0]);
     if (!b) return;
-    if (!pixel_stage(x[1])) { log_once("nvnCommandBufferBindSeparateTextures.stage", static_cast<unsigned>(x[1])); return; }
+    const int si = stage_index(x[1]);
+    if (si < 0) { log_once("nvnCommandBufferBindSeparateTextures.stage", static_cast<unsigned>(x[1])); return; }
     const unsigned first = static_cast<unsigned>(x[2]);
     const unsigned n = static_cast<unsigned>(x[3]);
     const uint64_t* handles = guest_ptr<const uint64_t>(x[4]);
@@ -1386,23 +1401,25 @@ void cmdbuf_bind_separate_textures(nvngfx_ctx*, uint64_t* x) {
     for (unsigned i = 0; i < n; ++i) {
         const unsigned slot = first + i;
         if (slot >= NVNGFX_MAX_TEXTURE_SLOTS) { log_once("nvnCommandBufferBindSeparateTextures.slot", slot); break; }
-        b->sepTexHandle[slot] = handles[i];
+        b->sepTexHandle[si][slot] = handles[i];
     }
-    b->argbuf = nil;
+    b->argbuf[si] = nil;
 }
 void cmdbuf_bind_separate_sampler(nvngfx_ctx*, uint64_t* x) {
     CmdBuf* b = find<CmdBuf>(x[0]);
     if (!b) return;
-    if (!pixel_stage(x[1])) { log_once("nvnCommandBufferBindSeparateSampler.stage", static_cast<unsigned>(x[1])); return; }
+    const int si = stage_index(x[1]);
+    if (si < 0) { log_once("nvnCommandBufferBindSeparateSampler.stage", static_cast<unsigned>(x[1])); return; }
     const unsigned slot = static_cast<unsigned>(x[2]);
     if (slot >= NVNGFX_MAX_SAMPLER_SLOTS) { log_once("nvnCommandBufferBindSeparateSampler.slot", slot); return; }
-    b->sepSampHandle[slot] = x[3];
-    b->argbuf = nil;
+    b->sepSampHandle[si][slot] = x[3];
+    b->argbuf[si] = nil;
 }
 void cmdbuf_bind_separate_samplers(nvngfx_ctx*, uint64_t* x) {
     CmdBuf* b = find<CmdBuf>(x[0]);
     if (!b) return;
-    if (!pixel_stage(x[1])) { log_once("nvnCommandBufferBindSeparateSamplers.stage", static_cast<unsigned>(x[1])); return; }
+    const int si = stage_index(x[1]);
+    if (si < 0) { log_once("nvnCommandBufferBindSeparateSamplers.stage", static_cast<unsigned>(x[1])); return; }
     const unsigned first = static_cast<unsigned>(x[2]);
     const unsigned n = static_cast<unsigned>(x[3]);
     const uint64_t* handles = guest_ptr<const uint64_t>(x[4]);
@@ -1410,9 +1427,9 @@ void cmdbuf_bind_separate_samplers(nvngfx_ctx*, uint64_t* x) {
     for (unsigned i = 0; i < n; ++i) {
         const unsigned slot = first + i;
         if (slot >= NVNGFX_MAX_SAMPLER_SLOTS) { log_once("nvnCommandBufferBindSeparateSamplers.slot", slot); break; }
-        b->sepSampHandle[slot] = handles[i];
+        b->sepSampHandle[si][slot] = handles[i];
     }
-    b->argbuf = nil;
+    b->argbuf[si] = nil;
 }
 
 /* Handle -> host resource.  The pool index in the handle is the guest ID;
@@ -1470,23 +1487,29 @@ struct Program {
     };
     PsoSlot slots[4];
 
-    /* Argument-buffer layout: the fragment stage's [[id(k)]] numbering,
-     * copied out of the offline blob when one is installed.  A real Breath of
-     * the Wild fragment shader needs 42 entries, so this is NVNGFX_MAX_ARGS
-     * and not the 8 the hand-written self-test started with.  numArgs == 0
-     * keeps the M3.81 behaviour: uniform buffer i is id(i). */
+    /* Argument-buffer layout: each stage's [[id(k)]] numbering, copied out
+     * of the offline blob when one is installed.  A real Breath of the Wild
+     * fragment shader needs 42 entries, so this is NVNGFX_MAX_ARGS and not
+     * the 8 the hand-written self-test started with.  numArgs == 0 keeps the
+     * M3.81 behaviour: uniform buffer i is id(i). */
     nvngfx_shader_arg args[NVNGFX_MAX_ARGS] = {};
     unsigned numArgs = 0;
+    nvngfx_shader_arg vargs[NVNGFX_MAX_ARGS] = {};
+    unsigned vNumArgs = 0;
     /* The shader's embedded c1 segment, copied out of the blob.  A c1-only
      * fragment shader has no command-buffer binding at all, so this also
      * decides whether buffer(0) must be bound when has_arguments() is false. */
     std::vector<unsigned char> c1;
     bool hasC1 = false;
     id<MTLBuffer> c1Buffer = nil;
-    /* Whether the fragment function declares an argument buffer at
+    std::vector<unsigned char> vc1;
+    bool vHasC1 = false;
+    id<MTLBuffer> vc1Buffer = nil;
+    /* Whether the stage's function declares an argument buffer at
      * buffer(0).  Constant-colour programs do not, and binding the table to
      * those would feed them the wrong bytes. */
     bool hasArgBuffer = false;
+    bool vHasArgBuffer = false;
     /* A translated shader can also name its resources directly
      * (`texture2d<T> tex [[texture(0)]]`).  That path does not need a
      * Metal 3 resource ID, so it is the fallback for devices whose
@@ -1531,6 +1554,7 @@ void pso_drop(Program* p) {
         p->slots[i].hasLayout = false;
     }
     p->hasArgBuffer = false;
+    p->vHasArgBuffer = false;
     p->directBindings = false;
 }
 
@@ -1605,6 +1629,13 @@ MTLVertexDescriptor* vertex_descriptor(const CmdBuf* b, unsigned long long* layo
             if (why) *why = "vertex attribute format has no Metal counterpart";
             return nil;
         }
+        if (a.stream >= NVNGFX_VERTEX_STREAM_MAX) {
+            /* NVNGFX_VERTEX_STREAM_BASE + stream has to stay inside Metal's
+             * 0..30 argument table. */
+            log_once("nvnPipeline.vertexStreamIndex", a.stream);
+            if (why) *why = "vertex stream index does not fit Metal's table";
+            return nil;
+        }
         const MTLVertexFormat f = mtl_vertex_format(kind, comps);
         if (f == MTLVertexFormatInvalid) {
             log_once("nvnPipeline.vertexFormatRow", a.format);
@@ -1613,23 +1644,24 @@ MTLVertexDescriptor* vertex_descriptor(const CmdBuf* b, unsigned long long* layo
         }
         vd.attributes[i].format = f;
         vd.attributes[i].offset = a.offset;
-        vd.attributes[i].bufferIndex = a.stream;
+        vd.attributes[i].bufferIndex = NVNGFX_VERTEX_STREAM_BASE + a.stream;
         used[a.stream] = true;
     }
-    for (unsigned st = 0; st < NVNGFX_MAX_VERTEX_STREAMS; ++st) {
+    for (unsigned st = 0; st < NVNGFX_VERTEX_STREAM_MAX; ++st) {
         if (!used[st]) continue;
         if (b->stream[st].stride == 0) {
             log_once("nvnPipeline.vertexStride", st);
             if (why) *why = "vertex stream stride is zero";
             return nil;
         }
-        vd.layouts[st].stride = b->stream[st].stride;
+        const unsigned idx = NVNGFX_VERTEX_STREAM_BASE + st;
+        vd.layouts[idx].stride = b->stream[st].stride;
         if (b->stream[st].divisor) {
-            vd.layouts[st].stepFunction = MTLVertexStepFunctionPerInstance;
-            vd.layouts[st].stepRate = b->stream[st].divisor;
+            vd.layouts[idx].stepFunction = MTLVertexStepFunctionPerInstance;
+            vd.layouts[idx].stepRate = b->stream[st].divisor;
         } else {
-            vd.layouts[st].stepFunction = MTLVertexStepFunctionPerVertex;
-            vd.layouts[st].stepRate = 1;
+            vd.layouts[idx].stepFunction = MTLVertexStepFunctionPerVertex;
+            vd.layouts[idx].stepRate = 1;
         }
     }
     return vd;
@@ -1713,6 +1745,7 @@ id<MTLRenderPipelineState> program_pipeline(Ctx* c, Program* p, MTLPixelFormat f
          * written with the fixed 8-byte-entry ABI below, matching the
          * working d2r-mobile backend. */
         p->hasArgBuffer = std::strstr(fs, "[[buffer(0)]]") != nullptr;
+        p->vHasArgBuffer = std::strstr(vs, "[[buffer(0)]]") != nullptr;
         p->directBindings =
             !p->hasArgBuffer &&
             (std::strstr(fs, "[[texture(") != nullptr ||
@@ -1768,9 +1801,10 @@ bool bind_vertex_streams(CmdBuf* b) {
     for (unsigned i = 0; i < b->numAttrib && i < NVNGFX_MAX_VERTEX_ATTRIBS; ++i) {
         const nvngfx_vattr& a = b->attrib[i];
         if (nvngfx_vertex_type(a.format) == NVNGFX_VF_NONE) continue;
-        if (a.stream < NVNGFX_MAX_VERTEX_STREAMS) used[a.stream] = true;
+        if (a.stream < NVNGFX_VERTEX_STREAM_MAX) used[a.stream] = true;
+        else log_once("nvnCommandBufferDraw.vertexStreamIndex", a.stream);
     }
-    for (unsigned st = 0; st < NVNGFX_MAX_VERTEX_STREAMS; ++st) {
+    for (unsigned st = 0; st < NVNGFX_VERTEX_STREAM_MAX; ++st) {
         if (!used[st]) continue;
         id<MTLBuffer> buf = nil;
         size_t off = 0;
@@ -1780,7 +1814,8 @@ bool bind_vertex_streams(CmdBuf* b) {
             log_once("nvnCommandBufferDraw.vertexBuffer", st);
             return false;
         }
-        [b->enc setVertexBuffer:buf offset:off atIndex:st];
+        [b->enc setVertexBuffer:buf offset:off
+                         atIndex:NVNGFX_VERTEX_STREAM_BASE + st];
     }
     return true;
 }
@@ -1810,18 +1845,26 @@ void prog_initialize(nvngfx_ctx*, uint64_t* x) {
 /* Copies a blob's layout into the program.  pso_drop() must not clear it (the
  * layout belongs to the shaders, not to a pipeline), but SetShaders does,
  * because new shaders may describe a different one. */
-void prog_apply_arg_layout(Program* p, const nvngfx_shader_blob* blob) {
+void prog_apply_arg_layout(Program* p, const nvngfx_shader_blob* blob,
+                           nvngfx_stage stage) {
     if (!p) return;
-    p->numArgs = nvngfx_shader_copy_args(blob, p->args, NVNGFX_MAX_ARGS);
-    p->c1.clear();
-    p->hasC1 = false;
-    for (unsigned i = 0; i < p->numArgs; ++i)
-        if (p->args[i].kind == NVNGFX_ARG_C1) p->hasC1 = true;
+    const bool isFs = stage == NVNGFX_STAGE_FRAGMENT;
+    nvngfx_shader_arg* const args = isFs ? p->args : p->vargs;
+    unsigned& numArgs = isFs ? p->numArgs : p->vNumArgs;
+    std::vector<unsigned char>& c1 = isFs ? p->c1 : p->vc1;
+    bool& hasC1 = isFs ? p->hasC1 : p->vHasC1;
+    __strong id<MTLBuffer>* const c1Buffer =
+        isFs ? &p->c1Buffer : &p->vc1Buffer;
+    numArgs = nvngfx_shader_copy_args(blob, args, NVNGFX_MAX_ARGS);
+    c1.clear();
+    hasC1 = false;
+    for (unsigned i = 0; i < numArgs; ++i)
+        if (args[i].kind == NVNGFX_ARG_C1) hasC1 = true;
     if (blob && blob->c1 && blob->c1_size)
-        p->c1.assign(blob->c1, blob->c1 + blob->c1_size);
+        c1.assign(blob->c1, blob->c1 + blob->c1_size);
     /* New shaders (or a re-applied sidecar) invalidate the old copy.  A draw
      * that still needs c1 recreates it from the Program's own bytes. */
-    p->c1Buffer = nil;
+    *c1Buffer = nil;
 }
 
 /* nvnProgramSetShaders(NVNprogram*, int, const NVNshaderData*) -> NVNboolean
@@ -1861,27 +1904,27 @@ void prog_set_shaders(nvngfx_ctx*, uint64_t* x) {
             }
         }
     }
-    /* The fragment stage's [[id(k)]] layout travels with its MSL in the same
-     * blob.  The vertex layout is not consumed yet: buffer(0) is the first
-     * vertex stream in this backend, so the vertex argument buffer needs its
-     * own slot convention before it can be bound (docs/SHADER_CHAIN.md §6). */
+    /* Each stage's [[id(k)]] layout travels with its MSL in the same blob,
+     * and each stage gets its own copy here.  The vertex layout used to be
+     * ignored because buffer(0) was the first vertex stream; M3.87 moves the
+     * streams to NVNGFX_VERTEX_STREAM_BASE, so buffer(0) is the vertex
+     * argument buffer, exactly as the translator emits it. */
     p->numArgs = 0;
     p->c1.clear();
     p->hasC1 = false;
     p->c1Buffer = nil;
-    if (p->numStages > static_cast<unsigned>(NVNGFX_STAGE_FRAGMENT) &&
-        p->key[NVNGFX_STAGE_FRAGMENT][0]) {
-        const nvngfx_shader_blob* fb = nvngfx_shader_lookup_blob(
-            p->key[NVNGFX_STAGE_FRAGMENT], NVNGFX_STAGE_FRAGMENT, nullptr);
-        if (fb) prog_apply_arg_layout(p, fb);
-    }
-    for (unsigned st = 0; st < 3; ++st) {
-        if (st == static_cast<unsigned>(NVNGFX_STAGE_FRAGMENT)) continue;
+    p->vNumArgs = 0;
+    p->vc1.clear();
+    p->vHasC1 = false;
+    p->vc1Buffer = nil;
+    p->hasArgBuffer = false;
+    p->vHasArgBuffer = false;
+    p->directBindings = false;
+    for (unsigned st = 0; st < 2; ++st) {
         if (!p->key[st][0]) continue;
-        const nvngfx_shader_blob* ob = nvngfx_shader_lookup_blob(
+        const nvngfx_shader_blob* sb = nvngfx_shader_lookup_blob(
             p->key[st], static_cast<nvngfx_stage>(st), nullptr);
-        if (ob && ob->num_args)
-            log_once("nvnProgramSetShaders.unusedStageLayout", st);
+        if (sb) prog_apply_arg_layout(p, sb, static_cast<nvngfx_stage>(st));
     }
     /* New shaders invalidate the cached pipelines. */
     pso_drop(p);
@@ -2171,7 +2214,7 @@ void cmdbuf_begin_recording(nvngfx_ctx* ctx, uint64_t* x) {
     b->numColor = 0;
     b->depth = 0;
     b->pendingClear = false;
-    b->argbuf = nil;
+    b->argbuf[0] = b->argbuf[1] = nil;
 }
 
 /* nvnCommandBufferEndRecording(NVNcommandBuffer*) -> NVNcommandHandle
@@ -2248,11 +2291,7 @@ void cmdbuf_bind_uniform_buffer(nvngfx_ctx*, uint64_t* x) {
     if (!b) return;
     const unsigned stage = static_cast<unsigned>(x[1]);
     const int index = static_cast<int>(x[2]);
-    if (stage != 1) {
-        /* The argument buffer is bound at buffer(0), which is exactly
-         * where vertex stream 0 lives.  Until the vertex stage's
-         * index shift is known, only the pixel stage is wired; the
-         * rest is reported instead of silently misplaced. */
+    if (stage_index(x[1]) < 0) {
         log_once("nvnCommandBufferBindUniformBuffer.stage", stage);
         return;
     }
@@ -2261,9 +2300,10 @@ void cmdbuf_bind_uniform_buffer(nvngfx_ctx*, uint64_t* x) {
                  static_cast<unsigned>(index));
         return;
     }
-    b->ubo[index] = x[3];
-    b->uboSize[index] = x[4];
-    b->argbuf = nil;    /* contents changed */
+    const int si = stage_index(x[1]);
+    b->ubo[si][index] = x[3];
+    b->uboSize[si][index] = x[4];
+    b->argbuf[si] = nil;    /* contents changed */
 }
 
 /* nvnCommandBufferBindUniformBuffers(NVNcommandBuffer*, NVNshaderStage,
@@ -2287,16 +2327,17 @@ void cmdbuf_bind_uniform_buffers(nvngfx_ctx* ctx, uint64_t* x) {
     }
 }
 
-/* True when this recording has anything that lives in the argument
- * buffer: constants, a combined texture (which carries its sampler), or a
- * separate texture/sampler. */
-bool has_arguments(const CmdBuf* b) {
+/* True when this stage of the recording has anything that lives in its
+ * argument buffer: constants, a combined texture (which carries its
+ * sampler), or a separate texture/sampler.  `si` is 0 for vertex, 1 for
+ * fragment. */
+bool has_arguments(const CmdBuf* b, int si) {
     for (unsigned i = 0; i < NVNGFX_MAX_UBO_SLOTS; ++i)
-        if (b->ubo[i]) return true;
+        if (b->ubo[si][i]) return true;
     for (unsigned i = 0; i < NVNGFX_MAX_TEXTURE_SLOTS; ++i)
-        if (b->texHandle[i] || b->sepTexHandle[i]) return true;
+        if (b->texHandle[si][i] || b->sepTexHandle[si][i]) return true;
     for (unsigned i = 0; i < NVNGFX_MAX_SAMPLER_SLOTS; ++i)
-        if (b->sepSampHandle[i]) return true;
+        if (b->sepSampHandle[si][i]) return true;
     return false;
 }
 
@@ -2306,13 +2347,17 @@ bool has_arguments(const CmdBuf* b) {
  * is the same memory the GPU would read.  A missing binding, a range outside
  * the declared buffer, or memory outside a pool is a hard failure: filling the
  * argument word with zero would silently sample a dummy handle. */
-bool read_ubo_u32(const CmdBuf* b, unsigned slot, unsigned offset, uint32_t* out) {
-    if (!out || !b || slot >= NVNGFX_MAX_UBO_SLOTS || !b->ubo[slot]) return false;
-    const uint64_t size = b->uboSize[slot];
+bool read_ubo_u32(const CmdBuf* b, int si, unsigned slot, unsigned offset,
+                  uint32_t* out) {
+    if (!out || !b || si < 0 || si > 1 || slot >= NVNGFX_MAX_UBO_SLOTS ||
+        !b->ubo[si][slot])
+        return false;
+    const uint64_t size = b->uboSize[si][slot];
     if (size == 0 || static_cast<uint64_t>(offset) + 4u > size) return false;
     id<MTLBuffer> src = nil;
     size_t base = 0;
-    if (!pool_span(b->ubo[slot], static_cast<size_t>(size), &src, &base)) return false;
+    if (!pool_span(b->ubo[si][slot], static_cast<size_t>(size), &src, &base))
+        return false;
     if (![src contents]) return false;
     std::memcpy(out, static_cast<const unsigned char*>([src contents]) + base + offset, 4);
     return true;
@@ -2334,32 +2379,74 @@ bool read_ubo_u32(const CmdBuf* b, unsigned slot, unsigned offset, uint32_t* out
  *
  * Returns nil when nothing is bound or when a bound resource cannot be
  * resolved; the caller then drops the draw instead of encoding zeros. */
-id<MTLBuffer> argument_buffer(Ctx* c, CmdBuf* b) {
-    if (b->argbuf) return b->argbuf;
+/* Builds one stage's argument buffer for this recording.
+ *
+ * Metal packs an argument buffer by member declaration order, not by
+ * [[id(k)]].  Program::args / vargs therefore carry `packed`
+ * (0..numArgs-1), and each member is one 64-bit word at byte 8*packed: a
+ * buffer writes its gpuAddress + offset, a texture or sampler writes
+ * gpuResourceID.  This fixed ABI is what d2r-mobile's translated MSL
+ * expects, and it is also the only option where MTLArgumentEncoder is
+ * unusable (the iOS Simulator reports encodedLength == 0).
+ *
+ * Vertex and pixel stages have separate layouts and separate tables: a
+ * shader translation puts both at buffer(0) of its own stage, and NVN lets
+ * the two stages bind different resources to the same index.
+ *
+ * A bindless texture/sampler reads its 32-bit NVN handle from the bound
+ * uniform buffer first: low 20 bits name the texture, high 12 the sampler.
+ * A missing UBO, unreadable handle, or unregistered pool ID drops the draw.
+ *
+ * Returns 1 when *out holds the table (fresh or cached), 0 when this stage
+ * declares no argument buffer at all, and -1 when a bound resource cannot be
+ * resolved -- the caller then drops the draw instead of encoding zeros. */
+int argument_buffer(Ctx* c, CmdBuf* b, nvngfx_stage stage, id<MTLBuffer>* out) {
+    const int si = stage_index(static_cast<uint64_t>(stage));
+    if (si < 0 || !out) return -1;
+    *out = nil;
+    if (b->argbuf[si]) {
+        *out = b->argbuf[si];
+        return 1;
+    }
     Program* p = find<Program>(b->program);
+    if (!p) return 0;
+    const bool isFs = si == 1;
+    const nvngfx_shader_arg* const layout = isFs ? p->args : p->vargs;
+    const unsigned numLayout = isFs ? p->numArgs : p->vNumArgs;
+    const bool declaresTable = isFs ? p->hasArgBuffer : p->vHasArgBuffer;
+    const bool hasC1 = isFs ? p->hasC1 : p->vHasC1;
+    std::vector<unsigned char>& c1 = isFs ? p->c1 : p->vc1;
+    __strong id<MTLBuffer>* const c1Buffer =
+        isFs ? &p->c1Buffer : &p->vc1Buffer;
+    const MTLRenderStages stageFlag =
+        isFs ? MTLRenderStageFragment : MTLRenderStageVertex;
+
     /* c1 is not a command-buffer binding: it belongs to the shader.  A
-     * c1-only fragment shader therefore needs buffer(0) even though
-     * has_arguments() sees no UBO, texture or sampler on the command buffer. */
-    if (!has_arguments(b) && !(p && p->hasC1)) return nil;
-    if (!p || !p->hasArgBuffer) {
+     * c1-only shader therefore needs buffer(0) even though has_arguments()
+     * sees no UBO, texture or sampler on the command buffer. */
+    if (!has_arguments(b, si) && !hasC1) return 0;
+    if (!declaresTable) {
+        /* The sidecar names resources but the MSL has no table to put them
+         * in: the two halves of the blob disagree, so nothing is bindable. */
         log_once("nvnCommandBufferDraw.argumentLayout", p ? 1u : 0u);
-        return nil;
+        return -1;
     }
 
     nvngfx_shader_arg legacy[NVNGFX_MAX_ARGS] = {};
     const nvngfx_shader_arg* entries = nullptr;
     unsigned numEntries = 0;
-    if (p->numArgs == 0) {
+    if (numLayout == 0) {
         /* No sidecar: only uniform buffers have an id.  A bound texture
          * cannot be placed, so drop the draw instead of sampling slot 0. */
         for (unsigned i = 0; i < NVNGFX_MAX_TEXTURE_SLOTS; ++i) {
-            if (b->texHandle[i] || b->sepTexHandle[i] || b->sepSampHandle[i]) {
+            if (b->texHandle[si][i] || b->sepTexHandle[si][i] ||
+                b->sepSampHandle[si][i]) {
                 log_once("nvnCommandBufferDraw.textureLayout", i);
-                return nil;
+                return -1;
             }
         }
         for (unsigned i = 0; i < NVNGFX_MAX_UBO_SLOTS; ++i) {
-            if (!b->ubo[i]) continue;
+            if (!b->ubo[si][i]) continue;
             legacy[numEntries].id = static_cast<unsigned char>(i);
             legacy[numEntries].kind = NVNGFX_ARG_UBO;
             legacy[numEntries].slot = static_cast<signed char>(i);
@@ -2368,17 +2455,17 @@ id<MTLBuffer> argument_buffer(Ctx* c, CmdBuf* b) {
         }
         entries = legacy;
     } else {
-        entries = p->args;
-        numEntries = p->numArgs;
+        entries = layout;
+        numEntries = numLayout;
     }
-    if (numEntries == 0) return nil;
+    if (numEntries == 0) return 0;
 
     const size_t bytes = static_cast<size_t>(numEntries) * sizeof(uint64_t);
     id<MTLBuffer> ab = [c->device newBufferWithLength:bytes
                                               options:MTLResourceStorageModeShared];
     if (!ab) {
         log_once("nvnCommandBufferDraw.argumentBuffer", 1);
-        return nil;
+        return -1;
     }
     uint64_t* slots = static_cast<uint64_t*>([ab contents]);
     std::memset(slots, 0, bytes);
@@ -2391,81 +2478,77 @@ id<MTLBuffer> argument_buffer(Ctx* c, CmdBuf* b) {
             /* The layout lists what the shader reads, so an unbound slot is a
              * missing binding, not an optional one: a zero pointer here would
              * fault on the GPU or read the wrong memory. */
-            if (!b->ubo[slot]) {
+            if (!b->ubo[si][slot]) {
                 log_once("nvnCommandBufferDraw.missingUniformBuffer", slot);
-                return nil;
+                return -1;
             }
             id<MTLBuffer> src = nil;
             size_t off = 0;
-            const size_t len =
-                static_cast<size_t>(b->uboSize[slot] ? b->uboSize[slot] : 1);
-            if (!pool_span(b->ubo[slot], len, &src, &off)) {
+            const size_t len = static_cast<size_t>(
+                b->uboSize[si][slot] ? b->uboSize[si][slot] : 1);
+            if (!pool_span(b->ubo[si][slot], len, &src, &off)) {
                 log_once("nvnCommandBufferDraw.uniformBuffer", slot);
-                return nil;
+                return -1;
             }
             slots[e.packed] = static_cast<uint64_t>([src gpuAddress]) + off;
-            [b->enc useResource:src usage:MTLResourceUsageRead
-                           stages:MTLRenderStageFragment];
+            [b->enc useResource:src usage:MTLResourceUsageRead stages:stageFlag];
         } break;
         case NVNGFX_ARG_TEXTURE:
         case NVNGFX_ARG_SEPARATE_TEXTURE: {
             const uint64_t h = e.kind == NVNGFX_ARG_TEXTURE
-                                   ? b->texHandle[slot]
-                                   : b->sepTexHandle[slot];
+                                   ? b->texHandle[si][slot]
+                                   : b->sepTexHandle[si][slot];
             const Tex* t = bound_texture(b, h);
             if (!t || !t->mtl) {
                 log_once("nvnCommandBufferDraw.texture", slot);
-                return nil;
+                return -1;
             }
             slots[e.packed] = static_cast<uint64_t>(t->mtl.gpuResourceID._impl);
-            [b->enc useResource:t->mtl usage:MTLResourceUsageRead
-                           stages:MTLRenderStageFragment];
+            [b->enc useResource:t->mtl usage:MTLResourceUsageRead stages:stageFlag];
         } break;
         case NVNGFX_ARG_SAMPLER_OF_TEXTURE:
         case NVNGFX_ARG_SEPARATE_SAMPLER: {
             const uint64_t h = e.kind == NVNGFX_ARG_SAMPLER_OF_TEXTURE
-                                   ? b->texHandle[slot]
-                                   : b->sepSampHandle[slot];
+                                   ? b->texHandle[si][slot]
+                                   : b->sepSampHandle[si][slot];
             const PooledSampler* smp = bound_sampler(b, h);
             if (!smp || !smp->mtl) {
                 log_once("nvnCommandBufferDraw.sampler", slot);
-                return nil;
+                return -1;
             }
             slots[e.packed] = static_cast<uint64_t>(smp->mtl.gpuResourceID._impl);
         } break;
         case NVNGFX_ARG_C1: {
-            if (!p->hasC1) {
+            if (!hasC1) {
                 log_once("nvnCommandBufferDraw.missingC1", e.id);
-                return nil;
+                return -1;
             }
-            if (!p->c1Buffer) {
+            if (!*c1Buffer) {
                 /* Match the shared-bank layout nxnative uses: data rounded
                  * up to 256 bytes, then a 256-byte zero gap.  An explicit
                  * empty c1 still gets that zero span, never a zero-length
                  * MTLBuffer (which Metal may reject). */
-                const size_t data = p->c1.size();
+                const size_t data = c1.size();
                 const size_t need = ((data + 255u) & ~size_t(255u)) + 256u;
-                p->c1Buffer = [c->device newBufferWithLength:need
-                                                    options:MTLResourceStorageModeShared];
-                if (!p->c1Buffer) {
+                *c1Buffer = [c->device newBufferWithLength:need
+                                                   options:MTLResourceStorageModeShared];
+                if (!*c1Buffer) {
                     log_once("nvnCommandBufferDraw.c1Buffer", 1);
-                    return nil;
+                    return -1;
                 }
-                std::memset([p->c1Buffer contents], 0, need);
-                if (data)
-                    std::memcpy([p->c1Buffer contents], p->c1.data(), data);
+                std::memset([*c1Buffer contents], 0, need);
+                if (data) std::memcpy([*c1Buffer contents], c1.data(), data);
             }
-            slots[e.packed] = static_cast<uint64_t>([p->c1Buffer gpuAddress]);
-            [b->enc useResource:p->c1Buffer usage:MTLResourceUsageRead
-                           stages:MTLRenderStageFragment];
+            slots[e.packed] = static_cast<uint64_t>([*c1Buffer gpuAddress]);
+            [b->enc useResource:*c1Buffer usage:MTLResourceUsageRead stages:stageFlag];
         } break;
         case NVNGFX_ARG_TEXTURE_IN_UBO:
         case NVNGFX_ARG_SAMPLER_OF_UBO_TEXTURE:
         case NVNGFX_ARG_SAMPLER_IN_UBO: {
             uint32_t handle = 0;
-            if (!read_ubo_u32(b, slot, e.offset, &handle)) {
+            if (!read_ubo_u32(b, si, slot, e.offset, &handle)) {
                 log_once("nvnCommandBufferDraw.bindlessHandle", e.packed);
-                return nil;
+                return -1;
             }
             if (e.kind == NVNGFX_ARG_TEXTURE_IN_UBO) {
                 const unsigned tid = handle & NVNGFX_POOL_INDEX_MASK;
@@ -2474,11 +2557,11 @@ id<MTLBuffer> argument_buffer(Ctx* c, CmdBuf* b) {
                     : nullptr;
                 if (!t || !t->mtl) {
                     log_once("nvnCommandBufferDraw.bindlessTexture", e.packed);
-                    return nil;
+                    return -1;
                 }
                 slots[e.packed] = static_cast<uint64_t>(t->mtl.gpuResourceID._impl);
                 [b->enc useResource:t->mtl usage:MTLResourceUsageRead
-                               stages:MTLRenderStageFragment];
+                              stages:stageFlag];
             } else {
                 const unsigned sid = handle >> NVNGFX_POOL_INDEX_BITS;
                 const PooledSampler* smp = sid
@@ -2486,7 +2569,7 @@ id<MTLBuffer> argument_buffer(Ctx* c, CmdBuf* b) {
                     : nullptr;
                 if (!smp || !smp->mtl) {
                     log_once("nvnCommandBufferDraw.bindlessSampler", e.packed);
-                    return nil;
+                    return -1;
                 }
                 slots[e.packed] = static_cast<uint64_t>(smp->mtl.gpuResourceID._impl);
             }
@@ -2497,11 +2580,12 @@ id<MTLBuffer> argument_buffer(Ctx* c, CmdBuf* b) {
              * has no way to report an unfinished argument buffer. */
             log_once("nvnCommandBufferDraw.argUnsupported",
                      static_cast<unsigned>(e.id));
-            return nil;
+            return -1;
         }
     }
-    b->argbuf = ab;
-    return b->argbuf;
+    b->argbuf[si] = ab;
+    *out = ab;
+    return 1;
 }
 
 /* Direct texture/sampler bindings for shaders that name resources with
@@ -2510,21 +2594,23 @@ id<MTLBuffer> argument_buffer(Ctx* c, CmdBuf* b) {
  * handle, upload and sampler-state layers. */
 bool bind_direct_arguments(CmdBuf* b) {
     bool bound = false;
+    const int si = 1;   /* the direct path is the pixel stage's fallback */
     for (unsigned i = 0; i < NVNGFX_MAX_TEXTURE_SLOTS; ++i) {
-        if (i < NVNGFX_MAX_UBO_SLOTS && b->ubo[i]) {
+        if (i < NVNGFX_MAX_UBO_SLOTS && b->ubo[si][i]) {
             id<MTLBuffer> src = nil;
             size_t off = 0;
             const size_t len =
-                static_cast<size_t>(b->uboSize[i] ? b->uboSize[i] : 1);
-            if (!pool_span(b->ubo[i], len, &src, &off)) {
+                static_cast<size_t>(b->uboSize[si][i] ? b->uboSize[si][i] : 1);
+            if (!pool_span(b->ubo[si][i], len, &src, &off)) {
                 log_once("nvnCommandBufferDraw.directUniformBuffer", i);
                 return false;
             }
             [b->enc setFragmentBuffer:src offset:off atIndex:i];
             bound = true;
         }
-        const uint64_t texHandle =
-            b->texHandle[i] ? b->texHandle[i] : b->sepTexHandle[i];
+        const uint64_t texHandle = b->texHandle[si][i]
+                                       ? b->texHandle[si][i]
+                                       : b->sepTexHandle[si][i];
         if (texHandle) {
             const Tex* t = bound_texture(b, texHandle);
             if (!t || !t->mtl) {
@@ -2534,8 +2620,9 @@ bool bind_direct_arguments(CmdBuf* b) {
             [b->enc setFragmentTexture:t->mtl atIndex:i];
             bound = true;
         }
-        const uint64_t sampHandle =
-            b->texHandle[i] ? b->texHandle[i] : b->sepSampHandle[i];
+        const uint64_t sampHandle = b->texHandle[si][i]
+                                        ? b->texHandle[si][i]
+                                        : b->sepSampHandle[si][i];
         if (sampHandle) {
             const PooledSampler* s = bound_sampler(b, sampHandle);
             if (!s || !s->mtl) {
@@ -2549,17 +2636,27 @@ bool bind_direct_arguments(CmdBuf* b) {
     return bound;
 }
 
-/* Binds the pixel stage's resources before a draw.  True when there is
- * nothing to bind or the binding succeeded; false means the draw must not be
- * encoded, because a shader that reads constants or samples a texture would
- * read the wrong thing. */
+/* Binds both stages' resources before a draw.  The vertex table goes to
+ * buffer(0) of the vertex stage and the pixel table to buffer(0) of the
+ * fragment stage -- the same indices a spirv-cross translation gives
+ * `spvDescriptorSetBuffer0`.  Vertex streams live at
+ * NVNGFX_VERTEX_STREAM_BASE + stream instead, so they do not collide with
+ * the vertex table.
+ *
+ * True when there is nothing to bind or the binding succeeded; false means
+ * the draw must not be encoded, because a shader that reads constants or
+ * samples a texture would read the wrong thing. */
 bool bind_arguments(Ctx* c, CmdBuf* b) {
     Program* p = find<Program>(b->program);
-    if (!has_arguments(b) && !(p && p->hasC1)) return true;
+    id<MTLBuffer> ab = nil;
+    const int vr = argument_buffer(c, b, NVNGFX_STAGE_VERTEX, &ab);
+    if (vr < 0) return false;
+    if (vr > 0) [b->enc setVertexBuffer:ab offset:0 atIndex:0];
+
     if (p && p->directBindings) return bind_direct_arguments(b);
-    id<MTLBuffer> ab = argument_buffer(c, b);
-    if (!ab) return false;
-    [b->enc setFragmentBuffer:ab offset:0 atIndex:0];
+    const int fr = argument_buffer(c, b, NVNGFX_STAGE_FRAGMENT, &ab);
+    if (fr < 0) return false;
+    if (fr > 0) [b->enc setFragmentBuffer:ab offset:0 atIndex:0];
     return true;
 }
 
@@ -3563,10 +3660,10 @@ extern "C" int nvngfx_metal_selftest(void) {
                 std::fprintf(stderr,
                              "[selftest] draw 4 not encoded: pso=%d argbuf=%d "
                              "hasArgBuffer=%d numArgs=%u ubo0=0x%llx\n",
-                             b4->pso ? 1 : 0, b4->argbuf ? 1 : 0,
+                             b4->pso ? 1 : 0, b4->argbuf[1] ? 1 : 0,
                              p4 && p4->hasArgBuffer ? 1 : 0,
                              p4 ? p4->numArgs : 0u,
-                             static_cast<unsigned long long>(b4->ubo[0]));
+                             static_cast<unsigned long long>(b4->ubo[1][0]));
             }
             [b4->last waitUntilCompleted];
             if (b4->last.status == MTLCommandBufferStatusError) {
@@ -3809,7 +3906,7 @@ extern "C" int nvngfx_metal_selftest(void) {
                 std::fflush(stderr);
                 if (!useDirect) {
                     if (Program* p5 = find<Program>(kProg5))
-                        prog_apply_arg_layout(p5, found);
+                        prog_apply_arg_layout(p5, found, NVNGFX_STAGE_FRAGMENT);
                 }
             }
             /* Put the real table back before anything else looks a shader up. */
@@ -3859,24 +3956,24 @@ extern "C" int nvngfx_metal_selftest(void) {
             Program* p5 = find<Program>(kProg5);
             Tex* src5 = find<Tex>(kTexSrc);
             const PooledSampler* ps5 =
-                b5 ? bound_sampler(b5, b5->texHandle[0]) : nullptr;
+                b5 ? bound_sampler(b5, b5->texHandle[1][0]) : nullptr;
             uint64_t words[3] = {0, 0, 0};
-            const bool haveTable = b5 && b5->argbuf;
+            const bool haveTable = b5 && b5->argbuf[1];
             if (haveTable) {
-                std::memcpy(words, [b5->argbuf contents], sizeof words);
+                std::memcpy(words, [b5->argbuf[1] contents], sizeof words);
             }
             std::fprintf(stderr,
                          "[selftest] textured draw state: pso=%d argbuf=%d "
                          "hasArgs=%d encoded=%u draws=%u hasArgBuffer=%d "
                          "direct=%d numArgs=%u ubo0=0x%llx tex0=0x%llx\n",
                          b5 && b5->pso ? 1 : 0, haveTable ? 1 : 0,
-                         b5 && has_arguments(b5) ? 1 : 0,
+                         b5 && has_arguments(b5, 1) ? 1 : 0,
                          b5 ? b5->encoded : 0u, b5 ? b5->draws : 0u,
                          p5 && p5->hasArgBuffer ? 1 : 0,
                          p5 && p5->directBindings ? 1 : 0,
                          p5 ? p5->numArgs : 0u,
-                         b5 ? static_cast<unsigned long long>(b5->ubo[0]) : 0ull,
-                         b5 ? static_cast<unsigned long long>(b5->texHandle[0])
+                         b5 ? static_cast<unsigned long long>(b5->ubo[1][0]) : 0ull,
+                         b5 ? static_cast<unsigned long long>(b5->texHandle[1][0])
                             : 0ull);
             std::fprintf(stderr,
                          "[selftest] textured draw ids: tex=0x%llx samp=0x%llx "
@@ -4010,7 +4107,7 @@ extern "C" int nvngfx_metal_selftest(void) {
                     rc = 16390;
                     goto done;
                 }
-                prog_apply_arg_layout(p6, found);
+                prog_apply_arg_layout(p6, found, NVNGFX_STAGE_FRAGMENT);
                 /* The Program must own a copy: poison the source now. */
                 std::memset(c1Bytes, 0xAA, sizeof c1Bytes);
                 std::fprintf(stderr,
@@ -4141,7 +4238,7 @@ extern "C" int nvngfx_metal_selftest(void) {
                     rc = 16393;
                     goto done;
                 }
-                prog_apply_arg_layout(p7, found);
+                prog_apply_arg_layout(p7, found, NVNGFX_STAGE_FRAGMENT);
             }
             nvngfx_shader_set_blobs(saved7, saved7Count);
 
@@ -4183,7 +4280,9 @@ extern "C" int nvngfx_metal_selftest(void) {
                 rc = 16394;
                 goto done;
             }
-            id<MTLBuffer> table7 = argument_buffer(c, b7);
+            id<MTLBuffer> table7 = nil;
+            if (argument_buffer(c, b7, NVNGFX_STAGE_FRAGMENT, &table7) < 0)
+                table7 = nil;
             const Tex* tex7 = find<Tex>(kTexSrc);
             const PooledSampler* samp7 = bound_sampler(
                 b7, nvngfx_separate_sampler_handle(9));
@@ -4232,6 +4331,175 @@ extern "C" int nvngfx_metal_selftest(void) {
             }
         }
 
+        {
+            /* --- Draw 8: the vertex stage's argument buffer ------------
+             * The vertex shader reads its shift from buffer(0) and its
+             * positions through [[stage_in]] from stream 0.  The backend
+             * binds the vertex table at buffer(0) and stream 0 at
+             * NVNGFX_VERTEX_STREAM_BASE, so neither can be mistaken for the
+             * other.  The shift moves the full-screen triangle 1.5 to the
+             * left: the left eighth of the target turns magenta and the
+             * right eighth keeps the clear colour.  A missing table leaves
+             * the triangle centred; a stream bound at index 0 would feed the
+             * attribute the argument buffer's own bytes. */
+            const uint64_t kProg8 = 0x6200;
+            const uint64_t kCb8 = 0x6300;
+            struct { uint64_t data; uint64_t control; } sd8[2];
+            sd8[0].data = reinterpret_cast<uint64_t>(const_cast<char*>(
+                nvngfx_shader_selftest_msl_variant(NVNGFX_STAGE_VERTEX, 8)));
+            sd8[0].control = 0;
+            sd8[1].data = reinterpret_cast<uint64_t>(const_cast<char*>(
+                nvngfx_shader_selftest_msl_variant(NVNGFX_STAGE_FRAGMENT, 8)));
+            sd8[1].control = 0;
+            x[0] = kProg8; x[1] = 0;
+            prog_initialize(ctx, x);
+            x[0] = kProg8; x[1] = 2;
+            x[2] = reinterpret_cast<uint64_t>(&sd8[0]);
+            prog_set_shaders(ctx, x);
+            if (x[0] != 1) {
+                std::fprintf(stderr,
+                             "[selftest] vertex-ubo program: SetShaders failed\n");
+                rc = 16395;
+                goto done;
+            }
+
+            /* The pool's aligned base, recomputed here because the earlier
+             * block scoped its own pointer. */
+            unsigned char* const vpool = reinterpret_cast<unsigned char*>(
+                (reinterpret_cast<uintptr_t>(poolRaw) + 16383u) &
+                ~static_cast<uintptr_t>(16383u));
+            /* A second triangle at +64 and its shift at +3072. */
+            {
+                float* v = reinterpret_cast<float*>(vpool + 64);
+                v[0] = -1.0f; v[1] = -1.0f;
+                v[2] = 3.0f;  v[3] = -1.0f;
+                v[4] = -1.0f; v[5] = 3.0f;
+                float* sh = reinterpret_cast<float*>(vpool + 3072);
+                sh[0] = -1.5f; sh[1] = 0.0f; sh[2] = 0.0f; sh[3] = 0.0f;
+            }
+            /* RG32F attribute 0 at offset 0, fed by stream 0 with stride 8 --
+             * the same state draw 2 binds, rebuilt here so this recording
+             * does not depend on another command buffer's copy. */
+            alignas(16) unsigned char attrib8[8] = {};
+            alignas(16) unsigned char stream8[8] = {};
+            x[0] = reinterpret_cast<uint64_t>(attrib8);
+            vattrib_set_defaults(ctx, x);
+            x[0] = reinterpret_cast<uint64_t>(attrib8); x[1] = 0x16; x[2] = 0;
+            vattrib_set_format(ctx, x);
+            x[0] = reinterpret_cast<uint64_t>(attrib8); x[1] = 0;
+            vattrib_set_stream(ctx, x);
+            x[0] = reinterpret_cast<uint64_t>(stream8);
+            vstream_set_defaults(ctx, x);
+            x[0] = reinterpret_cast<uint64_t>(stream8); x[1] = 8;
+            vstream_set_stride(ctx, x);
+
+            const uint64_t target8 = kTex;
+            const float clear8[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+            x[0] = kCb8;
+            cmdbuf_begin_recording(ctx, x);
+            x[0] = kCb8; x[1] = 1; x[2] = reinterpret_cast<uint64_t>(&target8);
+            x[3] = 0; x[4] = 0; x[5] = 0;
+            cmdbuf_set_render_targets(ctx, x);
+            x[0] = kCb8; x[1] = 0; x[2] = reinterpret_cast<uint64_t>(clear8);
+            x[3] = 0xF;
+            cmdbuf_clear_color(ctx, x);
+            x[0] = kCb8; x[1] = 1;
+            x[2] = reinterpret_cast<uint64_t>(&attrib8[0]);
+            cmdbuf_bind_vertex_attrib_state(ctx, x);
+            x[0] = kCb8; x[1] = 1;
+            x[2] = reinterpret_cast<uint64_t>(&stream8[0]);
+            cmdbuf_bind_vertex_stream_state(ctx, x);
+            x[0] = kCb8; x[1] = 0;
+            x[2] = reinterpret_cast<uint64_t>(vpool + 64); x[3] = 24;
+            cmdbuf_bind_vertex_buffer(ctx, x);
+            x[0] = kCb8; x[1] = 0; x[2] = 0;
+            x[3] = reinterpret_cast<uint64_t>(vpool + 3072); x[4] = 16;
+            cmdbuf_bind_uniform_buffer(ctx, x);
+            x[0] = kCb8; x[1] = kProg8; x[2] = 0;
+            cmdbuf_bind_program(ctx, x);
+            x[0] = kCb8; x[1] = 0; x[2] = 0; x[3] = 3;
+            cmdbuf_draw_arrays(ctx, x);
+            x[0] = kCb8;
+            cmdbuf_end_recording(ctx, x);
+
+            CmdBuf* b8 = find<CmdBuf>(kCb8);
+            Program* p8 = find<Program>(kProg8);
+            if (!b8 || !b8->last || !p8) {
+                std::fprintf(stderr,
+                             "[selftest] vertex-ubo draw did not commit (cb=%d p=%d)\n",
+                             b8 ? 1 : 0, p8 ? 1 : 0);
+                rc = 16395;
+                goto done;
+            }
+            [b8->last waitUntilCompleted];
+            if (b8->last.status == MTLCommandBufferStatusError) {
+                std::fprintf(stderr,
+                             "[selftest] vertex-ubo command buffer error: %s\n",
+                             b8->last.error
+                                 ? [[b8->last.error localizedDescription] UTF8String]
+                                 : "(no description)");
+                rc = 16395;
+                goto done;
+            }
+
+            id<MTLBuffer> vtable = b8->argbuf[0];
+            uint64_t word8 = 0;
+            if (vtable && [vtable length] >= 8)
+                std::memcpy(&word8, [vtable contents], 8);
+            id<MTLBuffer> uboBuf = nil;
+            size_t uboOff = 0;
+            const bool uboKnown =
+                pool_span(reinterpret_cast<uint64_t>(vpool) + 3072, 16,
+                          &uboBuf, &uboOff);
+            const uint64_t wantWord =
+                uboKnown ? static_cast<uint64_t>([uboBuf gpuAddress]) + uboOff
+                         : ~0ull;
+            if (!vtable || [vtable length] != 8 || word8 != wantWord ||
+                !p8->vHasArgBuffer || b8->encoded != 1) {
+                std::fprintf(stderr,
+                             "[selftest] vertex table mismatch: len=%lu "
+                             "word=0x%llx want=0x%llx hasArg=%d encoded=%u\n",
+                             vtable ? static_cast<unsigned long>([vtable length]) : 0ul,
+                             static_cast<unsigned long long>(word8),
+                             static_cast<unsigned long long>(wantWord),
+                             p8->vHasArgBuffer ? 1 : 0, b8->encoded);
+                rc = 16395;
+                goto done;
+            }
+            {
+                unsigned char left[4] = {0, 0, 0, 0};
+                unsigned char right[4] = {0, 0, 0, 0};
+                const int wantMagenta[4] = {255, 0, 255, 255};
+                const int wantClear[4] = {0, 0, 0, 255};
+                if (!read_pixel_at(dev, c->queue, t->mtl, kSide,
+                                   kSide / 8, kSide / 2, left) ||
+                    !read_pixel_at(dev, c->queue, t->mtl, kSide,
+                                   (7 * kSide) / 8, kSide / 2, right)) {
+                    std::fprintf(stderr, "[selftest] vertex-ubo readback failed\n");
+                    rc = 16395;
+                    goto done;
+                }
+                if (!pixels_near(left, wantMagenta, 2) ||
+                    !pixels_near(right, wantClear, 2)) {
+                    std::fprintf(stderr,
+                                 "[selftest] vertex-ubo pixels (%u,%u,%u,%u) / "
+                                 "(%u,%u,%u,%u), want (%d,%d,%d,%d) / (%d,%d,%d,%d)\n",
+                                 left[0], left[1], left[2], left[3],
+                                 right[0], right[1], right[2], right[3],
+                                 wantMagenta[0], wantMagenta[1], wantMagenta[2],
+                                 wantMagenta[3], wantClear[0], wantClear[1],
+                                 wantClear[2], wantClear[3]);
+                    rc = 16395;
+                    goto done;
+                }
+                std::fprintf(stderr,
+                             "[selftest] vertex table: buffer(0) word=0x%llx, "
+                             "stream at %d, shifted pixels read back\n",
+                             static_cast<unsigned long long>(word8),
+                             NVNGFX_VERTEX_STREAM_BASE);
+            }
+        }
+
     done:
         nvngfx_shader_set_msl_passthrough(0);
         forget<CmdBuf>(kCb);
@@ -4256,6 +4524,8 @@ extern "C" int nvngfx_metal_selftest(void) {
         forget<CmdBuf>(0x5F00);
         forget<Program>(0x6000);
         forget<CmdBuf>(0x6100);
+        forget<Program>(0x6200);
+        forget<CmdBuf>(0x6300);
         g_tex_specs.erase(kTexSrcBuilder);
         g_sampler_specs.erase(kSamplerBuilder5);
         nvngfx_metal_destroy(ctx);
