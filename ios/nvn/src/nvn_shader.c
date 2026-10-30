@@ -107,6 +107,8 @@ static const char* const kVsUv =
     "    NvngfxVaryings v;\n"
     "    v.position = float4(p[vid], 0.0, 1.0);\n"
     "    v.uv = p[vid] * 0.5 + 0.5;\n"
+    "    /* Metal's texture origin is top-left while NDC +y is up. */\n"
+    "    v.uv.y = 1.0 - v.uv.y;\n"
     "    return v;\n"
     "}\n";
 
