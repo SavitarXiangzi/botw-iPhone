@@ -3480,9 +3480,32 @@ Metal 描述**修对了，端到端只有 2D array 跑过；这一轮补上最�
 `texturecube_array<float>`，且采样语句带 layer `0` / `1`。两者都要求
 顶点阶段与 variant 4 同一个 `kVsUv`。
 
+### 第一次 CI：预算算错，被自检当场抓住
+
+run 41072154244 的 iOS job 报：
+
+```text
+[selftest] draw 12: guest cube layout failed (layers=6 size=3072)
+BOTW_SELFTEST rc=16401
+```
+
+`layers` 是对的，错在我给自检写的 `size <= 1024` 预算。`nvngfx_tex_layout()`
+把每层对齐到 block 边界，2×2 RGBA8 的一层仍是 **512 字节**，cube 6 层 =
+3072，cube array 12 层 = 6144；原来的 16 KiB guest pool 也装不下
+12288 + 3072 / 13824 + 6144 两组纹理。于是：
+
+- guest pool 从 16 KiB 提到 64 KiB（仍按同一个常量分配、memset、建 builder）；
+- 预算检查改成 `size == 512 * layers`，并把 cube array 挪到 offset 16384；
+- `tests/nvn_texlayout_test.cpp` 加一条 2×2 的可移植断言
+  （`layer_size = 512`、cube `size = 3072`、cube array `size = 6144`），
+  免得再靠模拟器才发现。
+
+这轮自检的价值就在这里：它不是“跑通就行”，而是把布局算术和池预算一起钉住。
+
 ### 本地证据
 
 ```text
+nvn_texlayout_test: ok (block shapes, sizes, offsets, round trip, refusals)
 nvn_shader_test: ok (seam, blob table, packed slots, bindless, c1, SHA-256, shader key, layered/cube fixtures)
 syntax_check_metal: ok (clang++.exe)
 build_abi_test: all tests passed

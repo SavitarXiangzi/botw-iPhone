@@ -3686,8 +3686,11 @@ extern "C" int nvngfx_metal_selftest(void) {
              * (allocation, memset, builder) must agree.  Using
              * sizeof(vertexPool) here was a bug: vertexPool is a
              * pointer, so the pool was 8 bytes and every span check
-             * rejected the 24-byte vertex range. */
-            const size_t kPoolSize = 16384;
+             * rejected the 24-byte vertex range.  The pool is 64 KiB so the
+             * cube and cube-array draws below fit: each layer is block
+             * aligned, so a 2x2 face still costs 512 bytes and a two-cube
+             * array costs 12 * 512. */
+            const size_t kPoolSize = 65536;
             poolRaw = std::malloc(kPoolSize + kPoolSize);
             if (!poolRaw) {
                 std::fprintf(stderr, "[selftest] could not allocate the pool page\n");
@@ -5378,8 +5381,10 @@ extern "C" int nvngfx_metal_selftest(void) {
                     0, 255, 0, 255, 0, 255, 0, 255,
                     0, 255, 0, 255, 0, 255, 0, 255};
                 nvngfx_texlayout cl = {};
+                /* A layer is block-aligned, so a 2x2 RGBA8 face still
+                 * occupies a full 512-byte layer: 6 * 512 for the cube. */
                 bool ok = nvngfx_tex_layout(&cd, &cl) == 0 &&
-                          cl.layers == 6 && cl.size <= 1024;
+                          cl.layers == 6 && cl.size == 512ull * cl.layers;
                 for (unsigned face = 0; ok && face < 6; ++face) {
                     const unsigned char* const src =
                         face == 4 ? red : (face == 5 ? yellow : green);
@@ -5561,7 +5566,7 @@ extern "C" int nvngfx_metal_selftest(void) {
             const uint64_t kCb13 = 0x7100;
             const uint64_t kB13 =
                 reinterpret_cast<uint64_t>(guestCubeArrayBuilder);
-            const unsigned kCubeArrayOffset = 13824;
+            const unsigned kCubeArrayOffset = 16384;
             unsigned char* const vpool13 = reinterpret_cast<unsigned char*>(
                 (reinterpret_cast<uintptr_t>(poolRaw) + 16383u) &
                 ~static_cast<uintptr_t>(16383u));
@@ -5589,7 +5594,8 @@ extern "C" int nvngfx_metal_selftest(void) {
                     0, 255, 0, 255, 0, 255, 0, 255};
                 nvngfx_texlayout al13 = {};
                 bool ok = nvngfx_tex_layout(&ad13, &al13) == 0 &&
-                          al13.layers == 12 && al13.size <= 1024;
+                          al13.layers == 12 &&
+                          al13.size == 512ull * al13.layers;
                 for (unsigned face = 0; ok && face < 12; ++face) {
                     const unsigned char* const src =
                         face == 4 ? red : (face == 11 ? yellow : green);

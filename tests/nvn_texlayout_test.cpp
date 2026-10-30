@@ -141,6 +141,25 @@ static void test_sizes() {
         CHECK(L.layer_size == 16384);
         CHECK(L.size == 12 * 16384);
     }
+    {
+        /* What the cube self-tests have to reserve in a guest pool.  A layer
+         * starts block aligned, so a 2x2 RGBA8 face still costs a full 512
+         * bytes; the pool budget check in nvn_metal.mm uses this arithmetic
+         * and the simulator caught it when it was off (3072 > 1024). */
+        nvngfx_texdesc tiny = make_desc(0x25, 2, 2, 1);
+        tiny.target = 8;
+        CHECK(nvngfx_tex_layout(&tiny, &L) == 0);
+        CHECK(L.layers == 6);
+        CHECK(L.layer_size == 512);
+        CHECK(L.size == 3072);
+
+        tiny.target = 9;
+        tiny.depth = 2;
+        CHECK(nvngfx_tex_layout(&tiny, &L) == 0);
+        CHECK(L.layers == 12);
+        CHECK(L.layer_size == 512);
+        CHECK(L.size == 6144);
+    }
 }
 
 static void test_bl_offset() {
