@@ -7,16 +7,59 @@ on:
   workflow_dispatch:
 
 jobs:
-  core-syntax:
-    # Fast gate: the C ABI must compile with a plain clang before we pay for a macOS runner.
+  # Everything that can be checked without a Mac.  If this job is red there is
+  # no point paying for a macOS runner.
+  portable:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Compile C++ core (host clang)
-        run: clang++ -std=c++20 -Wall -Wextra -Werror -c core/src/botw_core.cpp -Icore/include -o /tmp/botw_core.o
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Generated NVN artefacts are up to date
+        run: python scripts/gen_nvn.py --repo . --check
+
+      - name: Repository invariants (registry / bindings / no title data)
+        run: python scripts/verify_ios.py
+
+      - name: Coverage progress (log only)
+        run: python scripts/nvn_status.py
+
+      - name: Release gate is still closed (expected to fail on purpose)
+        run: |
+          if python scripts/verify_ios.py --release; then
+            echo "::error::verify_ios --release passed but kEnumsVerified is still 0"
+            exit 1
+          fi
+          echo "release gate correctly refuses to pass"
+
+      - name: Build + run the NVN ABI and core smoke tests (clang)
+        run: |
+          set -euo pipefail
+          INC="-I core/include -I ios/nvn/include"
+          LIB="ios/nvn/src/nvn_dispatch.cpp ios/nvn/src/nvn_null.cpp core/src/botw_core.cpp"
+          FLAGS="-std=c++20 -Wall -Wextra -Werror -O1"
+          clang++ $FLAGS $INC tests/nvn_abi_test.cpp    $LIB -o /tmp/nvn_abi_test
+          clang++ $FLAGS $INC tests/core_smoke_test.cpp $LIB -o /tmp/core_smoke_test
+          /tmp/nvn_abi_test
+          /tmp/core_smoke_test
+
+      # nvn_metal.mm is ObjC++; this parses it against tests/stubs/ so a type
+      # error in the Metal backend is caught without a mac runner.
+      - name: Metal backend type-checks (clang + stub headers)
+        run: python scripts/syntax_check_metal.py --require
+
+      - name: C ABI compiles on its own (header hygiene)
+        run: |
+          clang++ -std=c++20 -Wall -Wextra -Werror -I core/include -I ios/nvn/include \
+            -fsyntax-only core/src/botw_core.cpp
+          clang -std=c11 -Wall -Wextra -Werror -I ios/nvn/include \
+            -fsyntax-only ios/nvn/include/nvn_api.h
 
   ios:
-    needs: core-syntax
+    needs: portable
     # XcodeGen 2.44+ emits objectVersion 77 (Xcode 16 format); macos-14 only has Xcode 15.
     runs-on: macos-15
     steps:
@@ -47,7 +90,6 @@ jobs:
           echo "$out" | head -12
 
       - name: Build for iOS Simulator
-        id: sim
         working-directory: ios
         run: |
           set -o pipefail
@@ -58,8 +100,7 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             build > build-sim.log 2>&1 || rc=$?
           if [ -n "${rc:-}" ]; then
-            # surface the compiler errors as annotations so they are readable without log auth
-            grep -E "(error|fatal error):" build-sim.log | head -15 | while read -r line; do
+            grep -E "(error|fatal error):" build-sim.log | head -25 | while read -r line; do
               echo "::error::$line"
             done
             echo "::error::xcodebuild exited with $rc"
@@ -68,24 +109,50 @@ jobs:
           fi
           tail -20 build-sim.log
 
-      - name: Build for device (unsigned)
+      # Debug on purpose: nvn_metal.mm refuses an NDEBUG build while the NVN
+      # enum values are unverified, so a Release build here would always fail.
+      - name: Build for device (unsigned, Debug)
         working-directory: ios
         run: |
           set -o pipefail
           xcodebuild -project BotW.xcodeproj -scheme BotW \
-            -configuration Release -sdk iphoneos \
+            -configuration Debug -sdk iphoneos \
             -destination 'generic/platform=iOS' \
             -derivedDataPath build-device \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
             build > build-dev.log 2>&1 || rc=$?
           if [ -n "${rc:-}" ]; then
-            grep -E "(error|fatal error):" build-dev.log | head -15 | while read -r line; do
+            grep -E "(error|fatal error):" build-dev.log | head -25 | while read -r line; do
               echo "::error::$line"
             done
             tail -60 build-dev.log
             exit "$rc"
           fi
           tail -20 build-dev.log
+
+      # The release gate is enforced by the compiler, not by a script that
+      # someone can forget to run.  Assert it actually fires.
+      - name: Release build must be refused
+        working-directory: ios
+        run: |
+          set -o pipefail
+          if xcodebuild -project BotW.xcodeproj -scheme BotW \
+               -configuration Release -sdk iphoneos \
+               -destination 'generic/platform=iOS' \
+               -derivedDataPath build-release \
+               CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+               build > build-release.log 2>&1; then
+            echo "::error::Release build succeeded but NVN enums are unverified"
+            tail -40 build-release.log
+            exit 1
+          fi
+          if ! grep -q "Release build refused" build-release.log; then
+            echo "::error::Release build failed for the wrong reason"
+            grep -E "error:" build-release.log | head -20
+            tail -40 build-release.log
+            exit 1
+          fi
+          echo "release gate correctly refuses to compile"
 
       - name: Upload simulator app
         uses: actions/upload-artifact@v4

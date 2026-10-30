@@ -5,17 +5,50 @@ options:
     iOS: "17.0"
   createIntermediateGroups: true
   xcodeVersion: "16.0"
+
 settings:
   base:
-    SWIFT_VERSION: "5.9"
+    # 5.0 is the Swift *language mode*, not the toolchain version.  Pinning it
+    # keeps the project on Swift 5 semantics (no Swift 6 strict concurrency),
+    # which is what an MTKView draw callback and a C ABI want.
+    SWIFT_VERSION: "5.0"
     CLANG_CXX_LANGUAGE_STANDARD: "c++20"
+    CLANG_CXX_LIBRARY: "libc++"
     ENABLE_USER_SCRIPT_SANDBOXING: NO
+    CLANG_WARN_DOCUMENTATION_COMMENTS: NO
+  configs:
+    Release:
+      # nvn_metal.mm uses NDEBUG as its "this is a shipping build" signal and
+      # refuses to compile while NVN enum values are unverified.  Set it here
+      # instead of relying on Xcode's defaults.
+      GCC_PREPROCESSOR_DEFINITIONS: "$(inherited) NDEBUG=1"
+
 targets:
   BotW:
     type: application
     platform: iOS
     sources:
+      # Swift app shell (Metal view, frame pump, HUD).
       - path: BotW
+      # Portable C ABI: the boundary the emulator core talks to.
+      - path: ../core/src
+        group: core
+      - path: ../core/include
+        group: core
+        buildPhase: none
+      # NVN host-HLE: generated dispatch + portable null backend + Metal backend.
+      - path: nvn/src
+        group: nvn
+      - path: nvn/include
+        group: nvn
+        buildPhase: none
+      - path: nvn/shaders
+        group: nvn
+        buildPhase: none
+    dependencies:
+      - sdk: Metal.framework
+      - sdk: MetalKit.framework
+      - sdk: QuartzCore.framework
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.botw.app
@@ -26,6 +59,15 @@ targets:
         INFOPLIST_KEY_UIStatusBarHidden: YES
         TARGETED_DEVICE_FAMILY: "1,2"
         PRODUCT_NAME: BotW
+        SWIFT_OBJC_BRIDGING_HEADER: $(SRCROOT)/BotW/BotWBridge.h
+        HEADER_SEARCH_PATHS:
+          - $(SRCROOT)/../core/include
+          - $(SRCROOT)/nvn/include
+        OTHER_CPLUSPLUSFLAGS: "$(inherited) -Wall -Wextra -Werror"
+        OTHER_CFLAGS: "$(inherited) -Wall -Wextra -Werror"
+        GCC_ENABLE_CPP_EXCEPTIONS: NO
+        CLANG_ENABLE_OBJC_ARC: YES
+
 schemes:
   BotW:
     build:

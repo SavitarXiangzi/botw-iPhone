@@ -10,11 +10,20 @@ SDK/NVN 调用整层接管（HLE）**，而不是跑一个通用模拟器。
 ## 目录
 
 ```
-ios/            SwiftUI + Metal 壳（M0：可运行的渲染循环）
-core/           与 iOS 对接的 C ABI；后续接 NVN→Metal 回放后端
-docs/           路线图、HLE 边界说明
+ios/BotW/       SwiftUI + Metal 壳（MTKView 渲染循环 + NVN 覆盖数 HUD）
+ios/nvn/        NVN host-HLE：513 入口点注册表、生成的分发表、Metal 后端
+  registry.json   从标题自己的 getproc 字符串提取，29 个域
+  src/nvn_metal.mm 32 个入口点的 Metal 实现（其余是日志桩）
+  src/nvn_null.cpp 空后端：任何主机都能编译、跑 ABI 测试
+  shaders/        空目录，路线说明在里面的 README
+core/           与 iOS 对接的 C ABI（Swift 只能看到 botw_core.h）
+scripts/        注册表提取、代码生成、门禁校验、MSVC 编译脚本
+tests/          513 入口点一致性 + C ABI 冒烟测试
+docs/           路线图、HLE 边界、NVN 覆盖表、iOS 移植手册
 .github/        GitHub Actions：无 Mac 也能编译验证
 ```
+
+**从 `docs/IOS_PORTING.md` 开始读**，那是 iOS 侧的操作手册与缺口清单。
 
 ## 当前状态（里程碑）
 
@@ -44,6 +53,8 @@ docs/           路线图、HLE 边界说明
 | M3.26 | 互斥真正修好：主线程 tag=0 让 M3.24 的互斥形同虚设；现在线程真同步、资源真加载 | 🟢 20 帧 + 541 MiB，卡在吞吐 |
 | M3.27 | `GetSystemTick` 的 HLE 往返 35 µs × 几十万次 = 30 s 死窗口；改成入口一条 `b` + 内联计数器 | ✅ 死窗口消失 |
 | M3.28 | 178 帧后静止的全量快照：主线程无限等 LightEvent，32 线程 idle，唯一活动是 250 µs 轮询 worker | 🔴 缺完成通知 |
+| M3.65–M3.71 | 12 MB 缓冲区是包尾 `0x49E000` 的逐字节拷贝；真正卡点是 58.2 MiB 分配返回 0；最小跳过让字节序转换器返回 | ✅ 结论已定，draws 仍为 0 |
+| iOS 骨架 | 513 入口点注册表 + 生成分发表 + Metal 后端 32 项 + 三重门禁 | 🟢 可编译可验证，无画面 |
 | M4 | NVN → Metal 回放（管线/纹理/命令缓冲） | ⬜ |
 | M5 | 音频（nn::audio → AVAudioEngine）、输入 | ⬜ |
 | M6 | 真机性能与内存（6 GB 机型起步） | ⬜ |
@@ -193,19 +204,64 @@ guest 业务代码
 这样一条通路同时服务所有命令，且校验逻辑与真机一致。协议细节见
 [`docs/HLE_BOUNDARY.md`](docs/HLE_BOUNDARY.md#ipccmif-协议实测)。
 
+## iOS 骨架现状（本轮新增，全部可机器验证）
+
+这不是"能玩了"，是"接口面已经量出来、能编译、能被门禁卡住"。
+
+| 项目 | 数字 | 怎么来的 |
+|---|---:|---|
+| NVN 入口点 | **513** | 扫 `main.reloc.bin` 里会被 `nvnDeviceGetProcAddress` 按名解析的字符串 |
+| 域 | 29 | 按前缀归类（CommandBuffer 144、Texture 45、TextureBuilder 43…） |
+| Metal 后端已实现 | **32**（6.2%） | 真实 `BIND(...)`，不是靠注释声称 |
+| 未实现 | 481 | 按"挡住第一个 draw call"排序，见 `docs/IOS_PORTING.md` |
+| 生成的代码 | 2 个文件 | `gen_nvn.py` 生成 `nvn_api.h` / `nvn_dispatch.cpp`，`--check` 防手改 |
+
+三条诚实说明：
+
+1. **现在不会产生 draw call**：`MTLRenderCommandEncoder` 从未创建（渲染目标绑定未实现），
+   所有 `drawArrays` 直接返回。
+2. **纹理只分配句柄**：`NVNtextureBuilder` 字段偏移未验证，猜偏移会得到"跑得正常、采样全黑"。
+3. **Release 编不过**：`kEnumsVerified = 0`，`nvn_metal.mm` 用 `#error` 拒绝 NDEBUG 构建。
+   把没验证的 NVN 枚举值带上船，等于发一个颜色全错的版本。
+
 ## 本地验证（不需要 Mac）
 
-CI 会做两件事：用 clang 编译 `core/`，再用 XcodeGen + xcodebuild 在 macOS runner 上
-分别编译模拟器版和未签名真机版。推送即可，无需本地 Xcode。
+四条命令，全部在 Windows 上跑过（MSVC 2022，`/W4 /WX`）：
 
-```bash
-git init && git add . && git commit -m "M0: ios shell + metal renderer"
-git remote add origin <your-repo>
-git push -u origin main
+```powershell
+C:\Python314\python.exe scripts\gen_nvn.py --repo . --check     # 生成物是否最新
+C:\Python314\python.exe scripts\verify_ios.py                   # 7 类仓库不变量
+C:\Python314\python.exe scripts\nvn_status.py                   # 覆盖进度 + 下一步
+C:\Python314\python.exe scripts\syntax_check_metal.py           # Objective-C++ 语法检查（需 clang）
+powershell -ExecutionPolicy Bypass -File scripts\build_abi_test.ps1   # 真编译真运行 + 上面那条
 ```
+
+最近一次实测：
+
+```
+nvn_abi_test: ok (513 procs)              exit=0
+core_smoke_test: ok (nvn 0/513 on null)   exit=0
+syntax_check_metal: ok (clang++.exe)
+verify_ios: ok
+build_abi_test: all tests passed
+```
+
+`syntax_check_metal.py` 用 `tests/stubs/` 里的最小 Metal/QuartzCore 桩头文件，
+让 clang 以 `-fsyntax-only -x objective-c++` 解析 `nvn_metal.mm`。它已经抓到过一个
+真错误（`Tex**` 被当成 `Tex*` 赋值），这是没有 Mac 时唯一能验证 ObjC++ 的手段。
+它查不出链接、可用性标注和 ARC 语义——那部分只能靠 macOS runner。
+
+`verify_ios.py --release` **应该失败**（1 个问题：`kEnumsVerified = 0`）。CI 里有一条
+步专门断言它失败，因为这正是门禁在工作。
+
+CI 分两个 job：`portable`（Ubuntu，无需 Apple 工具链）负责上面这些；
+`ios`（macOS 15）用 XcodeGen 生成工程，再 `xcodebuild` 编模拟器 Debug 版，
+并断言 Release 版**必须**编译失败。
 
 ## 你需要准备
 
 * 已购买的《旷野之息》1.6.0（含本体 + 更新）
 * `prod.keys`（仅本地使用，**永远不要**提交）
 * 一台 iPhone（建议 6 GB RAM 及以上），用于真机验证
+* 若要出 `.app`：macOS + Xcode 16 或更新 + `brew install xcodegen`
+  （XcodeGen 生成 `BotW.xcodeproj`，`.xcodeproj` 本身不入库）

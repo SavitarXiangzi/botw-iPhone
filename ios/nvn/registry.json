@@ -1,0 +1,3116 @@
+{
+ "schema": 1,
+ "source": "runtime-resolved nvn* name strings in title binary",
+ "count": 513,
+ "domains": {
+  "CommandBuffer": 144,
+  "Texture": 45,
+  "TextureBuilder": 43,
+  "Device": 27,
+  "SamplerBuilder": 25,
+  "MultisampleState": 23,
+  "QueueBuilder": 19,
+  "BlendState": 15,
+  "Queue": 15,
+  "Sampler": 15,
+  "DepthStencilState": 13,
+  "Window": 12,
+  "WindowBuilder": 12,
+  "Buffer": 11,
+  "MemoryPool": 10,
+  "PolygonState": 9,
+  "MemoryPoolBuilder": 8,
+  "SamplerPool": 8,
+  "TexturePool": 8,
+  "BufferBuilder": 7,
+  "ColorState": 7,
+  "Event": 7,
+  "Program": 7,
+  "Sync": 6,
+  "VertexAttribState": 5,
+  "VertexStreamState": 5,
+  "ChannelMaskState": 3,
+  "DeviceBuilder": 3,
+  "Bootstrap": 1
+ },
+ "procs": [
+  {
+   "name": "nvnBlendStateGetAdvancedMode",
+   "domain": "BlendState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnBlendStateGetAdvancedNormalizedDst",
+   "domain": "BlendState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnBlendStateGetAdvancedOverlap",
+   "domain": "BlendState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnBlendStateGetAdvancedPremultipliedSrc",
+   "domain": "BlendState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnBlendStateGetBlendEquation",
+   "domain": "BlendState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnBlendStateGetBlendFunc",
+   "domain": "BlendState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnBlendStateGetBlendTarget",
+   "domain": "BlendState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnBlendStateSetAdvancedMode",
+   "domain": "BlendState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnBlendStateSetAdvancedNormalizedDst",
+   "domain": "BlendState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnBlendStateSetAdvancedOverlap",
+   "domain": "BlendState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnBlendStateSetAdvancedPremultipliedSrc",
+   "domain": "BlendState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnBlendStateSetBlendEquation",
+   "domain": "BlendState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnBlendStateSetBlendFunc",
+   "domain": "BlendState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnBlendStateSetBlendTarget",
+   "domain": "BlendState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnBlendStateSetDefaults",
+   "domain": "BlendState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnBootstrapLoader",
+   "domain": "Bootstrap",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnBufferBuilderGetDevice",
+   "domain": "BufferBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnBufferBuilderGetMemoryOffset",
+   "domain": "BufferBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnBufferBuilderGetMemoryPool",
+   "domain": "BufferBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnBufferBuilderGetSize",
+   "domain": "BufferBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnBufferBuilderSetDefaults",
+   "domain": "BufferBuilder",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnBufferBuilderSetDevice",
+   "domain": "BufferBuilder",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnBufferBuilderSetStorage",
+   "domain": "BufferBuilder",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnBufferFinalize",
+   "domain": "Buffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnBufferFlushMappedRange",
+   "domain": "Buffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnBufferGetAddress",
+   "domain": "Buffer",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnBufferGetDebugID",
+   "domain": "Buffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnBufferGetMemoryOffset",
+   "domain": "Buffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnBufferGetMemoryPool",
+   "domain": "Buffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnBufferGetSize",
+   "domain": "Buffer",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnBufferInitialize",
+   "domain": "Buffer",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnBufferInvalidateMappedRange",
+   "domain": "Buffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnBufferMap",
+   "domain": "Buffer",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnBufferSetDebugLabel",
+   "domain": "Buffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnChannelMaskStateGetChannelMask",
+   "domain": "ChannelMaskState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnChannelMaskStateSetChannelMask",
+   "domain": "ChannelMaskState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnChannelMaskStateSetDefaults",
+   "domain": "ChannelMaskState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnColorStateGetAlphaTest",
+   "domain": "ColorState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnColorStateGetBlendEnable",
+   "domain": "ColorState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnColorStateGetLogicOp",
+   "domain": "ColorState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnColorStateSetAlphaTest",
+   "domain": "ColorState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnColorStateSetBlendEnable",
+   "domain": "ColorState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnColorStateSetDefaults",
+   "domain": "ColorState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnColorStateSetLogicOp",
+   "domain": "ColorState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferAddCommandMemory",
+   "domain": "CommandBuffer",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferAddControlMemory",
+   "domain": "CommandBuffer",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferBarrier",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferBeginRecording",
+   "domain": "CommandBuffer",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferBeginTransformFeedback",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferBindBlendState",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferBindChannelMaskState",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferBindColorState",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferBindCoverageModulationTable",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferBindDepthStencilState",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferBindImage",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferBindImages",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferBindMultisampleState",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferBindPolygonState",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferBindProgram",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferBindSeparateSampler",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferBindSeparateSamplers",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferBindSeparateTexture",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferBindSeparateTextures",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferBindStorageBuffer",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferBindStorageBuffers",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferBindTexture",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferBindTextures",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferBindTransformFeedbackBuffer",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferBindTransformFeedbackBuffers",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferBindUniformBuffer",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferBindUniformBuffers",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferBindVertexAttribState",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferBindVertexBuffer",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferBindVertexBuffers",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferBindVertexStreamState",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferCallCommands",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferClearBuffer",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferClearColor",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferClearColori",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferClearColorui",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferClearDepthStencil",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferClearTexture",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferClearTexturei",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferClearTextureui",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferCopyBufferToBuffer",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferCopyBufferToTexture",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferCopyCommands",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferCopyTextureToBuffer",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferCopyTextureToTexture",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferDiscardColor",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferDiscardDepthStencil",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferDispatchCompute",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferDispatchComputeIndirect",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferDownsample",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferDownsampleTextureView",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferDrawArrays",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferDrawArraysIndirect",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferDrawArraysInstanced",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferDrawElements",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferDrawElementsBaseVertex",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferDrawElementsIndirect",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferDrawElementsInstanced",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferDrawTexture",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferDrawTransformFeedback",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferEndRecording",
+   "domain": "CommandBuffer",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferEndTransformFeedback",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferFenceSync",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferFinalize",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferGetCommandMemoryFree",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferGetCommandMemorySize",
+   "domain": "CommandBuffer",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferGetCommandMemoryUsed",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferGetControlMemoryFree",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferGetControlMemorySize",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferGetControlMemoryUsed",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferGetCopyImageStride",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferGetCopyRowStride",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferGetMemoryCallback",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferGetMemoryCallbackData",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferInitialize",
+   "domain": "CommandBuffer",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferInsertDebugMarker",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferInsertDebugMarkerDynamic",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferInsertDebugMarkerStatic",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferIsRecording",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferMultiDrawArraysIndirectCount",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferMultiDrawElementsIndirectCount",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferPauseTransformFeedback",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferPopDebugGroup",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferPopDebugGroupId",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferPushDebugGroup",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferPushDebugGroupDynamic",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferPushDebugGroupStatic",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferReportCounter",
+   "domain": "CommandBuffer",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferReportValue",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferResetCounter",
+   "domain": "CommandBuffer",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferResolveDepthBuffer",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferRestoreZCullData",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferResumeTransformFeedback",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferSaveZCullData",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferSetAlphaRef",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferSetBlendColor",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferSetColorReductionEnable",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferSetColorReductionThresholds",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferSetCommandMemoryCallbackEnabled",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferSetConservativeRasterDilate",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferSetConservativeRasterEnable",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferSetCopyImageStride",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferSetCopyRowStride",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferSetDebugLabel",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferSetDepthBounds",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferSetDepthClamp",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferSetDepthRange",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferSetDepthRanges",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferSetInnerTessellationLevels",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferSetLineWidth",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferSetMemoryCallback",
+   "domain": "CommandBuffer",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferSetMemoryCallbackData",
+   "domain": "CommandBuffer",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferSetOuterTessellationLevels",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferSetPatchSize",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferSetPointSize",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferSetPolygonOffsetClamp",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferSetPrimitiveRestart",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferSetProgramSubroutines",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferSetRasterizerDiscard",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferSetRenderEnable",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferSetRenderEnableConditional",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferSetRenderTargets",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferSetSampleMask",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferSetSamplerPool",
+   "domain": "CommandBuffer",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferSetScissor",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferSetScissors",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferSetShaderScratchMemory",
+   "domain": "CommandBuffer",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferSetStencilCullCriteria",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferSetStencilMask",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferSetStencilRef",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferSetStencilValueMask",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferSetSubpixelPrecisionBias",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferSetTexturePool",
+   "domain": "CommandBuffer",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferSetTiledCacheAction",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferSetTiledCacheTileSize",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferSetViewport",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferSetViewportSwizzles",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferSetViewports",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferSignalEvent",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferTiledDownsample",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferTiledDownsampleTextureView",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferUpdateUniformBuffer",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferWaitEvent",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferWaitSync",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnDepthStencilStateGetDepthFunc",
+   "domain": "DepthStencilState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnDepthStencilStateGetDepthTestEnable",
+   "domain": "DepthStencilState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnDepthStencilStateGetDepthWriteEnable",
+   "domain": "DepthStencilState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnDepthStencilStateGetStencilFunc",
+   "domain": "DepthStencilState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnDepthStencilStateGetStencilOp",
+   "domain": "DepthStencilState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnDepthStencilStateGetStencilTestEnable",
+   "domain": "DepthStencilState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnDepthStencilStateSetDefaults",
+   "domain": "DepthStencilState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnDepthStencilStateSetDepthFunc",
+   "domain": "DepthStencilState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnDepthStencilStateSetDepthTestEnable",
+   "domain": "DepthStencilState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnDepthStencilStateSetDepthWriteEnable",
+   "domain": "DepthStencilState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnDepthStencilStateSetStencilFunc",
+   "domain": "DepthStencilState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnDepthStencilStateSetStencilOp",
+   "domain": "DepthStencilState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnDepthStencilStateSetStencilTestEnable",
+   "domain": "DepthStencilState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnDeviceApplyDeferredFinalizes",
+   "domain": "Device",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnDeviceBuilderGetFlags",
+   "domain": "DeviceBuilder",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnDeviceBuilderSetDefaults",
+   "domain": "DeviceBuilder",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnDeviceBuilderSetFlags",
+   "domain": "DeviceBuilder",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnDeviceFinalize",
+   "domain": "Device",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnDeviceFinalizeCommandHandle",
+   "domain": "Device",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnDeviceGenerateDebugDomainId",
+   "domain": "Device",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnDeviceGetCurrentTimestampInNanoseconds",
+   "domain": "Device",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnDeviceGetDepthMode",
+   "domain": "Device",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnDeviceGetImageHandle",
+   "domain": "Device",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnDeviceGetInteger",
+   "domain": "Device",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnDeviceGetProcAddress",
+   "domain": "Device",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnDeviceGetSeparateSamplerHandle",
+   "domain": "Device",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnDeviceGetSeparateTextureHandle",
+   "domain": "Device",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnDeviceGetTexelFetchHandle",
+   "domain": "Device",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnDeviceGetTextureHandle",
+   "domain": "Device",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnDeviceGetTimestampInNanoseconds",
+   "domain": "Device",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnDeviceGetWindowOriginMode",
+   "domain": "Device",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnDeviceInitialize",
+   "domain": "Device",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnDeviceInstallDebugCallback",
+   "domain": "Device",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnDeviceIsExternalDebuggerAttached",
+   "domain": "Device",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnDeviceRegisterFastClearColor",
+   "domain": "Device",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnDeviceRegisterFastClearColori",
+   "domain": "Device",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnDeviceRegisterFastClearColorui",
+   "domain": "Device",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnDeviceRegisterFastClearDepth",
+   "domain": "Device",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnDeviceSetDebugLabel",
+   "domain": "Device",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnDeviceSetDepthMode",
+   "domain": "Device",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnDeviceSetIntermediateShaderCache",
+   "domain": "Device",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnDeviceSetWindowOriginMode",
+   "domain": "Device",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnDeviceWalkDebugDatabase",
+   "domain": "Device",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnEventBuilderGetStorage",
+   "domain": "Event",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnEventBuilderSetDefaults",
+   "domain": "Event",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnEventBuilderSetStorage",
+   "domain": "Event",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnEventFinalize",
+   "domain": "Event",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnEventGetValue",
+   "domain": "Event",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnEventInitialize",
+   "domain": "Event",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnEventSignal",
+   "domain": "Event",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnMemoryPoolBuilderGetDevice",
+   "domain": "MemoryPoolBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnMemoryPoolBuilderGetFlags",
+   "domain": "MemoryPoolBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnMemoryPoolBuilderGetMemory",
+   "domain": "MemoryPoolBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnMemoryPoolBuilderGetSize",
+   "domain": "MemoryPoolBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnMemoryPoolBuilderSetDefaults",
+   "domain": "MemoryPoolBuilder",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnMemoryPoolBuilderSetDevice",
+   "domain": "MemoryPoolBuilder",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnMemoryPoolBuilderSetFlags",
+   "domain": "MemoryPoolBuilder",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnMemoryPoolBuilderSetStorage",
+   "domain": "MemoryPoolBuilder",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnMemoryPoolFinalize",
+   "domain": "MemoryPool",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnMemoryPoolFlushMappedRange",
+   "domain": "MemoryPool",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnMemoryPoolGetBufferAddress",
+   "domain": "MemoryPool",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnMemoryPoolGetFlags",
+   "domain": "MemoryPool",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnMemoryPoolGetSize",
+   "domain": "MemoryPool",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnMemoryPoolInitialize",
+   "domain": "MemoryPool",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnMemoryPoolInvalidateMappedRange",
+   "domain": "MemoryPool",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnMemoryPoolMap",
+   "domain": "MemoryPool",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnMemoryPoolMapVirtual",
+   "domain": "MemoryPool",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnMemoryPoolSetDebugLabel",
+   "domain": "MemoryPool",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnMultisampleStateGetAlphaToCoverageDither",
+   "domain": "MultisampleState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnMultisampleStateGetAlphaToCoverageEnable",
+   "domain": "MultisampleState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnMultisampleStateGetCoverageModulationMode",
+   "domain": "MultisampleState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnMultisampleStateGetCoverageToColorEnable",
+   "domain": "MultisampleState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnMultisampleStateGetCoverageToColorOutput",
+   "domain": "MultisampleState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnMultisampleStateGetMultisampleEnable",
+   "domain": "MultisampleState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnMultisampleStateGetRasterSamples",
+   "domain": "MultisampleState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnMultisampleStateGetSampleLocationsEnable",
+   "domain": "MultisampleState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnMultisampleStateGetSampleLocationsGrid",
+   "domain": "MultisampleState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnMultisampleStateGetSampleLocationsGridEnable",
+   "domain": "MultisampleState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnMultisampleStateGetSamples",
+   "domain": "MultisampleState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnMultisampleStateSetAlphaToCoverageDither",
+   "domain": "MultisampleState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnMultisampleStateSetAlphaToCoverageEnable",
+   "domain": "MultisampleState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnMultisampleStateSetCoverageModulationMode",
+   "domain": "MultisampleState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnMultisampleStateSetCoverageToColorEnable",
+   "domain": "MultisampleState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnMultisampleStateSetCoverageToColorOutput",
+   "domain": "MultisampleState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnMultisampleStateSetDefaults",
+   "domain": "MultisampleState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnMultisampleStateSetMultisampleEnable",
+   "domain": "MultisampleState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnMultisampleStateSetRasterSamples",
+   "domain": "MultisampleState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnMultisampleStateSetSampleLocations",
+   "domain": "MultisampleState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnMultisampleStateSetSampleLocationsEnable",
+   "domain": "MultisampleState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnMultisampleStateSetSampleLocationsGridEnable",
+   "domain": "MultisampleState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnMultisampleStateSetSamples",
+   "domain": "MultisampleState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnPolygonStateGetCullFace",
+   "domain": "PolygonState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnPolygonStateGetFrontFace",
+   "domain": "PolygonState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnPolygonStateGetPolygonMode",
+   "domain": "PolygonState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnPolygonStateGetPolygonOffsetEnables",
+   "domain": "PolygonState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnPolygonStateSetCullFace",
+   "domain": "PolygonState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnPolygonStateSetDefaults",
+   "domain": "PolygonState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnPolygonStateSetFrontFace",
+   "domain": "PolygonState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnPolygonStateSetPolygonMode",
+   "domain": "PolygonState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnPolygonStateSetPolygonOffsetEnables",
+   "domain": "PolygonState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnProgramFinalize",
+   "domain": "Program",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnProgramInitialize",
+   "domain": "Program",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnProgramSetDebugLabel",
+   "domain": "Program",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnProgramSetSampleShading",
+   "domain": "Program",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnProgramSetShaders",
+   "domain": "Program",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnProgramSetShadersExt",
+   "domain": "Program",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnProgramSetSubroutineLinkage",
+   "domain": "Program",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnQueueAcquireTexture",
+   "domain": "Queue",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnQueueBuilderGetCommandFlushThreshold",
+   "domain": "QueueBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnQueueBuilderGetCommandMemorySize",
+   "domain": "QueueBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnQueueBuilderGetComputeMemorySize",
+   "domain": "QueueBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnQueueBuilderGetControlMemorySize",
+   "domain": "QueueBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnQueueBuilderGetDevice",
+   "domain": "QueueBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnQueueBuilderGetFlags",
+   "domain": "QueueBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnQueueBuilderGetMemory",
+   "domain": "QueueBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnQueueBuilderGetMemorySize",
+   "domain": "QueueBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnQueueBuilderGetQueueMemorySize",
+   "domain": "QueueBuilder",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnQueueBuilderGetQueuePriority",
+   "domain": "QueueBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnQueueBuilderSetCommandFlushThreshold",
+   "domain": "QueueBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnQueueBuilderSetCommandMemorySize",
+   "domain": "QueueBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnQueueBuilderSetComputeMemorySize",
+   "domain": "QueueBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnQueueBuilderSetControlMemorySize",
+   "domain": "QueueBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnQueueBuilderSetDefaults",
+   "domain": "QueueBuilder",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnQueueBuilderSetDevice",
+   "domain": "QueueBuilder",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnQueueBuilderSetFlags",
+   "domain": "QueueBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnQueueBuilderSetQueueMemory",
+   "domain": "QueueBuilder",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnQueueBuilderSetQueuePriority",
+   "domain": "QueueBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnQueueFenceSync",
+   "domain": "Queue",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnQueueFinalize",
+   "domain": "Queue",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnQueueFinish",
+   "domain": "Queue",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnQueueFlush",
+   "domain": "Queue",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnQueueGetError",
+   "domain": "Queue",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnQueueGetTotalCommandMemoryUsed",
+   "domain": "Queue",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnQueueGetTotalComputeMemoryUsed",
+   "domain": "Queue",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnQueueGetTotalControlMemoryUsed",
+   "domain": "Queue",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnQueueInitialize",
+   "domain": "Queue",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnQueuePresentTexture",
+   "domain": "Queue",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnQueueResetMemoryUsageCounts",
+   "domain": "Queue",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnQueueSetDebugLabel",
+   "domain": "Queue",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnQueueSubmitCommands",
+   "domain": "Queue",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnQueueWaitSync",
+   "domain": "Queue",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnSamplerBuilderGetBorderColor",
+   "domain": "SamplerBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnSamplerBuilderGetBorderColori",
+   "domain": "SamplerBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnSamplerBuilderGetBorderColorui",
+   "domain": "SamplerBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnSamplerBuilderGetCompare",
+   "domain": "SamplerBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnSamplerBuilderGetDevice",
+   "domain": "SamplerBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnSamplerBuilderGetLodBias",
+   "domain": "SamplerBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnSamplerBuilderGetLodClamp",
+   "domain": "SamplerBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnSamplerBuilderGetLodSnap",
+   "domain": "SamplerBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnSamplerBuilderGetMaxAnisotropy",
+   "domain": "SamplerBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnSamplerBuilderGetMinMagFilter",
+   "domain": "SamplerBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnSamplerBuilderGetReductionFilter",
+   "domain": "SamplerBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnSamplerBuilderGetWrapMode",
+   "domain": "SamplerBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnSamplerBuilderSetBorderColor",
+   "domain": "SamplerBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnSamplerBuilderSetBorderColori",
+   "domain": "SamplerBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnSamplerBuilderSetBorderColorui",
+   "domain": "SamplerBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnSamplerBuilderSetCompare",
+   "domain": "SamplerBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnSamplerBuilderSetDefaults",
+   "domain": "SamplerBuilder",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnSamplerBuilderSetDevice",
+   "domain": "SamplerBuilder",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnSamplerBuilderSetLodBias",
+   "domain": "SamplerBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnSamplerBuilderSetLodClamp",
+   "domain": "SamplerBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnSamplerBuilderSetLodSnap",
+   "domain": "SamplerBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnSamplerBuilderSetMaxAnisotropy",
+   "domain": "SamplerBuilder",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnSamplerBuilderSetMinMagFilter",
+   "domain": "SamplerBuilder",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnSamplerBuilderSetReductionFilter",
+   "domain": "SamplerBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnSamplerBuilderSetWrapMode",
+   "domain": "SamplerBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnSamplerCompare",
+   "domain": "Sampler",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnSamplerFinalize",
+   "domain": "Sampler",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnSamplerGetBorderColor",
+   "domain": "Sampler",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnSamplerGetBorderColori",
+   "domain": "Sampler",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnSamplerGetBorderColorui",
+   "domain": "Sampler",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnSamplerGetCompare",
+   "domain": "Sampler",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnSamplerGetDebugID",
+   "domain": "Sampler",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnSamplerGetLodBias",
+   "domain": "Sampler",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnSamplerGetLodClamp",
+   "domain": "Sampler",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnSamplerGetMaxAnisotropy",
+   "domain": "Sampler",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnSamplerGetMinMagFilter",
+   "domain": "Sampler",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnSamplerGetReductionFilter",
+   "domain": "Sampler",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnSamplerGetWrapMode",
+   "domain": "Sampler",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnSamplerInitialize",
+   "domain": "Sampler",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnSamplerPoolFinalize",
+   "domain": "SamplerPool",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnSamplerPoolGetMemoryOffset",
+   "domain": "SamplerPool",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnSamplerPoolGetMemoryPool",
+   "domain": "SamplerPool",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnSamplerPoolGetSize",
+   "domain": "SamplerPool",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnSamplerPoolInitialize",
+   "domain": "SamplerPool",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnSamplerPoolRegisterSampler",
+   "domain": "SamplerPool",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnSamplerPoolRegisterSamplerBuilder",
+   "domain": "SamplerPool",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnSamplerPoolSetDebugLabel",
+   "domain": "SamplerPool",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnSamplerSetDebugLabel",
+   "domain": "Sampler",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnSyncCreateGLSync",
+   "domain": "Sync",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnSyncFinalize",
+   "domain": "Sync",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnSyncInitialize",
+   "domain": "Sync",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnSyncInitializeFromFencedGLSync",
+   "domain": "Sync",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnSyncSetDebugLabel",
+   "domain": "Sync",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnSyncWait",
+   "domain": "Sync",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureBuilderGetDepth",
+   "domain": "TextureBuilder",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureBuilderGetDepthStencilMode",
+   "domain": "TextureBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureBuilderGetDevice",
+   "domain": "TextureBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureBuilderGetFlags",
+   "domain": "TextureBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureBuilderGetFormat",
+   "domain": "TextureBuilder",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureBuilderGetGLTextureName",
+   "domain": "TextureBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureBuilderGetHeight",
+   "domain": "TextureBuilder",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureBuilderGetLevels",
+   "domain": "TextureBuilder",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureBuilderGetMemoryOffset",
+   "domain": "TextureBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureBuilderGetMemoryPool",
+   "domain": "TextureBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureBuilderGetPackagedTextureData",
+   "domain": "TextureBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureBuilderGetPackagedTextureLayout",
+   "domain": "TextureBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureBuilderGetRawStorageClass",
+   "domain": "TextureBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureBuilderGetSamples",
+   "domain": "TextureBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureBuilderGetSparseTileLayout",
+   "domain": "TextureBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureBuilderGetStorageAlignment",
+   "domain": "TextureBuilder",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureBuilderGetStorageClass",
+   "domain": "TextureBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureBuilderGetStorageSize",
+   "domain": "TextureBuilder",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureBuilderGetStride",
+   "domain": "TextureBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureBuilderGetSwizzle",
+   "domain": "TextureBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureBuilderGetTarget",
+   "domain": "TextureBuilder",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureBuilderGetWidth",
+   "domain": "TextureBuilder",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureBuilderGetZCullStorageSize",
+   "domain": "TextureBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureBuilderSetDefaults",
+   "domain": "TextureBuilder",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureBuilderSetDepth",
+   "domain": "TextureBuilder",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureBuilderSetDepthStencilMode",
+   "domain": "TextureBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureBuilderSetDevice",
+   "domain": "TextureBuilder",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureBuilderSetFlags",
+   "domain": "TextureBuilder",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureBuilderSetFormat",
+   "domain": "TextureBuilder",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureBuilderSetGLTextureName",
+   "domain": "TextureBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureBuilderSetHeight",
+   "domain": "TextureBuilder",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureBuilderSetLevels",
+   "domain": "TextureBuilder",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureBuilderSetPackagedTextureData",
+   "domain": "TextureBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureBuilderSetPackagedTextureLayout",
+   "domain": "TextureBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureBuilderSetSamples",
+   "domain": "TextureBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureBuilderSetSize1D",
+   "domain": "TextureBuilder",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureBuilderSetSize2D",
+   "domain": "TextureBuilder",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureBuilderSetSize3D",
+   "domain": "TextureBuilder",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureBuilderSetStorage",
+   "domain": "TextureBuilder",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureBuilderSetStride",
+   "domain": "TextureBuilder",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureBuilderSetSwizzle",
+   "domain": "TextureBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureBuilderSetTarget",
+   "domain": "TextureBuilder",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureBuilderSetWidth",
+   "domain": "TextureBuilder",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureCompare",
+   "domain": "Texture",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureFinalize",
+   "domain": "Texture",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureFlushTexels",
+   "domain": "Texture",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureGetDebugID",
+   "domain": "Texture",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureGetDepth",
+   "domain": "Texture",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureGetDepthStencilMode",
+   "domain": "Texture",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureGetFlags",
+   "domain": "Texture",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureGetFormat",
+   "domain": "Texture",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureGetHeight",
+   "domain": "Texture",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureGetLevels",
+   "domain": "Texture",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureGetMemoryOffset",
+   "domain": "Texture",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureGetMemoryPool",
+   "domain": "Texture",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureGetRawStorageClass",
+   "domain": "Texture",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureGetSamples",
+   "domain": "Texture",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureGetSparseTileLayout",
+   "domain": "Texture",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureGetStorageClass",
+   "domain": "Texture",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureGetStorageSize",
+   "domain": "Texture",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureGetStride",
+   "domain": "Texture",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureGetSwizzle",
+   "domain": "Texture",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureGetTarget",
+   "domain": "Texture",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureGetTextureAddress",
+   "domain": "Texture",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureGetViewOffset",
+   "domain": "Texture",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureGetWidth",
+   "domain": "Texture",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureGetZCullStorageSize",
+   "domain": "Texture",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureInitialize",
+   "domain": "Texture",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureInvalidateTexels",
+   "domain": "Texture",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTexturePoolFinalize",
+   "domain": "TexturePool",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTexturePoolGetMemoryOffset",
+   "domain": "TexturePool",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTexturePoolGetMemoryPool",
+   "domain": "TexturePool",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTexturePoolGetSize",
+   "domain": "TexturePool",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTexturePoolInitialize",
+   "domain": "TexturePool",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnTexturePoolRegisterImage",
+   "domain": "TexturePool",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTexturePoolRegisterTexture",
+   "domain": "TexturePool",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnTexturePoolSetDebugLabel",
+   "domain": "TexturePool",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureReadTexels",
+   "domain": "Texture",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureReadTexelsStrided",
+   "domain": "Texture",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureSetDebugLabel",
+   "domain": "Texture",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureViewCompare",
+   "domain": "Texture",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureViewGetDepthStencilMode",
+   "domain": "Texture",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureViewGetFormat",
+   "domain": "Texture",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureViewGetLayers",
+   "domain": "Texture",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureViewGetLevels",
+   "domain": "Texture",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureViewGetSwizzle",
+   "domain": "Texture",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureViewGetTarget",
+   "domain": "Texture",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureViewSetDefaults",
+   "domain": "Texture",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureViewSetDepthStencilMode",
+   "domain": "Texture",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureViewSetFormat",
+   "domain": "Texture",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureViewSetLayers",
+   "domain": "Texture",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureViewSetLevels",
+   "domain": "Texture",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureViewSetSwizzle",
+   "domain": "Texture",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureViewSetTarget",
+   "domain": "Texture",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureWriteTexels",
+   "domain": "Texture",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnTextureWriteTexelsStrided",
+   "domain": "Texture",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnVertexAttribStateGetFormat",
+   "domain": "VertexAttribState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnVertexAttribStateGetStreamIndex",
+   "domain": "VertexAttribState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnVertexAttribStateSetDefaults",
+   "domain": "VertexAttribState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnVertexAttribStateSetFormat",
+   "domain": "VertexAttribState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnVertexAttribStateSetStreamIndex",
+   "domain": "VertexAttribState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnVertexStreamStateGetDivisor",
+   "domain": "VertexStreamState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnVertexStreamStateGetStride",
+   "domain": "VertexStreamState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnVertexStreamStateSetDefaults",
+   "domain": "VertexStreamState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnVertexStreamStateSetDivisor",
+   "domain": "VertexStreamState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnVertexStreamStateSetStride",
+   "domain": "VertexStreamState",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnWindowAcquireTexture",
+   "domain": "Window",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnWindowBuilderGetDevice",
+   "domain": "WindowBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnWindowBuilderGetNativeWindow",
+   "domain": "WindowBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnWindowBuilderGetNumActiveTextures",
+   "domain": "WindowBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnWindowBuilderGetNumTextures",
+   "domain": "WindowBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnWindowBuilderGetPresentInterval",
+   "domain": "WindowBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnWindowBuilderGetTexture",
+   "domain": "WindowBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnWindowBuilderSetDefaults",
+   "domain": "WindowBuilder",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnWindowBuilderSetDevice",
+   "domain": "WindowBuilder",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnWindowBuilderSetNativeWindow",
+   "domain": "WindowBuilder",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnWindowBuilderSetNumActiveTextures",
+   "domain": "WindowBuilder",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnWindowBuilderSetPresentInterval",
+   "domain": "WindowBuilder",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnWindowBuilderSetTextures",
+   "domain": "WindowBuilder",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnWindowFinalize",
+   "domain": "Window",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnWindowGetCrop",
+   "domain": "Window",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnWindowGetNativeWindow",
+   "domain": "Window",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnWindowGetNumActiveTextures",
+   "domain": "Window",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnWindowGetNumTextures",
+   "domain": "Window",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnWindowGetPresentInterval",
+   "domain": "Window",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnWindowInitialize",
+   "domain": "Window",
+   "prototype": true,
+   "metal": false
+  },
+  {
+   "name": "nvnWindowSetCrop",
+   "domain": "Window",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnWindowSetDebugLabel",
+   "domain": "Window",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnWindowSetNumActiveTextures",
+   "domain": "Window",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnWindowSetPresentInterval",
+   "domain": "Window",
+   "prototype": true,
+   "metal": false
+  }
+ ]
+}

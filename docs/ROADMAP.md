@@ -1836,3 +1836,53 @@ t=0.6  pc=0x40E5403C  [0x42CBEF68] = 1
 ```
 
 M3 出口（swapchain + draws>0）**仍未达成**。
+
+## M3.72 转向：先交 iOS 侧可验证的骨架
+
+M3.71 把唯一未解问题收敛成「58.2 MiB 该由谁满足」，三个候选都要靠 hook 继续挖。
+继续挖的边际收益在下降——**即使挖通了，iOS 侧仍然是空的**。所以本轮换轨道：
+把 iOS 侧做成"别人拿 Mac 就能编、没 Mac 也能验、验不过就红"的骨架。
+
+### 做了什么
+
+| 交付 | 数字 | 证据 |
+|---|---:|---|
+| NVN 入口点注册表 | 513（29 域） | 扫 `main.reloc.bin` 里 `nvnDeviceGetProcAddress` 按名解析的字符串，运行时按名取，名字即接口面 |
+| 生成的分发表 | 2 个文件 | `nvn_api.h`（名字表+ABI）、`nvn_dispatch.cpp`（二分查找+缺失上报）；`gen_nvn.py --check` 防手改 |
+| Metal 后端入口 | 32 / 513（6.2%） | `BIND(...)` 与 `implemented_metal.txt` 由门禁强制相等 |
+| 可移植 null 后端 | 0 / 513 | 让 ABI 测试在 Windows/Linux 上真跑 |
+| ABI 测试 | 513 procs | MSVC 2022 `/W4 /WX`，`nvn_abi_test` + `core_smoke_test` 均 exit=0 |
+| ObjC++ 语法检查 | 1 个 TU | clang + `tests/stubs/` 桩头文件，`-Wall -Wextra -Werror` |
+
+### 两个真 bug（不是设计缺口）
+
+1. `Tex** list = obj<Tex>(x[1]);` —— 把句柄当 `Tex*` 赋给 `Tex**`，Xcode 里必然
+   编译失败。**是 `syntax_check_metal.py` 抓到的**，不是靠读代码。
+2. `MTKView.delegate` 是 weak，`Pump` 建完就释放 → 首帧永远不会来，屏幕全黑
+   且帧号不动。改成由 Coordinator 强引用。
+
+### 三道门禁
+
+* 编译期：`nvn_metal.mm` 里 `#if defined(NDEBUG) #error`，Release 直接编不过；
+  `NDEBUG` 由 `ios/project.yml` 的 Release 配置显式给出，不依赖 Xcode 默认值。
+* 仓库级：`verify_ios.py --release` 在 `kEnumsVerified = 0` 时报错；
+  CI 有一条专门断言它**必须失败**。
+* 一致性：`BIND` 列表 ∩ registry == `implemented_metal.txt`，且 `project.yml`
+  里每个 `- path:` 必须真实存在（否则 `xcodegen generate` 只在 mac runner 上炸）。
+
+### 明确没做到
+
+* **没有 draw call**：`MTLRenderCommandEncoder` 从未创建（渲染目标绑定未实现），
+  `drawArrays` 走 `if (!b->enc) return;`。
+* **没有纹理**：`nvnTextureInitialize` 只 `new Tex()`，builder 字段偏移未验证。
+* **没有着色器**：NVN 给的是 Maxwell SASS，Metal 不接受，需要
+  SASS → IR → SPIR-V → MSL 离线翻译（`ios/nvn/shaders/README.md`）。
+* **M3 出口仍未达成**：58.2 MiB 的三个候选（C/A/B）原地挂起，没有新证据。
+
+### 下一步（按序）
+
+1. `nvnCommandBufferSetRenderTargets` → 让 `enc` 真的建起来，先做 clear-only 的
+   "屏幕出纯色、帧号增长"。
+2. 验证 `NVNtextureBuilder` 字段偏移，`nvnTextureInitialize` 建出真 `MTLTexture`。
+3. `nvnCommandBufferBindProgram` + `nvnProgramInitialize`，开始 SASS 翻译。
+4. 剩下的 481 个按 `scripts/nvn_status.py` 的 P0/P1/P2 顺序推。
