@@ -1223,9 +1223,16 @@ const nvngfx_backend k_metal = {"metal", nullptr, metal_resolve};
  *   1 no Metal device   2 backend not ready   4 texture     8 program
  *  16 recording       32 pipeline         64 draw colour  128 readback */
 extern "C" int nvngfx_metal_selftest(void) {
-    /* Fake guest object addresses: table keys only, never dereferenced. */
-    const uint64_t kTex = 0x5100;
-    const uint64_t kTexBuilder = 0x5101;
+    /* NVN objects live in guest memory, and guest memory is host memory here.
+     * The texture and its builder are written through by the backend
+     * (nvnTextureBuilderSetDefaults memsets 0x80 bytes), so they get real
+     * backing store.  The command buffer and program are only table keys.
+     * Passing a made-up address for the builder is how the first version of
+     * this test crashed: the key looked fine until the memset. */
+    alignas(16) unsigned char texObject[0x80] = {};
+    alignas(16) unsigned char texBuilder[0x80] = {};
+    const uint64_t kTex = reinterpret_cast<uint64_t>(texObject);
+    const uint64_t kTexBuilder = reinterpret_cast<uint64_t>(texBuilder);
     const uint64_t kCb = 0x5200;
     const uint64_t kProg = 0x5300;
     const NSUInteger kSide = 64;
