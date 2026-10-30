@@ -21,7 +21,7 @@ ios/nvn/        NVN host-HLE：513 入口点注册表、生成的分发表、Met
 core/           与 iOS 对接的 C ABI（Swift 只能看到 botw_core.h）
 scripts/        注册表提取、代码生成、门禁校验、MSVC 编译脚本
 tests/          513 入口点一致性 + C ABI 冒烟 + 157 项纹理格式表测试
-docs/           路线图、HLE 边界、NVN 覆盖表、iOS 移植手册
+docs/           路线图、HLE 边界、NVN 覆盖表、iOS 移植手册、着色器链
 .github/        GitHub Actions：无 Mac 也能编译验证
 ```
 

@@ -369,9 +369,12 @@ def check_doc_refs() -> None:
 def check_leaks() -> None:
     forbidden_ext = (".xci", ".nsp", ".nca", ".nso", ".kdb", ".keys", ".bin")
     forbidden_names = {"prod.keys", "title.keys"}
-    for dirpath, _dirs, files in os.walk(REPO):
-        if ".git" in dirpath.split(os.sep):
-            continue
+    # `build/` is gitignored and is where the offline shader chain writes the
+    # code areas it extracts from the game.  Nothing under it can be committed,
+    # so it is not what this check is about; the working tree is.
+    skip_dirs = {".git", "build", "DerivedData"}
+    for dirpath, dirs, files in os.walk(REPO):
+        dirs[:] = [d for d in dirs if d not in skip_dirs]
         for f in files:
             if f in forbidden_names or f.endswith(forbidden_ext):
                 fail(f"forbidden artefact in tree: {os.path.relpath(os.path.join(dirpath, f), REPO)}")

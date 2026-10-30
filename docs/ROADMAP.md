@@ -2183,3 +2183,22 @@ build_abi_test: all tests passed
 | 模拟器 Metal 的实测 | 本轮推送前没跑过，CI 结果见下 |
 
 **没有真机运行记录**，本机无设备。
+
+## M3.77 离线着色器链在 Windows 上跑通（本轮）
+
+不再是"没有翻译器"的状态：`Bootup_Graphics.pack` 里取出真实 shader，
+`dmsh_xlate`（Ryujinx）→ SPIR-V，`spirv-cross` → MSL，**都在本机从源码构建并执行**。
+
+```
+extract: 1 file(s), 5102 shader(s): 2033 vs, 3069 ps
+translate: 2/2 shader(s)
+  d756ff62a57fc508_vs → 3,411 行 MSL, vertex, notes = 0
+  029de06ee5b5d21b_ps → 4,573 行 MSL, fragment, notes = 0
+```
+
+新增：`scripts/shader_chain/`（`build_tools.ps1`、`nx_shader.py`）、
+`docs/SHADER_CHAIN.md`、`nvngfx_shader_lookup()` / `nvngfx_shader_set_blobs()`。
+
+仍然没有的：`xcrun metal` → `.metallib`（只有 macOS，CI 上做）；
+运行时按 key 取 MSL 的接线（要在 `nvnProgramSetShaders` 里算 key）；
+顶点描述符（`BindVertexAttribState`）；**没有真机验证**，自检用的仍是内置 MSL。

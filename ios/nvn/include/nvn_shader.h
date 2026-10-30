@@ -12,6 +12,8 @@
 #ifndef NVN_SHADER_H
 #define NVN_SHADER_H
 
+#include <stddef.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -35,6 +37,52 @@ typedef enum {
  * see docs/IOS_PORTING.md, section 8. */
 const char* nvngfx_shader_to_msl(const void* code, unsigned long long size,
                                  nvngfx_stage stage, const char** why);
+
+
+/* ---------------------------------------------------------------------------
+ * Offline MSL blobs
+ *
+ * The translator that exists in this project reads Maxwell SASS on a computer,
+ * not on the phone: see docs/SHADER_CHAIN.md.  Its output is a set of MSL
+ * sources named after the shader key, and this table is how they reach the
+ * backend.
+ *
+ * The key is the one both this repository and nxnative use:
+ *     sha256(first 0x880 bytes of the control section (its own length when
+ *            shorter) || code area)[0..7]
+ * printed as 16 lowercase hex digits.  The code area here is the one the guest
+ * passes in NVNshaderData::data, *including* its 0x30 header.
+ *
+ * Lookup never copies or allocates: the table must stay alive for as long as
+ * it is installed, which is why the generated one is a static array. */
+typedef struct nvngfx_shader_blob {
+    const char* key;   /* exactly 16 hex digits, any case */
+    int stage;         /* nvngfx_stage; compute blobs are not accepted yet */
+    const char* msl;   /* NUL-terminated MSL source, entry point renamed below */
+} nvngfx_shader_blob;
+
+/* Installs a static table.  Nothing is copied.  Returns 0 on success, or
+ * -(index + 1) naming the first bad entry (bad key, bad stage, empty MSL, or a
+ * duplicate key+stage).  On failure the previous table stays installed: the
+ * caller never sees a half-installed table. */
+int nvngfx_shader_set_blobs(const nvngfx_shader_blob* blobs, size_t count);
+
+/* Uninstalls the table (lookups then fail with "no blob table"). */
+void nvngfx_shader_clear_blobs(void);
+
+/* Number of installed entries (0 with no table). */
+size_t nvngfx_shader_blob_count(void);
+
+/* Finds the MSL for `key` at `stage`.  Returns NULL and sets `why` when the
+ * key is malformed, the table is empty, or the shader is not in it. */
+const char* nvngfx_shader_lookup(const char* key, nvngfx_stage stage,
+                                 const char** why);
+
+/* The name the backend looks up in the library built from a blob.  Renaming is
+ * done when the blob is generated (scripts/shader_chain/nx_shader.py), so the
+ * two halves cannot drift. */
+#define NVNGFX_ENTRY_VERTEX "nvngfx_main_vs"
+#define NVNGFX_ENTRY_FRAGMENT "nvngfx_main_fs"
 
 /* Host-only switch: when on, nvngfx_shader_to_msl() treats `code` as MSL
  * source (NUL-terminated within `size` when size is non-zero) and returns it

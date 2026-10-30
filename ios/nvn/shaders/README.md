@@ -1,4 +1,4 @@
-# shader/ -- 空目录，但必须存在
+# shader/ -- 离线着色器产物放这里（当前为空）
 
 这个目录现在**没有可用的着色器**，只放说明。原因是 NVN 和 Metal 在这一点上
 没有可自动翻译的公共层：
@@ -26,3 +26,22 @@ Maxwell SASS  --(反汇编)-->  Maxwell IR  --(提升)-->  SPIR-V  --(spirv-cros
 
 在 shader 跑通之前，Metal 后端能做的“有画面”的事只有 clear + present，
 这一点已经写在 `docs/IOS_PORTING.md` 的“渲染管线分阶段”一节里。
+---
+
+## 2026-10-30 更新（M3.77）
+
+上面的"待办"第 2、3 条已经不成立了：**不需要自己写反汇编器/提升器**。
+参考实现 nxnative 用 Ryujinx 的 shader 翻译库把 Maxwell SASS 直接译成 SPIR-V，
+再用 SPIRV-Cross 转 MSL；这条链已经在 Windows 上跑通并验证过真实 shader：
+
+```powershell
+powershell -File scripts/shader_chain/build_tools.ps1 -Src <nxnative checkout>
+C:\Python314\python.exe scripts\shader_chain\nx_shader.py extract <pack> --out build\shader-chain\work
+C:\Python314\python.exe scripts\shader_chain\nx_shader.py translate --work ... --out ...
+```
+
+细节、已验证的数字、格式要点和还缺的步骤见
+[`docs/SHADER_CHAIN.md`](../../../docs/SHADER_CHAIN.md)。
+
+这个目录仍然**不存放任何游戏派生产物**（`.metal` / `.metallib` 都在
+`build/` 下，已 gitignore）；要用的时候由 CI 或本机生成。

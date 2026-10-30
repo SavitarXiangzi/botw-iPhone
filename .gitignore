@@ -17,3 +17,7 @@ title.keys
 RomFS/
 _doc_*.py
 _patch_*.py
+
+# Python bytecode (scripts are run, not installed)
+__pycache__/
+*.pyc
