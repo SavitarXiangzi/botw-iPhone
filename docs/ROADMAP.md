@@ -3731,3 +3731,110 @@ BOTW_SELFTEST rc=0
 - guest 在首次上传后继续修改纹理内存时不会重传；
 - CPU scratch + 完整 RGBA8 staging 的内存开销还很高，尤其是大 BC1 纹理；
 - 没有真机记录。
+
+## M3.95 显式纹理更新：WriteTexels / FlushTexels 触发重传
+
+覆盖从 **131/513** 提升到 **134/513（26.1%）**，Texture 域从 **1/45** 到
+**4/45**。新增的是 `nvnTextureWriteTexels`、`nvnTextureWriteTexelsStrided`
+和 `nvnTextureFlushTexels`。这一轮没有碰 SASS 翻译器；它解决的是“纹理第一次
+上传后，guest 明确要求改写或刷新时，Metal 副本如何再次同步”。
+
+### 单区域读改写
+
+`ios/nvn/src/nvn_texlayout.c` 新增：
+
+```c
+int nvngfx_tex_write_region(
+    const nvngfx_texdesc* d, unsigned level, unsigned layer,
+    int x, int y, int z, int width, int height,
+    const void* src, size_t src_row, size_t src_image,
+    void* storage);
+```
+
+它处理一个 mip / layer / slice 内的子区域：
+
+- 先把整级从 guest 的 block-linear 或 LINEAR 布局 deswizzle 到临时行主序图像；
+- 只覆盖目标矩形/体素块，区域外字节原样保留；
+- 再按 guest 布局 swizzle 回去；LINEAR 的行尾 padding 不读也不写；
+- 2D 的 region depth 映射到数组层，3D 的 `z` 映射到 slice；
+- BCn 的起点和尺寸必须按 4×4 块对齐，否则拒绝；
+- 拒绝负坐标、越界、窄源行距、未知格式或空 geometry。
+
+这是正确性优先的实现：每个区域都要分配一份整级临时图像，**不是最终性能
+方案**。大 mip 的 CPU 内存峰值和拷贝量都会明显高于只改几十字节。
+
+### Metal 后端
+
+`Tex` 增加 `dirty` 标志：
+
+- `tex_upload()` 对已上传但标脏的纹理重新执行整条 mip 链上传；
+- `WriteTexels` 支持 `NVNtextureView` 的 base level / min layer；
+- view 若改变 format 或 target 则拒绝；swizzle 与 depth-stencil 模式目前忽略；
+- `FlushTexels` 没有脏页信息，保守地把整张纹理标脏，下次采样重传；
+- host-rendered 渲染目标不会从 guest 重新上传，避免宿主渲染结果被覆盖。
+
+`Texture` 域现在是 4/45：initialize、两个 WriteTexels 入口和 FlushTexels。
+`NVNcopyRegion` / `NVNtextureView` 的结构布局来自 nxnative 的实测声明，不是
+Nintendo SDK 头文件；因此当前只使用已验证的 level/layer 和一致性检查。
+
+### 可移植测试
+
+`tests/nvn_texlayout_test.cpp` 新增 `test_write_region()`：
+
+- block-linear RGBA8 只改内部 2×2，四周边界逐像素不变；
+- LINEAR `stride = 32` 时只改有效字节，行尾 `0xEE` padding 保持；
+- BC1 只允许整块写入，块内起点或越界尾端被拒；
+- 3D 的 `z=1` 命中第二 slice，slice 0 不变；3D 不接受数组层 1；
+- 2D 不接受 z slice 1；空指针、非法 mip、窄源行距被拒。
+
+```text
+nvn_texlayout_test: ok (block shapes, sizes, offsets, round trip, linear, write region, refusals)
+build_abi_test: all tests passed
+verify_ios: ok (metal bindings: 134/513)
+```
+
+### 第十六条 draw：连续更新端到端
+
+自检创建一张 2×2 RGBA8 guest 纹理，初始四象限为红/绿/蓝/白，先完成一次
+采样回读；随后：
+
+1. 调用 `nvnTextureWriteTexels` 改成黄/青/品红/黑，重画并回读；
+2. 直接改写 guest storage，再调用 `nvnTextureFlushTexels` 改成
+   棕/钢蓝/橙/天蓝，第三次重画并回读。
+
+每轮还检查纹理已重新上传、`dirty` 已清掉。失败码：
+
+- `16409`：初始布局、建纹理或编码失败；
+- `16410`：WriteTexels 后的重传或像素错误；
+- `16411`：FlushTexels 后的重传或像素错误。
+
+成功日志：
+
+```text
+[selftest] draw 16: WriteTexels and FlushTexels both re-uploaded a sampled texture
+```
+
+自检现在列出 **16 条** draw，模拟器实际执行 **15 条**；第十三条 cube array
+仍需 `BOTW_SELFTEST_CUBE_ARRAY=1`，默认跳过。
+
+### CI 证据
+
+run [41090664172](https://github.com/SavitarXiangzi/botw-iPhone/actions/runs/41090664172)：
+
+- portable job `124183374680`：success；
+- iOS job `124183554875`：success；
+- iOS 的 “Run the replay-layer self-test in the simulator” 步骤 success。
+
+工作流要求 `BOTW_SELFTEST rc=0` 才会通过。当前账号没有仓库 admin 权限，
+REST 下载原始 job 日志返回 **403**，所以这里只记录 job/step 状态，不伪造
+逐行日志。源码中的成功字符串和失败码如上。
+
+### 还没有的
+
+| 缺口 | 后果 |
+|---|---|
+| 通用 texture view | 采样时仍没有完整应用 view 的格式/目标/层级语义；WriteTexels 只用 level/layer |
+| 任意 mapped write 的脏页跟踪 | guest 绕过 WriteTexels/FlushTexels 直接改 pool 字节时不会自动重传 |
+| 精确 FlushTexels | 没有脏页表，整条 mip 链重传，更新一个 texel 也可能付出整张纹理的拷贝 |
+| RMW 内存 | WriteTexels 需要整级临时线性图像，大纹理会抬高 CPU 内存峰值 |
+| 真机 | 仍只有 CI 的 iOS 模拟器记录，没有 iPhone/iPad 真机帧率与内存数据 |
