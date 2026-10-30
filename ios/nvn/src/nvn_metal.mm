@@ -3545,6 +3545,24 @@ extern "C" int nvngfx_metal_selftest(void) {
                 cmdbuf_end_recording(ctx, x);
             }
             CmdBuf* b5 = find<CmdBuf>(kCb5);
+            if (b5 && b5->argbuf) {
+                Tex* src5 = find<Tex>(kTexSrc);
+                const PooledSampler* ps5 = bound_sampler(b5, b5->texHandle[0]);
+                const uint64_t* words =
+                    static_cast<const uint64_t*>([b5->argbuf contents]);
+                std::fprintf(stderr,
+                             "[selftest] textured draw ids: tex=0x%llx samp=0x%llx "
+                             "table=0x%llx,0x%llx,0x%llx\n",
+                             src5 ? static_cast<unsigned long long>(
+                                        src5->mtl.gpuResourceID._impl)
+                                  : 0ull,
+                             ps5 ? static_cast<unsigned long long>(
+                                       ps5->mtl.gpuResourceID._impl)
+                                 : 0ull,
+                             static_cast<unsigned long long>(words[0]),
+                             static_cast<unsigned long long>(words[1]),
+                             static_cast<unsigned long long>(words[2]));
+            }
             if (!b5 || !b5->last || b5->encoded != 1) {
                 std::fprintf(stderr,
                              "[selftest] textured draw was not encoded (asked %u, "
