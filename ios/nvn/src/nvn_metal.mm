@@ -260,6 +260,13 @@ struct CmdBuf {
      * caller (the self-test) wait for it and keeps the door open for real
      * submit semantics. */
     id<MTLCommandBuffer> last = nil;
+    /* Viewport and scissor are command-buffer state.  Record them instead of
+     * opening a render pass early: a texture upload may need to end the pass,
+     * and ensure_encoder() must be able to restore them when it reopens. */
+    MTLViewport viewport = {};
+    bool hasViewport = false;
+    MTLScissorRect scissor = {};
+    bool hasScissor = false;
 };
 
 /* Builder specs are gathered in a side table keyed by the guest's builder
@@ -2217,6 +2224,8 @@ bool ensure_encoder(Ctx* c, CmdBuf* b) {
         }
         rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
         b->enc = [b->cb renderCommandEncoderWithDescriptor:rpd];
+        if (b->enc && b->hasViewport) [b->enc setViewport:b->viewport];
+        if (b->enc && b->hasScissor) [b->enc setScissorRect:b->scissor];
     }
     b->pendingClear = false;
     return b->enc != nil;
@@ -2235,6 +2244,8 @@ void cmdbuf_begin_recording(nvngfx_ctx* ctx, uint64_t* x) {
     b->depth = 0;
     b->pendingClear = false;
     b->argbuf[0] = b->argbuf[1] = nil;
+    b->hasViewport = false;
+    b->hasScissor = false;
 }
 
 /* nvnCommandBufferEndRecording(NVNcommandBuffer*) -> NVNcommandHandle
@@ -2404,16 +2415,16 @@ bool read_ubo_u32(const CmdBuf* b, int si, unsigned slot, unsigned offset,
  * is reported once and left as it was; a render target is never uploaded at
  * all, because this backend is its only writer.
  *
- * The upload command buffer is committed but intentionally not waited on.
- * This function runs while the draw's render encoder is open, and waiting for
- * another command buffer from inside an encoder deadlocks the simulator.
- * Metal executes a queue's command buffers in submission order, so committing
- * the upload first is sufficient: the draw's command buffer is committed
- * later and cannot sample before the copy has run.  Metal retains the staging
- * buffer until the upload command buffer completes.
+ * The blits go into the draw's own command buffer before its render pass is
+ * opened.  End an earlier pass first if one is still open: allocating a second
+ * command buffer and waiting for it from inside an encoder deadlocks the
+ * simulator, and a blit must not be encoded while a render encoder is active.
+ * The caller reopens the pass, with viewport/scissor restored by
+ * ensure_encoder().
  *
  * Returns false only when the caller must not sample the texture. */
-bool tex_upload(Ctx* c, Tex* t) {
+bool tex_upload(Ctx* c, CmdBuf* b, Tex* t) {
+    if (!b || !b->cb) return false;
     if (!t || !t->mtl) return false;
     if (t->uploaded || t->uploadTried) return t->uploaded;
     t->uploadTried = true;
@@ -2466,8 +2477,13 @@ bool tex_upload(Ctx* c, Tex* t) {
         log_once("nvnTextureUpload.staging", 1);
         return false;
     }
-    id<MTLCommandBuffer> cb = [c->queue commandBuffer];
-    id<MTLBlitCommandEncoder> blit = cb ? [cb blitCommandEncoder] : nil;
+    if (b->enc) {
+        end_encoder(b);
+        /* useResource: is encoder state, so a table built for the previous
+         * pass must be rebuilt for the pass that follows this upload. */
+        b->argbuf[0] = b->argbuf[1] = nil;
+    }
+    id<MTLBlitCommandEncoder> blit = [b->cb blitCommandEncoder];
     if (!blit) {
         log_once("nvnTextureUpload.encoder", 1);
         return false;
@@ -2516,7 +2532,6 @@ bool tex_upload(Ctx* c, Tex* t) {
         ++done;
     }
     [blit endEncoding];
-    [cb commit];
     t->uploadedLevels = done;
     /* Partial copies are not a usable texture: sampling a missing mip would
      * return whatever Metal left there.  Keep the draw dropped instead. */
@@ -2524,12 +2539,55 @@ bool tex_upload(Ctx* c, Tex* t) {
     return t->uploaded;
 }
 
-/* Resolves a bound texture handle and makes sure its pixels are there. */
-Tex* texture_for_sampling(Ctx* c, const CmdBuf* b, uint64_t handle) {
+/* Resolves a bound texture that prepare_textures() has already filled.  The
+ * argument-buffer path runs with a render encoder open, so it must not try to
+ * start an upload there; a missing upload is a dropped draw, never a zero
+ * texture. */
+Tex* texture_for_sampling(Ctx*, const CmdBuf* b, uint64_t handle) {
     Tex* t = const_cast<Tex*>(bound_texture(b, handle));
     if (!t || !t->mtl) return nullptr;
-    if (!tex_upload(c, t)) return nullptr;
+    if (!t->uploaded) {
+        log_once("nvnCommandBufferDraw.textureNotPrepared", 1);
+        return nullptr;
+    }
     return t;
+}
+
+/* Fills every texture this draw can sample, before any render encoder opens.
+ * Bound slots cover the direct and argument-buffer paths; bindless handles are
+ * read from their uniform buffers here for the same reason argument_buffer()
+ * reads them later.  A resolution/upload failure is left for the binding path
+ * to report only if the shader actually uses that resource. */
+bool prepare_textures(Ctx* c, CmdBuf* b) {
+    if (!b || !b->cb) return false;
+    auto upload = [c, b](uint64_t handle) {
+        Tex* t = const_cast<Tex*>(bound_texture(b, handle));
+        if (t && t->mtl) (void)tex_upload(c, b, t);
+    };
+    for (int si = 0; si < 2; ++si) {
+        for (unsigned slot = 0; slot < NVNGFX_MAX_TEXTURE_SLOTS; ++slot) {
+            const uint64_t h = b->texHandle[si][slot]
+                                   ? b->texHandle[si][slot]
+                                   : b->sepTexHandle[si][slot];
+            if (h) upload(h);
+        }
+    }
+    Program* p = find<Program>(b->program);
+    if (!p) return true;
+    for (int si = 0; si < 2; ++si) {
+        const nvngfx_shader_arg* args = si == 0 ? p->vargs : p->args;
+        const unsigned n = si == 0 ? p->vNumArgs : p->numArgs;
+        for (unsigned i = 0; i < n; ++i) {
+            const nvngfx_shader_arg& e = args[i];
+            if (e.kind != NVNGFX_ARG_TEXTURE_IN_UBO) continue;
+            uint32_t handle = 0;
+            if (!read_ubo_u32(b, si, e.slot, e.offset, &handle)) continue;
+            const unsigned tid = handle & NVNGFX_POOL_INDEX_MASK;
+            if (tid)
+                upload(nvngfx_texture_handle(tid, handle >> 20));
+        }
+    }
+    return true;
 }
 
 /* Builds one stage's argument buffer for this recording.
@@ -2820,14 +2878,15 @@ void cmdbuf_draw_arrays(nvngfx_ctx* ctx, uint64_t* x) {
     CmdBuf* b = find<CmdBuf>(x[0]);
     if (!b) return;
     b->draws++;
-    /* Opening the pass is what makes a recorded ClearColor happen. */
-    if (!ensure_encoder(c, b)) return;
     if (!ensure_pipeline(c, b)) {
         /* The honest line: there is no translated shader, so there is no
          * pipeline, so this draw is dropped.  Once per process. */
         log_once("nvnCommandBufferDrawArrays.noPipeline", 1);
         return;
     }
+    if (!prepare_textures(c, b)) return;
+    /* Opening the pass is what makes a recorded ClearColor happen. */
+    if (!ensure_encoder(c, b)) return;
     const uint32_t primitive = static_cast<uint32_t>(x[1]);
     const unsigned first = static_cast<unsigned>(x[2]);
     const unsigned count = static_cast<unsigned>(x[3]);
@@ -2854,11 +2913,12 @@ void cmdbuf_draw_elements(nvngfx_ctx* ctx, uint64_t* x) {
     CmdBuf* b = find<CmdBuf>(x[0]);
     if (!b) return;
     b->draws++;
-    if (!ensure_encoder(c, b)) return;
     if (!ensure_pipeline(c, b)) {
         log_once("nvnCommandBufferDrawElements.noPipeline", 1);
         return;
     }
+    if (!prepare_textures(c, b)) return;
+    if (!ensure_encoder(c, b)) return;
     const uint32_t primitive = static_cast<uint32_t>(x[1]);
     const uint32_t indexType = static_cast<uint32_t>(x[2]);
     const unsigned count = static_cast<unsigned>(x[3]);
@@ -2886,26 +2946,28 @@ void cmdbuf_draw_elements(nvngfx_ctx* ctx, uint64_t* x) {
 
 /* nvnCommandBufferSetViewport(NVNcommandBuffer*, int x, int y, int w, int h) */
 void cmdbuf_set_viewport(nvngfx_ctx* ctx, uint64_t* x) {
-    Ctx* c = ctx_of(ctx);
+    (void)ctx;
     CmdBuf* b = find<CmdBuf>(x[0]);
-    if (!c || !b || !ensure_encoder(c, b)) return;
-    MTLViewport vp = {static_cast<double>(static_cast<int>(x[1])),
-                      static_cast<double>(static_cast<int>(x[2])),
-                      static_cast<double>(static_cast<int>(x[3])),
-                      static_cast<double>(static_cast<int>(x[4])), 0.0, 1.0};
-    [b->enc setViewport:vp];
+    if (!b) return;
+    b->viewport = {static_cast<double>(static_cast<int>(x[1])),
+                   static_cast<double>(static_cast<int>(x[2])),
+                   static_cast<double>(static_cast<int>(x[3])),
+                   static_cast<double>(static_cast<int>(x[4])), 0.0, 1.0};
+    b->hasViewport = true;
+    if (b->enc) [b->enc setViewport:b->viewport];
 }
 
 /* nvnCommandBufferSetScissor(NVNcommandBuffer*, int x, int y, int w, int h) */
 void cmdbuf_set_scissor(nvngfx_ctx* ctx, uint64_t* x) {
-    Ctx* c = ctx_of(ctx);
+    (void)ctx;
     CmdBuf* b = find<CmdBuf>(x[0]);
-    if (!c || !b || !ensure_encoder(c, b)) return;
-    MTLScissorRect r = {static_cast<NSUInteger>(static_cast<int>(x[1])),
-                        static_cast<NSUInteger>(static_cast<int>(x[2])),
-                        static_cast<NSUInteger>(static_cast<int>(x[3])),
-                        static_cast<NSUInteger>(static_cast<int>(x[4]))};
-    [b->enc setScissorRect:r];
+    if (!b) return;
+    b->scissor = {static_cast<NSUInteger>(static_cast<int>(x[1])),
+                  static_cast<NSUInteger>(static_cast<int>(x[2])),
+                  static_cast<NSUInteger>(static_cast<int>(x[3])),
+                  static_cast<NSUInteger>(static_cast<int>(x[4]))};
+    b->hasScissor = true;
+    if (b->enc) [b->enc setScissorRect:b->scissor];
 }
 
 /* ------------------------------------------------------------------ */
