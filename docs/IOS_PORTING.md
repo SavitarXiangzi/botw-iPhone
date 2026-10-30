@@ -319,9 +319,10 @@ NVN 窗口另建一个**没人能看见**的 `CAMetalLayer`——客体的帧全
 
 **已经能证明的部分**：`nvngfx_metal_selftest()` 用内置 MSL 走完
 texture -> render target -> clear -> program -> pipeline -> draw -> 回读，
-CI 在 iOS 模拟器里用 `simctl` 启动 App，环境变量 `BOTW_SELFTEST=1` 让 App
-在 `init()` 里跑它、打印 `BOTW_SELFTEST rc=<n>` 并 `exit(rc)`；断言中心像素等于
-`(64,128,191,255)`（也就是 rc=0）。所以“Metal 这半边是通的”是可执行的结论，不是声称；
+CI 在 iOS 模拟器里用 `simctl` 启动 App（`--selftest`），App 在 `init()` 里跑它、
+把 `BOTW_SELFTEST rc=<n>` 写进容器的 `Documents/selftest.txt` 并 `exit(rc)`；
+断言中心像素等于 `(64,128,191,255)`，也就是 rc=0。**已在 CI 上跑通**
+（run 40997940031）。所以“Metal 这半边是通的”是可执行的结论，不是声称；
 “客体的 shader 能跑”仍然完全没验证。
 
 **阶段 C：纹理正确**

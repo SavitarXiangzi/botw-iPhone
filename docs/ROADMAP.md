@@ -2145,12 +2145,18 @@ blit 到 shared buffer -> 检查中心像素 == (64,128,191,255)
 顶点用 `[[vertex_id]]` 生成全屏三角形，所以**不需要顶点缓冲**——这正是
 “先把管线跑通、顶点输入留到后面”的意思。
 
-CI 在 iOS 模拟器里用 `simctl` 安装并启动 App，`BOTW_SELFTEST=1` 让
-`BotWApp.init()` 跑完自检、打印 `BOTW_SELFTEST rc=0` 再 `exit(0)`。
+CI 在 iOS 模拟器里用 `simctl` 安装并启动 App（启动参数 `--selftest`），
+`BotWApp.init()` 先写 `BOTW_SELFTEST start`、跑自检、再写 `BOTW_SELFTEST rc=0`
+并 `exit(0)`；工作流读 App 容器里的 `Documents/selftest.txt` 断言。
 
-先试过 XCTest unit-test bundle：`xcodebuild test` 在该 runner 上只报
-“Executed 0 tests” 然后 TEST FAILED，日志里没有原因，注解里只有 348 秒等待。
-`simctl` + 退出码更短，也能看见失败原因，所以换成它。
+**已跑通**（run 40997940031，commit `6f99850`，`ios` job 全绿）。
+这条路线上踩过两个真 bug，都值得记：
+
+| 现象 | 原因 |
+|---|---|
+| `xcodebuild test` 只报 “Executed 0 tests” + TEST FAILED，没有原因 | XCTest bundle 在该 runner 的宿主问题；日志拿不到（非 admin），注解只有 348 秒等待。改用 simctl |
+| 写出的 `selftest.txt` 只有 `start`，没有 rc | 自检给 texture builder 传了假地址 `0x5101`，`nvnTextureBuilderSetDefaults` 会 `memset` 0x80 字节 → 段错误 |
+| 第一次连 `start` 都没有 | `--console-pty` 在 App 秒退时接不上；改成写 App 容器文件 |
 
 ### 证据
 

@@ -262,9 +262,10 @@ build_abi_test: all tests passed
 ```
 
 Mac 侧还有一条**真的执行**的测试：CI 用 `simctl` 在 iOS 模拟器里安装并启动 App，
-`BOTW_SELFTEST=1` 让 App 在 `init()` 里跑完
-texture -> target -> clear -> pipeline -> draw -> 回读然后 `exit(rc)`。
-它不替代真机，但比“编过了”强一档。
+`--selftest` 让 App 在 `init()` 里跑完
+texture -> target -> clear -> pipeline -> draw -> 回读然后 `exit(rc)`，
+结果写进 App 容器的 `Documents/selftest.txt` 由工作流断言。
+**已跑通**（run 40997940031）。它不替代真机，但比“编过了”强一档。
 
 > 为什么不用 XCTest：本仓库先试过 unit-test bundle，`xcodebuild test` 在 runner 上
 > 只报 “Executed 0 tests” 然后 TEST FAILED，日志里没有任何原因（拿不到 admin 日志，
