@@ -270,8 +270,18 @@ def cmd_translate(a):
                   file=sys.stderr)
             continue
         base = os.path.join(a.out, j["key"])
+        msl = rename_entry(precise(r.stdout), j["stage"])
         with open(base + ".metal", "w", encoding="utf-8") as f:
-            f.write(rename_entry(precise(r.stdout), j["stage"]))
+            f.write(msl)
+        # c1 is a pointer in the MSL argument buffer, not inline data.  Only
+        # write a sidecar when this stage declares the member: an empty file
+        # means "explicit empty c1", while a missing one means the shader never
+        # reads c1.  Drop a stale sidecar from an earlier run.
+        if re.search(r"\b[a-z]+_c1\b", msl):
+            with open(base + ".c1", "wb") as f:
+                f.write(bytes.fromhex(j.get("c1", "")))
+        elif os.path.exists(base + ".c1"):
+            os.remove(base + ".c1")
         res = os.path.join(tmp, j["key"] + ".res.json")
         if os.path.exists(res):
             meta = json.load(open(res, encoding="utf-8"))

@@ -51,7 +51,7 @@ BAD = PS.replace("[[id(9)]]", "[[id(64)]]")
 
 EXPECTED_PS = [
     "{0, NVNGFX_ARG_UBO, 0},",
-    "{1, NVNGFX_ARG_UNSUPPORTED, -1},",
+    "{1, NVNGFX_ARG_C1, -1},",             # embedded constant segment
     "{2, NVNGFX_ARG_TEXTURE, 10},",          # tcb handle 0x1C -> c2 0x70 -> slot 10
     "{3, NVNGFX_ARG_SAMPLER_OF_TEXTURE, 10},",
     "{4, NVNGFX_ARG_SEPARATE_TEXTURE, 0},",  # tcb handle 0x5A -> c2 0x168 -> separate 0
@@ -94,6 +94,10 @@ def main():
                 continue
             with open(os.path.join(msl, name), "w", encoding="utf-8", newline="\n") as f:
                 f.write(text)
+        c1_path = os.path.join(msl, "aaaaaaaaaaaaaaaa_ps.c1")
+        c1 = bytes(range(16))
+        with open(c1_path, "wb") as f:
+            f.write(c1)
         out = os.path.join(tmp, "out.gen.c")
         r = run(msl, out)
         check(r.returncode == 0, "generator failed on a valid table: " + r.stderr.strip())
@@ -105,12 +109,47 @@ def main():
         # A vertex stage with no argument buffer gets no array, and its blob
         # row says "no layout" with two zeros.
         check("kArgs_bbbbbbbbbbbbbbbb_vs" not in text, "vs should have no layout array")
-        check(re.search(r'"bbbbbbbbbbbbbbbb", NVNGFX_STAGE_VERTEX,\s*\n\s*".*?", 0, 0\},', text, re.S)
-              is not None, "vs blob row should carry 0, 0")
+        check(re.search(r'"bbbbbbbbbbbbbbbb", NVNGFX_STAGE_VERTEX,\s*\n\s*".*?", 0, 0, 0, 0\},', text, re.S)
+              is not None, "vs blob row should carry no layout and no c1")
+        check("kC1_aaaaaaaaaaaaaaaa_ps" in text,
+              "ps blob should carry the c1 byte array")
         check(re.search(r'"aaaaaaaaaaaaaaaa", NVNGFX_STAGE_FRAGMENT,\s*\n\s*".*?", '
-                        r'kArgs_aaaaaaaaaaaaaaaa_ps, 10\},', text, re.S) is not None,
-              "ps blob row should reference its layout and length")
-        check("unsupported=6" in r.stdout, "summary should count 6 unsupported: " + r.stdout)
+                        r'kArgs_aaaaaaaaaaaaaaaa_ps, 10, kC1_aaaaaaaaaaaaaaaa_ps, 16\},',
+                        text, re.S) is not None,
+              "ps blob row should reference its layout and c1 bytes")
+        check("unsupported=5" in r.stdout, "summary should count 5 unsupported: " + r.stdout)
+        check("c1=1 shader(s), 16 bytes" in r.stdout,
+              "summary should count c1 bytes: " + r.stdout)
+
+        # A c1 declaration without its sidecar is a build error, not a draw
+        # that reads an unset pointer.
+        os.remove(c1_path)
+        missing = os.path.join(tmp, "missing.gen.c")
+        r_missing = run(msl, missing)
+        check(r_missing.returncode != 0, "generator accepted a missing c1 sidecar")
+        check("c1" in (r_missing.stderr + r_missing.stdout).lower(),
+              "missing c1 failure should name c1")
+        check(not os.path.exists(missing), "no output on a missing c1 error")
+
+        # A present but zero-length sidecar means an explicit empty c1.
+        open(c1_path, "wb").close()
+        empty = os.path.join(tmp, "empty.gen.c")
+        r_empty = run(msl, empty)
+        check(r_empty.returncode == 0, "generator rejected an empty c1: " + r_empty.stderr)
+        with open(empty, encoding="utf-8") as f:
+            empty_text = f.read()
+        check("kEmptyC1" in empty_text, "empty c1 should use the shared zero array")
+        check("kEmptyC1, 0" in empty_text, "empty c1 should have size zero")
+
+        # And an oversized sidecar is refused before it can allocate.
+        with open(c1_path, "wb") as f:
+            f.write(b"x" * (64 * 1024 + 1))
+        large = os.path.join(tmp, "large.gen.c")
+        r_large = run(msl, large)
+        check(r_large.returncode != 0, "generator accepted an oversized c1")
+        check(not os.path.exists(large), "no output on an oversized c1 error")
+        with open(c1_path, "wb") as f:
+            f.write(c1)
 
         # An id the runtime would refuse must stop the build, not ship silently.
         with open(os.path.join(msl, "cccccccccccccccc_ps.metal"), "w",
@@ -125,7 +164,7 @@ def main():
     if failures:
         print("test_gen_blobs: %d failure(s)" % failures)
         return 1
-    print("test_gen_blobs: ok (ids, slots, holes, refusals)")
+    print("test_gen_blobs: ok (ids, slots, c1, holes, refusals)")
     return 0
 
 

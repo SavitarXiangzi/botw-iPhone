@@ -87,6 +87,7 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace {
 
@@ -1476,6 +1477,12 @@ struct Program {
      * keeps the M3.81 behaviour: uniform buffer i is id(i). */
     nvngfx_shader_arg args[NVNGFX_MAX_ARGS] = {};
     unsigned numArgs = 0;
+    /* The shader's embedded c1 segment, copied out of the blob.  A c1-only
+     * fragment shader has no command-buffer binding at all, so this also
+     * decides whether buffer(0) must be bound when has_arguments() is false. */
+    std::vector<unsigned char> c1;
+    bool hasC1 = false;
+    id<MTLBuffer> c1Buffer = nil;
     /* Whether the fragment function declares an argument buffer at
      * buffer(0).  Constant-colour programs do not, and binding the table to
      * those would feed them the wrong bytes. */
@@ -1804,7 +1811,17 @@ void prog_initialize(nvngfx_ctx*, uint64_t* x) {
  * layout belongs to the shaders, not to a pipeline), but SetShaders does,
  * because new shaders may describe a different one. */
 void prog_apply_arg_layout(Program* p, const nvngfx_shader_blob* blob) {
+    if (!p) return;
     p->numArgs = nvngfx_shader_copy_args(blob, p->args, NVNGFX_MAX_ARGS);
+    p->c1.clear();
+    p->hasC1 = false;
+    for (unsigned i = 0; i < p->numArgs; ++i)
+        if (p->args[i].kind == NVNGFX_ARG_C1) p->hasC1 = true;
+    if (blob && blob->c1 && blob->c1_size)
+        p->c1.assign(blob->c1, blob->c1 + blob->c1_size);
+    /* New shaders (or a re-applied sidecar) invalidate the old copy.  A draw
+     * that still needs c1 recreates it from the Program's own bytes. */
+    p->c1Buffer = nil;
 }
 
 /* nvnProgramSetShaders(NVNprogram*, int, const NVNshaderData*) -> NVNboolean
@@ -1849,6 +1866,9 @@ void prog_set_shaders(nvngfx_ctx*, uint64_t* x) {
      * vertex stream in this backend, so the vertex argument buffer needs its
      * own slot convention before it can be bound (docs/SHADER_CHAIN.md §6). */
     p->numArgs = 0;
+    p->c1.clear();
+    p->hasC1 = false;
+    p->c1Buffer = nil;
     if (p->numStages > static_cast<unsigned>(NVNGFX_STAGE_FRAGMENT) &&
         p->key[NVNGFX_STAGE_FRAGMENT][0]) {
         const nvngfx_shader_blob* fb = nvngfx_shader_lookup_blob(
@@ -2298,7 +2318,10 @@ bool has_arguments(const CmdBuf* b) {
 id<MTLBuffer> argument_buffer(Ctx* c, CmdBuf* b) {
     if (b->argbuf) return b->argbuf;
     Program* p = find<Program>(b->program);
-    if (!has_arguments(b)) return nil;
+    /* c1 is not a command-buffer binding: it belongs to the shader.  A
+     * c1-only fragment shader therefore needs buffer(0) even though
+     * has_arguments() sees no UBO, texture or sampler on the command buffer. */
+    if (!has_arguments(b) && !(p && p->hasC1)) return nil;
     if (!p || !p->hasArgBuffer) {
         log_once("nvnCommandBufferDraw.argumentLayout", p ? 1u : 0u);
         return nil;
@@ -2394,10 +2417,36 @@ id<MTLBuffer> argument_buffer(Ctx* c, CmdBuf* b) {
             }
             slots[e.id] = static_cast<uint64_t>(smp->mtl.gpuResourceID._impl);
         } break;
+        case NVNGFX_ARG_C1: {
+            if (!p->hasC1) {
+                log_once("nvnCommandBufferDraw.missingC1", e.id);
+                return nil;
+            }
+            if (!p->c1Buffer) {
+                /* Match the shared-bank layout nxnative uses: data rounded
+                 * up to 256 bytes, then a 256-byte zero gap.  An explicit
+                 * empty c1 still gets that zero span, never a zero-length
+                 * MTLBuffer (which Metal may reject). */
+                const size_t data = p->c1.size();
+                const size_t need = ((data + 255u) & ~size_t(255u)) + 256u;
+                p->c1Buffer = [c->device newBufferWithLength:need
+                                                    options:MTLResourceStorageModeShared];
+                if (!p->c1Buffer) {
+                    log_once("nvnCommandBufferDraw.c1Buffer", 1);
+                    return nil;
+                }
+                std::memset([p->c1Buffer contents], 0, need);
+                if (data)
+                    std::memcpy([p->c1Buffer contents], p->c1.data(), data);
+            }
+            slots[e.id] = static_cast<uint64_t>([p->c1Buffer gpuAddress]);
+            [b->enc useResource:p->c1Buffer usage:MTLResourceUsageRead
+                           stages:MTLRenderStageFragment];
+        } break;
         default:
-            /* c1, the driver tables, a handle that lives in a uniform buffer,
-             * an image or a typed buffer: this layer cannot fill that word,
-             * and Metal has no way to report an unfinished argument buffer. */
+            /* The driver tables, a handle that lives in a uniform buffer, an
+             * image or a typed buffer: this layer cannot fill that word, and
+             * Metal has no way to report an unfinished argument buffer. */
             log_once("nvnCommandBufferDraw.argUnsupported",
                      static_cast<unsigned>(e.id));
             return nil;
@@ -2457,8 +2506,8 @@ bool bind_direct_arguments(CmdBuf* b) {
  * encoded, because a shader that reads constants or samples a texture would
  * read the wrong thing. */
 bool bind_arguments(Ctx* c, CmdBuf* b) {
-    if (!has_arguments(b)) return true;
     Program* p = find<Program>(b->program);
+    if (!has_arguments(b) && !(p && p->hasC1)) return true;
     if (p && p->directBindings) return bind_direct_arguments(b);
     id<MTLBuffer> ab = argument_buffer(c, b);
     if (!ab) return false;
@@ -3673,7 +3722,8 @@ extern "C" int nvngfx_metal_selftest(void) {
             const char* fsText5 = nvngfx_shader_selftest_msl_variant(
                 NVNGFX_STAGE_FRAGMENT, useDirect ? 4 : 5);
             const nvngfx_shader_blob testBlob[] = {
-                {"00000000000000a5", NVNGFX_STAGE_FRAGMENT, fsText5, testArgs, 3},
+                {"00000000000000a5", NVNGFX_STAGE_FRAGMENT, fsText5, testArgs, 3,
+                 nullptr, 0},
             };
             size_t savedCount = 0;
             const nvngfx_shader_blob* saved = nvngfx_shader_blob_table(&savedCount);
@@ -3847,6 +3897,135 @@ extern "C" int nvngfx_metal_selftest(void) {
             }
         }
 
+        {
+            /* --- Sixth draw: a c1-only fragment shader -------------------
+             * The sidecar carries the raw c1 bytes; the MSL names them with
+             * one [[id(2)]] pointer.  There is no UBO/texture/sampler binding,
+             * so this also proves the backend binds buffer(0) for c1 alone.
+             * The local bytes are overwritten after SetShaders: a readback of
+             * the original colour proves the Program copied them rather than
+             * keeping a pointer to the temporary blob. */
+            const uint64_t kProg6 = 0x5E00;
+            const uint64_t kCb6 = 0x5F00;
+            struct { uint64_t data; uint64_t control; } sd6[2];
+            sd6[0].data = reinterpret_cast<uint64_t>(const_cast<char*>(
+                nvngfx_shader_selftest_msl_variant(NVNGFX_STAGE_VERTEX, 6)));
+            sd6[0].control = 0;
+            sd6[1].data = reinterpret_cast<uint64_t>(const_cast<char*>(
+                nvngfx_shader_selftest_msl_variant(NVNGFX_STAGE_FRAGMENT, 6)));
+            sd6[1].control = 0;
+            x[0] = kProg6; x[1] = 0;
+            prog_initialize(ctx, x);
+            x[0] = kProg6; x[1] = 2;
+            x[2] = reinterpret_cast<uint64_t>(&sd6[0]);
+            prog_set_shaders(ctx, x);
+            if (x[0] != 1) {
+                std::fprintf(stderr, "[selftest] c1 program: SetShaders failed\n");
+                rc = 16390;
+                goto done;
+            }
+
+            unsigned char c1Bytes[256] = {};
+            const float c1Colour[4] = {0.25f, 0.5f, 0.75f, 1.0f};
+            std::memcpy(c1Bytes, c1Colour, sizeof c1Colour);
+            const nvngfx_shader_arg c1Args[] = {
+                {2, NVNGFX_ARG_C1, -1},
+            };
+            const nvngfx_shader_blob c1Blob[] = {
+                {"00000000000000a6", NVNGFX_STAGE_FRAGMENT,
+                 nvngfx_shader_selftest_msl_variant(NVNGFX_STAGE_FRAGMENT, 6),
+                 c1Args, 1, c1Bytes, sizeof c1Bytes},
+            };
+            size_t c1SavedCount = 0;
+            const nvngfx_shader_blob* c1Saved =
+                nvngfx_shader_blob_table(&c1SavedCount);
+            if (nvngfx_shader_set_blobs(c1Blob, 1) != 0) {
+                std::fprintf(stderr, "[selftest] c1 test blob was refused\n");
+                rc = 16390;
+                goto done;
+            }
+            {
+                const nvngfx_shader_blob* found = nvngfx_shader_lookup_blob(
+                    "00000000000000a6", NVNGFX_STAGE_FRAGMENT, nullptr);
+                Program* p6 = find<Program>(kProg6);
+                if (!found || !p6 || found->c1 != c1Bytes ||
+                    found->c1_size != sizeof c1Bytes) {
+                    std::fprintf(stderr, "[selftest] c1 blob lookup failed\n");
+                    nvngfx_shader_set_blobs(c1Saved, c1SavedCount);
+                    rc = 16390;
+                    goto done;
+                }
+                prog_apply_arg_layout(p6, found);
+                /* The Program must own a copy: poison the source now. */
+                std::memset(c1Bytes, 0xAA, sizeof c1Bytes);
+                std::fprintf(stderr,
+                             "[selftest] c1 sidecar: key=%s bytes=%u id=%u\n",
+                             found->key, found->c1_size,
+                             static_cast<unsigned>(c1Args[0].id));
+            }
+            nvngfx_shader_set_blobs(c1Saved, c1SavedCount);
+
+            {
+                const uint64_t target = kTex;
+                const float clear6[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+                x[0] = kCb6;
+                cmdbuf_begin_recording(ctx, x);
+                x[0] = kCb6; x[1] = 1;
+                x[2] = reinterpret_cast<uint64_t>(&target);
+                x[3] = 0; x[4] = 0; x[5] = 0;
+                cmdbuf_set_render_targets(ctx, x);
+                x[0] = kCb6; x[1] = 0;
+                x[2] = reinterpret_cast<uint64_t>(clear6);
+                x[3] = 0xF;
+                cmdbuf_clear_color(ctx, x);
+                x[0] = kCb6; x[1] = kProg6; x[2] = 0;
+                cmdbuf_bind_program(ctx, x);
+                x[0] = kCb6; x[1] = 0; x[2] = 0; x[3] = 3;
+                cmdbuf_draw_arrays(ctx, x);
+                x[0] = kCb6;
+                cmdbuf_end_recording(ctx, x);
+            }
+            CmdBuf* b6 = find<CmdBuf>(kCb6);
+            Program* p6 = find<Program>(kProg6);
+            if (!b6 || !b6->last || b6->encoded != 1 || !p6 ||
+                !p6->hasC1 || !p6->c1Buffer || p6->c1.size() != sizeof c1Bytes) {
+                std::fprintf(stderr,
+                             "[selftest] c1 draw not encoded (encoded=%u c1=%d "
+                             "buffer=%d bytes=%zu)\n",
+                             b6 ? b6->encoded : 0u,
+                             p6 && p6->hasC1 ? 1 : 0,
+                             p6 && p6->c1Buffer ? 1 : 0,
+                             p6 ? p6->c1.size() : 0u);
+                rc = 16391;
+                goto done;
+            }
+            [b6->last waitUntilCompleted];
+            if (b6->last.status == MTLCommandBufferStatusError) {
+                std::fprintf(stderr, "[selftest] c1 draw command buffer error: %s\n",
+                             b6->last.error
+                                 ? [[b6->last.error localizedDescription] UTF8String]
+                                 : "(no description)");
+                rc = 16391;
+                goto done;
+            }
+            {
+                unsigned char px[4] = {0, 0, 0, 0};
+                const int want[4] = {64, 128, 191, 255};
+                if (!read_center_pixel(dev, c->queue, t->mtl, kSide, px) ||
+                    !pixels_near(px, want, 2)) {
+                    std::fprintf(stderr,
+                                 "[selftest] c1 draw centre pixel is "
+                                 "(%u,%u,%u,%u), want (%d,%d,%d,%d)\n",
+                                 px[0], px[1], px[2], px[3],
+                                 want[0], want[1], want[2], want[3]);
+                    rc = 16392;
+                    goto done;
+                }
+                std::fprintf(stderr,
+                             "[selftest] c1 draw read back its copied constants\n");
+            }
+        }
+
     done:
         nvngfx_shader_set_msl_passthrough(0);
         forget<CmdBuf>(kCb);
@@ -3867,6 +4046,8 @@ extern "C" int nvngfx_metal_selftest(void) {
         forget<Sampler>(kSampler5);
         forget<Program>(0x5C00);
         forget<CmdBuf>(0x5D00);
+        forget<Program>(0x5E00);
+        forget<CmdBuf>(0x5F00);
         g_tex_specs.erase(kTexSrcBuilder);
         g_sampler_specs.erase(kSamplerBuilder5);
         nvngfx_metal_destroy(ctx);

@@ -73,9 +73,9 @@ int main() {
     CHECK(why != nullptr && std::strstr(why, "no offline MSL blob table") != nullptr);
 
     static const nvngfx_shader_blob blobs[] = {
-        {"0123456789ABCDEF", NVNGFX_STAGE_VERTEX, "vertex void nvngfx_main_vs() {}", nullptr, 0},
-        {"fedcba9876543210", NVNGFX_STAGE_FRAGMENT, "fragment void nvngfx_main_fs() {}",
-         nullptr, 0},
+        {"0123456789ABCDEF", NVNGFX_STAGE_VERTEX, "vertex void nvngfx_main_vs() {}", nullptr, 0, nullptr, 0},
+        {"fedcba9876543210", NVNGFX_STAGE_FRAGMENT,
+         "fragment void nvngfx_main_fs() {}", nullptr, 0, nullptr, 0},
     };
     CHECK(nvngfx_shader_set_blobs(blobs, 2) == 0);
     CHECK(nvngfx_shader_blob_count() == 2);
@@ -94,8 +94,8 @@ int main() {
 
     /* A duplicate key+stage is rejected, and the installed table survives. */
     static const nvngfx_shader_blob dup[] = {
-        {"0123456789abcdef", NVNGFX_STAGE_VERTEX, "x", nullptr, 0},
-        {"0123456789ABCDEF", NVNGFX_STAGE_VERTEX, "y", nullptr, 0},
+        {"0123456789abcdef", NVNGFX_STAGE_VERTEX, "x", nullptr, 0, nullptr, 0},
+        {"0123456789ABCDEF", NVNGFX_STAGE_VERTEX, "y", nullptr, 0, nullptr, 0},
     };
     CHECK(nvngfx_shader_set_blobs(dup, 2) == -2);
     CHECK(nvngfx_shader_blob_count() == 2);
@@ -104,23 +104,31 @@ int main() {
 
     /* Compute blobs are refused rather than silently never matched. */
     static const nvngfx_shader_blob cs[] = {
-        {"0123456789abcdef", NVNGFX_STAGE_COMPUTE, "z", nullptr, 0},
+        {"0123456789abcdef", NVNGFX_STAGE_COMPUTE, "z", nullptr, 0, nullptr, 0},
     };
     CHECK(nvngfx_shader_set_blobs(cs, 1) == -1);
     CHECK(nvngfx_shader_set_blobs(nullptr, 1) == -1);
 
     /* The argument layout sidecar.  A real fragment shader names 42 entries,
      * so the interesting cases are a hole in the id range, a kind with no
-     * slot, and a table that has to be refused whole rather than half-used. */
+     * slot, and a table that has to be refused whole rather than half-used.
+     * C1 is the embedded constant segment: it has no NVN binding slot, but its
+     * bytes must be present (an explicit empty segment is valid). */
     {
+        static const unsigned char c1[] = {
+            0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x00, 0x40,
+            0x00, 0x00, 0x40, 0x3f, 0x00, 0x00, 0x80, 0x3f,
+        };
         static const nvngfx_shader_arg layout[] = {
             {5, NVNGFX_ARG_UBO, 0},
             {9, NVNGFX_ARG_TEXTURE, 0},
             {12, NVNGFX_ARG_SAMPLER_OF_TEXTURE, 0},
-            {13, NVNGFX_ARG_UNSUPPORTED, -1},
+            {13, NVNGFX_ARG_C1, -1},
+            {14, NVNGFX_ARG_UNSUPPORTED, -1},
         };
         static const nvngfx_shader_blob with_args[] = {
-            {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", layout, 4},
+            {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", layout, 5,
+             c1, sizeof c1},
         };
         CHECK(nvngfx_shader_set_blobs(with_args, 1) == 0);
         CHECK(nvngfx_shader_blob_count() == 1);
@@ -128,20 +136,32 @@ int main() {
         const nvngfx_shader_blob* b =
             nvngfx_shader_lookup_blob("0011223344556677", NVNGFX_STAGE_FRAGMENT, &why);
         CHECK(b == &with_args[0]);
-        CHECK(b != nullptr && b->num_args == 4);
+        CHECK(b != nullptr && b->num_args == 5);
         CHECK(b != nullptr && b->args[2].kind == NVNGFX_ARG_SAMPLER_OF_TEXTURE);
+        CHECK(b != nullptr && b->c1 == c1 && b->c1_size == sizeof c1);
         CHECK(nvngfx_shader_lookup("0011223344556677", NVNGFX_STAGE_FRAGMENT, &why) ==
               with_args[0].msl);
 
         /* A blob's layout is copied verbatim, holes included. */
         nvngfx_shader_arg copied[NVNGFX_MAX_ARGS] = {};
-        CHECK(nvngfx_shader_copy_args(b, copied, NVNGFX_MAX_ARGS) == 4);
+        CHECK(nvngfx_shader_copy_args(b, copied, NVNGFX_MAX_ARGS) == 5);
         CHECK(copied[0].id == 5 && copied[0].slot == 0);
         CHECK(copied[1].id == 9 && copied[1].kind == NVNGFX_ARG_TEXTURE);
-        CHECK(copied[3].kind == NVNGFX_ARG_UNSUPPORTED && copied[3].slot == -1);
+        CHECK(copied[3].kind == NVNGFX_ARG_C1 && copied[3].slot == -1);
+        CHECK(copied[4].kind == NVNGFX_ARG_UNSUPPORTED && copied[4].slot == -1);
         /* A destination that cannot hold the whole layout gets nothing. */
-        CHECK(nvngfx_shader_copy_args(b, copied, 3) == 0);
+        CHECK(nvngfx_shader_copy_args(b, copied, 4) == 0);
         CHECK(nvngfx_shader_copy_args(nullptr, copied, NVNGFX_MAX_ARGS) == 0);
+
+        /* A zero-length c1 is explicit data, not a missing sidecar. */
+        static const nvngfx_shader_blob empty_c1[] = {
+            {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", layout, 5,
+             c1, 0},
+        };
+        CHECK(nvngfx_shader_set_blobs(empty_c1, 1) == 0);
+        b = nvngfx_shader_lookup_blob("0011223344556677", NVNGFX_STAGE_FRAGMENT, &why);
+        CHECK(b != nullptr && b->c1 == c1 && b->c1_size == 0);
+        CHECK(nvngfx_shader_set_blobs(with_args, 1) == 0);
 
         /* Every way a layout can be wrong; the installed table must survive. */
         static const nvngfx_shader_arg descending[] = {
@@ -164,21 +184,32 @@ int main() {
         static const nvngfx_shader_arg unsupported_with_slot[] = {
             {1, NVNGFX_ARG_UNSUPPORTED, 0},
         };
+        static const nvngfx_shader_arg c1_with_slot[] = {
+            {1, NVNGFX_ARG_C1, 0},
+        };
+        static const nvngfx_shader_arg c1_without_bytes[] = {
+            {1, NVNGFX_ARG_C1, -1},
+        };
         static const nvngfx_shader_arg missing_slot[] = {
             {1, NVNGFX_ARG_UBO, -1},
         };
         static const nvngfx_shader_arg too_many[NVNGFX_MAX_ARGS + 1] = {};
         static const nvngfx_shader_blob bad[] = {
-            {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", descending, 2},
-            {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", duplicate_id, 2},
-            {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", texture_slot_too_high, 1},
-            {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", id_too_high, 1},
-            {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", bad_kind, 1},
-            {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", unsupported_with_slot, 1},
-            {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", missing_slot, 1},
+            {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", descending, 2, nullptr, 0},
+            {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", duplicate_id, 2, nullptr, 0},
+            {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", texture_slot_too_high, 1, nullptr, 0},
+            {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", id_too_high, 1, nullptr, 0},
+            {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", bad_kind, 1, nullptr, 0},
+            {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", unsupported_with_slot, 1, nullptr, 0},
+            {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", c1_with_slot, 1, c1, sizeof c1},
+            {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", c1_without_bytes, 1, nullptr, 0},
+            {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", c1_without_bytes, 1, c1,
+             NVNGFX_MAX_C1_BYTES + 1},
+            {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", c1_without_bytes, 1, nullptr, 1},
+            {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", missing_slot, 1, nullptr, 0},
             {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", too_many,
-             NVNGFX_MAX_ARGS + 1},
-            {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", layout, 0},
+             NVNGFX_MAX_ARGS + 1, nullptr, 0},
+            {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", layout, 0, nullptr, 0},
         };
         for (std::size_t i = 0; i < sizeof bad / sizeof bad[0]; ++i)
             CHECK(nvngfx_shader_set_blobs(&bad[i], 1) == -1);
@@ -244,6 +275,6 @@ int main() {
         std::printf("nvn_shader_test: %d failure(s)\n", g_failures);
         return 1;
     }
-    std::printf("nvn_shader_test: ok (seam, blob table, SHA-256, shader key)\n");
+    std::printf("nvn_shader_test: ok (seam, blob table, c1, SHA-256, shader key)\n");
     return 0;
 }

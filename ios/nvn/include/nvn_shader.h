@@ -63,6 +63,7 @@ const char* nvngfx_shader_to_msl(const void* code, unsigned long long size,
  * member's *name* says which NVN binding it came from:
  *
  *     vp_c<N> / fp_c<N>          constant bank N -> uniform buffer slot N - 3
+ *     vp_c1 / fp_c1              the embedded c1 segment (blob->c1)
  *     fp_t_tcb_<handle>          combined texture (the c2 handle table)
  *     fp_t_tcb_<handle>Smplr     the sampler carried by that combined handle
  *     fp_t_cb<N>_<handle>        a handle in uniform buffer N (bindless)
@@ -71,8 +72,8 @@ const char* nvngfx_shader_to_msl(const void* code, unsigned long long size,
  * The generator (scripts/shader_chain/gen_blobs.py) decodes that naming into
  * the table below and ships it next to the MSL, so the backend never has to
  * guess an [[id(k)]] ordering at run time.  Anything the replay layer cannot
- * fill yet -- the c1 constant bank, the c0/c2 driver tables, a handle that
- * lives in a uniform buffer, images, typed buffers -- is recorded as
+ * fill yet -- the c0/c2 driver tables, a handle that lives in a uniform
+ * buffer, images, typed buffers -- is recorded as
  * NVNGFX_ARG_UNSUPPORTED, and a draw that needs one is dropped instead of
  * reading an unset word.
  *
@@ -90,6 +91,12 @@ const char* nvngfx_shader_to_msl(const void* code, unsigned long long size,
 #define NVNGFX_MAX_TEXTURE_SLOTS 32
 #define NVNGFX_MAX_SAMPLER_SLOTS 32
 
+/* c1 is the shader's embedded constant segment (control +0x700/+0x704).
+ * nxnative's measured BOTW library uses 0, 256, 512 or 768 bytes; 64 KiB is
+ * the same hard ceiling its c1 banks use, so a corrupt sidecar cannot make the
+ * phone allocate an unbounded buffer. */
+#define NVNGFX_MAX_C1_BYTES (64u * 1024u)
+
 typedef enum nvngfx_arg_kind {
     NVNGFX_ARG_UBO = 1,                /* slot = uniform buffer index r (c[3+r]) */
     NVNGFX_ARG_TEXTURE = 2,            /* slot = combined texture slot r */
@@ -98,13 +105,14 @@ typedef enum nvngfx_arg_kind {
                                         * there is no separate binding */
     NVNGFX_ARG_SEPARATE_TEXTURE = 4,   /* slot = separate texture slot r */
     NVNGFX_ARG_SEPARATE_SAMPLER = 5,   /* slot = separate sampler slot r */
-    NVNGFX_ARG_UNSUPPORTED = 6         /* see above: the draw cannot be filled */
+    NVNGFX_ARG_C1 = 6,                 /* slot = -1; the data is blob->c1 */
+    NVNGFX_ARG_UNSUPPORTED = 7         /* see above: the draw cannot be filled */
 } nvngfx_arg_kind;
 
 typedef struct nvngfx_shader_arg {
     unsigned char id;    /* [[id(k)]] in the MSL argument buffer */
     unsigned char kind;  /* nvngfx_arg_kind */
-    signed char slot;    /* NVN binding slot, or -1 for UNSUPPORTED */
+    signed char slot;    /* NVN binding slot, or -1 for C1 / UNSUPPORTED */
 } nvngfx_shader_arg;
 
 typedef struct nvngfx_shader_blob {
@@ -116,15 +124,24 @@ typedef struct nvngfx_shader_blob {
      * "uniform buffer i is id(i)" and drops any draw that binds a texture. */
     const nvngfx_shader_arg* args;
     unsigned num_args;
+    /* Raw bytes of the embedded c1 segment, in guest order.  NULL/0 means the
+     * sidecar had no c1 for this shader.  A non-NULL pointer with c1_size == 0
+     * is an explicit empty c1 (some shaders declare it and read zeros); that
+     * distinction must survive generation.  A blob with a C1 layout entry must
+     * carry a non-NULL c1 pointer, even when its size is zero. */
+    const unsigned char* c1;
+    unsigned c1_size;
 } nvngfx_shader_blob;
 
 /* Installs a static table.  Nothing is copied.  Returns 0 on success, or
  * -(index + 1) naming the first bad entry (bad key, bad stage, empty MSL, or a
  * duplicate key+stage).  A layout is also checked: ids must be ascending and
  * unique, no id above NVNGFX_MAX_ARG_ID, every kind in range with a slot that
- * fits its table, and UNSUPPORTED entries must carry slot -1.  On failure the
- * previous table stays installed: the caller never sees a half-installed
- * table. */
+ * fits its table, and C1 / UNSUPPORTED entries must carry slot -1.  A C1
+ * entry must also name a blob with c1 data (an empty blob is valid), c1_size
+ * must not exceed NVNGFX_MAX_C1_BYTES, and a non-zero size needs a pointer.
+ * On failure the previous table stays installed: the caller never sees a
+ * half-installed table. */
 int nvngfx_shader_set_blobs(const nvngfx_shader_blob* blobs, size_t count);
 
 /* Uninstalls the table (lookups then fail with "no blob table"). */
