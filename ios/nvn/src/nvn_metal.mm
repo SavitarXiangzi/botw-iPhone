@@ -24,15 +24,15 @@
  *         on a computer, never in the repository.  Everything else on that
  *         path -- pipeline creation with a real vertex descriptor, buffer
  *         binding, draw encoding, pixel readback -- is executed by
- *         nvngfx_metal_selftest() in CI's iOS Simulator: six draws, a
+ *         nvngfx_metal_selftest() in CI's iOS Simulator: eight draws, a
  *         bindless table probe, and a vertex-stage argument-buffer draw whose
- *         shifted pixels are read back.  One draw samples a 2x2 texture
- *         through a texture pool, a sampler pool and an argument buffer; a
- *         sampler state object is also created, compared and read back.
+ *         shifted pixels are read back.  The last draw builds a block-linear
+ *         texture in a guest memory pool and proves that the sampled pixels
+ *         came from that storage, not from a host-side upload.  A sampler
+ *         state object is also created, compared and read back.
  *         MRT / depth attachment / texture views
- *         guest-pixel upload (the self-test's texture is filled by a host
- *         blit; a texture's storage is not read from guest memory yet)
- *         texture tiling, BCn -> ASTC/ETC2 transcode, compute, sync/fence
+ *         streaming texture updates and a LINEAR-storage upload path
+ *         BCn -> ASTC/ETC2 transcode, compute, sync/fence
  *
  * Argument ABI: measured, not guessed
  * -----------------------------------
@@ -78,6 +78,7 @@
 #include "nvn_pool.h"
 #include "nvn_sampler.h"
 #include "nvn_shader.h"
+#include "nvn_texlayout.h"
 #include "nvn_texture.h"
 #include "nvn_vertex.h"
 
@@ -170,6 +171,20 @@ struct Tex {
     uint64_t pool = 0;
     ptrdiff_t offset = 0;
     id<MTLTexture> mtl = nil;
+    /* The builder state, kept so the upload path can ask nvn_texlayout for
+     * the storage geometry without a second side table. */
+    nvngfx_texdesc desc = {};
+    /* A sampled texture starts empty and is filled from the guest's pool the
+     * first time a draw reads it.  `uploadTried` makes that a one-shot even
+     * when it failed, so a broken texture does not pay for it every draw. */
+    bool uploadTried = false;
+    bool uploaded = false;
+    /* Set once this texture has been a render target in this process: the
+     * pixels in it are ours, not the guest's, so uploading would overwrite
+     * what we just drew. */
+    bool rendered = false;
+    /* How many mip levels the guest storage actually provided. */
+    unsigned uploadedLevels = 0;
 };
 
 struct Sampler {
@@ -723,11 +738,10 @@ MTLTextureType to_metal_texture_type(int rank) {
  *
  * Builds a real MTLTexture from what the builder setters recorded.  Important
  * limitation, stated here and in the docs: the texture is HOST allocated and
- * does not alias the guest's storage.  That is harmless for a render target
- * (we are the only writer and the pixels only leave through present), and it
- * is wrong for a sampled texture (the guest's pixels would not be seen).
- * Until the block-linear deswizzle path exists, only render targets are
- * meaningful -- see docs/IOS_PORTING.md, texture path.
+ * does not alias the guest's storage.  A render target is filled by this
+ * backend and is never overwritten from the guest.  A sampled texture is
+ * copied lazily from the guest pool on its first draw by tex_upload(), which
+ * deswizzles every mip level first.  See docs/IOS_PORTING.md, texture path.
  */
 void tex_initialize(nvngfx_ctx* ctx, uint64_t* x) {
     Ctx* c = ctx_of(ctx);
@@ -781,6 +795,12 @@ void tex_initialize(nvngfx_ctx* ctx, uint64_t* x) {
         t->target = static_cast<uint32_t>(d.target);
         t->pool = d.pool;
         t->offset = static_cast<ptrdiff_t>(d.offset);
+        t->desc = d;
+        t->layers = 1;
+        t->uploadTried = false;
+        t->uploaded = false;
+        t->rendered = false;
+        t->uploadedLevels = 0;
         t->mtl = [c->device newTextureWithDescriptor:td];
         x[0] = t->mtl ? 1u : 0u;
     }
@@ -2254,6 +2274,12 @@ void cmdbuf_set_render_targets(nvngfx_ctx*, uint64_t* x) {
         b->color[i] = (list && i < b->numColor) ? list[i] : 0u;
     }
     b->depth = x[4];
+    /* A texture that has been rendered into holds this backend's pixels, not
+     * the guest's, so the upload path must leave it alone from now on. */
+    for (unsigned i = 0; i < b->numColor; ++i) {
+        if (Tex* t = find<Tex>(b->color[i])) t->rendered = true;
+    }
+    if (Tex* dt = find<Tex>(b->depth)) dt->rendered = true;
     /* A pipeline is compiled for one colour format. */
     b->pso = nil;
     /* Texture views are not supported yet; passing a view is legal but the
@@ -2363,22 +2389,146 @@ bool read_ubo_u32(const CmdBuf* b, int si, unsigned slot, unsigned offset,
     return true;
 }
 
-/* Builds the pixel stage's argument buffer for this recording.
+/* Copies a texture's guest bytes into its MTLTexture, once.
  *
- * Metal packs an argument buffer by member declaration order, not by
- * [[id(k)]].  Program::args therefore carries `packed` (0..numArgs-1), and each
- * member is one 64-bit word at byte 8*packed: a buffer writes its
- * gpuAddress + offset, a texture or sampler writes gpuResourceID.  This fixed
- * ABI is what d2r-mobile's translated MSL expects, and it is also the only
- * option where MTLArgumentEncoder is unusable (the iOS Simulator reports
- * encodedLength == 0).
+ * The guest fills texture storage inside a memory pool -- decompressed mip
+ * chains included -- while the MTLTexture created at nvnTextureInitialize is
+ * host allocated and starts empty.  Without this, a sampled texture reads
+ * zeros however correct the binding is.
  *
- * A bindless texture/sampler reads its 32-bit NVN handle from the bound uniform
- * buffer first: low 20 bits name the texture, high 12 the sampler.  A missing
- * UBO, unreadable handle, or unregistered pool ID drops the draw.
+ * One blit per level and slice, from a shared staging buffer that
+ * nvngfx_tex_deswizzle() filled out of the pool's MTLBuffer (the pool wraps
+ * the guest's own bytes, so this is a copy of the same memory the GPU would
+ * have read).  A texture this path cannot handle (multisampled, LINEAR,
+ * BUFFER, unknown format, storage outside the pool, a level whose width is
+ * not a whole number of blocks) is reported once and left as it was; a render
+ * target is never uploaded at all, because this backend is its only writer.
  *
- * Returns nil when nothing is bound or when a bound resource cannot be
- * resolved; the caller then drops the draw instead of encoding zeros. */
+ * Returns false only when the caller must not sample the texture. */
+bool tex_upload(Ctx* c, Tex* t) {
+    if (!t || !t->mtl) return false;
+    if (t->uploaded || t->uploadTried) return t->uploaded;
+    t->uploadTried = true;
+    if (t->rendered) {
+        t->uploaded = true;
+        return true;
+    }
+    if (!t->desc.pool || t->desc.offset < 0) {
+        /* Host-only texture (the self-test's, or one the guest never gave
+         * storage).  Nothing to copy; the host already owns the pixels. */
+        t->uploaded = true;
+        return true;
+    }
+    Pool* p = find<Pool>(t->desc.pool);
+    if (!p || !p->buffer || !p->storage) {
+        log_once("nvnTextureUpload.pool", static_cast<unsigned>(t->desc.pool));
+        return false;
+    }
+    nvngfx_texlayout L;
+    if (nvngfx_tex_layout(&t->desc, &L) != 0) {
+        log_once("nvnTextureUpload.layout", static_cast<unsigned>(t->desc.format));
+        return false;
+    }
+    const unsigned long long off = static_cast<unsigned long long>(t->desc.offset);
+    if (off > p->size || L.size > p->size - off) {
+        log_once("nvnTextureUpload.range", static_cast<unsigned>(L.size));
+        return false;
+    }
+    if (![p->buffer contents]) return false;
+    const unsigned char* const base =
+        static_cast<const unsigned char*>([p->buffer contents]) + off;
+
+    const unsigned levels = t->desc.levels ? static_cast<unsigned>(t->desc.levels) : 1u;
+    /* The largest level decides the staging buffer. */
+    size_t staging = 0;
+    for (unsigned l = 0; l < levels; ++l) {
+        unsigned rb = 0, rows = 0, slices = 0;
+        if (nvngfx_tex_level_geometry(&t->desc, l, 0, &rb, &rows, &slices,
+                                      nullptr, nullptr, nullptr) != 0) {
+            log_once("nvnTextureUpload.geometry", l);
+            break;
+        }
+        const size_t need = static_cast<size_t>(rb) * rows * slices;
+        if (need > staging) staging = need;
+    }
+    if (staging == 0) return false;
+    id<MTLBuffer> stg = [c->device newBufferWithLength:staging
+                                               options:MTLResourceStorageModeShared];
+    if (!stg) {
+        log_once("nvnTextureUpload.staging", 1);
+        return false;
+    }
+    id<MTLCommandBuffer> cb = [c->queue commandBuffer];
+    id<MTLBlitCommandEncoder> blit = cb ? [cb blitCommandEncoder] : nil;
+    if (!blit) {
+        log_once("nvnTextureUpload.encoder", 1);
+        return false;
+    }
+
+    unsigned done = 0;
+    const unsigned layers = L.layers ? L.layers : 1u;
+    for (unsigned l = 0; l < levels; ++l) {
+        unsigned rb = 0, rows = 0, slices = 0;
+        if (nvngfx_tex_level_geometry(&t->desc, l, 0, &rb, &rows, &slices,
+                                      nullptr, nullptr, nullptr) != 0) {
+            log_once("nvnTextureUpload.geometry", l);
+            break;
+        }
+        /* A compressed level's last block may cover fewer texels than its
+         * storage does; the copy size stays the level's real size, while the
+         * source row is allowed to carry the whole block. */
+        const unsigned bw = L.block_width ? L.block_width : 1u;
+        const unsigned bh = L.block_height ? L.block_height : 1u;
+        const unsigned texelsWide = rb / (L.bytes_per_block ? L.bytes_per_block : 1u);
+        const unsigned lw = (t->width >> l) ? (t->width >> l) : 1u;
+        const unsigned lh = (t->height >> l) ? (t->height >> l) : 1u;
+        if (texelsWide * bw < lw || rows * bh < lh) {
+            log_once("nvnTextureUpload.blockEdge", l);
+            break;
+        }
+        bool levelComplete = true;
+        for (unsigned layer = 0; layer < layers; ++layer) {
+            if (nvngfx_tex_deswizzle(&t->desc, l, layer, base, [stg contents],
+                                     rb) != 0) {
+                log_once("nvnTextureUpload.deswizzle", l);
+                levelComplete = false;
+                break;
+            }
+            [blit copyFromBuffer:stg
+                    sourceOffset:0
+               sourceBytesPerRow:rb
+             sourceBytesPerImage:static_cast<NSUInteger>(rb) * rows
+                      sourceSize:MTLSizeMake(lw, lh, slices)
+                       toTexture:t->mtl
+                destinationSlice:layer
+                destinationLevel:l
+               destinationOrigin:MTLOriginMake(0, 0, 0)];
+        }
+        if (!levelComplete) break;
+        ++done;
+    }
+    [blit endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+    if (cb.status == MTLCommandBufferStatusError) {
+        log_once("nvnTextureUpload.commandBuffer", 1);
+        return false;
+    }
+    t->uploadedLevels = done;
+    /* Partial copies are not a usable texture: sampling a missing mip would
+     * return whatever Metal left there.  Keep the draw dropped instead. */
+    t->uploaded = done == levels;
+    return t->uploaded;
+}
+
+/* Resolves a bound texture handle and makes sure its pixels are there. */
+Tex* texture_for_sampling(Ctx* c, const CmdBuf* b, uint64_t handle) {
+    Tex* t = const_cast<Tex*>(bound_texture(b, handle));
+    if (!t || !t->mtl) return nullptr;
+    if (!tex_upload(c, t)) return nullptr;
+    return t;
+}
+
 /* Builds one stage's argument buffer for this recording.
  *
  * Metal packs an argument buffer by member declaration order, not by
@@ -2498,7 +2648,7 @@ int argument_buffer(Ctx* c, CmdBuf* b, nvngfx_stage stage, id<MTLBuffer>* out) {
             const uint64_t h = e.kind == NVNGFX_ARG_TEXTURE
                                    ? b->texHandle[si][slot]
                                    : b->sepTexHandle[si][slot];
-            const Tex* t = bound_texture(b, h);
+            const Tex* t = texture_for_sampling(c, b, h);
             if (!t || !t->mtl) {
                 log_once("nvnCommandBufferDraw.texture", slot);
                 return -1;
@@ -2552,9 +2702,10 @@ int argument_buffer(Ctx* c, CmdBuf* b, nvngfx_stage stage, id<MTLBuffer>* out) {
             }
             if (e.kind == NVNGFX_ARG_TEXTURE_IN_UBO) {
                 const unsigned tid = handle & NVNGFX_POOL_INDEX_MASK;
-                const Tex* t = tid
-                    ? bound_texture(b, nvngfx_texture_handle(tid, handle >> 20))
-                    : nullptr;
+                const Tex* t =
+                    tid ? texture_for_sampling(
+                              c, b, nvngfx_texture_handle(tid, handle >> 20))
+                        : nullptr;
                 if (!t || !t->mtl) {
                     log_once("nvnCommandBufferDraw.bindlessTexture", e.packed);
                     return -1;
@@ -2592,7 +2743,7 @@ int argument_buffer(Ctx* c, CmdBuf* b, nvngfx_stage stage, id<MTLBuffer>* out) {
  * [[texture(k)]] / [[sampler(k)]].  This is the non-Metal3 fallback: it
  * never needs gpuResourceID, so the simulator can still exercise the pool,
  * handle, upload and sampler-state layers. */
-bool bind_direct_arguments(CmdBuf* b) {
+bool bind_direct_arguments(Ctx* c, CmdBuf* b) {
     bool bound = false;
     const int si = 1;   /* the direct path is the pixel stage's fallback */
     for (unsigned i = 0; i < NVNGFX_MAX_TEXTURE_SLOTS; ++i) {
@@ -2612,7 +2763,7 @@ bool bind_direct_arguments(CmdBuf* b) {
                                        ? b->texHandle[si][i]
                                        : b->sepTexHandle[si][i];
         if (texHandle) {
-            const Tex* t = bound_texture(b, texHandle);
+            const Tex* t = texture_for_sampling(c, b, texHandle);
             if (!t || !t->mtl) {
                 log_once("nvnCommandBufferDraw.directTexture", i);
                 return false;
@@ -2653,7 +2804,7 @@ bool bind_arguments(Ctx* c, CmdBuf* b) {
     if (vr < 0) return false;
     if (vr > 0) [b->enc setVertexBuffer:ab offset:0 atIndex:0];
 
-    if (p && p->directBindings) return bind_direct_arguments(b);
+    if (p && p->directBindings) return bind_direct_arguments(c, b);
     const int fr = argument_buffer(c, b, NVNGFX_STAGE_FRAGMENT, &ab);
     if (fr < 0) return false;
     if (fr > 0) [b->enc setFragmentBuffer:ab offset:0 atIndex:0];
@@ -3696,15 +3847,16 @@ extern "C" int nvngfx_metal_selftest(void) {
         {
             /* --- Fifth draw: a texture and a sampler from the pools -------
              * This is the whole binding path a real draw needs, short of a
-             * translated shader and a guest upload:
+             * translated shader:
              *   builder -> texture -> pool id 5
              *   builder -> sampler -> pool id 9
              *   SetTexturePool / SetSamplerPool
              *   nvnDeviceGetTextureHandle(5, 9) -> BindTexture
              *   argument buffer: id(0) constants, id(1) texture, id(2) sampler
-             * The pixels come from a host blit (upload_rgba8), not from the
-             * guest's memory; that half is still missing and is called out in
-             * the docs. */
+             * The pixels come from a host blit (upload_rgba8).  Draw 9 below
+             * repeats the sampling path with the texels built directly in a
+             * guest memory pool, so this draw can stay focused on the pool and
+             * sampler-state plumbing. */
             const uint64_t kProg5 = 0x5C00;
             const uint64_t kCb5 = 0x5D00;
             x[0] = kTexSrcBuilder;
@@ -4500,6 +4652,173 @@ extern "C" int nvngfx_metal_selftest(void) {
             }
         }
 
+        {
+            /* --- Draw 9: a texture whose pixels come from guest memory ----
+             * Every earlier draw got its texels from a host blit.  This one
+             * builds a 2x2 RGBA8 texture whose storage is inside the memory
+             * pool, writes the block-linear bytes the way the guest's decoder
+             * would, and lets the draw path copy them out: tex_upload() calls
+             * nvngfx_tex_deswizzle() and blits the result into the private
+             * MTLTexture before the pipeline samples it.  The texels are one
+             * colour on purpose -- a pixel that is not the clear colour can
+             * only come from a table that reached the GPU. */
+            const uint64_t kTexGuest = 0x6400;
+            const uint64_t kProg9 = 0x6500;
+            const uint64_t kCb9 = 0x6600;
+            const unsigned kGuestOffset = 8192;
+            unsigned char* const vpool9 = reinterpret_cast<unsigned char*>(
+                (reinterpret_cast<uintptr_t>(poolRaw) + 16383u) &
+                ~static_cast<uintptr_t>(16383u));
+
+            nvngfx_texdesc gd;
+            nvngfx_texdesc_defaults(&gd);
+            gd.target = 0;
+            gd.format = 0x25;                    /* RGBA8_UNORM */
+            gd.width = 2;
+            gd.height = 2;
+            gd.levels = 1;
+            gd.samples = 1;
+            gd.pool = 0x5400;   /* the pool object the earlier draws built */
+            gd.offset = kGuestOffset;
+            {
+                /* Row 0: cyan, cyan.  Row 1: cyan, cyan. */
+                const unsigned char texels[16] = {
+                    0, 255, 255, 255, 0, 255, 255, 255,
+                    0, 255, 255, 255, 0, 255, 255, 255};
+                nvngfx_texlayout gl;
+                if (nvngfx_tex_layout(&gd, &gl) != 0 || gl.size > 1024 ||
+                    nvngfx_tex_swizzle(&gd, 0, 0, texels, 8,
+                                       vpool9 + kGuestOffset) != 0) {
+                    std::fprintf(stderr,
+                                 "[selftest] guest texture layout failed\n");
+                    rc = 16396;
+                    goto done;
+                }
+            }
+            {
+                /* tex_initialize reads the builder state, so replay the
+                 * builder calls that describe this texture. */
+                const uint64_t kB = 0x6450;
+                x[0] = kB;
+                tex_builder_set_defaults(ctx, x);
+                x[0] = kB; x[1] = 0;
+                tex_builder_set_target(ctx, x);
+                x[0] = kB; x[1] = 0x25;
+                tex_builder_set_format(ctx, x);
+                x[0] = kB; x[1] = 2; x[2] = 2;
+                tex_builder_set_size2d(ctx, x);
+                x[0] = kB; x[1] = 1;
+                tex_builder_set_levels(ctx, x);
+                x[0] = kB; x[1] = 1;
+                tex_builder_set_samples(ctx, x);
+                x[0] = kB; x[1] = 0x5400; x[2] = kGuestOffset;
+                tex_builder_set_storage(ctx, x);
+                x[0] = kTexGuest; x[1] = kB;
+                tex_initialize(ctx, x);
+            }
+            Tex* guestTex = find<Tex>(kTexGuest);
+            if (x[0] != 1 || !guestTex || !guestTex->mtl) {
+                std::fprintf(stderr, "[selftest] guest texture was not created\n");
+                rc = 16396;
+                goto done;
+            }
+
+            struct { uint64_t data; uint64_t control; } sd9[2];
+            sd9[0].data = reinterpret_cast<uint64_t>(const_cast<char*>(
+                nvngfx_shader_selftest_msl_variant(NVNGFX_STAGE_VERTEX, 4)));
+            sd9[0].control = 0;
+            sd9[1].data = reinterpret_cast<uint64_t>(const_cast<char*>(
+                nvngfx_shader_selftest_msl_variant(NVNGFX_STAGE_FRAGMENT, 4)));
+            sd9[1].control = 0;
+            x[0] = kProg9; x[1] = 0;
+            prog_initialize(ctx, x);
+            x[0] = kProg9; x[1] = 2;
+            x[2] = reinterpret_cast<uint64_t>(&sd9[0]);
+            prog_set_shaders(ctx, x);
+            if (x[0] != 1) {
+                std::fprintf(stderr, "[selftest] guest texture: SetShaders failed\n");
+                rc = 16396;
+                goto done;
+            }
+            x[0] = kTexPool; x[1] = 6; x[2] = kTexGuest; x[3] = 0;
+            tex_pool_register_texture(ctx, x);
+
+            const uint64_t target9 = kTex;
+            const float clear9[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+            x[0] = kCb9;
+            cmdbuf_begin_recording(ctx, x);
+            x[0] = kCb9; x[1] = 1; x[2] = reinterpret_cast<uint64_t>(&target9);
+            x[3] = 0; x[4] = 0; x[5] = 0;
+            cmdbuf_set_render_targets(ctx, x);
+            x[0] = kCb9; x[1] = 0; x[2] = reinterpret_cast<uint64_t>(clear9);
+            x[3] = 0xF;
+            cmdbuf_clear_color(ctx, x);
+            x[0] = kCb9; x[1] = kTexPool;
+            cmdbuf_set_texture_pool(ctx, x);
+            x[0] = kCb9; x[1] = kSampPool;
+            cmdbuf_set_sampler_pool(ctx, x);
+            x[0] = 0; x[1] = 6; x[2] = 9;
+            dev_get_texture_handle(ctx, x);
+            const uint64_t ghandle = x[0];
+            x[0] = kCb9; x[1] = 1; x[2] = 0; x[3] = ghandle;
+            cmdbuf_bind_texture(ctx, x);
+            x[0] = kCb9; x[1] = kProg9; x[2] = 0;
+            cmdbuf_bind_program(ctx, x);
+            x[0] = kCb9; x[1] = 0; x[2] = 0; x[3] = 3;
+            cmdbuf_draw_arrays(ctx, x);
+            x[0] = kCb9;
+            cmdbuf_end_recording(ctx, x);
+
+            CmdBuf* b9 = find<CmdBuf>(kCb9);
+            if (!b9 || !b9->last) {
+                std::fprintf(stderr, "[selftest] guest texture draw did not commit\n");
+                rc = 16396;
+                goto done;
+            }
+            [b9->last waitUntilCompleted];
+            if (b9->last.status == MTLCommandBufferStatusError) {
+                std::fprintf(stderr,
+                             "[selftest] guest texture command buffer error: %s\n",
+                             b9->last.error
+                                 ? [[b9->last.error localizedDescription] UTF8String]
+                                 : "(no description)");
+                rc = 16396;
+                goto done;
+            }
+            if (!guestTex->uploaded || guestTex->uploadedLevels != 1 ||
+                b9->encoded != 1) {
+                std::fprintf(stderr,
+                             "[selftest] guest texture not used: uploaded=%d "
+                             "levels=%u encoded=%u\n",
+                             guestTex->uploaded ? 1 : 0,
+                             guestTex->uploadedLevels, b9->encoded);
+                rc = 16396;
+                goto done;
+            }
+            {
+                unsigned char px[4] = {0, 0, 0, 0};
+                const int wantCyan[4] = {0, 255, 255, 255};
+                if (!read_center_pixel(dev, c->queue, t->mtl, kSide, px)) {
+                    std::fprintf(stderr, "[selftest] guest texture readback failed\n");
+                    rc = 16396;
+                    goto done;
+                }
+                if (!pixels_near(px, wantCyan, 2)) {
+                    std::fprintf(stderr,
+                                 "[selftest] guest texture centre is "
+                                 "(%u,%u,%u,%u), want (%d,%d,%d,%d)\n",
+                                 px[0], px[1], px[2], px[3], wantCyan[0],
+                                 wantCyan[1], wantCyan[2], wantCyan[3]);
+                    rc = 16396;
+                    goto done;
+                }
+                std::fprintf(stderr,
+                             "[selftest] guest texture: %u level(s) deswizzled "
+                             "from the pool and sampled back\n",
+                             guestTex->uploadedLevels);
+            }
+        }
+
     done:
         nvngfx_shader_set_msl_passthrough(0);
         forget<CmdBuf>(kCb);
@@ -4526,7 +4845,11 @@ extern "C" int nvngfx_metal_selftest(void) {
         forget<CmdBuf>(0x6100);
         forget<Program>(0x6200);
         forget<CmdBuf>(0x6300);
+        forget<Tex>(0x6400);
+        forget<Program>(0x6500);
+        forget<CmdBuf>(0x6600);
         g_tex_specs.erase(kTexSrcBuilder);
+        g_tex_specs.erase(0x6450);
         g_sampler_specs.erase(kSamplerBuilder5);
         nvngfx_metal_destroy(ctx);
         return rc;
