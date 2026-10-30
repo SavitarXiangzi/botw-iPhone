@@ -2400,9 +2400,17 @@ bool read_ubo_u32(const CmdBuf* b, int si, unsigned slot, unsigned offset,
  * nvngfx_tex_deswizzle() filled out of the pool's MTLBuffer (the pool wraps
  * the guest's own bytes, so this is a copy of the same memory the GPU would
  * have read).  A texture this path cannot handle (multisampled, LINEAR,
- * BUFFER, unknown format, storage outside the pool, a level whose width is
- * not a whole number of blocks) is reported once and left as it was; a render
- * target is never uploaded at all, because this backend is its only writer.
+ * BUFFER, unknown format, storage outside the pool, unsupported layer count)
+ * is reported once and left as it was; a render target is never uploaded at
+ * all, because this backend is its only writer.
+ *
+ * The upload command buffer is committed but intentionally not waited on.
+ * This function runs while the draw's render encoder is open, and waiting for
+ * another command buffer from inside an encoder deadlocks the simulator.
+ * Metal executes a queue's command buffers in submission order, so committing
+ * the upload first is sufficient: the draw's command buffer is committed
+ * later and cannot sample before the copy has run.  Metal retains the staging
+ * buffer until the upload command buffer completes.
  *
  * Returns false only when the caller must not sample the texture. */
 bool tex_upload(Ctx* c, Tex* t) {
@@ -2509,11 +2517,6 @@ bool tex_upload(Ctx* c, Tex* t) {
     }
     [blit endEncoding];
     [cb commit];
-    [cb waitUntilCompleted];
-    if (cb.status == MTLCommandBufferStatusError) {
-        log_once("nvnTextureUpload.commandBuffer", 1);
-        return false;
-    }
     t->uploadedLevels = done;
     /* Partial copies are not a usable texture: sampling a missing mip would
      * return whatever Metal left there.  Keep the draw dropped instead. */
