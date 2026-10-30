@@ -421,8 +421,15 @@ M3.92 补上另外两种层形状：第十二条建 `MTLTextureTypeCube`（`arra
 红放在 slice 4、黄放在 slice 11，着色器从 cube 0 取 +Z、从 cube 1 取 -Z。
 后者同时验证“Metal 的数组长度”和“上传的总 slice 数”没有混用：把 12 写成 2
 会让 slice 11 落空，写成 6 则越界。失败码 `16401/16402`（cube）、
-`16403/16404`（cube array）。这两条在本地只能过语法与 fixture 检查，
-端到端结果以提交后的 iOS job 为准。
+`16403/16404`（cube array）。
+
+第十二条（cube）已在 run 41080975529 的 iOS job 上跑通：
+`draw 12: cube faces 4/5 sampled from guest memory`，上传日志是
+`pool=0x7300 offset=0 levels=1 layers=6 staging=96 bytes`。第十三条在模拟器上
+**跑不了**：建 `MTLTextureTypeCubeArray` 时进程直接消失，`@try/@catch` 抓不到
+（不是 NSException），也没有崩溃报告，所以它改成 opt-in —— 只有设了
+`BOTW_SELFTEST_CUBE_ARRAY=1` 才执行；模拟器上打印跳过原因后继续。
+布局与 shader 由 `nvn_texlayout_test` / `nvn_shader_test` 覆盖，端到端要等真机。
 
 第五条在模拟器里走的是**直连纹理/采样器绑定**：模拟器的
 `MTLTexture.gpuResourceID` 是 0，参数缓冲区的纹理条目在那里没有意义

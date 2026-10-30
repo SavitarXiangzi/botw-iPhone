@@ -56,7 +56,7 @@ docs/           路线图、HLE 边界、NVN 覆盖表、iOS 移植手册、着�
 | M3.27 | `GetSystemTick` 的 HLE 往返 35 µs × 几十万次 = 30 s 死窗口；改成入口一条 `b` + 内联计数器 | ✅ 死窗口消失 |
 | M3.28 | 178 帧后静止的全量快照：主线程无限等 LightEvent，32 线程 idle，唯一活动是 250 µs 轮询 worker | 🔴 缺完成通知 |
 | M3.65–M3.71 | 12 MB 缓冲区是包尾 `0x49E000` 的逐字节拷贝；真正卡点是 58.2 MiB 分配返回 0；最小跳过让字节序转换器返回 | ✅ 结论已定，draws 仍为 0 |
-| iOS 骨架 | 513 入口点注册表 + 生成分发表 + Metal 后端 131 项 + 三重门禁 | 🟡 十三条合成 draw（前十一条已在 CI 模拟器通过：run 41070475247；M3.92 的 cube / cube-array draw 待本次 CI），含 bindless、顶点参数缓冲区、c1 常量段、guest pool 解块上传和离线 MSL bundle；客体仍无画面 |
+| iOS 骨架 | 513 入口点注册表 + 生成分发表 + Metal 后端 131 项 + 三重门禁 | 🟡 十二条合成 draw 已在 CI 模拟器通过（M3.92 的 cube：run 41080975529；第十三条 cube array 需 `BOTW_SELFTEST_CUBE_ARRAY=1`，模拟器的 Metal 建 CubeArray 会崩），含 bindless、顶点参数缓冲区、c1 常量段、guest pool 解块上传和离线 MSL bundle；客体仍无画面 |
 | M4 | NVN → Metal 回放（管线/纹理/命令缓冲） | ⬜ |
 | M5 | 音频（nn::audio → AVAudioEngine）、输入 | ⬜ |
 | M6 | 真机性能与内存（6 GB 机型起步） | ⬜ |
@@ -228,7 +228,7 @@ guest 业务代码
 2. **客体的 draw 仍然一条都不执行**：program、管线、draw 编码都写好了，
    但 `nvngfx_shader_to_msl()` 没有翻译器（NVN 给的是 Maxwell SASS），
    所以管线建不出来，draw 停在一条 `noPipeline` 日志。
-   **例外且刻意**：`nvngfx_metal_selftest()` 用内置 MSL 和离线 bundle 跑十三条合成 draw，
+   **例外且刻意**：`nvngfx_metal_selftest()` 用内置 MSL 和离线 bundle 跑十二条合成 draw（cube array 是第十三条，模拟器跳过），
    由 CI 用 `simctl` 启动 App（`BOTW_SELFTEST=1`）执行并回读像素。它证明的是
    Metal 这半边，不是客体能跑。
 3. **采样纹理是宿主分配的 `MTLTexture`，首次采样时才从 guest 池填充**：
@@ -271,13 +271,15 @@ Mac 侧还有一条**真的执行**的测试：CI 用 `simctl` 在 iOS 模拟器
 `--selftest` 让 App 在 `init()` 里跑完
 texture -> target -> clear -> pipeline -> draw -> 回读然后 `exit(rc)`，
 结果写进 App 容器的 `Documents/selftest.txt` 由工作流断言。
-现在执行十三条 draw；M3.85 的 run 41042618062、block-linear 布局的 run 41047317230、
+现在执行十二条 draw；M3.85 的 run 41042618062、block-linear 布局的 run 41047317230、
 从 guest 池解块上传纹理的 run 41051685313、离线 MSL bundle 的 run 41064580709、
 分层纹理的 run 41070475247 均已通过。第十条真正从 `<app>/shaders/manifest.tsv` 取 MSL、按 guest key
 建管线并回读橙色像素；第十一条从 guest pool 上传两层 2D 数组，片段着色器
-分别采样 layer 0/1，回读左红右黄；第十二、十三条继续用 guest pool 上层数最多
-的两种形状：cube 取 +Z / -Z 两面、cube array 取 cube 1 的 -Z 面（第 11 个
-slice），回读颜色对不对。CI 现在设置
+分别采样 layer 0/1，回读左红右黄；第十二条上传一个 6 面 cube，取 +Z / -Z
+两面回读左红右黄（已在 run 41080975529 通过）。第十三条的 cube array 要把
+第 11 个 slice 送到 cube 1 的 -Z 面，但模拟器的 Metal 在
+`newTextureWithDescriptor`（`MTLTextureTypeCubeArray`）里直接把进程带崩，
+所以这条只有显式设置 `BOTW_SELFTEST_CUBE_ARRAY=1` 才跑，模拟器上跳过并打印原因。CI 现在设置
 `BOTW_REQUIRE_SHADER_BUNDLE=1`，bundle 缺失会让自检返回 `rc=16397`，不能静默跳过。
 它不替代真机，但比“编过了”强一档。
 

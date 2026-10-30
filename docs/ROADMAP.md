@@ -3480,7 +3480,7 @@ Metal 描述**修对了，端到端只有 2D array 跑过；这一轮补上最�
 `texturecube_array<float>`，且采样语句带 layer `0` / `1`。两者都要求
 顶点阶段与 variant 4 同一个 `kVsUv`。
 
-### 第一次 CI：预算算错，被自检当场抓住
+### CI 上连翻四次车，每次都被自检指出来
 
 run 41072154244 的 iOS job 报：
 
@@ -3507,6 +3507,29 @@ BOTW_SELFTEST rc=16401
 `newBufferWithBytesNoCopy` 对 64 KiB 应该没有意见，但既有的 16 KiB 页是
 **跑通过**的尺寸，于是退回“多一块小页”，而不是在同一块页上赌。
 
+换成第二块页之后，run 41077027673 死在 draw 11 与 12 之间：
+
+```text
+[selftest] draw 11: 2D array layers 0/1 sampled from guest memory
+（然后进程消失，没有 rc 行）
+```
+
+原因很土：`unsigned char* vpool12` 在 `std::malloc` **之前**就从
+`poolRaw2` 算出来了，那时它还是 `nullptr`，于是 `memset(nullptr, 0, 16384)`
+直接写空指针。把指针计算挪到 malloc 之后就好。这类错误在 Windows 上
+一条都测不出来——自检才是唯一的执行环境。
+
+接着 run 41079561654：draw 12 一次通过（`cube faces 4/5 sampled from guest
+memory`），draw 13 在建 `MTLTextureTypeCubeArray` 时把模拟器带崩：
+`@try/@catch` 没抓到（说明不是 NSException），也没有崩溃报告，最后一条 trace
+停在 `draw 13 guest bytes ready`。因此第十三条改成 opt-in：
+
+```text
+[selftest] draw 13 skipped: MTLTextureTypeCubeArray aborts the iOS Simulator's
+Metal (layout and shader are covered by the portable tests); set
+BOTW_SELFTEST_CUBE_ARRAY=1 on a device to run it
+```
+
 ### 本地证据
 
 ```text
@@ -3517,10 +3540,22 @@ build_abi_test: all tests passed
 verify_ios: ok
 ```
 
-第十二、十三条 draw 的模拟器结果待本次 iOS job 确认；在拿到
-`draw 12: cube faces 4/5 sampled from guest memory` 与
-`draw 13: cube array layer 0 face 4 and layer 1 face 5 sampled from guest memory`
-两行日志之前，不把 M3.92 记成 CI 已验证。
+### CI 证据
+
+run [41080975529](https://github.com/SavitarXiangzi/botw-iPhone/actions/runs/41080975529)，
+portable job 124149684772、iOS job 124149867094 均通过。模拟器日志：
+
+```text
+[nvn] texture upload: pool=0x7300 offset=0 levels=1 layers=6 staging=96 bytes (largest slice=16)
+[selftest] draw 12: cube faces 4/5 sampled from guest memory
+[selftest] draw 13 skipped: MTLTextureTypeCubeArray aborts the iOS Simulator's Metal ...
+BOTW_SELFTEST rc=0
+```
+
+`layers=6` 是 cube 的六个面，`staging=96` 是 6 × 16 字节；`pool=0x7300` 是这一轮
+新加的第二块 16 KiB 页。第十三条在真机（或支持 CubeArray 的宿主）上设
+`BOTW_SELFTEST_CUBE_ARRAY=1` 才会执行，届时期望的日志是
+`draw 13: cube array layer 0 face 4 and layer 1 face 5 sampled from guest memory`。
 
 ### 仍然没有的
 
