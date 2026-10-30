@@ -145,15 +145,19 @@ jobs:
           xcrun simctl bootstatus "$UDID" -b
           APP=build/Build/Products/Debug-iphonesimulator/BotW.app
           xcrun simctl install "$UDID" "$APP"
+          # stdout is attached after launch and the hook exits immediately, so
+          # the result is written to Documents/selftest.txt as well.
           set +e
-          SIMCTL_CHILD_BOTW_SELFTEST=1 xcrun simctl launch --console-pty \
-            --terminate-running-process "$UDID" dev.botw.app > selftest.log 2>&1
-          launch_rc=$?
+          SIMCTL_CHILD_BOTW_SELFTEST=1 xcrun simctl launch \
+            --terminate-running-process "$UDID" dev.botw.app
+          sleep 3
           set -e
-          cat selftest.log | head -40
-          if ! grep -q "BOTW_SELFTEST rc=0" selftest.log; then
-            echo "::error::self-test did not report rc=0 (simctl exit $launch_rc)"
-            tail -40 selftest.log | while IFS= read -r line; do echo "::error::$line"; done
+          DATA=$(xcrun simctl get_app_container "$UDID" dev.botw.app data)
+          echo "container: $DATA"
+          cat "$DATA/Documents/selftest.txt" 2>/dev/null || echo "(no selftest.txt)"
+          if ! grep -q "BOTW_SELFTEST rc=0" "$DATA/Documents/selftest.txt" 2>/dev/null; then
+            echo "::error::self-test did not report rc=0"
+            ls -la "$DATA/Documents" 2>/dev/null | while IFS= read -r l; do echo "::error::$l"; done
             exit 1
           fi
           echo "replay-layer self-test: one draw, pixel readback, rc=0"

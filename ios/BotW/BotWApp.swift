@@ -11,7 +11,16 @@ struct BotWApp: App {
         // only failing a build.
         if ProcessInfo.processInfo.environment["BOTW_SELFTEST"] == "1" {
             let rc = botw_core_selftest()
-            print("BOTW_SELFTEST rc=\(rc)")
+            let line = "BOTW_SELFTEST rc=\(rc)\n"
+            // The console is attached by simctl after launch, so a process
+            // that exits in milliseconds can lose its stdout.  A file in the
+            // app container survives that race and is read by CI afterwards.
+            if let dir = FileManager.default.urls(for: .documentDirectory,
+                                                  in: .userDomainMask).first {
+                try? line.write(to: dir.appendingPathComponent("selftest.txt"),
+                                atomically: true, encoding: .utf8)
+            }
+            print(line, terminator: "")
             fflush(stdout)
             exit(rc == 0 ? 0 : 1)
         }
