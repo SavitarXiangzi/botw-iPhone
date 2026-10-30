@@ -325,7 +325,8 @@ CI 在 iOS 模拟器里用 `simctl` 启动 App（`--selftest`），App 在 `init
 把 `BOTW_SELFTEST rc=<n>` 写进容器的 `Documents/selftest.txt` 并 `exit(rc)`；
 现在跑**三条** draw（`[[vertex_id]]` / `[[attribute(0)]]` / 16 位索引的
 `DrawElements`），每条断言中心像素、全部通过才 rc=0。M3.76 的 run
-40997940031 证明了第一条，M3.79 / M3.80 的两条等各自的 `ios` job 给结论。所以“Metal 这半边是通的”是可执行的结论，不是声称；
+40997940031 证明了第一条；run 41008588834 证明**三条全部通过**
+（`portable` 与 `ios` 双绿，设备构建也 success）。所以“Metal 这半边是通的”是可执行的结论，不是声称；
 “客体的 shader 能跑”仍然完全没验证。
 
 **阶段 C：纹理正确**

@@ -85,6 +85,11 @@ C:\Python314\python.exe scripts\shader_chain\nx_shader.py translate `
   小写 16 进制。code area **含** 0x30 头。
 * 包是三层：`SARC`（BOTW 的 pack 把 SFAT 紧跟在头后面、`data_offset` 指向数据区，
   不是标准的指向 SFAT；两种都要试）→ 成员常常是 `Yaz0` → 解开后又是 SARC 或 BNSH。
+* **顶点入口必须用 `[[stage_in]]` 结构体**，属性写在成员上：
+  `struct In { float2 p [[attribute(0)]]; }; vertex Out vs(In in [[stage_in]])`。
+  裸的函数参数 `float2 p [[attribute(0)]]` 在本项目的模拟器上让管线建不出来
+  （M3.80，run 41007654642 失败 / 41008588834 通过）。spirv-cross 本来就这么发，
+  所以只影响手写的自检 MSL。
 
 ## 5. 与运行时的接口
 
@@ -176,7 +181,7 @@ C:\Python314\python.exe scripts\shader_chain\gen_blobs.py --msl build\shader-cha
 | `xcrun metal` → `.metallib` | 未做；只能在 macOS/CI 上做，本机没有 |
 | 整作 19,592 个 shader 全量构建 | 未做；只验证了 1 个 pack 的 5,102 个 key 中的 2 个 |
 | 编译期校验（MSL 语法） | 未做；Windows 没有 Metal 前端，MSL 只在 CI 的 macOS 上才能编 |
-| 真机 / 模拟器上跑真实 shader | 未做。自检用的仍是内置 MSL（M3.80 起是**三条** draw：`[[vertex_id]]`、顶点属性、以及 16 位索引的 `DrawElements`） |
+| 真机 / 模拟器上跑真实 shader | 未做。自检用的仍是内置 MSL（M3.80 起是**三条** draw：`[[vertex_id]]`、顶点属性、以及 16 位索引的 `DrawElements`；三条均在 run 41008588834 通过） |
 | compute / geometry shader | 未做（`extract` 目前跳过 cs） |
 | 运行时按 key 取 MSL | **已接线**（M3.78，见 §5.1） |
 | 顶点描述符 | **已接**（M3.79） |

@@ -2433,8 +2433,9 @@ verify_ios: ok (metal bindings: 64/513)
 NVN host-HLE 64/513 (12.5%)   P0 blockers open: 0/6
 ```
 
-模拟器上的第三条 draw 只有 CI 能证明（本机无 Metal）；结论看本轮推送后的
-`ios` job，**不在这里预先声称通过**。
+模拟器上的三条 draw 由 run **41008588834** 证明：`portable` success、
+`ios` success。自检写出的 `BOTW_SELFTEST rc=0` 让 CI 继续跑完了
+设备构建与「Release 必须被拒」两步，两步也都 success。
 
 ### 两次 CI 才看清的自检缺陷
 
@@ -2455,6 +2456,13 @@ NVN host-HLE 64/513 (12.5%)   P0 blockers open: 0/6
 * draw 2 / 3 的顶点着色器改成 spirv-cross 的形状（一个 `[[stage_in]]` 结构体，
   成员带 `[[attribute(0)]]`），而不是裸的 `[[attribute(0)]]` 参数 —— 自检要
   测的正是翻译器实际产出的形式。
+
+第三轮 run 41008588834 通过。那两轮之间**只有 shader 形状这一处改动会影响
+绘制**（`encoded` 计数器只加数、`--console` 只改 CI），所以结论是：Metal 不接受
+裸的 `[[attribute(n)]]` 顶点参数 —— 库或管线创建失败，没有管线，draw 被丢弃。
+严格说这是排除法，不是从日志里读到的：成功那一轮的原始日志要 token 才能读，
+`--console` 抓到的 `[nvn]` 行没能取回。好在 spirv-cross 产出的正是结构体形式，
+真实翻译链不受这条限制影响。
 
 ### 仍然没有的
 
