@@ -2677,3 +2677,113 @@ GitHub Actions `macos-15` 模拟器结论；**CI 尚未确认**。
 | 真实 shader 的 draw | 仍是 0 条；四条自检 draw 都用内置 MSL |
 | 外部 guest 浮点寄存器桥 | `nvngfx_args.f[]` 已定义，仓库外调用端还没填 |
 | 真机 | **没有真机运行记录** |
+## M3.83 描述符池、句柄与采样纹理的 draw（本轮）
+
+覆盖从 **104 -> 131 / 513（25.5%）**。新增 27 个入口：5 个句柄 getter、
+7 个 texture pool、7 个 sampler pool、8 个 command buffer 绑定。
+
+### 句柄是池索引，不是宿主指针
+
+nxnative 的 `hle_nvn.c` 把 `NVNtextureHandle` 定义成一个打包整数：
+`nvnDeviceGetTextureHandle(d, tex, samp)` 返回 `tex | samp << 20`；
+`GetTexelFetchHandle` 返回 `tex`；`GetSeparateTextureHandle` / `GetImageHandle`
+返回 `id`；`GetSeparateSamplerHandle` 返回 `id << 20`。低 20 位是纹理池 ID，
+高 20 位是采样器池 ID，image 与 texture 共用索引空间。
+
+**ID 是客体池内编号**，不是宿主槽位：两个池可以各自注册 id 5 而指向不同纹理。
+查表时才把绑定池的 base 加上去，这也是 `SetTexturePool` / `SetSamplerPool`
+必须发生在 draw 之前的原因。
+
+### 池编号：照 nxnative 的 dpool_add
+
+`ios/nvn/include/nvn_pool.h` / `src/nvn_pool.c` 是不含 Apple 头文件的纯算术，
+Windows 上由 `tests/nvn_pool_test.cpp` 直接跑：
+
+- 每种池最多 **16 个**（nxnative 的 `NDPOOL`）；第 17 个返回 0 并记日志，
+  不会悄悄和 0 号池共用编号。
+- base 按创建顺序分配，大小向上取整到 **256 项**。一个 4 项的池也占 256，
+  所以下一个池的 id 0 不会撞上它。
+- 同一个池再次 `Initialize` 返回原 base；`Finalize` **不回收**编号，
+  因为旧 command buffer 的句柄可能还在飞。
+- `nvngfx_pool_slot()` 检查 id 是否落在该池的 `size` 内，越界返回 -1。
+
+### 注册：纹理存地址，采样器存快照
+
+`nvnTexturePoolRegisterTexture` / `RegisterImage` 只保存客体 `NVNtexture*`
+（和 view）地址，槽位键是 `base + id`。draw 解析句柄时再 `find<Tex>()`，
+所以 `nvnTextureFinalize` 之后槽位自然解析失败，draw 被丢弃并记日志，
+而不是悬空解引用或绑定 0 号槽。
+
+`nvnSamplerPoolRegisterSampler` 从 sampler 对象复制状态并复用它的
+`MTLSamplerState`；`RegisterSamplerBuilder` 没有 sampler 对象可查，
+所以在注册时快照 builder 的状态并**当场**建 `MTLSamplerState`，
+避免每帧 draw 重新分配。
+
+### 参数缓冲区改用 MTLArgumentEncoder
+
+M3.81 手写了一个 16 项、每项 8 字节的地址表。本轮改成从 fragment function
+取 `newArgumentEncoderWithBufferIndex:0`，用 Metal 自己算出的布局：
+
+- `setBuffer:offset:atIndex:` 写 uniform buffer；
+- `setTexture:atIndex:` 写纹理；
+- `setSamplerState:atIndex:` 写采样器（descriptor 的
+  `supportArgumentBuffers = YES` 是前提，M3.82 已设）。
+
+`[[id(k)]]` 到 NVN 槽位的映射存在 `Program::args` 里。翻译产物还没带
+侧车，所以只有内置 MSL 声明了 `id(0)=常量 / id(1)=纹理 / id(2)=采样器`；
+`numArgs == 0` 时保留旧规则（buffer i 就是 id(i)），而这时如果有纹理被绑，
+draw 会被丢弃并记 `nvnCommandBufferDraw.textureLayout`，不会拿未填的槽位去采样。
+
+### 自检：第五条 draw
+
+`nvngfx_metal_selftest()` 现在跑五条 draw。第五条走完整绑定路径：
+
+1. 2x2 RGBA8 纹理经 `nvnTextureBuilder*` + `nvnTextureInitialize` 建出；
+2. `upload_rgba8()` 用 staging buffer + blit 填红/绿/蓝/白四格
+   （**宿主上传**，不是 guest 内存）；
+3. sampler builder 设 nearest + clamp，`RegisterSamplerBuilder` 进池 id 9；
+   再从 sampler 对象 `RegisterSampler` 进 id 10，两条注册路径都跑；
+4. `nvnDeviceGetTextureHandle(5, 9)` -> `BindTexture(cb, PIXEL, 0, h)`；
+5. 参数缓冲区 id(0) 是白色常量，id(1)/id(2) 是纹理和采样器；
+6. 回读目标四角，必须分别等于红/绿/蓝/白（容差 2）。
+
+失败码：池/纹理 16385，draw 未编码或命令缓冲错误 16387，四角逐像素不符 16388。
+成功时 stderr 出现 `[selftest] textured draw sampled all four pool texels`。
+
+### 证据（本地）
+
+```
+nvn_abi_test: ok (513 procs)
+core_smoke_test: ok
+nvn_texture_test: ok (157 formats in table)
+nvn_shader_test: ok
+nvn_vertex_test: ok (packing, 26 formats, layout id)
+nvn_sampler_test: ok (filters, wrap, compare, reduction, clamps)
+nvn_pool_test: ok (bases, slots, handles)
+syntax_check_metal: ok (clang++.exe)
+build_abi_test: all tests passed
+
+gen_nvn.py --check: generated artifacts up to date (513 procs, 131 implemented)
+extract_nvn_signatures.py --check: ok (470 shapes, max arity 8)
+verify_ios: ok
+  metal bindings: 131/513
+```
+
+这些只证明 Windows 上的池算术、C ABI 和 Metal 源码通过类型检查。
+`MTLArgumentEncoder` 能否真的把 texture/sampler 写进参数缓冲区、四角像素
+是否对，仍要等本轮推送后的 GitHub Actions `macos-15` 模拟器结论；
+**CI 尚未确认**。上一轮（M3.82）的 run 41018975699 以
+`BOTW_SELFTEST rc=0` 通过，证明 sampler 状态路径在模拟器里是通的。
+
+### 仍然没有的
+
+| 缺口 | 后果 |
+|---|---|
+| guest 纹理上传 | 自检的像素是宿主 blit；BOTW 放进池里的像素还读不到 |
+| tiled / block-linear 布局 | 即使上传，未解块的纹理仍是花屏 |
+| 真实 shader 的 `[[id(k)]]` 侧车 | 只有内置 MSL 有布局；翻译产物还不能采样 |
+| 非 pixel stage 的绑定 | 顶点/几何/计算的纹理绑定只记日志 |
+| `nvnTexturePoolGetMemoryPool` / `SamplerPoolGetMemoryPool` | 不在 470 个已测形状里，未绑 |
+| `nvnCommandBufferBindImage(s)` | compute 图像路径未接 |
+| 真实 shader 的 draw | 仍是 0 条；五条自检 draw 都用内置 MSL |
+| 真机 | **没有真机运行记录** |

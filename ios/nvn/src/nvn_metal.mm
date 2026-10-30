@@ -24,10 +24,13 @@
  *         on a computer, never in the repository.  Everything else on that
  *         path -- pipeline creation with a real vertex descriptor, buffer
  *         binding, draw encoding, pixel readback -- is executed by
- *         nvngfx_metal_selftest() in CI's iOS Simulator (four draws, plus a
- *         sampler state object that is created, compared and read back).
+ *         nvngfx_metal_selftest() in CI's iOS Simulator (five draws: the
+ *         fifth samples a 2x2 texture through a texture pool, a sampler pool
+ *         and an argument buffer; a sampler state object is also created,
+ *         compared and read back).
  *         MRT / depth attachment / texture views
- *         guest-pixel upload (textures are host-owned, not aliased)
+ *         guest-pixel upload (the self-test's texture is filled by a host
+ *         blit; a texture's storage is not read from guest memory yet)
  *         texture tiling, BCn -> ASTC/ETC2 transcode, compute, sync/fence
  *
  * Argument ABI: measured, not guessed
@@ -71,6 +74,7 @@
 
 #include "nvn_backend.h"
 #include "nvn_metal.h"
+#include "nvn_pool.h"
 #include "nvn_sampler.h"
 #include "nvn_shader.h"
 #include "nvn_texture.h"
@@ -215,9 +219,19 @@ struct CmdBuf {
      * setFragmentBytes. */
     uint64_t ubo[16] = {};
     uint64_t uboSize[16] = {};
-    /* One MTLBuffer of 16 eight-byte entries, rebuilt whenever the
-     * binding changes and dropped when a new recording starts (the
-     * previous one may still be in flight). */
+    /* The descriptor pools the guest bound, and the handles it bound for
+     * the pixel stage.  A handle is a pool ID (texture in the low 20 bits,
+     * sampler in the next 20), not a host pointer: the bound pool's base is
+     * added when the handle is resolved, so the pool has to be bound before
+     * the draw that uses it. */
+    uint64_t texPool = 0;
+    uint64_t sampPool = 0;
+    uint64_t texHandle[16] = {};
+    uint64_t sepTexHandle[16] = {};
+    uint64_t sepSampHandle[16] = {};
+    /* The argument buffer, rebuilt whenever a binding changes and dropped
+     * when a new recording starts (the previous one may still be in
+     * flight). */
     id<MTLBuffer> argbuf = nil;
     /* The last committed buffer.  nvnQueueSubmitCommands is not implemented,
      * so a frame is committed at EndRecording; keeping the handle lets a
@@ -248,6 +262,36 @@ struct SamplerSpec {
     nvngfx_sampler state = {};
     uint64_t device = 0;
     float lodSnap = 0.0f;
+};
+
+/* A sampler as a pool stores it.  A registration from an NVNsampler object
+ * could keep the object address, but a builder registration has no object to
+ * look at later, so the pool snapshots the state and the Metal state. */
+struct PooledSampler {
+    nvngfx_sampler state = {};
+    id<MTLSamplerState> mtl = nil;
+};
+
+/* NVNtexturePool / NVNsamplerPool.  `base` is the pool's first slot in the
+ * host table; registrations are keyed by base + id so two pools can hold
+ * different resources under the same guest ID. */
+struct TexturePool {
+    uint64_t memory = 0;
+    long long offset = 0;
+    int count = 0;
+    int base = 0;
+    std::string label;
+    std::unordered_map<int, uint64_t> textures;  /* slot -> NVNtexture* */
+    std::unordered_map<int, uint64_t> views;     /* slot -> NVNtextureView* */
+};
+
+struct SamplerPool {
+    uint64_t memory = 0;
+    long long offset = 0;
+    int count = 0;
+    int base = 0;
+    std::string label;
+    std::unordered_map<int, PooledSampler> samplers;  /* slot -> snapshot */
 };
 
 Ctx* ctx_of(nvngfx_ctx* ctx) { return reinterpret_cast<Ctx*>(ctx); }
@@ -289,6 +333,11 @@ std::unordered_map<uint64_t, int> g_device_flags;
  * field we need arrives through a setter we implement ourselves. */
 std::unordered_map<uint64_t, nvngfx_texdesc> g_tex_specs;
 std::unordered_map<uint64_t, SamplerSpec> g_sampler_specs;
+/* Pool numbering is process-wide, like nxnative's dpool_add: finalizing a
+ * pool does not give its range to the next one, because a command buffer
+ * recorded earlier may still refer to those slots. */
+nvngfx_pool_map g_tex_pool_map;
+nvngfx_pool_map g_samp_pool_map;
 
 /* Guest memory is host-visible, so a pointer argument is just a cast.  This
  * is the one place that assumption is spelled out. */
@@ -1116,6 +1165,282 @@ void sampler_compare(nvngfx_ctx*, uint64_t* x) {
 }
 
 /* ------------------------------------------------------------------ */
+/* descriptor pools                                                    */
+/* ------------------------------------------------------------------ */
+
+/* nvnTexturePoolInitialize(NVNtexturePool*, const NVNmemoryPool*,
+ *                          ptrdiff_t offset, int entries) -> NVNboolean */
+void tex_pool_initialize(nvngfx_ctx*, uint64_t* x) {
+    if (!x[0]) { x[0] = 0; return; }
+    int base = 0;
+    if (!nvngfx_pool_map_add(&g_tex_pool_map, x[0], static_cast<int>(x[3]), &base)) {
+        log_once("nvnTexturePoolInitialize.poolLimit", static_cast<unsigned>(x[0]));
+        x[0] = 0;
+        return;
+    }
+    TexturePool* p = find_or_add<TexturePool>(x[0]);
+    p->memory = x[1];
+    p->offset = static_cast<long long>(x[2]);
+    p->count = static_cast<int>(x[3]);
+    p->base = base;
+    x[0] = 1;
+}
+
+void tex_pool_finalize(nvngfx_ctx*, uint64_t* x) { forget<TexturePool>(x[0]); }
+
+void tex_pool_get_memory_offset(nvngfx_ctx*, uint64_t* x) {
+    const TexturePool* p = find<TexturePool>(x[0]);
+    x[0] = p ? static_cast<uint64_t>(p->offset) : 0;
+}
+void tex_pool_get_size(nvngfx_ctx*, uint64_t* x) {
+    const TexturePool* p = find<TexturePool>(x[0]);
+    x[0] = p ? static_cast<uint64_t>(p->count) : 0;
+}
+void tex_pool_set_debug_label(nvngfx_ctx*, uint64_t* x) {
+    TexturePool* p = find<TexturePool>(x[0]);
+    if (!p) return;
+    const char* label = guest_ptr<const char>(x[1]);
+    p->label = label ? label : "";
+}
+
+/* Registers a texture (or an image, which shares the pool index space) at
+ * `id`.  Only the guest address is stored: the MTLTexture belongs to the
+ * NVNtexture object and is looked up again when a draw resolves the handle,
+ * so finalizing the texture leaves the slot empty instead of dangling. */
+void tex_pool_register(nvngfx_ctx*, uint64_t* x, const char* reason) {
+    TexturePool* p = find<TexturePool>(x[0]);
+    if (!p) { log_once(reason, 0); return; }
+    const int id = static_cast<int>(x[1]);
+    if (id < 0 || id >= p->count) { log_once(reason, static_cast<unsigned>(id)); return; }
+    p->textures[p->base + id] = x[2];
+    p->views[p->base + id] = x[3];
+}
+void tex_pool_register_texture(nvngfx_ctx* ctx, uint64_t* x) {
+    tex_pool_register(ctx, x, "nvnTexturePoolRegisterTexture.invalidSlot");
+}
+void tex_pool_register_image(nvngfx_ctx* ctx, uint64_t* x) {
+    tex_pool_register(ctx, x, "nvnTexturePoolRegisterImage.invalidSlot");
+}
+
+/* nvnSamplerPoolInitialize / Finalize / GetMemoryOffset / GetSize /
+ * SetDebugLabel, the same shape as the texture pool. */
+void samp_pool_initialize(nvngfx_ctx*, uint64_t* x) {
+    if (!x[0]) { x[0] = 0; return; }
+    int base = 0;
+    if (!nvngfx_pool_map_add(&g_samp_pool_map, x[0], static_cast<int>(x[3]), &base)) {
+        log_once("nvnSamplerPoolInitialize.poolLimit", static_cast<unsigned>(x[0]));
+        x[0] = 0;
+        return;
+    }
+    SamplerPool* p = find_or_add<SamplerPool>(x[0]);
+    p->memory = x[1];
+    p->offset = static_cast<long long>(x[2]);
+    p->count = static_cast<int>(x[3]);
+    p->base = base;
+    x[0] = 1;
+}
+void samp_pool_finalize(nvngfx_ctx*, uint64_t* x) { forget<SamplerPool>(x[0]); }
+void samp_pool_get_memory_offset(nvngfx_ctx*, uint64_t* x) {
+    const SamplerPool* p = find<SamplerPool>(x[0]);
+    x[0] = p ? static_cast<uint64_t>(p->offset) : 0;
+}
+void samp_pool_get_size(nvngfx_ctx*, uint64_t* x) {
+    const SamplerPool* p = find<SamplerPool>(x[0]);
+    x[0] = p ? static_cast<uint64_t>(p->count) : 0;
+}
+void samp_pool_set_debug_label(nvngfx_ctx*, uint64_t* x) {
+    SamplerPool* p = find<SamplerPool>(x[0]);
+    if (!p) return;
+    const char* label = guest_ptr<const char>(x[1]);
+    p->label = label ? label : "";
+}
+
+int samp_pool_slot(const SamplerPool* p, uint64_t id_arg) {
+    const int id = static_cast<int>(id_arg);
+    if (!p || id < 0 || id >= p->count) return -1;
+    return p->base + id;
+}
+
+/* nvnSamplerPoolRegisterSampler(pool, id, const NVNsampler*) */
+void samp_pool_register_sampler(nvngfx_ctx*, uint64_t* x) {
+    SamplerPool* p = find<SamplerPool>(x[0]);
+    const int slot = samp_pool_slot(p, x[1]);
+    Sampler* s = find<Sampler>(x[2]);
+    if (!p || slot < 0 || !s) {
+        log_once("nvnSamplerPoolRegisterSampler.invalid", static_cast<unsigned>(x[1]));
+        return;
+    }
+    PooledSampler ps;
+    ps.state = s->state;
+    ps.mtl = s->mtl;
+    p->samplers[slot] = ps;
+}
+
+/* ...RegisterSamplerBuilder: the guest never built an NVNsampler, so the
+ * state is snapshotted from the builder and the Metal object is created
+ * here.  Creating it at registration, not at draw, keeps a per-frame
+ * draw from allocating a sampler state. */
+void samp_pool_register_builder(nvngfx_ctx* ctx, uint64_t* x) {
+    SamplerPool* p = find<SamplerPool>(x[0]);
+    const int slot = samp_pool_slot(p, x[1]);
+    if (!p || slot < 0) {
+        log_once("nvnSamplerPoolRegisterSamplerBuilder.invalid", static_cast<unsigned>(x[1]));
+        return;
+    }
+    const SamplerSpec& spec = sampler_spec_or_default(x[2]);
+    PooledSampler ps;
+    ps.state = spec.state;
+    ps.mtl = create_sampler_state(ctx_of(ctx), ps.state);
+    if (!ps.mtl) {
+        log_once("nvnSamplerPoolRegisterSamplerBuilder.noState", static_cast<unsigned>(x[1]));
+        return;
+    }
+    p->samplers[slot] = ps;
+}
+
+/* nvnCommandBufferSetTexturePool / SetSamplerPool.  The argument buffer
+ * currently cached was encoded against the old pool, so it is dropped. */
+void cmdbuf_set_texture_pool(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find<CmdBuf>(x[0]);
+    if (!b) return;
+    b->texPool = x[1];
+    b->argbuf = nil;
+}
+void cmdbuf_set_sampler_pool(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find<CmdBuf>(x[0]);
+    if (!b) return;
+    b->sampPool = x[1];
+    b->argbuf = nil;
+}
+
+/* nvnDeviceGetTextureHandle(device, tex, samp): tex is the low 20 bits and
+ * samp the next 20, exactly as nxnative defines them.  The guest passes pool
+ * IDs; the bases are added when a draw resolves the handle. */
+void dev_get_texture_handle(nvngfx_ctx*, uint64_t* x) {
+    x[0] = nvngfx_texture_handle(static_cast<unsigned>(x[1]),
+                                 static_cast<unsigned>(x[2]));
+}
+void dev_get_texel_fetch_handle(nvngfx_ctx*, uint64_t* x) {
+    x[0] = static_cast<uint32_t>(x[1]);
+}
+void dev_get_separate_texture_handle(nvngfx_ctx*, uint64_t* x) {
+    x[0] = static_cast<uint32_t>(x[1]);
+}
+void dev_get_separate_sampler_handle(nvngfx_ctx*, uint64_t* x) {
+    x[0] = nvngfx_separate_sampler_handle(static_cast<unsigned>(x[1]));
+}
+void dev_get_image_handle(nvngfx_ctx*, uint64_t* x) {
+    x[0] = static_cast<uint32_t>(x[1]);
+}
+
+bool pixel_stage(uint64_t stage) { return stage == NVNGFX_STAGE_FRAGMENT; }
+
+/* nvnCommandBufferBindTexture(cb, stage, slot, handle) and the plural form.
+ * Only the pixel stage is consumed: the argument buffer this backend builds
+ * is the fragment one.  Other stages are recorded as ignored so the reason is
+ * visible instead of silent. */
+void cmdbuf_bind_texture(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find<CmdBuf>(x[0]);
+    if (!b) return;
+    if (!pixel_stage(x[1])) { log_once("nvnCommandBufferBindTexture.stage", static_cast<unsigned>(x[1])); return; }
+    const unsigned slot = static_cast<unsigned>(x[2]);
+    if (slot >= 16) { log_once("nvnCommandBufferBindTexture.slot", slot); return; }
+    b->texHandle[slot] = x[3];
+    b->argbuf = nil;
+}
+void cmdbuf_bind_textures(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find<CmdBuf>(x[0]);
+    if (!b) return;
+    if (!pixel_stage(x[1])) { log_once("nvnCommandBufferBindTextures.stage", static_cast<unsigned>(x[1])); return; }
+    const unsigned first = static_cast<unsigned>(x[2]);
+    const unsigned n = static_cast<unsigned>(x[3]);
+    const uint64_t* handles = guest_ptr<const uint64_t>(x[4]);
+    if (!handles) return;
+    for (unsigned i = 0; i < n; ++i) {
+        const unsigned slot = first + i;
+        if (slot >= 16) { log_once("nvnCommandBufferBindTextures.slot", slot); break; }
+        b->texHandle[slot] = handles[i];
+    }
+    b->argbuf = nil;
+}
+void cmdbuf_bind_separate_texture(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find<CmdBuf>(x[0]);
+    if (!b) return;
+    if (!pixel_stage(x[1])) { log_once("nvnCommandBufferBindSeparateTexture.stage", static_cast<unsigned>(x[1])); return; }
+    const unsigned slot = static_cast<unsigned>(x[2]);
+    if (slot >= 16) { log_once("nvnCommandBufferBindSeparateTexture.slot", slot); return; }
+    b->sepTexHandle[slot] = x[3];
+    b->argbuf = nil;
+}
+void cmdbuf_bind_separate_textures(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find<CmdBuf>(x[0]);
+    if (!b) return;
+    if (!pixel_stage(x[1])) { log_once("nvnCommandBufferBindSeparateTextures.stage", static_cast<unsigned>(x[1])); return; }
+    const unsigned first = static_cast<unsigned>(x[2]);
+    const unsigned n = static_cast<unsigned>(x[3]);
+    const uint64_t* handles = guest_ptr<const uint64_t>(x[4]);
+    if (!handles) return;
+    for (unsigned i = 0; i < n; ++i) {
+        const unsigned slot = first + i;
+        if (slot >= 16) { log_once("nvnCommandBufferBindSeparateTextures.slot", slot); break; }
+        b->sepTexHandle[slot] = handles[i];
+    }
+    b->argbuf = nil;
+}
+void cmdbuf_bind_separate_sampler(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find<CmdBuf>(x[0]);
+    if (!b) return;
+    if (!pixel_stage(x[1])) { log_once("nvnCommandBufferBindSeparateSampler.stage", static_cast<unsigned>(x[1])); return; }
+    const unsigned slot = static_cast<unsigned>(x[2]);
+    if (slot >= 16) { log_once("nvnCommandBufferBindSeparateSampler.slot", slot); return; }
+    b->sepSampHandle[slot] = x[3];
+    b->argbuf = nil;
+}
+void cmdbuf_bind_separate_samplers(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find<CmdBuf>(x[0]);
+    if (!b) return;
+    if (!pixel_stage(x[1])) { log_once("nvnCommandBufferBindSeparateSamplers.stage", static_cast<unsigned>(x[1])); return; }
+    const unsigned first = static_cast<unsigned>(x[2]);
+    const unsigned n = static_cast<unsigned>(x[3]);
+    const uint64_t* handles = guest_ptr<const uint64_t>(x[4]);
+    if (!handles) return;
+    for (unsigned i = 0; i < n; ++i) {
+        const unsigned slot = first + i;
+        if (slot >= 16) { log_once("nvnCommandBufferBindSeparateSamplers.slot", slot); break; }
+        b->sepSampHandle[slot] = handles[i];
+    }
+    b->argbuf = nil;
+}
+
+/* Handle -> host resource.  The pool index in the handle is the guest ID;
+ * the bound pool's base turns it into the host slot the registration used.
+ * A finalised texture or a slot that was never registered resolves to null,
+ * and the draw is dropped rather than bound to whatever slot 0 holds. */
+const Tex* bound_texture(const CmdBuf* b, uint64_t handle) {
+    if (!b || !b->texPool || !handle) return nullptr;
+    const int slot = nvngfx_pool_slot(&g_tex_pool_map, b->texPool,
+                                      static_cast<int>(nvngfx_texture_handle_tex(handle)));
+    if (slot < 0) return nullptr;
+    const TexturePool* p = find<TexturePool>(b->texPool);
+    if (!p) return nullptr;
+    auto it = p->textures.find(slot);
+    if (it == p->textures.end() || !it->second) return nullptr;
+    return find<Tex>(it->second);
+}
+
+const PooledSampler* bound_sampler(const CmdBuf* b, uint64_t handle) {
+    if (!b || !b->sampPool || !handle) return nullptr;
+    const int slot = nvngfx_pool_slot(&g_samp_pool_map, b->sampPool,
+                                      static_cast<int>(nvngfx_texture_handle_samp(handle)));
+    if (slot < 0) return nullptr;
+    const SamplerPool* p = find<SamplerPool>(b->sampPool);
+    if (!p) return nullptr;
+    auto it = p->samplers.find(slot);
+    return it == p->samplers.end() ? nullptr : &it->second;
+}
+
+
+/* ------------------------------------------------------------------ */
 /* programs and pipelines                                              */
 /* ------------------------------------------------------------------ */
 
@@ -1141,6 +1466,23 @@ struct Program {
         bool hasLayout = false;          /* false: no vertex descriptor */
     };
     PsoSlot slots[4];
+
+    /* Argument-buffer layout.  A translated shader's [[id(k)]] numbering
+     * follows its SPIR-V descriptor order, not the NVN slot number; that
+     * mapping belongs to the translation sidecar and does not exist yet.
+     * numArgs == 0 keeps the M3.81 behaviour: uniform buffer i is id(i). */
+    struct ArgEntry {
+        unsigned id;
+        unsigned kind;   /* 0 buffer, 1 texture, 2 sampler */
+        unsigned slot;   /* NVN binding slot */
+    };
+    ArgEntry args[8];
+    unsigned numArgs = 0;
+    /* Created from the fragment function.  nil when the shader does not
+     * take an argument buffer at buffer(0), e.g. the constant-colour
+     * self-test programs. */
+    id<MTLArgumentEncoder> argEnc = nil;
+    NSUInteger argLen = 0;
 };
 
 /* The cached pipeline for (format, layout), or nil.  Also records the hit in
@@ -1352,6 +1694,15 @@ id<MTLRenderPipelineState> program_pipeline(Ctx* c, Program* p, MTLPixelFormat f
             log_once_str("nvnProgram.pipeline.function",
                          "MSL did not define nvngfx_main_vs / nvngfx_main_fs");
             return nil;
+        }
+
+        /* The fragment function knows where each [[id(k)]] sits in the
+         * argument buffer.  One encoder per program is enough: it is a
+         * function-level object, not a pipeline-state one, and every PSO
+         * slot for this program encodes the same layout. */
+        if (!p->argEnc) {
+            p->argEnc = [ffn newArgumentEncoderWithBufferIndex:0];
+            p->argLen = p->argEnc ? [p->argEnc encodedLength] : 0;
         }
 
         MTLRenderPipelineDescriptor* pd = [[MTLRenderPipelineDescriptor alloc] init];
@@ -1884,43 +2235,112 @@ void cmdbuf_bind_uniform_buffers(nvngfx_ctx* ctx, uint64_t* x) {
     }
 }
 
-/* Builds the pixel stage's argument buffer for this recording.  Entry i
- * is the GPU address of uniform buffer i -- what `constant _16* fp_cN
- * [[id(i)]]` dereferences.  Returns nil when nothing is bound. */
+/* True when this recording has anything that lives in the argument
+ * buffer: constants, a combined texture (which carries its sampler), or a
+ * separate texture/sampler. */
+bool has_arguments(const CmdBuf* b) {
+    for (unsigned i = 0; i < 16; ++i)
+        if (b->ubo[i] || b->texHandle[i] || b->sepTexHandle[i] || b->sepSampHandle[i]) return true;
+    return false;
+}
+
+/* Builds the pixel stage's argument buffer for this recording.
+ *
+ * The bytes are produced by an MTLArgumentEncoder made from the fragment
+ * function, so the offsets are Metal's layout rather than a guess: a
+ * uniform buffer becomes `setBuffer`, and a texture/sampler entry becomes a
+ * gpuResourceID at the same [[id(k)]] the shader names.  The id -> slot
+ * mapping is Program::args, which a translated shader has to bring from its
+ * SPIR-V descriptor order (sidecar); numArgs == 0 keeps the old "buffer i is
+ * id(i)" rule.
+ *
+ * Returns nil when nothing is bound or when a bound resource cannot be
+ * resolved; the caller then drops the draw instead of encoding zeros. */
 id<MTLBuffer> argument_buffer(Ctx* c, CmdBuf* b) {
     if (b->argbuf) return b->argbuf;
-    bool any = false;
-    for (unsigned i = 0; i < 16; ++i) any = any || b->ubo[i] != 0;
-    if (!any) return nil;
-    b->argbuf = [c->device newBufferWithLength:16 * sizeof(uint64_t)
-                                       options:MTLResourceStorageModeShared];
-    if (!b->argbuf) {
+    Program* p = find<Program>(b->program);
+    if (!has_arguments(b)) return nil;
+    if (!p || !p->argEnc || p->argLen == 0) {
+        log_once("nvnCommandBufferDraw.argumentLayout", p ? 1u : 0u);
+        return nil;
+    }
+    id<MTLBuffer> ab = [c->device newBufferWithLength:p->argLen
+                                              options:MTLResourceStorageModeShared];
+    if (!ab) {
         log_once("nvnCommandBufferDraw.argumentBuffer", 1);
         return nil;
     }
-    uint64_t* e = static_cast<uint64_t*>([b->argbuf contents]);
-    std::memset(e, 0, 16 * sizeof(uint64_t));
-    for (unsigned i = 0; i < 16; ++i) {
-        if (!b->ubo[i]) continue;
-        id<MTLBuffer> src = nil;
-        size_t off = 0;
-        const size_t len = static_cast<size_t>(b->uboSize[i] ? b->uboSize[i] : 1);
-        if (!pool_span(b->ubo[i], len, &src, &off)) {
-            log_once("nvnCommandBufferDraw.uniformBuffer", i);
-            continue;
+    [p->argEnc setArgumentBuffer:ab offset:0];
+
+    if (p->numArgs == 0) {
+        /* Without a layout a texture cannot be placed, and binding a buffer
+         * with an unset entry would sample garbage: drop the draw instead. */
+        for (unsigned i = 0; i < 16; ++i) {
+            if (b->texHandle[i] || b->sepTexHandle[i] || b->sepSampHandle[i]) {
+                log_once("nvnCommandBufferDraw.textureLayout", i);
+                return nil;
+            }
         }
-        e[i] = static_cast<uint64_t>([src gpuAddress]) + off;
+        for (unsigned i = 0; i < 16; ++i) {
+            if (!b->ubo[i]) continue;
+            id<MTLBuffer> src = nil;
+            size_t off = 0;
+            const size_t len = static_cast<size_t>(b->uboSize[i] ? b->uboSize[i] : 1);
+            if (!pool_span(b->ubo[i], len, &src, &off)) {
+                log_once("nvnCommandBufferDraw.uniformBuffer", i);
+                return nil;
+            }
+            [p->argEnc setBuffer:src offset:off atIndex:i];
+        }
+        b->argbuf = ab;
+        return b->argbuf;
     }
+
+    for (unsigned k = 0; k < p->numArgs && k < 8; ++k) {
+        const Program::ArgEntry& e = p->args[k];
+        if (e.slot >= 16) {
+            log_once("nvnCommandBufferDraw.argSlot", e.slot);
+            return nil;
+        }
+        if (e.kind == 0) {
+            if (!b->ubo[e.slot]) continue;
+            id<MTLBuffer> src = nil;
+            size_t off = 0;
+            const size_t len = static_cast<size_t>(b->uboSize[e.slot] ? b->uboSize[e.slot] : 1);
+            if (!pool_span(b->ubo[e.slot], len, &src, &off)) {
+                log_once("nvnCommandBufferDraw.uniformBuffer", e.slot);
+                return nil;
+            }
+            [p->argEnc setBuffer:src offset:off atIndex:e.id];
+        } else if (e.kind == 1) {
+            const uint64_t h = b->texHandle[e.slot] ? b->texHandle[e.slot]
+                                                   : b->sepTexHandle[e.slot];
+            const Tex* t = bound_texture(b, h);
+            if (!t || !t->mtl) {
+                log_once("nvnCommandBufferDraw.texture", e.slot);
+                return nil;
+            }
+            [p->argEnc setTexture:t->mtl atIndex:e.id];
+        } else {
+            const PooledSampler* s = bound_sampler(b, b->texHandle[e.slot] ? b->texHandle[e.slot]
+                                                                            : b->sepSampHandle[e.slot]);
+            if (!s || !s->mtl) {
+                log_once("nvnCommandBufferDraw.sampler", e.slot);
+                return nil;
+            }
+            [p->argEnc setSamplerState:s->mtl atIndex:e.id];
+        }
+    }
+    b->argbuf = ab;
     return b->argbuf;
 }
 
 /* Binds the argument buffer before a draw.  True when there is nothing
  * to bind or the binding succeeded; false means the draw must not be
- * encoded, because a shader that reads constants would read zeros. */
+ * encoded, because a shader that reads constants or samples a texture
+ * would read the wrong thing. */
 bool bind_arguments(Ctx* c, CmdBuf* b) {
-    bool any = false;
-    for (unsigned i = 0; i < 16; ++i) any = any || b->ubo[i] != 0;
-    if (!any) return true;
+    if (!has_arguments(b)) return true;
     id<MTLBuffer> ab = argument_buffer(c, b);
     if (!ab) return false;
     [b->enc setFragmentBuffer:ab offset:0 atIndex:0];
@@ -2097,6 +2517,11 @@ const Binding kBindings[] = {
     BIND("nvnDeviceBuilderGetFlags", dev_builder_get_flags),
     BIND("nvnDeviceInitialize", dev_initialize),
     BIND("nvnDeviceGetProcAddress", dev_get_proc_address),
+    BIND("nvnDeviceGetTextureHandle", dev_get_texture_handle),
+    BIND("nvnDeviceGetTexelFetchHandle", dev_get_texel_fetch_handle),
+    BIND("nvnDeviceGetSeparateTextureHandle", dev_get_separate_texture_handle),
+    BIND("nvnDeviceGetSeparateSamplerHandle", dev_get_separate_sampler_handle),
+    BIND("nvnDeviceGetImageHandle", dev_get_image_handle),
 
     BIND("nvnWindowBuilderSetDefaults", win_builder_set_defaults),
     BIND("nvnWindowBuilderSetNativeWindow", win_builder_set_native_window),
@@ -2132,6 +2557,14 @@ const Binding kBindings[] = {
     BIND("nvnTextureBuilderSetStride", tex_builder_set_stride),
     BIND("nvnTextureBuilderSetFlags", tex_builder_set_flags),
     BIND("nvnTextureInitialize", tex_initialize),
+
+    BIND("nvnTexturePoolInitialize", tex_pool_initialize),
+    BIND("nvnTexturePoolFinalize", tex_pool_finalize),
+    BIND("nvnTexturePoolGetMemoryOffset", tex_pool_get_memory_offset),
+    BIND("nvnTexturePoolGetSize", tex_pool_get_size),
+    BIND("nvnTexturePoolSetDebugLabel", tex_pool_set_debug_label),
+    BIND("nvnTexturePoolRegisterTexture", tex_pool_register_texture),
+    BIND("nvnTexturePoolRegisterImage", tex_pool_register_image),
 
     BIND("nvnSamplerBuilderSetDefaults", sampler_builder_set_defaults),
     BIND("nvnSamplerBuilderSetDevice", sampler_builder_set_device),
@@ -2172,6 +2605,14 @@ const Binding kBindings[] = {
     BIND("nvnSamplerGetReductionFilter", sampler_get_reduction),
     BIND("nvnSamplerCompare", sampler_compare),
 
+    BIND("nvnSamplerPoolInitialize", samp_pool_initialize),
+    BIND("nvnSamplerPoolFinalize", samp_pool_finalize),
+    BIND("nvnSamplerPoolGetMemoryOffset", samp_pool_get_memory_offset),
+    BIND("nvnSamplerPoolGetSize", samp_pool_get_size),
+    BIND("nvnSamplerPoolSetDebugLabel", samp_pool_set_debug_label),
+    BIND("nvnSamplerPoolRegisterSampler", samp_pool_register_sampler),
+    BIND("nvnSamplerPoolRegisterSamplerBuilder", samp_pool_register_builder),
+
     BIND("nvnProgramInitialize", prog_initialize),
     BIND("nvnProgramSetShaders", prog_set_shaders),
     BIND("nvnProgramFinalize", prog_finalize),
@@ -2191,6 +2632,14 @@ const Binding kBindings[] = {
     BIND("nvnCommandBufferBindVertexStreamState", cmdbuf_bind_vertex_stream_state),
     BIND("nvnCommandBufferBindUniformBuffer", cmdbuf_bind_uniform_buffer),
     BIND("nvnCommandBufferBindUniformBuffers", cmdbuf_bind_uniform_buffers),
+    BIND("nvnCommandBufferSetTexturePool", cmdbuf_set_texture_pool),
+    BIND("nvnCommandBufferSetSamplerPool", cmdbuf_set_sampler_pool),
+    BIND("nvnCommandBufferBindTexture", cmdbuf_bind_texture),
+    BIND("nvnCommandBufferBindTextures", cmdbuf_bind_textures),
+    BIND("nvnCommandBufferBindSeparateTexture", cmdbuf_bind_separate_texture),
+    BIND("nvnCommandBufferBindSeparateTextures", cmdbuf_bind_separate_textures),
+    BIND("nvnCommandBufferBindSeparateSampler", cmdbuf_bind_separate_sampler),
+    BIND("nvnCommandBufferBindSeparateSamplers", cmdbuf_bind_separate_samplers),
     BIND("nvnVertexAttribStateSetDefaults", vattrib_set_defaults),
     BIND("nvnVertexAttribStateSetFormat", vattrib_set_format),
     BIND("nvnVertexAttribStateSetStreamIndex", vattrib_set_stream),
@@ -2235,9 +2684,10 @@ const nvngfx_backend k_metal = {"metal", nullptr, metal_resolve};
 /* Copies the whole target into a shared buffer and hands back the centre
  * pixel.  Blit + waitUntilCompleted is the same readback the first version
  * did inline; pulling it out lets a second draw be checked the same way. */
-bool read_center_pixel(id<MTLDevice> dev, id<MTLCommandQueue> queue,
-                       id<MTLTexture> tex, NSUInteger side, unsigned char px[4]) {
-    if (!dev || !queue || !tex) return false;
+bool read_pixel_at(id<MTLDevice> dev, id<MTLCommandQueue> queue,
+                   id<MTLTexture> tex, NSUInteger side, NSUInteger x, NSUInteger y,
+                   unsigned char px[4]) {
+    if (!dev || !queue || !tex || x >= side || y >= side) return false;
     const NSUInteger bpr = side * 4;
     id<MTLBuffer> buf = [dev newBufferWithLength:bpr * side
                                         options:MTLResourceStorageModeShared];
@@ -2258,9 +2708,43 @@ bool read_center_pixel(id<MTLDevice> dev, id<MTLCommandQueue> queue,
     [cb waitUntilCompleted];
     if (cb.status == MTLCommandBufferStatusError) return false;
     const unsigned char* p = static_cast<const unsigned char*>([buf contents]) +
-                             (side / 2) * bpr + (side / 2) * 4;
+                             y * bpr + x * 4;
     for (int i = 0; i < 4; ++i) px[i] = p[i];
     return true;
+}
+
+bool read_center_pixel(id<MTLDevice> dev, id<MTLCommandQueue> queue,
+                       id<MTLTexture> tex, NSUInteger side, unsigned char px[4]) {
+    return read_pixel_at(dev, queue, tex, side, side / 2, side / 2, px);
+}
+
+/* Uploads RGBA8 rows into a private MTLTexture through a shared staging
+ * buffer.  The self-test uses this because the guest-upload path does not
+ * exist yet; a real upload copies from the guest pool instead of from `px`,
+ * but the blit itself is the same. */
+bool upload_rgba8(id<MTLDevice> dev, id<MTLCommandQueue> queue, id<MTLTexture> tex,
+                  const unsigned char* px, NSUInteger w, NSUInteger h) {
+    if (!dev || !queue || !tex || !px || w == 0 || h == 0) return false;
+    const NSUInteger bpr = w * 4;
+    id<MTLBuffer> src = [dev newBufferWithLength:bpr * h
+                                        options:MTLResourceStorageModeShared];
+    if (!src) return false;
+    std::memcpy([src contents], px, bpr * h);
+    id<MTLCommandBuffer> cb = [queue commandBuffer];
+    id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+    [blit copyFromBuffer:src
+            sourceOffset:0
+       sourceBytesPerRow:bpr
+     sourceBytesPerImage:bpr * h
+              sourceSize:MTLSizeMake(w, h, 1)
+               toTexture:tex
+        destinationSlice:0
+        destinationLevel:0
+       destinationOrigin:MTLOriginMake(0, 0, 0)];
+    [blit endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+    return cb.status != MTLCommandBufferStatusError;
 }
 
 /* True when every channel is within `tolerance` of `want`. */
@@ -2285,11 +2769,25 @@ extern "C" int nvngfx_metal_selftest(void) {
     alignas(16) unsigned char samplerBuilder[0x60] = {};
     alignas(16) unsigned char samplerObject[0x30] = {};
     alignas(16) unsigned char samplerObject2[0x30] = {};
+    /* Backing store for the textured draw: a 2x2 source texture, its builder,
+     * a texture pool, a sampler pool and a builder-registered sampler. */
+    alignas(16) unsigned char texSrcObject[0x80] = {};
+    alignas(16) unsigned char texSrcBuilder[0x80] = {};
+    alignas(16) unsigned char texPoolObject[0x20] = {};
+    alignas(16) unsigned char sampPoolObject[0x20] = {};
+    alignas(16) unsigned char samplerBuilder5[0x60] = {};
+    alignas(16) unsigned char samplerObject5[0x30] = {};
     const uint64_t kTex = reinterpret_cast<uint64_t>(texObject);
     const uint64_t kTexBuilder = reinterpret_cast<uint64_t>(texBuilder);
     const uint64_t kSamplerBuilder = reinterpret_cast<uint64_t>(samplerBuilder);
     const uint64_t kSampler = reinterpret_cast<uint64_t>(samplerObject);
     const uint64_t kSampler2 = reinterpret_cast<uint64_t>(samplerObject2);
+    const uint64_t kTexSrc = reinterpret_cast<uint64_t>(texSrcObject);
+    const uint64_t kTexSrcBuilder = reinterpret_cast<uint64_t>(texSrcBuilder);
+    const uint64_t kTexPool = reinterpret_cast<uint64_t>(texPoolObject);
+    const uint64_t kSampPool = reinterpret_cast<uint64_t>(sampPoolObject);
+    const uint64_t kSamplerBuilder5 = reinterpret_cast<uint64_t>(samplerBuilder5);
+    const uint64_t kSampler5 = reinterpret_cast<uint64_t>(samplerObject5);
     const uint64_t kCb = 0x5200;
     const uint64_t kProg = 0x5300;
     const NSUInteger kSide = 64;
@@ -2865,6 +3363,212 @@ extern "C" int nvngfx_metal_selftest(void) {
             }
         }
 
+        {
+            /* --- Fifth draw: a texture and a sampler from the pools -------
+             * This is the whole binding path a real draw needs, short of a
+             * translated shader and a guest upload:
+             *   builder -> texture -> pool id 5
+             *   builder -> sampler -> pool id 9
+             *   SetTexturePool / SetSamplerPool
+             *   nvnDeviceGetTextureHandle(5, 9) -> BindTexture
+             *   argument buffer: id(0) constants, id(1) texture, id(2) sampler
+             * The pixels come from a host blit (upload_rgba8), not from the
+             * guest's memory; that half is still missing and is called out in
+             * the docs. */
+            const uint64_t kProg5 = 0x5C00;
+            const uint64_t kCb5 = 0x5D00;
+            x[0] = kTexSrcBuilder;
+            tex_builder_set_defaults(ctx, x);
+            x[0] = kTexSrcBuilder; x[1] = 0;
+            tex_builder_set_target(ctx, x);
+            x[0] = kTexSrcBuilder; x[1] = 0x25;
+            tex_builder_set_format(ctx, x);          /* RGBA8_UNORM */
+            x[0] = kTexSrcBuilder; x[1] = 2; x[2] = 2;
+            tex_builder_set_size2d(ctx, x);
+            x[0] = kTexSrcBuilder; x[1] = 1;
+            tex_builder_set_levels(ctx, x);
+            x[0] = kTexSrcBuilder; x[1] = 1;
+            tex_builder_set_samples(ctx, x);
+            x[0] = kTexSrc; x[1] = kTexSrcBuilder;
+            tex_initialize(ctx, x);
+            Tex* src = find<Tex>(kTexSrc);
+            if (x[0] != 1 || !src || !src->mtl) {
+                std::fprintf(stderr, "[selftest] source texture was not created\n");
+                rc = 16385;
+                goto done;
+            }
+            {
+                /* Row 0: red, green.  Row 1: blue, white. */
+                const unsigned char texels[16] = {
+                    255, 0,   0,   255,  0,   255, 0,   255,
+                    0,   0,   255, 255,  255, 255, 255, 255};
+                if (!upload_rgba8(dev, c->queue, src->mtl, texels, 2, 2)) {
+                    std::fprintf(stderr, "[selftest] source texture upload failed\n");
+                    rc = 16385;
+                    goto done;
+                }
+            }
+            /* Nearest filtering and clamp-to-edge, so each corner pixel of
+             * the target reads exactly one texel of the 2x2 source. */
+            x[0] = kSamplerBuilder5;
+            sampler_builder_set_defaults(ctx, x);
+            x[0] = kSamplerBuilder5; x[1] = 0; x[2] = 0;
+            sampler_builder_set_minmag(ctx, x);
+            x[0] = kSamplerBuilder5; x[1] = 0; x[2] = 0; x[3] = 0;
+            sampler_builder_set_wrap(ctx, x);
+
+            /* Two pools of 16 entries each; IDs 5 and 9 are inside them. */
+            x[0] = kTexPool; x[1] = 0; x[2] = 0; x[3] = 16;
+            tex_pool_initialize(ctx, x);
+            x[0] = kTexPool; x[1] = 5; x[2] = kTexSrc; x[3] = 0;
+            tex_pool_register_texture(ctx, x);
+            x[0] = kSampPool; x[1] = 0; x[2] = 0; x[3] = 16;
+            samp_pool_initialize(ctx, x);
+            x[0] = kSampPool; x[1] = 9; x[2] = kSamplerBuilder5;
+            samp_pool_register_builder(ctx, x);
+            /* The other registration path: from an NVNsampler object. */
+            x[0] = kSampler5; x[1] = kSamplerBuilder5;
+            sampler_initialize(ctx, x);
+            x[0] = kSampPool; x[1] = 10; x[2] = kSampler5;
+            samp_pool_register_sampler(ctx, x);
+            {
+                TexturePool* tp = find<TexturePool>(kTexPool);
+                SamplerPool* sp = find<SamplerPool>(kSampPool);
+                x[0] = kTexPool;
+                tex_pool_get_size(ctx, x);
+                const uint64_t texSize = x[0];
+                x[0] = kSampPool;
+                samp_pool_get_memory_offset(ctx, x);
+                const uint64_t sampOffset = x[0];
+                if (!tp || tp->count != 16 || texSize != 16 || !sp ||
+                    sp->count != 16 || sampOffset != 0 ||
+                    sp->samplers.find(sp->base + 9) == sp->samplers.end() ||
+                    sp->samplers.find(sp->base + 10) == sp->samplers.end()) {
+                    std::fprintf(stderr,
+                                 "[selftest] descriptor pool registration failed\n");
+                    rc = 16385;
+                    goto done;
+                }
+            }
+
+            {
+                struct { uint64_t data; uint64_t control; } sd5[2];
+                sd5[0].data = reinterpret_cast<uint64_t>(const_cast<char*>(
+                    nvngfx_shader_selftest_msl_variant(NVNGFX_STAGE_VERTEX, 3)));
+                sd5[0].control = 0;
+                sd5[1].data = reinterpret_cast<uint64_t>(const_cast<char*>(
+                    nvngfx_shader_selftest_msl_variant(NVNGFX_STAGE_FRAGMENT, 3)));
+                sd5[1].control = 0;
+                x[0] = kProg5; x[1] = 0;
+                prog_initialize(ctx, x);
+                x[0] = kProg5; x[1] = 2;
+                x[2] = reinterpret_cast<uint64_t>(&sd5[0]);
+                prog_set_shaders(ctx, x);
+                if (x[0] != 1) {
+                    std::fprintf(stderr, "[selftest] program 5: SetShaders failed\n");
+                    rc = 16387;
+                    goto done;
+                }
+            }
+            /* The [[id(k)]] layout the translation sidecar will provide.  The
+             * built-in MSL puts the constant pointer at id(0), the texture at
+             * id(1) and the sampler at id(2). */
+            if (Program* p5 = find<Program>(kProg5)) {
+                p5->numArgs = 3;
+                p5->args[0] = Program::ArgEntry{0, 0, 0};
+                p5->args[1] = Program::ArgEntry{1, 1, 0};
+                p5->args[2] = Program::ArgEntry{2, 2, 0};
+            }
+
+            const uintptr_t poolBase5 =
+                (reinterpret_cast<uintptr_t>(poolRaw) + 16383u) &
+                ~static_cast<uintptr_t>(16383u);
+            const uintptr_t tintAt = poolBase5 + 2048;
+            {
+                float* f = reinterpret_cast<float*>(tintAt);
+                f[0] = 1.0f; f[1] = 1.0f; f[2] = 1.0f; f[3] = 1.0f;
+            }
+            {
+                const uint64_t target = kTex;
+                const float clear5[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+                x[0] = kCb5;
+                cmdbuf_begin_recording(ctx, x);
+                x[0] = kCb5; x[1] = 1;
+                x[2] = reinterpret_cast<uint64_t>(&target);
+                x[3] = 0; x[4] = 0; x[5] = 0;
+                cmdbuf_set_render_targets(ctx, x);
+                x[0] = kCb5; x[1] = 0;
+                x[2] = reinterpret_cast<uint64_t>(clear5);
+                x[3] = 0xF;
+                cmdbuf_clear_color(ctx, x);
+                x[0] = kCb5; x[1] = kTexPool;
+                cmdbuf_set_texture_pool(ctx, x);
+                x[0] = kCb5; x[1] = kSampPool;
+                cmdbuf_set_sampler_pool(ctx, x);
+                x[0] = 0; x[1] = 5; x[2] = 9;
+                dev_get_texture_handle(ctx, x);
+                const uint64_t handle = x[0];
+                x[0] = kCb5; x[1] = 1; x[2] = 0; x[3] = handle;
+                cmdbuf_bind_texture(ctx, x);
+                x[0] = kCb5; x[1] = 1; x[2] = 0;
+                x[3] = static_cast<uint64_t>(tintAt); x[4] = 16;
+                cmdbuf_bind_uniform_buffer(ctx, x);
+                x[0] = kCb5; x[1] = kProg5; x[2] = 0;
+                cmdbuf_bind_program(ctx, x);
+                x[0] = kCb5; x[1] = 0; x[2] = 0; x[3] = 3;
+                cmdbuf_draw_arrays(ctx, x);
+                x[0] = kCb5;
+                cmdbuf_end_recording(ctx, x);
+            }
+            CmdBuf* b5 = find<CmdBuf>(kCb5);
+            if (!b5 || !b5->last || b5->encoded != 1) {
+                std::fprintf(stderr,
+                             "[selftest] textured draw was not encoded (asked %u, "
+                             "encoded %u)\n",
+                             b5 ? b5->draws : 0u, b5 ? b5->encoded : 0u);
+                rc = 16387;
+                goto done;
+            }
+            [b5->last waitUntilCompleted];
+            if (b5->last.status == MTLCommandBufferStatusError) {
+                std::fprintf(stderr,
+                             "[selftest] textured draw command buffer error: %s\n",
+                             b5->last.error
+                                 ? [[b5->last.error localizedDescription] UTF8String]
+                                 : "(no description)");
+                rc = 16387;
+                goto done;
+            }
+            {
+                struct {
+                    NSUInteger x, y;
+                    int want[4];
+                    const char* corner;
+                } checks[4] = {
+                    {1, 1, {255, 0, 0, 255}, "top-left"},
+                    {kSide - 2, 1, {0, 255, 0, 255}, "top-right"},
+                    {1, kSide - 2, {0, 0, 255, 255}, "bottom-left"},
+                    {kSide - 2, kSide - 2, {255, 255, 255, 255}, "bottom-right"}};
+                for (int i = 0; i < 4; ++i) {
+                    unsigned char px[4] = {0, 0, 0, 0};
+                    if (!read_pixel_at(dev, c->queue, t->mtl, kSide, checks[i].x,
+                                       checks[i].y, px) ||
+                        !pixels_near(px, checks[i].want, 2)) {
+                        std::fprintf(stderr,
+                                     "[selftest] textured draw %s pixel is "
+                                     "(%u,%u,%u,%u), want (%d,%d,%d,%d)\n",
+                                     checks[i].corner, px[0], px[1], px[2], px[3],
+                                     checks[i].want[0], checks[i].want[1],
+                                     checks[i].want[2], checks[i].want[3]);
+                        rc = 16388;
+                        goto done;
+                    }
+                }
+                std::fprintf(stderr,
+                             "[selftest] textured draw sampled all four pool texels\n");
+            }
+        }
+
     done:
         nvngfx_shader_set_msl_passthrough(0);
         forget<CmdBuf>(kCb);
@@ -2879,6 +3583,14 @@ extern "C" int nvngfx_metal_selftest(void) {
         std::free(poolRaw);
         g_tex_specs.erase(kTexBuilder);
         g_sampler_specs.erase(kSamplerBuilder);
+        forget<Tex>(kTexSrc);
+        forget<TexturePool>(kTexPool);
+        forget<SamplerPool>(kSampPool);
+        forget<Sampler>(kSampler5);
+        forget<Program>(0x5C00);
+        forget<CmdBuf>(0x5D00);
+        g_tex_specs.erase(kTexSrcBuilder);
+        g_sampler_specs.erase(kSamplerBuilder5);
         nvngfx_metal_destroy(ctx);
         return rc;
     }

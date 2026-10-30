@@ -332,12 +332,14 @@ texture -> render target -> clear -> program -> pipeline -> draw -> 回读，
 并额外创建、比较和读回 `MTLSamplerState`。CI 在 iOS 模拟器里用 `simctl`
 启动 App（`--selftest`），App 在 `init()` 里跑它、把
 `BOTW_SELFTEST rc=<n>` 写进容器的 `Documents/selftest.txt` 并 `exit(rc)`；
-现在跑**四条** draw（`[[vertex_id]]` / `[[attribute(0)]]` / 16 位索引的
-`DrawElements` / `BindUniformBuffer` 参数缓冲区）加一条 sampler 状态路径，
-全部通过才 rc=0。M3.76 的 run 40997940031 证明了第一条；run 41008588834
-证明当时的三条（`portable` 与 `ios` 双绿，设备构建也 success）。第四条 draw 和
-sampler 检查的模拟器结果仍要看 M3.82 推送后的 CI。所以“Metal 这半边是通的”
-是已经执行过的结论；“客体的 shader 能跑”仍然完全没验证。
+现在跑**五条** draw（`[[vertex_id]]` / `[[attribute(0)]]` / 16 位索引的
+`DrawElements` / `BindUniformBuffer` 参数缓冲区 / 从 texture pool + sampler pool
+取句柄并采样 2x2 纹理）加一条 sampler 状态路径，全部通过才 rc=0。
+M3.76 的 run 40997940031 证明了第一条；run 41008588834 证明当时的三条；
+M3.82 的 run 41018975699 以 `BOTW_SELFTEST rc=0` 通过；M3.83 的第五条
+draw 要等本轮推送后的 CI。
+所以“Metal 这半边是通的”是已经执行过的结论；“客体的 shader 能跑”仍然完全
+没验证。
 
 **阶段 C：纹理正确**
 
@@ -350,9 +352,10 @@ sampler 检查的模拟器结果仍要看 M3.82 推送后的 CI。所以“Metal
 
 - Blend / DepthStencil / Multisample / Polygon / ChannelMask 的默认值表
   （`*SetDefaults` 可以先给出全零/安全默认，让 guest 至少在依赖具体值之前跑通）
-- ✅ Sampler：M3.82 已完成 builder、object、getter 和真实的
-  `MTLSamplerState`；sampler pool、`BindSeparateSampler` 和 argument buffer
-  里的 sampler 条目仍未做
+- ✅ Sampler：M3.82 完成 builder、object、getter 和真实的
+  `MTLSamplerState`；M3.83 完成 sampler pool、`BindSeparateSampler(s)` 与
+  argument buffer 的 sampler 条目。真实 shader 的 `[[id(k)]]` 顺序仍要从
+  侧车读
 - `nvnCommandBufferBarrier`、fence/sync、events
 
 ---
@@ -367,7 +370,7 @@ sampler 检查的模拟器结果仍要看 M3.82 推送后的 CI。所以“Metal
 | 描述来源 | builder setter 的记录值；**不读 guest builder 内存**，所以没有字段偏移风险 |
 | 像素归属 | 宿主所有，`MTLStorageModePrivate`，**不与 guest 内存 alias** |
 | 能干的事 | 当 render target（本轮 `setRenderTargets` 就是这么用的） |
-| 干不了的事 | 采样 guest 写进内存的像素；本轮没有任何 `replaceRegion`/blit 上传路径 |
+| 干不了的事 | 采样 guest 写进内存的像素；本轮的上传是**自检里的宿主 blit**（`upload_rgba8`），没有从 guest pool 读像素的路径 |
 | 格式 | 157 项表（见 `nvn_texture.c`），exact / substitute 分开标记，替代项返回 `lossy=1` |
 | 未支持 | texture view（initialize 的 view 参数）、tiled/swizzled 布局、BCn 解码 |
 
@@ -439,9 +442,9 @@ constexpr int kEnumsVerified = 0;
 | P0 | ~~`nvnCommandBufferSetRenderTargets`~~ | ✅ 本轮已实现；只剩 MRT / 深度 / view |
 | P0 | ~~`nvnCommandBufferBindProgram` / `nvnProgramInitialize`~~ | ✅ 本轮已实现（管线建到 `nvngfx_shader_to_msl` 为止） |
 | P0 | ~~`nvnCommandBufferBindVertexAttribState`~~ | ✅ 本轮已实现（含 `nvnVertexAttribState*` / `nvnVertexStreamState*` 与 `BindVertexStreamState`） |
-| P0 | 真实 shader 的第一次 draw | 锚点已通，UBO 锚点也通了；现在缺的是 argument buffer 的 texture / sampler 条目，以及真正的 Maxwell -> MSL |
+| P0 | 真实 shader 的第一次 draw | UBO、texture、sampler 三类 argument buffer 条目都已跑过；缺的是真实 shader 的 `[[id(k)]]` 侧车映射和真正的 Maxwell -> MSL |
 | P1 | `nvnTextureBuilder*` 剩余 29 个 | 已做 14 个；剩余主要是 getter 与 pool/offset 细节 |
-| P1 | ~~`nvnSamplerBuilder*` + `nvnSampler*`~~ | ✅ M3.82 已绑定 38 个入口，能建 `MTLSamplerState`；`SamplerBuilderGetDevice` 无已知形状、`SamplerGetDebugID` 的返回值语义未定，sampler pool 未做 |
+| P1 | ~~`nvnSamplerBuilder*` + `nvnSampler*` + sampler pool~~ | ✅ M3.82/M3.83：38 个 sampler 入口、8 个 pool/bind 入口，能建 `MTLSamplerState` 并从 pool 解析句柄；`SamplerBuilderGetDevice` 无已知形状、`SamplerGetDebugID` 的返回值语义未定 |
 | P1 | `NVNindexType` 枚举值核对 | nxnative 的 `nvn.h` 给出 0=u8 / 1=u16 / 2=u32；后端只接 1/2，u8 未知值不画，且该头文件是 reimplementation 而非 Nintendo SDK |
 | P0 | Maxwell SASS -> MSL 翻译器 | 不是入口点，是整条链的墙 |
 | P2 | 各 `*StateSetDefaults` / `*StateGet*` | 让 guest 的查询路径不崩 |
@@ -461,10 +464,10 @@ constexpr int kEnumsVerified = 0;
 | 渲染目标绑定 | 只挂 `color[0]`，深度/view 只记录 | MRT 与深度测试不可用 |
 | 着色器翻译 | 只留了接口，没有实现 | 客体的 draw 全部停在 `noPipeline` |
 | 纹理创建 | 建 host `MTLTexture`，不与 guest alias | 当目标可用；采样 guest 像素仍全黑 |
-| draw 执行 | 有 pipeline 就真的编码 draw；没有就丢弃 | 客体仍是 0 条；自检四条 draw 加 sampler 状态检查由 CI 执行 |
+| draw 执行 | 有 pipeline 就真的编码 draw；没有就丢弃 | 客体仍是 0 条；自检五条 draw 加 sampler 状态检查由 CI 执行 |
 | 顶点输入 | attrib/stream 已接，缓冲从 pool 零拷贝绑到 `MTLBuffer` | 自检的第二条 draw 就是这条路；客体尚未跑到 |
 | 浮点参数 | `nvngfx_args.f[8]` 已扩展，float 在低 32 位 | 本仓库外 guest 调用端仍需实现 s/d 寄存器桥 |
-| 采样器资源 | builder/object 与 `MTLSamplerState` 已建，sampler pool 未做 | 还不能给 argument buffer 一个可引用句柄 |
+| 采样器资源 | builder/object、sampler pool 与 `MTLSamplerState` 已建，句柄可解析 | 真实 shader 仍缺 `[[id(k)]]` 侧车 |
 | 同步/fence | 未实现 | 长时间跑可能撕裂 |
 | compute | 未实现 | 后处理不可用 |
 | 多线程 | 单队列 | 与真机行为有差异 |

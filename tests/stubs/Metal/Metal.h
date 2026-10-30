@@ -143,7 +143,23 @@ typedef enum MTLSamplerReductionMode : NSUInteger {
 @protocol MTLSamplerState
 @end
 
-@protocol MTLFunction;
+/* Metal argument buffers: the encoder owns the [[id(k)]] layout, which is
+ * why nvn_metal.mm asks the function for one instead of computing offsets. */
+@protocol MTLTexture;
+@protocol MTLSamplerState;
+
+@protocol MTLArgumentEncoder
+- (void)setArgumentBuffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset;
+- (void)setBuffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index;
+- (void)setTexture:(id<MTLTexture>)texture atIndex:(NSUInteger)index;
+- (void)setSamplerState:(id<MTLSamplerState>)sampler atIndex:(NSUInteger)index;
+@property (readonly) NSUInteger encodedLength;
+@end
+
+@protocol MTLFunction
+- (id<MTLArgumentEncoder>)newArgumentEncoderWithBufferIndex:(NSUInteger)index;
+@end
+
 @protocol MTLLibrary
 - (id<MTLFunction>)newFunctionWithName:(NSString*)name;
 @end
@@ -292,6 +308,15 @@ typedef void (^MTLDeallocator)(void* pointer, NSUInteger length);
       destinationOffset:(NSUInteger)dstOffset
  destinationBytesPerRow:(NSUInteger)bpr
 destinationBytesPerImage:(NSUInteger)bpi;
+- (void)copyFromBuffer:(id<MTLBuffer>)src
+          sourceOffset:(NSUInteger)srcOffset
+     sourceBytesPerRow:(NSUInteger)bpr
+   sourceBytesPerImage:(NSUInteger)bpi
+            sourceSize:(MTLSize)size
+             toTexture:(id<MTLTexture>)dst
+      destinationSlice:(NSUInteger)dstSlice
+      destinationLevel:(NSUInteger)dstLevel
+     destinationOrigin:(MTLOrigin)dstOrigin;
 @end
 
 @protocol MTLRenderCommandEncoder

@@ -23,10 +23,10 @@ try {
     if (-not (Test-Path $VcVars)) {
         Write-Error "vcvars64.bat not found at '$VcVars'. Pass -VcVars <path>."
     }
-    New-Item -ItemType Directory -Force -Path build\nvn\abi, build\nvn\core, build\nvn\tex, build\nvn\shd, build\nvn\vtx, build\nvn\smp | Out-Null
+    New-Item -ItemType Directory -Force -Path build\nvn\abi, build\nvn\core, build\nvn\tex, build\nvn\shd, build\nvn\vtx, build\nvn\smp, build\nvn\pool | Out-Null
 
     $inc = "/I core\include /I ios\nvn\include"
-    $lib = "ios\nvn\src\nvn_dispatch.cpp ios\nvn\src\nvn_null.cpp ios\nvn\src\nvn_sampler.c ios\nvn\src\nvn_texture.c ios\nvn\src\nvn_shader.c ios\nvn\src\nvn_shader_key.c ios\nvn\src\nvn_shader_blobs.gen.c ios\nvn\src\nvn_vertex.c core\src\botw_core.cpp"
+    $lib = "ios\nvn\src\nvn_dispatch.cpp ios\nvn\src\nvn_null.cpp ios\nvn\src\nvn_pool.c ios\nvn\src\nvn_sampler.c ios\nvn\src\nvn_texture.c ios\nvn\src\nvn_shader.c ios\nvn\src\nvn_shader_key.c ios\nvn\src\nvn_shader_blobs.gen.c ios\nvn\src\nvn_vertex.c core\src\botw_core.cpp"
     $flags = "/nologo /std:c++20 /EHsc /W4 /WX"
 
     $jobs = @(
@@ -35,7 +35,8 @@ try {
         @{ name = "nvn_texture_test"; src = "tests\nvn_texture_test.cpp"; obj = "build\nvn\tex\" },
         @{ name = "nvn_shader_test";  src = "tests\nvn_shader_test.cpp";  obj = "build\nvn\shd\" },
         @{ name = "nvn_vertex_test";  src = "tests\nvn_vertex_test.cpp";  obj = "build\nvn\vtx\" },
-        @{ name = "nvn_sampler_test"; src = "tests\nvn_sampler_test.cpp"; obj = "build\nvn\smp\" }
+        @{ name = "nvn_sampler_test"; src = "tests\nvn_sampler_test.cpp"; obj = "build\nvn\smp\" },
+        @{ name = "nvn_pool_test";    src = "tests\nvn_pool_test.cpp";    obj = "build\nvn\pool\" }
     )
 
     foreach ($j in $jobs) {

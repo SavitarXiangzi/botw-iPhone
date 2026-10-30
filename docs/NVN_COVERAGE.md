@@ -7,8 +7,8 @@
 `nvn*` 字符串（运行时按名解析，所以名字本身就暴露了完整接口面）。
 
 - 接口总数：**513**
-- Metal 后端已实现：**104**（20.3%）
-- 仍未实现：**409**
+- Metal 后端已实现：**131**（25.5%）
+- 仍未实现：**382**
 
 > 只有出现在 `ios/nvn/implemented_metal.txt` 里、且确实在
 > `ios/nvn/src/nvn_metal.mm` 中定义过的名字才算“已实现”。
@@ -18,10 +18,10 @@
 
 | 域 | 已实现 | 总数 | 进度 |
 |---|---:|---:|---|
-| CommandBuffer | 15 | 144 | `#         ` |
+| CommandBuffer | 23 | 144 | `##        ` |
 | Texture | 1 | 45 | `          ` |
 | TextureBuilder | 14 | 43 | `###       ` |
-| Device | 2 | 27 | `#         ` |
+| Device | 7 | 27 | `###       ` |
 | SamplerBuilder | 24 | 25 | `##########` |
 | MultisampleState | 0 | 23 | `          ` |
 | QueueBuilder | 0 | 19 | `          ` |
@@ -35,8 +35,8 @@
 | MemoryPool | 3 | 10 | `###       ` |
 | PolygonState | 0 | 9 | `          ` |
 | MemoryPoolBuilder | 3 | 8 | `####      ` |
-| SamplerPool | 0 | 8 | `          ` |
-| TexturePool | 0 | 8 | `          ` |
+| SamplerPool | 7 | 8 | `######### ` |
+| TexturePool | 7 | 8 | `######### ` |
 | BufferBuilder | 0 | 7 | `          ` |
 | ColorState | 0 | 7 | `          ` |
 | Event | 0 | 7 | `          ` |
@@ -112,7 +112,7 @@
 - [ ] `nvnColorStateSetDefaults`
 - [ ] `nvnColorStateSetLogicOp`
 
-### CommandBuffer (15/144)
+### CommandBuffer (23/144)
 
 - [ ] `nvnCommandBufferAddCommandMemory`
 - [ ] `nvnCommandBufferAddControlMemory`
@@ -129,14 +129,14 @@
 - [ ] `nvnCommandBufferBindMultisampleState`
 - [ ] `nvnCommandBufferBindPolygonState`
 - [x] `nvnCommandBufferBindProgram`
-- [ ] `nvnCommandBufferBindSeparateSampler`
-- [ ] `nvnCommandBufferBindSeparateSamplers`
-- [ ] `nvnCommandBufferBindSeparateTexture`
-- [ ] `nvnCommandBufferBindSeparateTextures`
+- [x] `nvnCommandBufferBindSeparateSampler`
+- [x] `nvnCommandBufferBindSeparateSamplers`
+- [x] `nvnCommandBufferBindSeparateTexture`
+- [x] `nvnCommandBufferBindSeparateTextures`
 - [ ] `nvnCommandBufferBindStorageBuffer`
 - [ ] `nvnCommandBufferBindStorageBuffers`
-- [ ] `nvnCommandBufferBindTexture`
-- [ ] `nvnCommandBufferBindTextures`
+- [x] `nvnCommandBufferBindTexture`
+- [x] `nvnCommandBufferBindTextures`
 - [ ] `nvnCommandBufferBindTransformFeedbackBuffer`
 - [ ] `nvnCommandBufferBindTransformFeedbackBuffers`
 - [x] `nvnCommandBufferBindUniformBuffer`
@@ -237,7 +237,7 @@
 - [ ] `nvnCommandBufferSetRenderEnableConditional`
 - [x] `nvnCommandBufferSetRenderTargets`
 - [ ] `nvnCommandBufferSetSampleMask`
-- [ ] `nvnCommandBufferSetSamplerPool`
+- [x] `nvnCommandBufferSetSamplerPool`
 - [x] `nvnCommandBufferSetScissor`
 - [ ] `nvnCommandBufferSetScissors`
 - [ ] `nvnCommandBufferSetShaderScratchMemory`
@@ -246,7 +246,7 @@
 - [ ] `nvnCommandBufferSetStencilRef`
 - [ ] `nvnCommandBufferSetStencilValueMask`
 - [ ] `nvnCommandBufferSetSubpixelPrecisionBias`
-- [ ] `nvnCommandBufferSetTexturePool`
+- [x] `nvnCommandBufferSetTexturePool`
 - [ ] `nvnCommandBufferSetTiledCacheAction`
 - [ ] `nvnCommandBufferSetTiledCacheTileSize`
 - [x] `nvnCommandBufferSetViewport`
@@ -275,7 +275,7 @@
 - [ ] `nvnDepthStencilStateSetStencilOp`
 - [ ] `nvnDepthStencilStateSetStencilTestEnable`
 
-### Device (2/27)
+### Device (7/27)
 
 - [ ] `nvnDeviceApplyDeferredFinalizes`
 - [ ] `nvnDeviceFinalize`
@@ -283,13 +283,13 @@
 - [ ] `nvnDeviceGenerateDebugDomainId`
 - [ ] `nvnDeviceGetCurrentTimestampInNanoseconds`
 - [ ] `nvnDeviceGetDepthMode`
-- [ ] `nvnDeviceGetImageHandle`
+- [x] `nvnDeviceGetImageHandle`
 - [ ] `nvnDeviceGetInteger`
 - [x] `nvnDeviceGetProcAddress`
-- [ ] `nvnDeviceGetSeparateSamplerHandle`
-- [ ] `nvnDeviceGetSeparateTextureHandle`
-- [ ] `nvnDeviceGetTexelFetchHandle`
-- [ ] `nvnDeviceGetTextureHandle`
+- [x] `nvnDeviceGetSeparateSamplerHandle`
+- [x] `nvnDeviceGetSeparateTextureHandle`
+- [x] `nvnDeviceGetTexelFetchHandle`
+- [x] `nvnDeviceGetTextureHandle`
 - [ ] `nvnDeviceGetTimestampInNanoseconds`
 - [ ] `nvnDeviceGetWindowOriginMode`
 - [x] `nvnDeviceInitialize`
@@ -479,16 +479,16 @@
 - [x] `nvnSamplerBuilderSetReductionFilter`
 - [x] `nvnSamplerBuilderSetWrapMode`
 
-### SamplerPool (0/8)
+### SamplerPool (7/8)
 
-- [ ] `nvnSamplerPoolFinalize`
-- [ ] `nvnSamplerPoolGetMemoryOffset`
+- [x] `nvnSamplerPoolFinalize`
+- [x] `nvnSamplerPoolGetMemoryOffset`
 - [ ] `nvnSamplerPoolGetMemoryPool`
-- [ ] `nvnSamplerPoolGetSize`
-- [ ] `nvnSamplerPoolInitialize`
-- [ ] `nvnSamplerPoolRegisterSampler`
-- [ ] `nvnSamplerPoolRegisterSamplerBuilder`
-- [ ] `nvnSamplerPoolSetDebugLabel`
+- [x] `nvnSamplerPoolGetSize`
+- [x] `nvnSamplerPoolInitialize`
+- [x] `nvnSamplerPoolRegisterSampler`
+- [x] `nvnSamplerPoolRegisterSamplerBuilder`
+- [x] `nvnSamplerPoolSetDebugLabel`
 
 ### Sync (0/6)
 
@@ -593,16 +593,16 @@
 - [x] `nvnTextureBuilderSetTarget`
 - [x] `nvnTextureBuilderSetWidth`
 
-### TexturePool (0/8)
+### TexturePool (7/8)
 
-- [ ] `nvnTexturePoolFinalize`
-- [ ] `nvnTexturePoolGetMemoryOffset`
+- [x] `nvnTexturePoolFinalize`
+- [x] `nvnTexturePoolGetMemoryOffset`
 - [ ] `nvnTexturePoolGetMemoryPool`
-- [ ] `nvnTexturePoolGetSize`
-- [ ] `nvnTexturePoolInitialize`
-- [ ] `nvnTexturePoolRegisterImage`
-- [ ] `nvnTexturePoolRegisterTexture`
-- [ ] `nvnTexturePoolSetDebugLabel`
+- [x] `nvnTexturePoolGetSize`
+- [x] `nvnTexturePoolInitialize`
+- [x] `nvnTexturePoolRegisterImage`
+- [x] `nvnTexturePoolRegisterTexture`
+- [x] `nvnTexturePoolSetDebugLabel`
 
 ### VertexAttribState (5/5)
 

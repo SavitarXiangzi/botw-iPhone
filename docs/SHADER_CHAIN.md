@@ -154,10 +154,15 @@ C:\Python314\python.exe scripts\shader_chain\gen_blobs.py --msl build\shader-cha
    `MTLVertexDescriptor`，顶点地址按 pool 找到对应 `MTLBuffer`。
 2. 资源绑定：MSL 用的是 `--msl-argument-buffers`，所有常量/纹理走
    `buffer(0)` 的 `spvDescriptorSetBuffer0`，槽位约定见 §6。
-   **常量已经接上**（M3.81）：`nvnCommandBufferBindUniformBuffer` 记录地址，
-   draw 前填一个 16 项的参数缓冲区，每项是 `MTLBuffer.gpuAddress + 偏移`。
-   `MTLSamplerState` 对象也已经能创建（M3.82，见 §5.4），但 **texture / sampler
-   条目仍未填**：它们需要 texture pool / sampler pool 先给出稳定句柄。
+   **常量已经接上**（M3.81）：`nvnCommandBufferBindUniformBuffer` 记录地址。
+   **texture / sampler 也已接上**（M3.83，见 §5.5）：texture pool /
+   sampler pool 给出稳定句柄，`BindTexture` / `BindSeparateSampler` 记录句柄，
+   draw 前用 `newArgumentEncoderWithBufferIndex:0` 得到的 `MTLArgumentEncoder`
+   把 buffer（`setBuffer`）、texture（`setTexture`）、sampler
+   （`setSamplerState`）写进同一个参数缓冲区。偏移由 Metal 的编码器决定，
+   不再是手算的 8 字节表。**仍然缺的**是每个真实 shader 的
+   `[[id(k)]]` ↔ NVN 槽位映射：它只能来自翻译侧车（SPIR-V 描述符顺序），
+   内置 MSL 里是手工声明的。
 3. 几何路径：`DrawArrays` 与 `DrawElements`（16/32 位索引）都已编码，
    顶点与索引都按 pool 零拷贝绑定（M3.79 / M3.80）。也就是说**画什么形状
    已经不缺了**；常量已进 argument buffer，缺的是纹理与 sampler 条目，
@@ -171,9 +176,40 @@ NVN 值（例如 wrap 0 与 7 不会被 Metal 映射“合并”），`nvnSample
 也按原始状态比较。`MTLSamplerReductionMode` 只在 iOS 26 SDK/系统上设置，
 旧系统保留 guest 值但不假装 Metal 已应用它。
 
-这仍**不是**资源绑定：没有 sampler pool，没有可注册的句柄，也没有
-`BindSeparateSampler` / `SetSamplerPool`，所以 argument buffer 里的
-`[[id(k)]]` sampler 槽位还是空的。
+M3.83 之后这**已经**是资源绑定的一部分：`nvnSamplerPoolInitialize` /
+`RegisterSampler` / `RegisterSamplerBuilder` 给出池内句柄，
+`nvnCommandBufferSetSamplerPool` 与 `nvnCommandBufferBindSeparateSampler(s)`
+把它接到 draw 上，argument buffer 的 `[[id(k)]]` sampler 槽位由
+`setSamplerState:` 填。具体见 §5.5。
+
+### 5.5 描述符池与句柄（M3.83）
+
+`nvnTexturePool*` / `nvnSamplerPool*` 的 14 个入口与 8 个 command buffer
+绑定入口已接。句柄按 nxnative 的定义打包：
+
+| 入口 | 返回值 |
+|---|---|
+| `nvnDeviceGetTextureHandle(d, tex, samp)` | `tex \| samp << 20` |
+| `nvnDeviceGetTexelFetchHandle(d, tex)` | `tex` |
+| `nvnDeviceGetSeparateTextureHandle(d, id)` | `id` |
+| `nvnDeviceGetSeparateSamplerHandle(d, id)` | `id << 20` |
+| `nvnDeviceGetImageHandle(d, id)` | `id`（与纹理共用池索引空间） |
+
+句柄里的 ID 是**客体池内 ID**，不是宿主槽位。查表时才加绑定池的 base：
+`nvngfx_pool_slot()`（`ios/nvn/include/nvn_pool.h`）。base 按池创建顺序分配、
+向上取整到 256 项，和 nxnative 的 `dpool_add` 一致；`Finalize` 不回收编号，
+避免旧 command buffer 的句柄指到新池。
+
+`nvnCommandBufferBindTexture(s)`、`BindSeparateTexture(s)`、
+`BindSeparateSampler(s)` 只消费 pixel stage；其他 stage 记一次日志后忽略，
+因为当前后端只建 fragment 的参数缓冲区。
+
+限制：
+
+- 纹理注册只保存客体地址；`nvnTextureFinalize` 后再采样会解析失败并丢 draw。
+- `nvnTexturePoolGetMemoryPool` / `nvnSamplerPoolGetMemoryPool` 不在
+  `signatures.json` 的 470 个形状里，未绑。
+- 真实 shader 的 `[[id(k)]]` 顺序仍缺侧车。
 
 ## 6. 绑定约定（nxnative 的驱动段布局）
 
@@ -197,7 +233,7 @@ NVN 值（例如 wrap 0 与 7 不会被 Metal 映射“合并”），`nvnSample
 | `xcrun metal` → `.metallib` | 未做；只能在 macOS/CI 上做，本机没有 |
 | 整作 19,592 个 shader 全量构建 | 未做；只验证了 1 个 pack 的 5,102 个 key 中的 2 个 |
 | 编译期校验（MSL 语法） | 未做；Windows 没有 Metal 前端，MSL 只在 CI 的 macOS 上才能编 |
-| 真机 / 模拟器上跑真实 shader | 未做。自检用的仍是内置 MSL（四条 draw：`[[vertex_id]]`、顶点属性、16 位索引的 `DrawElements`、`BindUniformBuffer` 参数缓冲区；另加一条 sampler 状态创建/比较路径） |
+| 真机 / 模拟器上跑真实 shader | 未做。自检用的仍是内置 MSL（五条 draw：`[[vertex_id]]`、顶点属性、16 位索引的 `DrawElements`、`BindUniformBuffer` 参数缓冲区、texture pool + sampler pool 采样；另加一条 sampler 状态创建/比较路径） |
 | compute / geometry shader | 未做（`extract` 目前跳过 cs） |
 | 运行时按 key 取 MSL | **已接线**（M3.78，见 §5.1） |
 | 顶点描述符 | **已接**（M3.79） |

@@ -91,6 +91,42 @@ static const char* const kFsGreen =
     "    return float4(0.0, 1.0, 0.0, 1.0);\n"
     "}\n";
 
+/* Variant 3: the first textured draw.  The fragment function samples the
+ * texture and the sampler the guest bound through an argument buffer, at the
+ * [[id(1)]] and [[id(2)]] the sidecar will one day name.  The vertex stage
+ * passes the texture coordinate as a varying so every pixel reads a known
+ * texel of a 2x2 texture. */
+static const char* const kVsUv =
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "\n"
+    "struct NvngfxVaryings { float4 position [[position]]; float2 uv; };\n"
+    "\n"
+    "vertex NvngfxVaryings nvngfx_main_vs(uint vid [[vertex_id]]) {\n"
+    "    const float2 p[3] = { float2(-1.0, -1.0), float2(3.0, -1.0), float2(-1.0, 3.0) };\n"
+    "    NvngfxVaryings v;\n"
+    "    v.position = float4(p[vid], 0.0, 1.0);\n"
+    "    v.uv = p[vid] * 0.5 + 0.5;\n"
+    "    return v;\n"
+    "}\n";
+
+static const char* const kFsTexture =
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "\n"
+    "struct NvngfxVaryings { float4 position [[position]]; float2 uv; };\n"
+    "\n"
+    "struct spvDescriptorSetBuffer0 {\n"
+    "    constant float4* tint [[id(0)]];\n"
+    "    texture2d<float> tex [[id(1)]];\n"
+    "    sampler smp [[id(2)]];\n"
+    "};\n"
+    "\n"
+    "fragment float4 nvngfx_main_fs(NvngfxVaryings in [[stage_in]],\n"
+    "                               constant spvDescriptorSetBuffer0& s0 [[buffer(0)]]) {\n"
+    "    return s0.tex.sample(s0.smp, in.uv) * (*s0.tint);\n"
+    "}\n";
+
 
 /* ------------------------------------------------------------------------- *
  * Offline MSL blobs
@@ -191,6 +227,11 @@ const char* nvngfx_shader_selftest_msl_variant(nvngfx_stage stage, int variant) 
     if (variant == 2) {
         if (stage == NVNGFX_STAGE_VERTEX) return kVs;
         if (stage == NVNGFX_STAGE_FRAGMENT) return kFsUbo;
+        return NULL;
+    }
+    if (variant == 3) {
+        if (stage == NVNGFX_STAGE_VERTEX) return kVsUv;
+        if (stage == NVNGFX_STAGE_FRAGMENT) return kFsTexture;
         return NULL;
     }
     if (stage == NVNGFX_STAGE_VERTEX) return kVs;
