@@ -435,7 +435,9 @@ M3.92 补上另外两种层形状：第十二条建 `MTLTextureTypeCube`（`arra
 `stride = 32`，guest 存储里每行只有 8 字节有效数据、其余是 padding。上排
 红/绿、下排蓝/白，回读左上红、左下蓝；如果上传忽略了 stride（把 8 字节当行距），
 左下会读到 padding 的 0 而变黑。失败码 `16405`（布局 / 建纹理 / 编码）、
-`16406`（像素不对）。
+`16406`（像素不对）。这条已在 run 41083158406 通过：
+`draw 14: LINEAR texture rows sampled from guest memory at a 32-byte stride`，
+同段日志里 `texture upload ... offset=12288 ... staging=16 bytes`。
 
 第五条在模拟器里走的是**直连纹理/采样器绑定**：模拟器的
 `MTLTexture.gpuResourceID` 是 0，参数缓冲区的纹理条目在那里没有意义

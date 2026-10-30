@@ -56,7 +56,7 @@ docs/           路线图、HLE 边界、NVN 覆盖表、iOS 移植手册、着�
 | M3.27 | `GetSystemTick` 的 HLE 往返 35 µs × 几十万次 = 30 s 死窗口；改成入口一条 `b` + 内联计数器 | ✅ 死窗口消失 |
 | M3.28 | 178 帧后静止的全量快照：主线程无限等 LightEvent，32 线程 idle，唯一活动是 250 µs 轮询 worker | 🔴 缺完成通知 |
 | M3.65–M3.71 | 12 MB 缓冲区是包尾 `0x49E000` 的逐字节拷贝；真正卡点是 58.2 MiB 分配返回 0；最小跳过让字节序转换器返回 | ✅ 结论已定，draws 仍为 0 |
-| iOS 骨架 | 513 入口点注册表 + 生成分发表 + Metal 后端 131 项 + 三重门禁 | 🟡 十四条合成 draw（前十二条已在 CI 模拟器通过：run 41080975529；第十三条 cube array 需 `BOTW_SELFTEST_CUBE_ARRAY=1`，模拟器的 Metal 建 CubeArray 会崩；第十四条 LINEAR 待本次 CI），含 bindless、顶点参数缓冲区、c1 常量段、guest pool 解块上传和离线 MSL bundle；客体仍无画面 |
+| iOS 骨架 | 513 入口点注册表 + 生成分发表 + Metal 后端 131 项 + 三重门禁 | 🟡 十四条合成 draw，其中十三条已在 CI 模拟器通过（LINEAR：run 41083158406；cube：run 41080975529）；第十三条 cube array 需 `BOTW_SELFTEST_CUBE_ARRAY=1`，模拟器的 Metal 建 CubeArray 会崩。含 bindless、顶点参数缓冲区、c1 常量段、guest pool 解块上传和离线 MSL bundle；客体仍无画面 |
 | M4 | NVN → Metal 回放（管线/纹理/命令缓冲） | ⬜ |
 | M5 | 音频（nn::audio → AVAudioEngine）、输入 | ⬜ |
 | M6 | 真机性能与内存（6 GB 机型起步） | ⬜ |

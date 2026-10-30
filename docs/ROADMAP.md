@@ -3620,7 +3620,18 @@ nvn_texlayout_test: ok (block shapes, sizes, offsets, round trip, linear, refusa
 
 这条抓的是“把 stride 当行宽”：若拷贝按 8 字节连续读，第二行会读到 padding，
 左下变黑；若把 padding 也上传成一行，右下会串色。失败码 `16405`（布局 / 建纹理 /
-编码）、`16406`（像素不对）。端到端结果以本次 iOS job 为准。
+编码）、`16406`（像素不对）。### CI 证据
+
+run [41083158406](https://github.com/SavitarXiangzi/botw-iPhone/actions/runs/41083158406)，
+portable job 124157289034、iOS job 124157532695 均通过：
+
+```text
+[nvn] texture upload: pool=0x7300 offset=12288 levels=1 layers=1 staging=16 bytes (largest slice=16)
+[selftest] draw 14: LINEAR texture rows sampled from guest memory at a 32-byte stride
+BOTW_SELFTEST rc=0
+```
+
+`staging=16` 是两行 × 8 字节——padding 没有进暂存区，正是 stride 被正确跨过。
 
 ### 还没有的
 - 每级独立 pitch（有的标题会给 mip 小级换更小的 pitch）没有建模，现在一条
