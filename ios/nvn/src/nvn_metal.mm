@@ -2815,9 +2815,8 @@ extern "C" int nvngfx_metal_selftest(void) {
             return 1;
         }
         std::fprintf(stderr,
-                     "[selftest] metal device: argumentBuffersTier=%lu "
-                     "apple7=%d metal3=%d unifiedMemory=%d\n",
-                     static_cast<unsigned long>(dev.argumentBuffersTier),
+                     "[selftest] metal device: apple7=%d metal3=%d "
+                     "unifiedMemory=%d\n",
                      [dev supportsFamily:MTLGPUFamilyApple7] ? 1 : 0,
                      [dev supportsFamily:MTLGPUFamilyMetal3] ? 1 : 0,
                      dev.hasUnifiedMemory ? 1 : 0);

@@ -55,11 +55,6 @@ enum {
 
 /* Device capability queries used by the self-test diagnostics.  The numeric
  * values are Metal's public values; only Apple7 and Metal3 are named here. */
-typedef NSUInteger MTLArgumentBuffersTier;
-enum {
-    MTLArgumentBuffersTier1 = 0,
-    MTLArgumentBuffersTier2 = 1,
-};
 typedef NSUInteger MTLGPUFamily;
 enum {
     MTLGPUFamilyApple7 = 1007,
@@ -427,7 +422,6 @@ destinationBytesPerImage:(NSUInteger)bpi;
 
 @protocol MTLDevice
 @property (readonly) NSString* name;
-@property (readonly) MTLArgumentBuffersTier argumentBuffersTier;
 @property (readonly) BOOL hasUnifiedMemory;
 - (BOOL)supportsFamily:(MTLGPUFamily)family;
 - (id<MTLCommandQueue>)newCommandQueue;
