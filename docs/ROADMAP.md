@@ -3431,8 +3431,19 @@ syntax_check_metal: ok (clang++.exe)
 build_abi_test: all tests passed
 ```
 
-模拟器里的实际 draw 结果需要在提交后的 iOS job 上确认；没有通过前不把
-M3.91 记成 CI 已验证。
+### CI 证据
+
+run [41070475247](https://github.com/SavitarXiangzi/botw-iPhone/actions/runs/41070475247)，
+portable job 124112907657、iOS job 124113134061 均通过。模拟器日志：
+
+```text
+[nvn] texture upload: pool=0x5400 offset=12288 levels=1 layers=2 staging=32 bytes (largest slice=16)
+[selftest] draw 11: 2D array layers 0/1 sampled from guest memory
+BOTW_SELFTEST rc=0
+```
+
+`layers=2` 说明上传确实按两个 slice 走，`staging=32` 是两个 16 字节 slice 的和
+（旧实现共用一块 16 字节暂存区时这里是 16，且回读两边同色）。
 
 ### 仍然没有的
 

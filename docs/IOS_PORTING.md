@@ -409,9 +409,10 @@ layer 0 全红、layer 1 全黄。运行时先检查 `MTLTexture.textureType == 
 和 `arrayLength == 2`，再让片段着色器同时采样两层，左半屏取 layer 0、右半屏
 取 layer 1，最后回读左红右黄。这个布局能抓住两个很容易静默通过的 bug：
 把数组建成普通 2D 纹理，以及所有 slice 复用同一块暂存区（两边都会变成最后一层）。
-通过时的日志应为
+通过时的日志为
 `[selftest] draw 11: 2D array layers 0/1 sampled from guest memory`；
-本地没有 Metal 模拟器，所以这条仍需提交后的 iOS job 确认。
+这条已在 run 41070475247 的 iOS job（124113134061）上执行通过，
+同一段日志里 `texture upload` 报 `layers=2 staging=32 bytes`。
 
 第五条在模拟器里走的是**直连纹理/采样器绑定**：模拟器的
 `MTLTexture.gpuResourceID` 是 0，参数缓冲区的纹理条目在那里没有意义

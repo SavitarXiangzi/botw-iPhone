@@ -56,7 +56,7 @@ docs/           路线图、HLE 边界、NVN 覆盖表、iOS 移植手册、着�
 | M3.27 | `GetSystemTick` 的 HLE 往返 35 µs × 几十万次 = 30 s 死窗口；改成入口一条 `b` + 内联计数器 | ✅ 死窗口消失 |
 | M3.28 | 178 帧后静止的全量快照：主线程无限等 LightEvent，32 线程 idle，唯一活动是 250 µs 轮询 worker | 🔴 缺完成通知 |
 | M3.65–M3.71 | 12 MB 缓冲区是包尾 `0x49E000` 的逐字节拷贝；真正卡点是 58.2 MiB 分配返回 0；最小跳过让字节序转换器返回 | ✅ 结论已定，draws 仍为 0 |
-| iOS 骨架 | 513 入口点注册表 + 生成分发表 + Metal 后端 131 项 + 三重门禁 | 🟡 十一条合成 draw（前十条已在 CI 模拟器通过；M3.91 的双层数组 draw 待本次 CI），含 bindless、顶点参数缓冲区、c1 常量段、guest pool 解块上传和离线 MSL bundle；客体仍无画面 |
+| iOS 骨架 | 513 入口点注册表 + 生成分发表 + Metal 后端 131 项 + 三重门禁 | 🟡 十一条合成 draw 已全部在 CI 模拟器通过（M3.91 双层数组：run 41070475247），含 bindless、顶点参数缓冲区、c1 常量段、guest pool 解块上传和离线 MSL bundle；客体仍无画面 |
 | M4 | NVN → Metal 回放（管线/纹理/命令缓冲） | ⬜ |
 | M5 | 音频（nn::audio → AVAudioEngine）、输入 | ⬜ |
 | M6 | 真机性能与内存（6 GB 机型起步） | ⬜ |
@@ -272,8 +272,8 @@ Mac 侧还有一条**真的执行**的测试：CI 用 `simctl` 在 iOS 模拟器
 texture -> target -> clear -> pipeline -> draw -> 回读然后 `exit(rc)`，
 结果写进 App 容器的 `Documents/selftest.txt` 由工作流断言。
 现在执行十一条 draw；M3.85 的 run 41042618062、block-linear 布局的 run 41047317230、
-从 guest 池解块上传纹理的 run 41051685313、离线 MSL bundle 的 run 41064580709
-均已通过。第十条真正从 `<app>/shaders/manifest.tsv` 取 MSL、按 guest key
+从 guest 池解块上传纹理的 run 41051685313、离线 MSL bundle 的 run 41064580709、
+分层纹理的 run 41070475247 均已通过。第十条真正从 `<app>/shaders/manifest.tsv` 取 MSL、按 guest key
 建管线并回读橙色像素；第十一条从 guest pool 上传两层 2D 数组，片段着色器
 分别采样 layer 0/1，回读左红右黄。CI 现在设置
 `BOTW_REQUIRE_SHADER_BUNDLE=1`，bundle 缺失会让自检返回 `rc=16397`，不能静默跳过。
