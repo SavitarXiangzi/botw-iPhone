@@ -3054,3 +3054,204 @@ blob，一并修掉带空洞的布局。
 | 真实 shader 的 draw | 仍是 0 条；c1、UBO、纹理、采样器布局都已解，但还没有标题 shader 的离线 MSL 全链路 |
 | blob 表查找 | 线性表；19,592 条时每次 SetShaders 是 O(n) |
 | 真机 | **没有真机运行记录** |
+
+## M3.86 packed slot 与 bindless 句柄
+
+覆盖仍是 **131 / 513（25.5%）**：这一轮没有新增 NVN 入口，改的是参数缓冲区里
+“每一项写到哪个字节”的规则，以及句柄不在命令缓冲上时的解析路径。
+
+### id 是绑定号，packed 才是字节偏移
+
+M3.85 的自检把单个 `[[id(2)]]` 成员写到偏移 16，shader 读到的是偏移 0。结论：
+Metal 参数缓冲区按**成员声明顺序**紧凑排布，`[[id(k)]]` 只决定 encoder 的绑定
+号，不是字节偏移。于是 blob 的每个参数多一个 `packed`（0..numArgs-1，来自
+`spvDescriptorSetBuffer0` 里的声明顺序），运行时写 `slots[packed]`，不再写
+`slots[id]`。带空洞的真实布局（自检里的 5 / 9 / 12）现在也能落到正确位置。
+
+生成器对重复 `packed`、`id >= 64`、非法 kind 和越界槽位直接让构建失败，不会
+产出运行时才被拒绝的表。
+
+### bindless：句柄在统一缓冲里
+
+BOTW 的 `fp_t_cb7_*` 不在命令缓冲上绑纹理：它把一个 32 位 NVN 句柄写进统一
+缓冲，shader 自己读出来再解。新增三个 kind：
+
+| kind | 读什么 | 怎么解 |
+|---|---|---|
+| `TEXTURE_IN_UBO` | UBO 里 `offset` 处的 u32 | 低 20 位是纹理池 ID，高 12 位是采样器池 ID |
+| `SAMPLER_OF_UBO_TEXTURE` | 同一个 u32 | 高 12 位 -> 采样器池 |
+| `SAMPLER_IN_UBO` | UBO 里的 u32 | 低 20 位是采样器池 ID |
+
+`read_ubo_u32()` 直接按 pool 的字节偏移读（iOS 统一内存，不需要
+`gpuAddress`）。解析不出资源就丢 draw，并记
+`nvnCommandBufferDraw.bindless*`，绝不填零：填零会让 GPU 静默读到别处。
+
+### 自检：第七条 draw
+
+临时 blob（key `00000000000000a7`）声明 id 9 是纹理、id 12 是采样器，中间有
+空洞。draw 把打包后的句柄写进 UBO，编码后回读 `b->argbuf[1]` 的前两个 8 字节
+字：`word0/word1` 必须分别来自 id 9 与 12，即 `packed` 是 0/1 而不是 9/12。
+失败码 `16393`。
+
+### 证据
+
+run `41045568006`（commit `02d47ca`，portable job `124032097565`、ios job
+`124032250486`）两个 job 都 success，`BOTW_SELFTEST rc=0`：
+
+```
+[selftest] bindless table: packed 0/1 from ids 9/12, ubo=+0xA8 tex=... samp=...
+```
+
+### 仍然没有的
+
+| 缺口 | 后果 |
+|---|---|
+| Metal 3 硬件上的 raw table | 模拟器 `gpuResourceID == 0`，只验证了直连路径 |
+| image / storage buffer 的 bindless | compute 与部分像素路径 |
+| 顶点阶段参数缓冲区 | 见 M3.87 |
+
+## M3.87 顶点阶段参数缓冲区
+
+覆盖仍是 **131 / 513**。顶点和像素可以给同一个 `buffer(0)` 绑不同资源，所以
+`Program` 保留两套布局（`vargs` / `args`）和两张表（`b->argbuf[0]` / `[1]`）：
+
+- 顶点表 -> `setVertexBuffer:atIndex:0`
+- 像素表 -> `setFragmentBuffer:atIndex:0`
+- 顶点流从 **16** 开始（`NVNGFX_VERTEX_STREAM_BASE`），把 0 号槽让给参数缓冲区
+
+这是 d2r-mobile 的约定，也是让两者共存的唯一办法：`buffer(0)` 只有一个。
+
+### 自检：第八条 draw
+
+variant 8 的顶点 shader 从 `buffer(0)` 读平移量，顶点流 0 落在 `buffer(16)`。
+回读中心像素必须是平移后的颜色，同时检查 `b->argbuf[0]` 的第一个字等于
+stream 的 `gpuAddress + 16`。失败码 `16394`（建表/编码）与 `16395`（像素）。
+
+### 证据
+
+run `41046781000`（commit `7fbf820`）成功：
+
+```
+[selftest] vertex table: buffer(0) word=0x1500430c00, stream at 16, shifted pixels read back
+```
+
+## M3.88 Tegra X1 block-linear 尺寸与解块
+
+覆盖仍是 **131 / 513**。新增 `ios/nvn/src/nvn_texlayout.c`（纯 C，可在任何主机
+上跑，portable job 会编译并执行它的测试）。
+
+### 为什么不能按行拷
+
+Switch 的纹理在显存里是 **block-linear**：GOB 是 64 字节 × 8 行的块，按
+block height 分级，mip 起点还要按级别对齐。按 `width * 4` 逐行 memcpy 得到的
+是一张斜纹图。
+
+规则来自 nxnative（MIT）的 `dm/gfx/nvn/nvn_tex.c` 与
+`dm/gfx/tex/nvn_deswizzle.c`，后者又移植自 deko3d（zlib）。接口分四层：
+
+| 函数 | 给出什么 |
+|---|---|
+| `nvngfx_tex_layout()` | 整体 size、alignment、block 宽高、layers |
+| `nvngfx_tex_level_gobs()` | 某一级的 GOB 数 |
+| `nvngfx_tex_level_geometry()` | 一级一层的行字节、块行数、切片数 |
+| `nvngfx_tex_deswizzle()` / `nvngfx_tex_swizzle()` | 互为逆运算的搬运 |
+
+### 测试
+
+`tests/nvn_texlayout_test.cpp`：
+
+- 157 种格式的存储大小与 deko3d 的参考值逐个比对
+- mip 偏移单调且对齐
+- 随机像素 deswizzle -> swizzle 往返一致
+- 明确拒绝：multisample、`LINEAR` / `LINEAR_RENDER_TARGET`、`BUFFER`
+
+### 证据
+
+run `41047317230`（commit `dd3035d`）成功，portable job 里
+`nvn_texlayout_test: ok (block shapes, sizes, offsets, round trip, refusals)`。
+
+### 仍然没有的
+
+| 缺口 | 后果 |
+|---|---|
+| LINEAR 存储 | 本来线性，但仍要一条单独的拷贝分支 |
+| 分层 / cubemap | `MTLTextureType` 只按 rank 选 1D/2D/3D |
+| BCn | Apple GPU 没有对应格式，必须离线转码或 compute 解压 |
+
+## M3.89 从 guest 池采样纹理（本轮）
+
+覆盖仍是 **131 / 513**。这一轮把“纹理里是什么”接上了：某个纹理第一次被 draw
+采样时，后端从客体自己的内存池解块并上传。
+
+### 上传发生在哪一刻
+
+`prepare_textures()` 在 `ensure_encoder()` **之前**跑，遍历两个 stage 已绑定的
+纹理槽（含 `BindTextures` / `BindSeparateTexture`）和布局里的 bindless 句柄，
+对每个还没上传过的纹理调 `tex_upload()`。上传本身是一次 blit：
+
+1. `nvngfx_tex_layout()` 校验布局；`offset + size` 不得越过 pool（先比较再相加，
+   避免整数回绕）
+2. 每个 mip 一层 shared staging buffer，`nvngfx_tex_deswizzle()` 按层填
+3. blit 到私有 `MTLTexture` 的对应 level / slice
+4. **所有 level 都成功**才置 `uploaded`；半个 mip 链不算可用纹理
+
+blit 必须编码在这个 draw 自己的命令缓冲里，而且不能在 render pass 打开时编码
+（Metal 拒绝嵌套编码器）。所以 `tex_upload()` 先 `end_encoder()`，上传完由
+`ensure_encoder()` 重开 pass，并用记录下来的 viewport / scissor 恢复状态
+（`argbuf` 表也要重建，因为 `useResource:` 是 encoder 状态）。
+
+渲染目标永不上传：`SetRenderTargets` 把目标标记成 `rendered`，那块像素归本后端
+所有，客体内存里的旧内容不能覆盖它。
+
+### 三次失败换来的规则
+
+| 版本 | 现象 | 结论 |
+|---|---|---|
+| `638a9a5` | 自检卡住，120 s 看门狗杀掉 | 在 encoder 打开时等命令缓冲 = 死锁 |
+| `90a1ac3` | 仍然卡 | 光去掉 wait 不够，blit 和 render pass 抢同一个编码器 |
+| `d968d14` | 仍然卡 | 只有“先上传、再开 pass”才是对的 |
+| `9d8276e` | 不卡了，但 `selftest.txt` 只有 start | 进程在 draw 9 里**静默死掉** |
+
+最后一条的根因不在 Metal：自检把 `0x6450` 当作纹理 builder 的地址，而
+`nvnTextureBuilderSetDefaults()` 会 `memset` 0x80 字节**通过这个指针**。
+`0x6450` 是表键，不是内存，第一条 builder 调用就写到未映射页。`simctl` 对
+SIGSEGV 仍然报 `exit status: 0`，唯一的线索是“没有 rc 行”。
+
+修复（`3178261`）：
+
+- 自检改成真的分配一块 0x80 的 builder 后备存储
+- 所有 builder `SetDefaults` 走 `guest_write()`：地址 < 64 KiB 或长度回绕时记
+  一条 `nvn.guestPointer.write` 并丢掉这次调用。一个坏句柄应该是一行日志，
+  不是一次崩溃
+- CI 失败时打印模拟器最新的 `.ips` 崩溃报告，`launch exit status` 标明不可信
+
+### 自检：第九条 draw
+
+在 pool 的 offset 8192 处按 block-linear 写一张 2x2 全青 RGBA8 纹理，注册到
+纹理池 6 号槽，用句柄 `(6, 9)` 绑定后绘制。中心像素必须是青色——只有“从 pool
+解块并上传”这条路通了才可能。
+
+```
+[nvn] texture upload: pool=0x5400 offset=8192 levels=1 staging=16 bytes
+[nvn] texture upload encoded: 1 level(s)
+[selftest] guest texture: 1 level(s) deswizzled from the pool and sampled back
+BOTW_SELFTEST rc=0
+```
+
+失败码 `16396`。
+
+### 证据
+
+run `41051685313`（commit `3178261`）：portable job `124049028971`、ios job
+`124049107710` 都 success，`BOTW_SELFTEST rc=0`。
+
+### 仍然没有的
+
+| 缺口 | 后果 |
+|---|---|
+| 一次性上传 | 客体之后改写同一块纹理不会同步；需要帧边界 / 脏页跟踪 |
+| 分层 / cubemap | `MTLTextureType` 只按 rank 选，layer/slice 的复制还没接 |
+| LINEAR 存储 | 还没有按行拷贝的分支 |
+| BCn | Apple GPU 无对应格式，必须转码 |
+| 真实 shader 的 draw | 仍是 0 条 |
+| 真机 | 没有真机运行记录 |

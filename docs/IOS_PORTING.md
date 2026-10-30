@@ -3,11 +3,12 @@
 本文是 `ios/` 目录的操作手册。它描述的是**已经写进仓库的东西**和
 **机器能验证的事实**，不是你付钱就能玩到游戏的承诺。当前状态一句话：
 
-> iOS 侧的壳、C ABI、513 个 NVN 入口点的分发表、52 个 Metal 后端入口，
+> iOS 侧的壳、C ABI、513 个 NVN 入口点的分发表、131 个 Metal 后端入口，
 > 都能在非 Apple 主机上编译并跑通自测；纹理能建、渲染目标能绑、encoder
 > 能开，program -> pipeline -> draw -> 回读这条链已经在 **CI 的 iOS 模拟器**
-> 里跑通了一条合成 draw。**但客体的 draw 依然一条都不执行**：唯一的缺口是
-> Maxwell SASS -> MSL 的翻译器。
+> 里跑通了九条合成 draw，其中包括从 guest 内存池解块上传的纹理。
+> **但客体的 draw 依然一条都不执行**：首要缺口仍是 Maxwell SASS -> MSL 的
+> 翻译器，纹理分层、BCn 转码和同步也还没有闭环。
 
 ---
 
@@ -28,11 +29,11 @@ ios/nvn/include/nvn_api.h     生成：名字表 + 函数指针 ABI
 ios/nvn/src/nvn_dispatch.cpp  生成：二分查找 + 缺失上报
 ios/nvn/include/nvn_backend.h 后端接口（null / metal 二选一）
 ios/nvn/src/nvn_null.cpp      空后端，任何主机都能编译
-ios/nvn/src/nvn_metal.mm      Metal 后端（52 个入口，含大量 TODO）
+ios/nvn/src/nvn_metal.mm      Metal 后端（131 个入口，含大量 TODO）
 ios/nvn/src/nvn_texture.c     157 项 NVNformat -> MTLPixelFormat 表（附 lossy 标记）
 ios/nvn/include/nvn_texture.h 纹理描述结构 + 表查询接口
 ios/nvn/src/nvn_shader.c      着色器翻译的唯一接口：现在只会说"没有翻译器"
-ios/nvn/implemented_metal.txt 52 行，和 BIND(...) 列表由门禁强制相等
+ios/nvn/implemented_metal.txt 131 行，和 BIND(...) 列表由门禁强制相等
 ios/nvn/shaders/              空目录 + 路线说明（见该目录 README）
 docs/NVN_COVERAGE.md          生成的逐域覆盖表
 scripts/                      提取、生成、校验、编译脚本
@@ -71,9 +72,11 @@ C:\Python314\python.exe scripts\syntax_check_metal.py
 nvn_abi_test: ok (513 procs)                 exit=0
 core_smoke_test: ok (nvn 0/513 on null)      exit=0
 nvn_texture_test: ok (157 formats in table)  exit=0
-nvn_shader_test: ok (seam refuses SASS, passthrough opt-in)  exit=0
+nvn_shader_test: ok (seam, blob table, packed slots, bindless, c1, SHA-256, shader key)  exit=0
+nvn_vertex_test: ok (packing, 26 formats, layout id)  exit=0
+nvn_texlayout_test: ok (block shapes, sizes, offsets, round trip, refusals)  exit=0
 syntax_check_metal: ok (clang++.exe)
-verify_ios: ok (metal bindings: 52/513)
+verify_ios: ok (metal bindings: 131/513)
 build_abi_test: all tests passed
 ```
 
@@ -217,23 +220,27 @@ iOS 是统一内存，guest 堆本来就是宿主可读的，所以
 
 ---
 
-## 6. 已经实现的 52 个入口点
+## 6. 已经实现的 131 个入口点
 
 按域分布（完整明细见 `docs/NVN_COVERAGE.md`）：
 
 | 域 | 已实现/总数 | 说明 |
 |---|---:|---|
-| Window | 6/12 | 创建 CAMetalLayer、acquire、present interval、active textures |
-| WindowBuilder | 5/12 | native window、textures、interval、active count |
-| CommandBuffer | 13/144 | begin/end recording(+commit)、drawArrays、drawElements（16/32 位索引）、bindUniformBuffer(s)（像素阶段 -> 参数缓冲区）、viewport、scissor、clearColor、setRenderTargets、BindProgram、BindVertexBuffer(s) |
-| MemoryPool | 3/10 | builder storage/flags、initialize(零拷贝)、getSize |
-| MemoryPoolBuilder | 3/8 | defaults、storage、flags |
-| Device | 2/27 | initialize（建 queue）、getProcAddress |
-| DeviceBuilder | 3/3 | defaults、set/get flags |
-| Queue | 1/15 | presentTexture（blit 快路径） |
-| Texture | 1/45 | initialize 用 builder 记录的值真建 `MTLTexture`（host 分配） |
+| CommandBuffer | 23/144 | recording/commit、draw、buffer/vertex/index、viewport/scissor、clear、render target、program、texture/sampler 绑定 |
+| Texture | 1/45 | initialize 用 builder 记录的值真建 `MTLTexture`（host 分配，首次采样时从 guest 池填充） |
 | TextureBuilder | 14/43 | defaults + 13 个 setter：target/format/size1D/2D/3D/宽高深/levels/samples/storage/stride/flags |
-| Program | 3/7 | Initialize / SetShaders / Finalize；只记录 shader 的 guest 地址与 control 指针 |
+| Device | 7/27 | initialize、getProcAddress、纹理/采样器句柄查询等 |
+| SamplerBuilder | 24/25 | 状态 setter/getter 与 Metal 采样器创建 |
+| Sampler | 14/15 | builder -> `MTLSamplerState` |
+| SamplerPool / TexturePool | 7/8 + 7/8 | 注册、句柄和 pool 绑定 |
+| Window / WindowBuilder | 6/12 + 5/12 | CAMetalLayer、acquire、present interval、active textures |
+| MemoryPool / MemoryPoolBuilder | 3/10 + 3/8 | storage/flags、initialize(零拷贝)、getSize |
+| Queue | 1/15 | presentTexture（blit 快路径） |
+| Program | 3/7 | Initialize / SetShaders / Finalize；记录 shader 地址、control 指针、参数布局与 c1 |
+| VertexAttribState / VertexStreamState | 5/5 + 5/5 | attrib/stream 解码为 `MTLVertexDescriptor`，stream -> pool buffer |
+| DeviceBuilder | 3/3 | defaults、set/get flags |
+
+上表是主要域；完整 29 个域共 **131/513**，逐项状态见 `docs/NVN_COVERAGE.md`。
 
 **必须说清楚的六件事**，否则这张表会误导人：
 
@@ -250,7 +257,9 @@ iOS 是统一内存，guest 堆本来就是宿主可读的，所以
 1. `nvnTextureInitialize` 现在**真的建 `MTLTexture`**：尺寸、格式、级别、
    采样数全部来自 builder 的 setter 记录值，**不去猜 `NVNtextureBuilder`
    的字段偏移**。代价是像素由宿主分配（`MTLStorageModePrivate`），和 guest
-   内存**没有 alias**。它当渲染目标够用，当“采样 guest 上传的纹理”还不够。
+   内存**没有 alias**。渲染目标由本后端独占；采样纹理在第一次被 draw 读取时，
+   由 `tex_upload()` 从 guest pool 逐 mip 解 block-linear 并 blit 进来。上传是
+   一次性的，guest 之后修改同一块纹理不会自动同步。
 2. `nvnCommandBufferClearColor` 不再丢弃：它先关掉当前 encoder，把颜色记成
    `pendingClear`，下一次 draw 前的 `ensure_encoder()` 把它变成
    `loadAction = .clear`。mask 仍只记录（那是未验证的枚举）。
@@ -264,9 +273,10 @@ iOS 是统一内存，guest 堆本来就是宿主可读的，所以
    的 texture view 参数都只记日志。`EndRecording` 直接 `[cb commit]`，
    `nvnQueueSubmitCommands` 还没实现，所以“提交”这件事目前不等队列。
 
-5. 顶点缓冲只记录 guest 地址，**没有任何一条 draw 用到它**：`BindVertexAttribState`
-   还是 TODO，`NVNbufferRange` 的内容也没读。自检的三角形是用
-   `[[vertex_id]]` 生成的，故意不需要顶点缓冲。
+5. 顶点缓冲与顶点参数缓冲区已经接通：stream 从 pool 零拷贝绑定，顶点常量在
+   `buffer(0)`，stream 从 `NVNGFX_VERTEX_STREAM_BASE`（16）开始。自检 draw 2/3
+   使用真实顶点缓冲，draw 8 使用顶点阶段参数缓冲区并回读平移后的像素。客体尚未
+   跑到这些路径。
 
 ---
 
@@ -332,10 +342,11 @@ texture -> render target -> clear -> program -> pipeline -> draw -> 回读，
 并额外创建、比较和读回 `MTLSamplerState`。CI 在 iOS 模拟器里用 `simctl`
 启动 App（`--selftest`），App 在 `init()` 里跑它、把
 `BOTW_SELFTEST rc=<n>` 写进容器的 `Documents/selftest.txt` 并 `exit(rc)`；
-现在跑**六条** draw（`[[vertex_id]]` / `[[attribute(0)]]` / 16 位索引的
+现在跑**九条** draw（`[[vertex_id]]` / `[[attribute(0)]]` / 16 位索引的
 `DrawElements` / `BindUniformBuffer` 参数缓冲区 / 从 texture pool + sampler pool
-取句柄并采样 2x2 纹理 / 只通过 `[[id(0)]]` 读 c1 常量段）加一条
-sampler 状态路径，全部通过才 rc=0。
+取句柄并采样 2x2 纹理 / 只通过 `[[id(0)]]` 读 c1 常量段 / bindless 句柄表 / 顶点阶段
+参数缓冲区 / 从 guest pool 解块上传的 2x2 纹理）加一条 sampler 状态路径，
+全部通过才 rc=0。
 M3.76 的 run 40997940031 证明了第一条；run 41008588834 证明当时的三条；
 M3.82 的 run 41018975699 以 `BOTW_SELFTEST rc=0` 通过；M3.83 的 run
 41034005513（ios job 123990428590）当时五条全过。M3.84 的 run 41037369546
@@ -359,8 +370,21 @@ M3.85 的 run 41042618062（portable job 124018857722、ios job 124019022555）�
 第一次 `3d8ba8f` 的 run 41040694114 在 iOS 上以 `rc=16392` 失败（中心像素全
 0）：自检把单个 c1 成员声明在 `[[id(2)]]`，而 Metal 参数缓冲区按成员声明顺序
 紧凑排布，运行时按 `id*8` 写到了偏移 16。`ddde8f8` 改成 `[[id(0)]]` 后通过。
-真实 BOTW shader 的 id 0..41 连续，所以真实 c1（id=2）不受影响；带空洞的布局
-仍需要把 packed slot 写进 blob（见 `docs/ROADMAP.md` 的 M3.85 段）。
+M3.86 已把声明顺序写进 blob 的 `packed` 字段，因此带空洞的真实布局也按紧凑
+参数缓冲区排布；M3.87 接上顶点阶段参数缓冲区，M3.88 补 block-linear 尺寸/解块，
+M3.89 把访存池里的纹理接进采样路径。细节与自检编号见 `docs/ROADMAP.md`。
+
+M3.86–M3.89 的 run `41045568006`（packed slot 与 bindless）、`41046781000`
+（顶点阶段参数缓冲区）、`41047317230`（block-linear 布局与解块）和 `41051685313`
+（从 guest 池上传纹理；portable job `124049028971`、ios job `124049107710`）
+都以 `BOTW_SELFTEST rc=0` 通过。第九条 draw 的日志：
+
+```
+[nvn] texture upload: pool=0x5400 offset=8192 levels=1 staging=16 bytes
+[nvn] texture upload encoded: 1 level(s)
+[selftest] guest texture: 1 level(s) deswizzled from the pool and sampled back
+```
+
 
 第五条在模拟器里走的是**直连纹理/采样器绑定**：模拟器的
 `MTLTexture.gpuResourceID` 是 0，参数缓冲区的纹理条目在那里没有意义
@@ -373,7 +397,8 @@ M3.85 的 run 41042618062（portable job 124018857722、ios job 124019022555）�
 **阶段 C：纹理正确**
 
 - `nvnTextureBuilder*` 的字段偏移验证
-- 平铺（tiled/swizzled）布局 → Metal 的 linear 或自定义 `MTLTexture` 视图
+- ✅ 平铺：M3.88 的 Tegra X1 block-linear 尺寸 + 解块，M3.89 接到首次采样上传；
+  仍缺 LINEAR 存储和分层/立方体纹理的完整复制
 - BCn（BC1/BC3/BC4/BC5）在 Apple GPU 上没有对应格式，必须**离线转码**
   成 ASTC/ETC2，或者运行时用 compute 解压。这是个体力活，不是难点。
 
@@ -385,7 +410,7 @@ M3.85 的 run 41042618062（portable job 124018857722、ios job 124019022555）�
   `MTLSamplerState`；M3.83 完成 sampler pool、`BindSeparateSampler(s)` 与
   参数缓冲区/直连绑定两条路径。M3.84 已把真实 shader 的 `[[id(k)]]` 顺序
   写成 `gen_blobs.py` 侧车并在 `prog_set_shaders()` 里应用；M3.85 接上
-  c1 常量段；bindless、顶点阶段的参数缓冲区仍未接
+  c1 常量段；M3.86 接上 packed slot 与 bindless；M3.87 接上顶点阶段参数缓冲区
 - `nvnCommandBufferBarrier`、fence/sync、events
 
 ---
@@ -399,10 +424,10 @@ M3.85 的 run 41042618062（portable job 124018857722、ios job 124019022555）�
 |---|---|
 | 描述来源 | builder setter 的记录值；**不读 guest builder 内存**，所以没有字段偏移风险 |
 | 像素归属 | 宿主所有，`MTLStorageModePrivate`，**不与 guest 内存 alias** |
-| 能干的事 | 当 render target（本轮 `setRenderTargets` 就是这么用的） |
-| 干不了的事 | 采样 guest 写进内存的像素；本轮的上传是**自检里的宿主 blit**（`upload_rgba8`），没有从 guest pool 读像素的路径 |
+| 能干的事 | render target；第一次采样时从 guest pool 做一次性 block-linear 解块 + blit 上传 |
+| 上传粒度 | 逐 mip、逐层；所有层都成功才允许采样，否则丢 draw，不读半张纹理 |
 | 格式 | 157 项表（见 `nvn_texture.c`），exact / substitute 分开标记，替代项返回 `lossy=1` |
-| 未支持 | texture view（initialize 的 view 参数）、tiled/swizzled 布局、BCn 解码 |
+| 未支持 | texture view、LINEAR 存储上传、分层/立方体 MTLTexture 类型、BCn 解码、guest 后续更新同步 |
 
 所以别把“`nvnTextureInitialize` 返回 1”理解成“纹理能用了”。它只证明
 **描述符合法、Metal 分配成功**。
@@ -463,7 +488,7 @@ constexpr int kEnumsVerified = 0;
 
 ---
 
-## 10. 剩余 461 个入口点的优先级
+## 10. 剩余 382 个入口点的优先级
 
 不要按字母序做。按“挡住第一个 draw call 的”排序：
 
@@ -472,7 +497,7 @@ constexpr int kEnumsVerified = 0;
 | P0 | ~~`nvnCommandBufferSetRenderTargets`~~ | ✅ 本轮已实现；只剩 MRT / 深度 / view |
 | P0 | ~~`nvnCommandBufferBindProgram` / `nvnProgramInitialize`~~ | ✅ 本轮已实现（管线建到 `nvngfx_shader_to_msl` 为止） |
 | P0 | ~~`nvnCommandBufferBindVertexAttribState`~~ | ✅ 本轮已实现（含 `nvnVertexAttribState*` / `nvnVertexStreamState*` 与 `BindVertexStreamState`） |
-| P0 | 真实 shader 的第一次 draw | UBO、texture、sampler 三类 argument buffer 条目都已跑过；`[[id(k)]]` 侧车映射已接（M3.84）；c1 已接（M3.85）；仍缺 bindless、顶点参数缓冲区，以及把标题 shader 真正翻成 MSL 的离线链路 |
+| P0 | 真实 shader 的第一次 draw | UBO/texture/sampler、`[[id(k)]]` 侧车、c1、packed slot、bindless、顶点参数缓冲区和 guest 纹理上传都已接上；仍缺把标题 shader 真正翻成 MSL 的离线链路，以及分层纹理/BCn 等格式缺口 |
 | P1 | `nvnTextureBuilder*` 剩余 29 个 | 已做 14 个；剩余主要是 getter 与 pool/offset 细节 |
 | P1 | ~~`nvnSamplerBuilder*` + `nvnSampler*` + sampler pool~~ | ✅ M3.82/M3.83：38 个 sampler 入口、8 个 pool/bind 入口，能建 `MTLSamplerState` 并从 pool 解析句柄；`SamplerBuilderGetDevice` 无已知形状、`SamplerGetDebugID` 的返回值语义未定 |
 | P1 | `NVNindexType` 枚举值核对 | nxnative 的 `nvn.h` 给出 0=u8 / 1=u16 / 2=u32；后端只接 1/2，u8 未知值不画，且该头文件是 reimplementation 而非 Nintendo SDK |
@@ -493,11 +518,11 @@ constexpr int kEnumsVerified = 0;
 |---|---|---|
 | 渲染目标绑定 | 只挂 `color[0]`，深度/view 只记录 | MRT 与深度测试不可用 |
 | 着色器翻译 | 只留了接口，没有实现 | 客体的 draw 全部停在 `noPipeline` |
-| 纹理创建 | 建 host `MTLTexture`，不与 guest alias | 当目标可用；采样 guest 像素仍全黑 |
-| draw 执行 | 有 pipeline 就真的编码 draw；没有就丢弃 | 客体仍是 0 条；自检六条 draw 加 sampler 状态检查由 CI 执行 |
+| 纹理创建 | 建 host `MTLTexture`，首次采样时从 guest pool 一次性解块/上传 | 基础 2D block-linear 纹理可采样；分层、LINEAR、BCn 与后续更新仍不完整 |
+| draw 执行 | 有 pipeline 就真的编码 draw；没有就丢弃 | 客体仍是 0 条；自检九条 draw 加 sampler 状态由 CI 执行 |
 | 顶点输入 | attrib/stream 已接，缓冲从 pool 零拷贝绑到 `MTLBuffer` | 自检的第二条 draw 就是这条路；客体尚未跑到 |
 | 浮点参数 | `nvngfx_args.f[8]` 已扩展，float 在低 32 位 | 本仓库外 guest 调用端仍需实现 s/d 寄存器桥 |
-| 采样器资源 | builder/object、sampler pool 与 `MTLSamplerState` 已建，句柄可解析 | 真实 shader 的 `[[id(k)]]` 侧车已接（M3.84）；c1 已接（M3.85）；bindless 仍未解 |
+| 采样器资源 | builder/object、sampler pool 与 `MTLSamplerState` 已建，句柄可解析 | `[[id(k)]]`、c1、packed slot、bindless 与顶点参数缓冲区已接；真实标题 shader 仍缺离线翻译链 |
 | 同步/fence | 未实现 | 长时间跑可能撕裂 |
 | compute | 未实现 | 后处理不可用 |
 | 多线程 | 单队列 | 与真机行为有差异 |
@@ -529,4 +554,4 @@ Swift 侧同理：`Renderer.swift` / `GameView.swift` 只做了括号与结构�
 | `[nvn] nvnCommandBufferDraw.pipeline: no translator...` | 正常，这条就是当前的墙；自检不经过它 |
 | 屏幕全黑且 `frame` 不动 | `MTKView.delegate` 是 weak，Pump 必须被 Coordinator 强引用（已在 `GameView.swift` 修过一次） |
 | `[nvn] UNVERIFIED xxx = 0x...` | 正常，那是诚实闸门在报未验证的枚举 |
-| `[nvn] not implemented: nvnYyy` | 该入口不在 52 个里，按第 10 节排期 |
+| `[nvn] not implemented: nvnYyy` | 该入口不在 131 个里，按第 10 节排期 |

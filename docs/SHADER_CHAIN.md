@@ -304,7 +304,7 @@ packed slot 写进 blob，尚未接（M3.85 的自检暴露了这一点）。
 | `xcrun metal` → `.metallib` | 未做；只能在 macOS/CI 上做，本机没有 |
 | 整作 19,592 个 shader 全量构建 | 未做；只验证了 1 个 pack 的 5,102 个 key 中的 2 个 |
 | 编译期校验（MSL 语法） | 未做；Windows 没有 Metal 前端，MSL 只在 CI 的 macOS 上才能编 |
-| 真机 / 模拟器上跑真实 shader | 未做。自检用的仍是内置 MSL（六条 draw：`[[vertex_id]]`、顶点属性、16 位索引的 `DrawElements`、`BindUniformBuffer` 参数缓冲区、texture pool + sampler pool 采样、只通过 `[[id(0)]]` 读 c1 常量段；另加一条 sampler 状态创建/比较路径） |
+| 真机 / 模拟器上跑真实 shader | 未做。自检用的仍是内置 MSL（九条 draw：`[[vertex_id]]`、顶点属性、16 位索引的 `DrawElements`、`BindUniformBuffer` 参数缓冲区、texture pool + sampler pool 采样、只通过 `[[id(0)]]` 读 c1 常量段、bindless 句柄表、顶点阶段参数缓冲区、从 guest 池解块上传的 2x2 纹理；另加一条 sampler 状态创建/比较路径） |
 | compute / geometry shader | 未做（`extract` 目前跳过 cs） |
 | 运行时按 key 取 MSL | **已接线**（M3.78，见 §5.1） |
 | 顶点描述符 | **已接**（M3.79） |
@@ -315,5 +315,7 @@ packed slot 写进 blob，尚未接（M3.85 的自检暴露了这一点）。
 macOS 上补；运行时按 key 取 MSL 已接线（M3.78），顶点与索引都已接（M3.79 / M3.80），
 UBO 已进 argument buffer（M3.81），sampler 状态对象已能创建（M3.82），
 texture/sampler 条目也已接（M3.83，模拟器走直连绑定），真实 shader 的
-`[[id(k)]]` 布局侧车已接（M3.84），c1 已接（M3.85）；bindless 与顶点参数
-缓冲区仍未解，所以还没有任何一条真实 shader 在 Metal 里执行过。**
+`[[id(k)]]` 布局侧车已接（M3.84），c1 已接（M3.85）；bindless 与顶点参数缓冲区已接（M3.86 / M3.87）；
+block-linear 解块与 guest 池纹理上传已接（M3.88 / M3.89）。**真实 shader 仍然
+没有在 Metal 里执行过**：缺的是把离线 MSL 打进 App 并用标题自己的 key 命中的
+那一步，以及 `xcrun metal` 的编译期校验。
