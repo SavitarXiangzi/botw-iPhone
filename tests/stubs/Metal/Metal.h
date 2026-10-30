@@ -245,6 +245,9 @@ destinationBytesPerImage:(NSUInteger)bpi;
 - (void)setVertexBuffer:(id<MTLBuffer>)buffer
                  offset:(NSUInteger)offset
                 atIndex:(NSUInteger)index;
+- (void)setFragmentBuffer:(id<MTLBuffer>)buffer
+                   offset:(NSUInteger)offset
+                  atIndex:(NSUInteger)index;
 @end
 
 @class MTLRenderPassDescriptor;
@@ -281,6 +284,8 @@ destinationBytesPerImage:(NSUInteger)bpi;
 
 @protocol MTLBuffer
 - (void*)contents;
+/* Metal 3 / iOS 16+: the GPU address an argument buffer entry stores. */
+@property (readonly) unsigned long long gpuAddress;
 @end
 
 @interface MTLTextureDescriptor : NSObject

@@ -2473,3 +2473,89 @@ NVN host-HLE 64/513 (12.5%)   P0 blockers open: 0/6
 | `DrawElementsInstanced` / `DrawArraysInstanced` | 未做（原型已在 `signatures.json` 里） |
 | 真实 shader 的 draw | 仍然是 0 条；三条自检都用内置 MSL |
 | 真机 | **没有真机运行记录** |
+
+## M3.81 参数缓冲区接通：BindUniformBuffer -> `[[buffer(0)]]`（本轮）
+
+spirv-cross 的 MSL 不读 `setFragmentBytes`，它读一个**参数缓冲区**：
+
+```
+fragment main0_out nvngfx_main_fs(main0_in in [[stage_in]],
+                                  constant spvDescriptorSetBuffer0& spvDescriptorSet0 [[buffer(0)]])
+struct spvDescriptorSetBuffer0 { constant _16* fp_c3 [[id(0)]]; ... };
+```
+
+本轮把这条通路接上，覆盖 **64 -> 66 / 513**，并用**第四条自检 draw** 证明。
+
+### 客体的入口
+
+| 入口 | 行为 |
+|---|---|
+| `nvnCommandBufferBindUniformBuffer(cb, stage, index, address, size)` | stage 1（像素）记录 address / size；其它 stage 只记一次日志（原因见下） |
+| `nvnCommandBufferBindUniformBuffers(cb, stage, first, n, ranges)` | 逐个调用上面的 |
+
+`NVNshaderStage` 的数值来自 nxnative 的观察（0 vertex / 1 pixel / 2 geometry /
+5 compute），不是 Nintendo 头文件。
+
+### 为什么只有像素阶段
+
+参数缓冲区绑在 **buffer(0)**，而顶点流的 `setVertexBuffer:atIndex:` 0 号槽
+正是顶点数据；spirv-cross 的顶点着色器同样把参数缓冲区放在 buffer(0)。所以
+真实顶点常量需要一个**索引偏移**约定（顶点流从高槽位开始，或顶点参数缓冲区
+换一个 buffer index）。这个约定没验证之前，顶点阶段的 UBO 只记录并打一条
+`nvnCommandBufferBindUniformBuffer.stage`，不猜位置。
+
+### 编码
+
+参数缓冲区是一段 16 项的 `MTLBuffer`（`MTLResourceStorageModeShared`），
+每项 8 字节，内容是 **`MTLBuffer.gpuAddress + 池内偏移`** —— 也就是 MSL 里
+`constant _16*` 直接解引用的那个地址。绑定：
+
+```
+[b->enc setFragmentBuffer:abuf offset:0 atIndex:0]
+```
+
+* 每次 `BeginRecording` 丢掉旧的参数缓冲区（上一次提交可能还在飞），
+  绑定变化时也丢掉，下一次 draw 重建。真正跑起来要换成环形分配器。
+* UBO 地址不在任何内存池里 -> 该项留 0（不是留一个错地址），记一条
+  `nvnCommandBufferDraw.uniformBuffer`；参数缓冲区分配不出来 -> **不画**。
+
+### 自检：第四条 draw
+
+| # | 入口 | 验证的东西 | 期望像素 |
+|---|---|---|---|
+| 4 | `BindUniformBuffer` + `[[buffer(0)]]` | **条目编码（8 字节 GPU 地址）、`setFragmentBuffer`、MSL 从 `[[id(0)]]` 读常量** | (0,0,255,255) |
+
+用的 MSL 就是 spirv-cross 的形状：
+
+```
+struct spvDescriptorSetBuffer0 { constant float4* tint [[id(0)]]; };
+fragment float4 nvngfx_main_fs(constant spvDescriptorSetBuffer0& s0 [[buffer(0)]]) {
+    return *s0.tint;
+}
+```
+
+一个蓝色 float4 写在内存池 +1024 处，走客体入口
+`nvnCommandBufferBindUniformBuffer(cb, 1, 0, addr, 16)`。失败码 `8192`。
+
+### 证据（本地）
+
+```
+build_abi_test: all tests passed
+  nvn_vertex_test: ok (packing, 26 formats, layout id)
+  syntax_check_metal: ok
+verify_ios: ok (metal bindings: 66/513)
+NVN host-HLE 66/513 (12.9%)   P0 blockers open: 0/6
+```
+
+模拟器上的第四条 draw 只有 CI 能证明（本机无 Metal），结论看本轮推送后的
+`ios` job。
+
+### 仍然没有的
+
+| 缺口 | 后果 |
+|---|---|
+| 纹理 / sampler 条目 | `[[id(k)]]` 的 texture/sampler 还没填；需要纹理池 + 采样器池给出句柄 |
+| `[[id(k)]]` 与 NVN 槽位的映射 | 已翻译的两份 MSL 里，id 是**按 binding 排序后的连续编号**（cbuf 在前、纹理随后各带一个 sampler）；运行时还没读 sidecar JSON 去建这张表 |
+| 顶点阶段的参数缓冲区 | 与顶点流 0 号槽冲突，索引偏移约定未定 |
+| 真实 shader 的 draw | 仍然是 0 条 |
+| 真机 | **没有真机运行记录** |

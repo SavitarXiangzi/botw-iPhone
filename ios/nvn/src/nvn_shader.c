@@ -68,6 +68,21 @@ static const char* const kVsAttr =
     "    return v;\n"
     "}\n";
 
+/* Variant 2: everything the fragment shader knows comes through the
+ * argument buffer at buffer(0), which is the shape spirv-cross emits for
+ * a real program (`constant spvDescriptorSetBuffer0& spvDescriptorSet0
+ * [[buffer(0)]]`, with `[[id(k)]]` members).  One constant pointer is
+ * enough to prove the entry encoding and the binding. */
+static const char* const kFsUbo =
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "\n"
+    "struct spvDescriptorSetBuffer0 { constant float4* tint [[id(0)]]; };\n"
+    "\n"
+    "fragment float4 nvngfx_main_fs(constant spvDescriptorSetBuffer0& s0 [[buffer(0)]]) {\n"
+    "    return *s0.tint;\n"
+    "}\n";
+
 static const char* const kFsGreen =
     "#include <metal_stdlib>\n"
     "using namespace metal;\n"
@@ -171,6 +186,11 @@ const char* nvngfx_shader_selftest_msl_variant(nvngfx_stage stage, int variant) 
     if (variant == 1) {
         if (stage == NVNGFX_STAGE_VERTEX) return kVsAttr;
         if (stage == NVNGFX_STAGE_FRAGMENT) return kFsGreen;
+        return NULL;
+    }
+    if (variant == 2) {
+        if (stage == NVNGFX_STAGE_VERTEX) return kVs;
+        if (stage == NVNGFX_STAGE_FRAGMENT) return kFsUbo;
         return NULL;
     }
     if (stage == NVNGFX_STAGE_VERTEX) return kVs;

@@ -7,8 +7,8 @@
 `nvn*` 字符串（运行时按名解析，所以名字本身就暴露了完整接口面）。
 
 - 接口总数：**513**
-- Metal 后端已实现：**64**（12.5%）
-- 仍未实现：**449**
+- Metal 后端已实现：**66**（12.9%）
+- 仍未实现：**447**
 
 > 只有出现在 `ios/nvn/implemented_metal.txt` 里、且确实在
 > `ios/nvn/src/nvn_metal.mm` 中定义过的名字才算“已实现”。
@@ -18,7 +18,7 @@
 
 | 域 | 已实现 | 总数 | 进度 |
 |---|---:|---:|---|
-| CommandBuffer | 13 | 144 | `#         ` |
+| CommandBuffer | 15 | 144 | `#         ` |
 | Texture | 1 | 45 | `          ` |
 | TextureBuilder | 14 | 43 | `###       ` |
 | Device | 2 | 27 | `#         ` |
@@ -112,7 +112,7 @@
 - [ ] `nvnColorStateSetDefaults`
 - [ ] `nvnColorStateSetLogicOp`
 
-### CommandBuffer (13/144)
+### CommandBuffer (15/144)
 
 - [ ] `nvnCommandBufferAddCommandMemory`
 - [ ] `nvnCommandBufferAddControlMemory`
@@ -139,8 +139,8 @@
 - [ ] `nvnCommandBufferBindTextures`
 - [ ] `nvnCommandBufferBindTransformFeedbackBuffer`
 - [ ] `nvnCommandBufferBindTransformFeedbackBuffers`
-- [ ] `nvnCommandBufferBindUniformBuffer`
-- [ ] `nvnCommandBufferBindUniformBuffers`
+- [x] `nvnCommandBufferBindUniformBuffer`
+- [x] `nvnCommandBufferBindUniformBuffers`
 - [x] `nvnCommandBufferBindVertexAttribState`
 - [x] `nvnCommandBufferBindVertexBuffer`
 - [x] `nvnCommandBufferBindVertexBuffers`

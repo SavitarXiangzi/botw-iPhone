@@ -199,6 +199,16 @@ struct CmdBuf {
     nvngfx_vattr attrib[NVNGFX_MAX_VERTEX_ATTRIBS] = {};
     unsigned numAttrib = 0;
     nvngfx_vstream stream[NVNGFX_MAX_VERTEX_STREAMS] = {};
+    /* Uniform buffers bound for the pixel stage, as guest addresses.
+     * These are what the argument buffer is built from: a
+     * spirv-cross shader reads its constants through it, not through
+     * setFragmentBytes. */
+    uint64_t ubo[16] = {};
+    uint64_t uboSize[16] = {};
+    /* One MTLBuffer of 16 eight-byte entries, rebuilt whenever the
+     * binding changes and dropped when a new recording starts (the
+     * previous one may still be in flight). */
+    id<MTLBuffer> argbuf = nil;
     /* The last committed buffer.  nvnQueueSubmitCommands is not implemented,
      * so a frame is committed at EndRecording; keeping the handle lets a
      * caller (the self-test) wait for it and keeps the door open for real
@@ -1356,6 +1366,7 @@ void cmdbuf_begin_recording(nvngfx_ctx* ctx, uint64_t* x) {
     b->numColor = 0;
     b->depth = 0;
     b->pendingClear = false;
+    b->argbuf = nil;
 }
 
 /* nvnCommandBufferEndRecording(NVNcommandBuffer*) -> NVNcommandHandle
@@ -1422,6 +1433,98 @@ void cmdbuf_clear_color(nvngfx_ctx* ctx, uint64_t* x) {
     log_once("nvnCommandBufferClearColor.mask", static_cast<unsigned>(b->clearMask));
 }
 
+/* NVNshaderStage, as nxnative observes it: 0 vertex, 1 pixel,
+ * 2 geometry, 5 compute (3 and 4 never appear in this title). */
+
+/* nvnCommandBufferBindUniformBuffer(NVNcommandBuffer*, NVNshaderStage,
+ *                                  int index, NVNbufferAddress, size_t) */
+void cmdbuf_bind_uniform_buffer(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    if (!b) return;
+    const unsigned stage = static_cast<unsigned>(x[1]);
+    const int index = static_cast<int>(x[2]);
+    if (stage != 1) {
+        /* The argument buffer is bound at buffer(0), which is exactly
+         * where vertex stream 0 lives.  Until the vertex stage's
+         * index shift is known, only the pixel stage is wired; the
+         * rest is reported instead of silently misplaced. */
+        log_once("nvnCommandBufferBindUniformBuffer.stage", stage);
+        return;
+    }
+    if (index < 0 || index >= 16) {
+        log_once("nvnCommandBufferBindUniformBuffer.index",
+                 static_cast<unsigned>(index));
+        return;
+    }
+    b->ubo[index] = x[3];
+    b->uboSize[index] = x[4];
+    b->argbuf = nil;    /* contents changed */
+}
+
+/* nvnCommandBufferBindUniformBuffers(NVNcommandBuffer*, NVNshaderStage,
+ *     int first, int count, const NVNbufferRange*) */
+void cmdbuf_bind_uniform_buffers(nvngfx_ctx* ctx, uint64_t* x) {
+    const int n = static_cast<int>(x[3]);
+    const uint64_t* rg = guest_ptr<const uint64_t>(x[4]);
+    if (n < 0 || n > 16 || (n > 0 && !rg)) {
+        log_once("nvnCommandBufferBindUniformBuffers.count",
+                 static_cast<unsigned>(n));
+        return;
+    }
+    for (int k = 0; k < n; ++k) {
+        uint64_t y[8] = {};
+        y[0] = x[0];
+        y[1] = x[1];
+        y[2] = static_cast<uint64_t>(static_cast<int>(x[2]) + k);
+        y[3] = rg[2 * k];
+        y[4] = rg[2 * k + 1];
+        cmdbuf_bind_uniform_buffer(ctx, y);
+    }
+}
+
+/* Builds the pixel stage's argument buffer for this recording.  Entry i
+ * is the GPU address of uniform buffer i -- what `constant _16* fp_cN
+ * [[id(i)]]` dereferences.  Returns nil when nothing is bound. */
+id<MTLBuffer> argument_buffer(Ctx* c, CmdBuf* b) {
+    if (b->argbuf) return b->argbuf;
+    bool any = false;
+    for (unsigned i = 0; i < 16; ++i) any = any || b->ubo[i] != 0;
+    if (!any) return nil;
+    b->argbuf = [c->device newBufferWithLength:16 * sizeof(uint64_t)
+                                       options:MTLResourceStorageModeShared];
+    if (!b->argbuf) {
+        log_once("nvnCommandBufferDraw.argumentBuffer", 1);
+        return nil;
+    }
+    uint64_t* e = static_cast<uint64_t*>([b->argbuf contents]);
+    std::memset(e, 0, 16 * sizeof(uint64_t));
+    for (unsigned i = 0; i < 16; ++i) {
+        if (!b->ubo[i]) continue;
+        id<MTLBuffer> src = nil;
+        size_t off = 0;
+        const size_t len = static_cast<size_t>(b->uboSize[i] ? b->uboSize[i] : 1);
+        if (!pool_span(b->ubo[i], len, &src, &off)) {
+            log_once("nvnCommandBufferDraw.uniformBuffer", i);
+            continue;
+        }
+        e[i] = static_cast<uint64_t>([src gpuAddress]) + off;
+    }
+    return b->argbuf;
+}
+
+/* Binds the argument buffer before a draw.  True when there is nothing
+ * to bind or the binding succeeded; false means the draw must not be
+ * encoded, because a shader that reads constants would read zeros. */
+bool bind_arguments(Ctx* c, CmdBuf* b) {
+    bool any = false;
+    for (unsigned i = 0; i < 16; ++i) any = any || b->ubo[i] != 0;
+    if (!any) return true;
+    id<MTLBuffer> ab = argument_buffer(c, b);
+    if (!ab) return false;
+    [b->enc setFragmentBuffer:ab offset:0 atIndex:0];
+    return true;
+}
+
 /* nvnCommandBufferDrawArrays(NVNcommandBuffer*, NVNdrawPrimitive, int first, int count) */
 void cmdbuf_draw_arrays(nvngfx_ctx* ctx, uint64_t* x) {
     Ctx* c = ctx_of(ctx);
@@ -1440,6 +1543,7 @@ void cmdbuf_draw_arrays(nvngfx_ctx* ctx, uint64_t* x) {
     const unsigned first = static_cast<unsigned>(x[2]);
     const unsigned count = static_cast<unsigned>(x[3]);
     [b->enc setRenderPipelineState:b->pso];
+    if (!bind_arguments(c, b)) return;
     /* No attribute state bound (the self-test's [[vertex_id]] program) means
      * no vertex descriptor and nothing to bind. */
     if (b->numAttrib > 0 && !bind_vertex_streams(b)) return;
@@ -1482,6 +1586,7 @@ void cmdbuf_draw_elements(nvngfx_ctx* ctx, uint64_t* x) {
         return;
     }
     [b->enc setRenderPipelineState:b->pso];
+    if (!bind_arguments(c, b)) return;
     if (b->numAttrib > 0 && !bind_vertex_streams(b)) return;
     [b->enc drawIndexedPrimitives:to_metal_primitive(primitive)
                        indexCount:count
@@ -1644,6 +1749,8 @@ const Binding kBindings[] = {
     BIND("nvnCommandBufferBindVertexBuffers", cmdbuf_bind_vertex_buffers),
     BIND("nvnCommandBufferBindVertexAttribState", cmdbuf_bind_vertex_attrib_state),
     BIND("nvnCommandBufferBindVertexStreamState", cmdbuf_bind_vertex_stream_state),
+    BIND("nvnCommandBufferBindUniformBuffer", cmdbuf_bind_uniform_buffer),
+    BIND("nvnCommandBufferBindUniformBuffers", cmdbuf_bind_uniform_buffers),
     BIND("nvnVertexAttribStateSetDefaults", vattrib_set_defaults),
     BIND("nvnVertexAttribStateSetFormat", vattrib_set_format),
     BIND("nvnVertexAttribStateSetStreamIndex", vattrib_set_stream),
@@ -2114,6 +2221,98 @@ extern "C" int nvngfx_metal_selftest(void) {
             std::fprintf(stderr,
                          "[selftest] draw 3 (DrawElements, 16-bit indices) produced "
                          "the expected pixel\n");
+        }
+
+        {
+            /* --- Fourth draw: the argument buffer ------------------
+             * A spirv-cross shader reads every constant and texture
+             * through `constant spvDescriptorSetBuffer0& [[buffer(0)]]`,
+             * whose entries are `constant _16* fp_cN [[id(k)]]`.  This
+             * draw proves the entry encoding -- an eight-byte GPU
+             * address -- and the binding, driven by the guest's own
+             * nvnCommandBufferBindUniformBuffer. */
+            const uint64_t kProg4 = 0x5900;
+            const uint64_t kCb4 = 0x5A00;
+            const uintptr_t poolBase4 =
+                (reinterpret_cast<uintptr_t>(poolRaw) + 16383u) &
+                ~static_cast<uintptr_t>(16383u);
+            const uintptr_t blueAt = poolBase4 + 1024;
+            {
+                float* f = reinterpret_cast<float*>(blueAt);
+                f[0] = 0.0f; f[1] = 0.0f; f[2] = 1.0f; f[3] = 1.0f;
+            }
+            {
+                struct { uint64_t data; uint64_t control; } sd4[2];
+                sd4[0].data = reinterpret_cast<uint64_t>(const_cast<char*>(
+                    nvngfx_shader_selftest_msl_variant(NVNGFX_STAGE_VERTEX, 2)));
+                sd4[0].control = 0;
+                sd4[1].data = reinterpret_cast<uint64_t>(const_cast<char*>(
+                    nvngfx_shader_selftest_msl_variant(NVNGFX_STAGE_FRAGMENT, 2)));
+                sd4[1].control = 0;
+                x[0] = kProg4; x[1] = 0;
+                prog_initialize(ctx, x);
+                x[0] = kProg4; x[1] = 2; x[2] = reinterpret_cast<uint64_t>(&sd4[0]);
+                prog_set_shaders(ctx, x);
+                if (x[0] != 1) {
+                    std::fprintf(stderr, "[selftest] program 4: SetShaders failed\n");
+                    rc = 8192;
+                    goto done;
+                }
+            }
+            {
+                const uint64_t target = kTex;
+                const float clear4[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+                x[0] = kCb4;
+                cmdbuf_begin_recording(ctx, x);
+                x[0] = kCb4; x[1] = 1; x[2] = reinterpret_cast<uint64_t>(&target);
+                x[3] = 0; x[4] = 0; x[5] = 0;
+                cmdbuf_set_render_targets(ctx, x);
+                x[0] = kCb4; x[1] = 0; x[2] = reinterpret_cast<uint64_t>(clear4);
+                x[3] = 0xF;
+                cmdbuf_clear_color(ctx, x);
+                /* pixel stage (1), slot 0, 16 bytes of constants */
+                x[0] = kCb4; x[1] = 1; x[2] = 0;
+                x[3] = static_cast<uint64_t>(blueAt); x[4] = 16;
+                cmdbuf_bind_uniform_buffer(ctx, x);
+                x[0] = kCb4; x[1] = kProg4; x[2] = 0;
+                cmdbuf_bind_program(ctx, x);
+                x[0] = kCb4; x[1] = 0; x[2] = 0; x[3] = 3;
+                cmdbuf_draw_arrays(ctx, x);
+                x[0] = kCb4;
+                cmdbuf_end_recording(ctx, x);
+            }
+            CmdBuf* b4 = find<CmdBuf>(kCb4);
+            if (!b4 || !b4->last) {
+                std::fprintf(stderr, "[selftest] draw 4 committed nothing\n");
+                rc = 8192;
+                goto done;
+            }
+            [b4->last waitUntilCompleted];
+            if (b4->last.status == MTLCommandBufferStatusError) {
+                std::fprintf(stderr, "[selftest] draw 4 command buffer error: %s\n",
+                             b4->last.error
+                                 ? [[b4->last.error localizedDescription] UTF8String]
+                                 : "(no description)");
+                rc = 8192;
+                goto done;
+            }
+            {
+                unsigned char px[4] = {0, 0, 0, 0};
+                const int want[4] = {0, 0, 255, 255};
+                if (!read_center_pixel(dev, c->queue, t->mtl, kSide, px) ||
+                    !pixels_near(px, want, 2)) {
+                    std::fprintf(stderr,
+                                 "[selftest] draw 4 centre pixel is (%u,%u,%u,%u), "
+                                 "want (%d,%d,%d,%d); draws asked %u, encoded %u\n",
+                                 px[0], px[1], px[2], px[3], want[0], want[1],
+                                 want[2], want[3], b4->draws, b4->encoded);
+                    rc = 8192;
+                    goto done;
+                }
+                std::fprintf(stderr,
+                             "[selftest] draw 4 (argument buffer) produced the "
+                             "expected pixel\n");
+            }
         }
 
     done:

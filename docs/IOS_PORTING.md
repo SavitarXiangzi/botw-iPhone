@@ -218,7 +218,7 @@ iOS 是统一内存，guest 堆本来就是宿主可读的，所以
 |---|---:|---|
 | Window | 6/12 | 创建 CAMetalLayer、acquire、present interval、active textures |
 | WindowBuilder | 5/12 | native window、textures、interval、active count |
-| CommandBuffer | 11/144 | begin/end recording(+commit)、drawArrays、drawElements（16/32 位索引）、viewport、scissor、clearColor、setRenderTargets、BindProgram、BindVertexBuffer(s) |
+| CommandBuffer | 13/144 | begin/end recording(+commit)、drawArrays、drawElements（16/32 位索引）、bindUniformBuffer(s)（像素阶段 -> 参数缓冲区）、viewport、scissor、clearColor、setRenderTargets、BindProgram、BindVertexBuffer(s) |
 | MemoryPool | 3/10 | builder storage/flags、initialize(零拷贝)、getSize |
 | MemoryPoolBuilder | 3/8 | defaults、storage、flags |
 | Device | 2/27 | initialize（建 queue）、getProcAddress |

@@ -1,5 +1,7 @@
 nvnCommandBufferBeginRecording
 nvnCommandBufferBindProgram
+nvnCommandBufferBindUniformBuffer
+nvnCommandBufferBindUniformBuffers
 nvnCommandBufferBindVertexAttribState
 nvnCommandBufferBindVertexBuffer
 nvnCommandBufferBindVertexBuffers

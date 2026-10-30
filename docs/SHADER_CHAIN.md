@@ -153,7 +153,10 @@ C:\Python314\python.exe scripts\shader_chain\gen_blobs.py --msl build\shader-cha
    `BindVertexStreamState` 把客体的 4 / 8 字节记录译成
    `MTLVertexDescriptor`，顶点地址按 pool 找到对应 `MTLBuffer`。
 2. 资源绑定：MSL 用的是 `--msl-argument-buffers`，所有常量/纹理走
-   `buffer(0)` 的 `spvDescriptorSetBuffer0`，槽位约定见 §6。**这就是下一块墙**。
+   `buffer(0)` 的 `spvDescriptorSetBuffer0`，槽位约定见 §6。
+   **常量已经接上**（M3.81）：`nvnCommandBufferBindUniformBuffer` 记录地址，
+   draw 前填一个 16 项的参数缓冲区，每项是 `MTLBuffer.gpuAddress + 偏移`。
+   纹理 / sampler 条目还没填。
 3. 几何路径：`DrawArrays` 与 `DrawElements`（16/32 位索引）都已编码，
    顶点与索引都按 pool 零拷贝绑定（M3.79 / M3.80）。也就是说**画什么形状
    已经不缺了**，缺的是第 2 条：常量与纹理还没进 argument buffer，
