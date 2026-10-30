@@ -1478,9 +1478,13 @@ struct Program {
     };
     ArgEntry args[8];
     unsigned numArgs = 0;
-    /* Created from the fragment function.  nil when the shader does not
-     * take an argument buffer at buffer(0), e.g. the constant-colour
-     * self-test programs. */
+    /* Kept so the argument encoder can be made lazily, only when this
+     * program is actually asked to bind resources.  Asking Metal for an
+     * encoder on a function that has no [[buffer(0)]] argument buffer can
+     * terminate the process; constant-colour self-test programs do exactly
+     * that on their first draw. */
+    id<MTLFunction> fsFn = nil;
+    bool hasArgBuffer = false;
     id<MTLArgumentEncoder> argEnc = nil;
     NSUInteger argLen = 0;
 };
@@ -1696,14 +1700,13 @@ id<MTLRenderPipelineState> program_pipeline(Ctx* c, Program* p, MTLPixelFormat f
             return nil;
         }
 
-        /* The fragment function knows where each [[id(k)]] sits in the
-         * argument buffer.  One encoder per program is enough: it is a
-         * function-level object, not a pipeline-state one, and every PSO
-         * slot for this program encodes the same layout. */
-        if (!p->argEnc) {
-            p->argEnc = [ffn newArgumentEncoderWithBufferIndex:0];
-            p->argLen = p->argEnc ? [p->argEnc encodedLength] : 0;
-        }
+        /* Remember the function, but do not ask Metal for an argument
+         * encoder yet.  Not every fragment function declares one: the
+         * constant-colour programs take no arguments at all, and calling
+         * newArgumentEncoderWithBufferIndex: on those is not a harmless
+         * nil return on every simulator runtime. */
+        p->fsFn = ffn;
+        p->hasArgBuffer = std::strstr(fs, "[[buffer(0)]]") != nullptr;
 
         MTLRenderPipelineDescriptor* pd = [[MTLRenderPipelineDescriptor alloc] init];
         pd.vertexFunction = vfn;
@@ -2260,6 +2263,10 @@ id<MTLBuffer> argument_buffer(Ctx* c, CmdBuf* b) {
     if (b->argbuf) return b->argbuf;
     Program* p = find<Program>(b->program);
     if (!has_arguments(b)) return nil;
+    if (p && !p->argEnc && p->hasArgBuffer && p->fsFn) {
+        p->argEnc = [p->fsFn newArgumentEncoderWithBufferIndex:0];
+        p->argLen = p->argEnc ? [p->argEnc encodedLength] : 0;
+    }
     if (!p || !p->argEnc || p->argLen == 0) {
         log_once("nvnCommandBufferDraw.argumentLayout", p ? 1u : 0u);
         return nil;
