@@ -693,6 +693,10 @@ struct Program {
     unsigned numStages = 0;
     uint64_t code[3] = {0, 0, 0};
     uint64_t control[3] = {0, 0, 0};
+    /* nvngfx_shader_key_from_guest() of each stage, or "" when the control
+     * section did not describe a code area.  Computed at SetShaders, before
+     * the guest is allowed to free the control section (Unity does). */
+    char key[3][17] = {};
     /* Metal bakes the colour format into a render pipeline, so the cache is
      * keyed by it as well as by the program address (the table key). */
     id<MTLRenderPipelineState> pso = nil;
@@ -710,12 +714,28 @@ id<MTLRenderPipelineState> program_pipeline(Ctx* c, Program* p, MTLPixelFormat f
 
     const char* whyVs = nullptr;
     const char* whyFs = nullptr;
-    const char* vs = nvngfx_shader_to_msl(
-        reinterpret_cast<const void*>(p->code[NVNGFX_STAGE_VERTEX]), 0,
-        NVNGFX_STAGE_VERTEX, &whyVs);
-    const char* fs = nvngfx_shader_to_msl(
-        reinterpret_cast<const void*>(p->code[NVNGFX_STAGE_FRAGMENT]), 0,
-        NVNGFX_STAGE_FRAGMENT, &whyFs);
+    /* An offline blob is the normal source: the chain translates on a
+     * computer, and the key computed at SetShaders finds the result here.
+     * nvngfx_shader_to_msl() stays as the fallback for a host that provides
+     * MSL directly (the self-test's passthrough). */
+    const char* vs = p->key[NVNGFX_STAGE_VERTEX][0]
+                          ? nvngfx_shader_lookup(p->key[NVNGFX_STAGE_VERTEX],
+                                                 NVNGFX_STAGE_VERTEX, &whyVs)
+                          : nullptr;
+    if (!vs) {
+        vs = nvngfx_shader_to_msl(
+            reinterpret_cast<const void*>(p->code[NVNGFX_STAGE_VERTEX]), 0,
+            NVNGFX_STAGE_VERTEX, &whyVs);
+    }
+    const char* fs = p->key[NVNGFX_STAGE_FRAGMENT][0]
+                          ? nvngfx_shader_lookup(p->key[NVNGFX_STAGE_FRAGMENT],
+                                                 NVNGFX_STAGE_FRAGMENT, &whyFs)
+                          : nullptr;
+    if (!fs) {
+        fs = nvngfx_shader_to_msl(
+            reinterpret_cast<const void*>(p->code[NVNGFX_STAGE_FRAGMENT]), 0,
+            NVNGFX_STAGE_FRAGMENT, &whyFs);
+    }
     if (!vs || !fs) {
         if (why) *why = !vs ? (whyVs ? whyVs : "no vertex shader")
                             : (whyFs ? whyFs : "no fragment shader");
@@ -820,6 +840,16 @@ void prog_set_shaders(nvngfx_ctx*, uint64_t* x) {
     for (int i = 0; i < 3; ++i) {
         p->code[i] = i < n ? sd[2 * i] : 0;
         p->control[i] = i < n ? sd[2 * i + 1] : 0;
+        p->key[i][0] = 0;
+        if (p->code[i] && p->control[i]) {
+            if (nvngfx_shader_key_from_guest(
+                    reinterpret_cast<const void*>(p->control[i]),
+                    reinterpret_cast<const void*>(p->code[i]), p->key[i]) != 0) {
+                /* Once per process, and not a failure: a program whose control
+                 * section is not readable yet is legal while it is being set. */
+                log_once("nvnProgramSetShaders.noKey", static_cast<unsigned>(i));
+            }
+        }
     }
     /* New shaders invalidate the cached pipeline. */
     p->pso = nil;
@@ -1400,6 +1430,10 @@ extern "C" const nvngfx_backend* nvngfx_metal_backend(void) {
 
 /* Lifetime is owned by the app: create once, install, destroy at exit. */
 extern "C" nvngfx_ctx* nvngfx_metal_create(void) {
+    /* The offline chain's output, if this build has any: the table lives in
+     * nvn_shader_blobs.gen.c and is empty in the committed tree.  Installing
+     * it here means a program's key finds its MSL without any further setup. */
+    nvngfx_shader_install_offline_blobs();
     return reinterpret_cast<nvngfx_ctx*>(new Ctx());
 }
 

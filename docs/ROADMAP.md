@@ -2200,5 +2200,66 @@ translate: 2/2 shader(s)
 `docs/SHADER_CHAIN.md`、`nvngfx_shader_lookup()` / `nvngfx_shader_set_blobs()`。
 
 仍然没有的：`xcrun metal` → `.metallib`（只有 macOS，CI 上做）；
-运行时按 key 取 MSL 的接线（要在 `nvnProgramSetShaders` 里算 key）；
+运行时按 key 取 MSL 的接线（M3.78 已补上，见下）；
 顶点描述符（`BindVertexAttribState`）；**没有真机验证**，自检用的仍是内置 MSL。
+
+## M3.78 真实 shader 的 key 在运行时算得出来，而且对得上（本轮）
+
+M3.77 结束时，链的两端各自能跑：离线能产出 `<key>_<stage>.metal`，运行时有个
+能按 key 查的表——**但没有任何东西在运行时算 key**。本轮把这根线接上，并且
+用真实数据证明接对了。
+
+### 做了什么
+
+| 位置 | 内容 |
+|---|---|
+| `ios/nvn/src/nvn_shader_key.c` | 纯 C SHA-256 + `nvngfx_shader_key_from_guest(control, code, out)`；规则与 nxnative `hle_nvn.c` 的 `keys_hash` 逐字一致 |
+| `nvn_metal.mm` · `Program::key[3][17]` | `nvnProgramSetShaders` 当场算 key（客体允许在这次调用之后释放 control 段） |
+| `nvn_metal.mm` · `program_pipeline()` | 先按 key 查离线表，查不到才回落到 `nvngfx_shader_to_msl()`（自检的 passthrough 走后者） |
+| `nvn_metal.mm` · `nvngfx_metal_create()` | 装 `nvngfx_shader_install_offline_blobs()` |
+| `ios/nvn/src/nvn_shader_blobs.gen.c` | 入库版本是**空表**；`gen_blobs.py` 才会填真东西 |
+| `scripts/shader_chain/gen_blobs.py` | `<key>_<stage>.metal` 目录 → C 表（分块转义） |
+| `scripts/shader_chain/keycheck.cpp` | 用**运行时那个 C 函数**重算真实 shader 的 key，和文件名逐个对账 |
+
+### 证据
+
+```
+build_abi_test: all tests passed
+  nvn_shader_test: ok (seam, blob table, SHA-256, shader key)
+keycheck build\shader-chain\work\code
+  keycheck: 5102 shader(s), 5102 match, 0 bad, 0 skipped
+gen_blobs --msl build\shader-chain\msl  -> 2 shader(s), 378.8 KiB
+  blobs installed: 2
+  vs=found (202798 bytes)  ps=found (175562 bytes)
+  wrong stage must miss: miss(ok)
+```
+
+SHA-256 钉了两个标准向量（空串、`abc`）；key 规则钉了两个 Python 独立算出的
+值（`2c8239fb360e36c1` / `a4a67a417698a5e1`）。
+
+### 踩到的坑（会静默毁掉整条链）
+
+key 哈希的 code area **含**开头 0x30 字节的头（`78 56 34 12 ...`），而交给
+翻译器的输入是从 SPH（+0x30）开始的。第一版 keycheck 拿已经去掉头的 `.bin`
+去算，**5102 个全部对不上**。运行时不会报任何错：`nvngfx_shader_lookup()`
+只是返回 NULL，然后静默回落到"没有翻译器"。所以：
+
+* `nx_shader.py extract --keep-full-code` 额外写 `<key>_<stage>.code`（带头）；
+* `verify_ios.py` 新增不变量：入库的 `nvn_shader_blobs.gen.c` 必须是空表，
+  超过 4 KiB 或出现 `kBlobs` 数组就 FAIL（防止有人把本体数据提交上来）。
+
+另外把 `nx_shader.py` 的 key 规则也统一成 `ctl_len()`（`0x760 <= u32@0x20 < 0x880`
+时取自身长度，否则 0x880），与 C 和 nxnative 三处同一个算法；BOTW 的 control 段
+都是 0x7D1 字节，所以这一改不影响已经产出的文件名。
+
+### 覆盖与仍然没有的
+
+覆盖仍是 **52/513**（本轮没有新增 NVN 入口；改的是已有入口的行为），P0 仍只剩
+`nvnCommandBufferBindVertexAttribState`。
+
+| 缺口 | 后果 |
+|---|---|
+| 顶点描述符 / argument buffer | 真实 shader 找得到、编得出管线，但顶点数据没接上，**没有一条真实 shader 跑过 draw** |
+| `xcrun metal` → `.metallib` | 未做；MSL 以 C 字符串进包，5,102 个约几十 MB，真正打包要换 metallib |
+| 全部 19,592 个 shader | 未做；只跑了一个 pack 的 5,102 个 |
+| 真机 | **没有真机运行记录**，本机无设备；CI 只在模拟器里验证自检 |

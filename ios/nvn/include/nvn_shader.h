@@ -84,6 +84,24 @@ const char* nvngfx_shader_lookup(const char* key, nvngfx_stage stage,
 #define NVNGFX_ENTRY_VERTEX "nvngfx_main_vs"
 #define NVNGFX_ENTRY_FRAGMENT "nvngfx_main_fs"
 
+
+/* Computes a shader's key straight from the guest's control section and code
+ * area (both are host-readable while nvnProgramSetShaders runs).  Writes 16
+ * lowercase hex digits plus NUL; returns 0, or -1 when the control section
+ * does not describe a code area.  The rule is the one written at the top of
+ * ios/nvn/src/nvn_shader_key.c, the same one scripts/shader_chain uses. */
+int nvngfx_shader_key_from_guest(const void* control, const void* code,
+                                 char out[17]);
+
+/* One-shot SHA-256.  Exposed so the portable test can pin it to the standard
+ * vectors ("", "abc"), which is what makes the key above trustworthy. */
+void nvngfx_sha256(const void* data, size_t len, unsigned char out[32]);
+
+/* Installs the offline blob table.  Defined by ios/nvn/src/nvn_shader_blobs.gen.c,
+ * which the committed tree ships empty; scripts/shader_chain/gen_blobs.py
+ * rewrites it from a directory of translated .metal files. */
+void nvngfx_shader_install_offline_blobs(void);
+
 /* Host-only switch: when on, nvngfx_shader_to_msl() treats `code` as MSL
  * source (NUL-terminated within `size` when size is non-zero) and returns it
  * unchanged.  Nothing is translated; this is how the Metal half of the

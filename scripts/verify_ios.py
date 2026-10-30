@@ -395,6 +395,30 @@ def check_leaks() -> None:
 
 # --------------------------------------------------------------------------- #
 
+def check_shader_blobs() -> None:
+    """The offline shader table must ship empty.
+
+    gen_blobs.py rewrites ios/nvn/src/nvn_shader_blobs.gen.c with MSL taken
+    from the title, and that file is inside the app target, so a forgotten
+    restore would publish game-derived text.  The committed copy installs no
+    blobs; anything else is a mistake, not a feature.
+    """
+    rel = "ios/nvn/src/nvn_shader_blobs.gen.c"
+    if not rel_exists(rel):
+        fail(f"missing {rel}")
+        return
+    text = read(rel)
+    size = len(text.encode("utf-8"))
+    if size > 4096:
+        fail(f"{rel}: {size} bytes; the committed copy must be the empty table")
+    if "kBlobs" in text or "nvngfx_shader_blob kBlobs" in text:
+        fail(f"{rel}: contains a blob array; run git checkout -- {rel}")
+    if "nvngfx_shader_set_blobs(0, 0)" not in text:
+        fail(f"{rel}: does not install the empty table")
+    else:
+        notes.append(f"{rel}: empty table (no title-derived MSL)")
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--release", action="store_true", help="apply release-only gates")
@@ -411,6 +435,7 @@ def main(argv: list[str] | None = None) -> int:
     check_enums(args.release)
     check_doc_refs()
     check_leaks()
+    check_shader_blobs()
 
     for n in notes:
         print("  . " + n)

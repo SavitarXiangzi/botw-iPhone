@@ -121,9 +121,20 @@ def walk(blob, label, out, depth=0):
             out.append(rec + ("%s#BNSH@%#x#var%d" % (label, base, rec[0]),))
 
 
+def ctl_len(ctl):
+    """Control bytes that take part in the key.
+
+    +0x20 holds the section's own length; use it when it is plausible
+    (0x760..0x87f), else the first 0x880.  This is the host's rule
+    (nxnative hle_nvn.c keys_hash, ios/nvn/src/nvn_shader_key.c): the same
+    three places must agree or every offline blob is orphaned."""
+    own = struct.unpack_from("<I", ctl, 0x20)[0] if len(ctl) >= 0x24 else 0
+    return own if 0x760 <= own < 0x880 else 0x880
+
+
 def shader_key(ctl, code):
     h = hashlib.sha256()
-    h.update(ctl[:0x880])
+    h.update(ctl[:ctl_len(ctl)])
     h.update(code)
     return h.hexdigest()[:16]
 
@@ -165,6 +176,11 @@ def cmd_extract(a):
             path = os.path.join("code", "%s_%s.bin" % (key, st))
             with open(os.path.join(out, path), "wb") as f:
                 f.write(code[0x30:])     # translator input: SPH + instructions
+            if a.keep_full_code:
+                # The key hashes the *whole* code area, 0x30 head included;
+                # keycheck.exe needs it to replay the runtime's hash.
+                with open(os.path.join(out, "code", "%s_%s.code" % (key, st)), "wb") as f:
+                    f.write(code)
             with open(os.path.join(out, path[:-4] + ".ctl"), "wb") as f:
                 f.write(ctl)
             rows.append((key, st, path, c1.hex(), where))
@@ -308,6 +324,10 @@ def main():
     e = sub.add_parser("extract", help="game package -> code files + manifest.tsv")
     e.add_argument("inputs", nargs="+", help=".pack/.sbfsha/.ssarc files or a directory")
     e.add_argument("--out", required=True)
+    e.add_argument("--keep-full-code", action="store_true",
+                   help="also write <key>_<stage>.code (full code area, 0x30 head "
+                        "included) so scripts/shader_chain/keycheck.cpp can replay the "
+                        "runtime's hash over real shaders")
     t = sub.add_parser("translate", help="manifest -> SPIR-V -> MSL")
     t.add_argument("--work", required=True, help="the --out directory of extract")
     t.add_argument("--out", required=True)

@@ -26,7 +26,7 @@ try {
     New-Item -ItemType Directory -Force -Path build\nvn\abi, build\nvn\core, build\nvn\tex, build\nvn\shd | Out-Null
 
     $inc = "/I core\include /I ios\nvn\include"
-    $lib = "ios\nvn\src\nvn_dispatch.cpp ios\nvn\src\nvn_null.cpp ios\nvn\src\nvn_texture.c ios\nvn\src\nvn_shader.c core\src\botw_core.cpp"
+    $lib = "ios\nvn\src\nvn_dispatch.cpp ios\nvn\src\nvn_null.cpp ios\nvn\src\nvn_texture.c ios\nvn\src\nvn_shader.c ios\nvn\src\nvn_shader_key.c ios\nvn\src\nvn_shader_blobs.gen.c core\src\botw_core.cpp"
     $flags = "/nologo /std:c++20 /EHsc /W4 /WX"
 
     $jobs = @(
@@ -57,6 +57,15 @@ try {
     if (-not (Test-Path $py)) { $py = "python" }
     & $py $syntax
     if ($LASTEXITCODE -ne 0) { Write-Error "nvn_metal.mm: syntax check failed"; exit 1 }
+
+    # keycheck.cpp is a host-only tool (it needs a game to say anything useful)
+    # but it must keep compiling: same flags as the CI hygiene step.
+    $clangpp = "C:\Program Files\LLVM\bin\clang++.exe"
+    if (Test-Path $clangpp) {
+        & $clangpp -std=c++20 -Wall -Wextra -Werror -I ios\nvn\include `
+            -fsyntax-only scripts\shader_chain\keycheck.cpp
+        if ($LASTEXITCODE -ne 0) { Write-Error "keycheck.cpp: syntax check failed"; exit 1 }
+    }
 
     Write-Host "build_abi_test: all tests passed"
 } finally {

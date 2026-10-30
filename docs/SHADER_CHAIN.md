@@ -1,6 +1,6 @@
 # 着色器链：Maxwell SASS → SPIR-V → MSL
 
-本轮（M3.77）把这条链**在 Windows 上真的跑通了**：从《旷野之息》的
+M3.77 把这条链**在 Windows 上真的跑通了**：从《旷野之息》的
 `Bootup_Graphics.pack` 里取出真实 shader，经 Ryujinx 的翻译器转成 SPIR-V，
 再经 SPIRV-Cross 转成 MSL。产物是 `.metal` 文本 + 反射 JSON。
 
@@ -93,15 +93,63 @@ C:\Python314\python.exe scripts\shader_chain\nx_shader.py translate `
 装进一张静态表，后端编译管线时按 key 取 MSL。入口名固定为
 `NVNGFX_ENTRY_VERTEX` / `NVNGFX_ENTRY_FRAGMENT`，由生成脚本改名，两边不会漂。
 
-**还差的接线**（下一步）：
+### 5.1 运行时按 key 取 MSL（M3.78 已接线）
 
-1. `nvnProgramSetShaders` 时算出每个 stage 的 key —— 需要从客体的 control+code
-   读内存（`prog_key` 的注释已经写死了算法，缺的是宿主侧地址翻译）。
-2. `program_pipeline()` 用 key 去 `nvngfx_shader_lookup()`，而不是只看指针。
-3. 顶点输入：生成的 MSL 是 `[[attribute(0)]] ...` 形式，需要按反射建
+`nvnProgramSetShaders` 拿到的 `NVNshaderData{data, control}` 是**宿主可读的地址**
+（客体把这两块内存放在自己被映射的堆里），所以 key 可以当场算，不用等地址翻译：
+
+| 位置 | 做了什么 |
+|---|---|
+| `ios/nvn/src/nvn_shader_key.c` | 纯 C SHA-256 + `nvngfx_shader_key_from_guest()`，规则同 §4 最后一条 |
+| `Program::key[3][17]`（`nvn_metal.mm`） | `prog_set_shaders` 时算出并留着；客体之后释放 control 段也不影响 |
+| `program_pipeline()` | 先 `nvngfx_shader_lookup(key, stage)`，取不到才回落到 `nvngfx_shader_to_msl()`（自检的 passthrough 走这条） |
+| `nvngfx_metal_create()` | 调 `nvngfx_shader_install_offline_blobs()` 装表 |
+
+控制段不描述 code area（`u32@0x704 == 0` 或越界）时**不猜**：key 留空，退回
+旧路径。SHA-256 在 `tests/nvn_shader_test.cpp` 里钉了两个标准向量和两个
+Python 独立算出的 key，改规则会让测试先红。
+
+**在真实 shader 上对过账**（这是这条接线唯一有意义的验证）：
+
+```
+nx_shader.py extract <Bootup_Graphics.pack> --out build\shader-chain\work --keep-full-code
+keycheck build\shader-chain\work\code
+  keycheck: 5102 shader(s), 5102 match, 0 bad, 0 skipped
+```
+
+`scripts/shader_chain/keycheck.cpp` 把**运行时那个 C 函数**跑在包里取出的
+control + code 上，和 Python 命名文件用的 key 逐个比。5102 个全中说明三处
+（`nx_shader.py` / `nvn_shader_key.c` / nxnative 的 `hle_nvn.c keys_hash`）
+现在是同一个算法。
+
+一个坑值得记下来：key 哈希的 code area **包含**开头 0x30 字节的头
+（`78 56 34 12 ...`），而给翻译器的输入是从 SPH（+0x30）开始的。第一版检查
+拿 `.bin`（已去掉头）去算，5102 个全对不上——离线产物全部会被判成"没找到"，
+而且**运行时不报错**，只是静默回落到旧路径。`--keep-full-code` 就是为这条
+检查加的。
+
+### 5.2 离线产物怎么进 App
+
+`ios/nvn/src/nvn_shader_blobs.gen.c` 里是 `nvngfx_shader_install_offline_blobs()`。
+**入库的那份是空表**（仓库不含任何游戏内容）；本机跑完 §3 的三步后再执行：
+
+```powershell
+C:\Python314\python.exe scripts\shader_chain\gen_blobs.py --msl build\shader-chain\msl `
+  --out ios\nvn\src\nvn_shader_blobs.gen.c
+```
+
+生成表里是 `{key, stage, MSL 文本}`，一条 shader 一个 C 字面量（每 4000 字符切一段，
+避免单个字面量过大）。5,102 个 key 全量塞进去大约几十 MB 文本，**不适合入库**，
+真正打包时应该改成 `.metallib` + 一个小索引表（那要 `xcrun metal`）。
+
+### 5.3 还差的接线（下一步）
+
+1. 顶点输入：生成的 MSL 是 `[[attribute(0)]] ...` 形式，需要按反射建
    `MTLVertexDescriptor` —— 这正是还挂着的 `BindVertexAttribState`。
-4. 资源绑定：MSL 用的是 `--msl-argument-buffers`，所有常量/纹理走
+2. 资源绑定：MSL 用的是 `--msl-argument-buffers`，所有常量/纹理走
    `buffer(0)` 的 `spvDescriptorSetBuffer0`，槽位约定见 §6。
+3. 真实 draw：现在 key 找得到 MSL，但顶点缓冲还没接到 pool 的 `MTLBuffer` 上，
+   所以还没有任何一条真实 shader 在 Metal 里执行过。
 
 ## 6. 绑定约定（nxnative 的驱动段布局）
 
@@ -127,7 +175,9 @@ C:\Python314\python.exe scripts\shader_chain\nx_shader.py translate `
 | 编译期校验（MSL 语法） | 未做；Windows 没有 Metal 前端，MSL 只在 CI 的 macOS 上才能编 |
 | 真机 / 模拟器上跑真实 shader | 未做。自检用的仍是内置 MSL |
 | compute / geometry shader | 未做（`extract` 目前跳过 cs） |
-| 顶点描述符与 argument buffer | 未接线，见 §5 |
+| 运行时按 key 取 MSL | **已接线**（M3.78，见 §5.1） |
+| 顶点描述符与 argument buffer | 未接线，见 §5.3 |
 
-一句话：**链的前 2/3 在 Windows 上真的通了，后 1/3 要在 CI 的 macOS 上补，
-运行时接线还没做。**
+一句话：**链的前 2/3 在 Windows 上真的通了，后 1/3（`xcrun metal`）要在 CI 的
+macOS 上补；运行时按 key 取 MSL 已接线（M3.78），但顶点与资源绑定还没接，
+所以还没有任何一条真实 shader 在 Metal 里执行过。**

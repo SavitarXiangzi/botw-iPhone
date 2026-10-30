@@ -111,10 +111,60 @@ int main() {
     nvngfx_shader_clear_blobs();
     CHECK(nvngfx_shader_blob_count() == 0);
 
+
+    /* SHA-256 and the shader key ---------------------------------------- */
+    {
+        unsigned char d[32];
+        char hex[65];
+        static const char kEmpty[] =
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        static const char kAbc[] =
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        nvngfx_sha256("", 0, d);
+        for (int i = 0; i < 32; ++i) std::snprintf(hex + 2 * i, 3, "%02x", d[i]);
+        CHECK(std::strcmp(hex, kEmpty) == 0);
+        nvngfx_sha256("abc", 3, d);
+        for (int i = 0; i < 32; ++i) std::snprintf(hex + 2 * i, 3, "%02x", d[i]);
+        CHECK(std::strcmp(hex, kAbc) == 0);
+    }
+
+    /* The key rule, against values computed independently in Python:
+     *   key = sha256(control[0:nctl] || code[0:ncode])[0..8]
+     *   nctl = 0x760 <= u32@0x20 < 0x880 ? u32@0x20 : 0x880
+     * ncode = u32@0x704.  A change here silently orphans every offline blob. */
+    {
+        static unsigned char ctl[0x880];
+        static unsigned char code[0x40];
+        char key[17];
+        for (unsigned i = 0; i < sizeof ctl; ++i) ctl[i] = static_cast<unsigned char>(i & 0xFF);
+        for (unsigned i = 0; i < sizeof code; ++i) code[i] = static_cast<unsigned char>(0xA0 + i);
+        auto put32 = [](unsigned char* p, unsigned at, unsigned v) {
+            p[at + 0] = static_cast<unsigned char>(v);
+            p[at + 1] = static_cast<unsigned char>(v >> 8);
+            p[at + 2] = static_cast<unsigned char>(v >> 16);
+            p[at + 3] = static_cast<unsigned char>(v >> 24);
+        };
+        put32(ctl, 0x20, 0x880);
+        put32(ctl, 0x704, 0x40);
+        CHECK(nvngfx_shader_key_from_guest(ctl, code, key) == 0);
+        CHECK(std::strcmp(key, "2c8239fb360e36c1") == 0);
+
+        /* A control section shorter than 0x880 hashes only its own length. */
+        put32(ctl, 0x20, 0x800);
+        CHECK(nvngfx_shader_key_from_guest(ctl, code, key) == 0);
+        CHECK(std::strcmp(key, "a4a67a417698a5e1") == 0);
+
+        /* No code length in the control section: no key, and no guessing. */
+        put32(ctl, 0x704, 0);
+        CHECK(nvngfx_shader_key_from_guest(ctl, code, key) == -1);
+        CHECK(nvngfx_shader_key_from_guest(nullptr, code, key) == -1);
+        CHECK(nvngfx_shader_key_from_guest(ctl, nullptr, key) == -1);
+    }
+
     if (g_failures) {
         std::printf("nvn_shader_test: %d failure(s)\n", g_failures);
         return 1;
     }
-    std::printf("nvn_shader_test: ok (seam refuses SASS, passthrough opt-in, blobs by key)\n");
+    std::printf("nvn_shader_test: ok (seam, blob table, SHA-256, shader key)\n");
     return 0;
 }
