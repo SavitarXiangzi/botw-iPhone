@@ -3609,10 +3609,20 @@ BOTW_SELFTEST rc=0
 nvn_texlayout_test: ok (block shapes, sizes, offsets, round trip, linear, refusals)
 ```
 
-### 还没有的
+### 第十四条 draw：LINEAR 端到端
 
-- 端到端：还没有一条从 guest pool 取 LINEAR 纹理、采样、回读的自检 draw；
-  `tex_upload()` 只是**不该**再拒绝它，模拟器上还没跑过。
+自检在第二块 pool 页的 offset 12288 放一张 2×2 RGBA8 的 LINEAR 纹理：
+
+- `flags = 0x10`（LINEAR），`stride = 32`，一行只有 8 字节有效数据；
+- 上排红 / 绿，下排蓝 / 白，其余 24 字节是 0；
+- 片段着色器复用 variant 4（`texture2d` + `sampler`），回读左上、左下两个角；
+- 期望左上红、左下蓝。
+
+这条抓的是“把 stride 当行宽”：若拷贝按 8 字节连续读，第二行会读到 padding，
+左下变黑；若把 padding 也上传成一行，右下会串色。失败码 `16405`（布局 / 建纹理 /
+编码）、`16406`（像素不对）。端到端结果以本次 iOS job 为准。
+
+### 还没有的
 - 每级独立 pitch（有的标题会给 mip 小级换更小的 pitch）没有建模，现在一条
   链共用一个 pitch。
 - 3D 线性纹理、线性渲染目标（`0x40`）都只有布局算术，没有真实使用场景。

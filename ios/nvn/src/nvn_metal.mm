@@ -5882,6 +5882,213 @@ extern "C" int nvngfx_metal_selftest(void) {
             }   /* BOTW_SELFTEST_CUBE_ARRAY */
         }
 
+        {
+            /* --- Draw 14: a LINEAR texture from guest memory --------------
+             * Linear storage has no GOBs: row 1 starts at the descriptor's
+             * stride, not right after row 0.  The guest bytes carry 16 bytes
+             * of padding per 8-byte row, so a copy that ignored the stride
+             * would read zeros for the second row and the bottom-left pixel
+             * would come back black instead of blue. */
+            alignas(16) unsigned char guestLinearBuilder[0x80] = {};
+            const uint64_t kTexGuestLinear = 0x7500;
+            const uint64_t kProg14 = 0x7600;
+            const uint64_t kCb14 = 0x7700;
+            const uint64_t kB14 = reinterpret_cast<uint64_t>(guestLinearBuilder);
+            const unsigned kLinearOffset = 12288;
+            unsigned char* const vpool14 =
+                poolRaw2 ? reinterpret_cast<unsigned char*>(
+                               (reinterpret_cast<uintptr_t>(poolRaw2) + 16383u) &
+                               ~static_cast<uintptr_t>(16383u))
+                         : nullptr;
+
+            if (!vpool14) {
+                std::fprintf(stderr,
+                             "[selftest] draw 14: the cube pool is missing\n");
+                rc = 16405;
+                goto done;
+            }
+
+            nvngfx_texdesc ld;
+            nvngfx_texdesc_defaults(&ld);
+            ld.target = 0;                       /* plain 2D */
+            ld.format = 0x25;                    /* RGBA8_UNORM */
+            ld.width = 2;
+            ld.height = 2;
+            ld.depth = 1;
+            ld.levels = 1;
+            ld.samples = 1;
+            ld.flags = 0x10;                     /* LINEAR */
+            ld.stride = 32;                      /* 8 real bytes + 24 padding */
+            ld.pool = kCubePool;
+            ld.offset = kLinearOffset;
+            {
+                const unsigned char top[8] = {255, 0, 0, 255, 0, 255, 0, 255};
+                const unsigned char bottom[8] = {0, 0, 255, 255,
+                                                 255, 255, 255, 255};
+                nvngfx_texlayout ll = {};
+                bool ok = nvngfx_tex_layout(&ld, &ll) == 0 &&
+                          ll.layers == 1 && ll.layer_size == 64;
+                unsigned char* const guest =
+                    vpool14 + kLinearOffset;
+                if (ok) {
+                    std::memset(guest, 0, 64);
+                    std::memcpy(guest, top, sizeof top);
+                    std::memcpy(guest + 32, bottom, sizeof bottom);
+                }
+                if (!ok) {
+                    std::fprintf(stderr,
+                                 "[selftest] draw 14: linear layout failed "
+                                 "(layers=%u size=%llu)\n",
+                                 ll.layers,
+                                 static_cast<unsigned long long>(ll.size));
+                    rc = 16405;
+                    goto done;
+                }
+            }
+            {
+                x[0] = kB14;
+                tex_builder_set_defaults(ctx, x);
+                x[0] = kB14; x[1] = 2; x[2] = 2;
+                tex_builder_set_size2d(ctx, x);
+                x[0] = kB14; x[1] = 0x25;
+                tex_builder_set_format(ctx, x);
+                x[0] = kB14; x[1] = 0x10;
+                tex_builder_set_flags(ctx, x);
+                x[0] = kB14; x[1] = 32;
+                tex_builder_set_stride(ctx, x);
+                x[0] = kB14; x[1] = 1;
+                tex_builder_set_levels(ctx, x);
+                x[0] = kB14; x[1] = 1;
+                tex_builder_set_samples(ctx, x);
+                x[0] = kB14; x[1] = kCubePool; x[2] = kLinearOffset;
+                tex_builder_set_storage(ctx, x);
+                x[0] = kTexGuestLinear; x[1] = kB14;
+                tex_initialize(ctx, x);
+            }
+            Tex* linearTex = find<Tex>(kTexGuestLinear);
+            if (x[0] != 1 || !linearTex || !linearTex->mtl ||
+                linearTex->mtl.textureType != MTLTextureType2D ||
+                linearTex->layers != 1) {
+                std::fprintf(stderr,
+                             "[selftest] draw 14: linear texture was not "
+                             "created (type=%lu layers=%u)\n",
+                             linearTex
+                                 ? static_cast<unsigned long>(
+                                       linearTex->mtl.textureType)
+                                 : 0ul,
+                             linearTex ? linearTex->layers : 0u);
+                rc = 16405;
+                goto done;
+            }
+
+            struct { uint64_t data; uint64_t control; } sd14[2];
+            sd14[0].data = reinterpret_cast<uint64_t>(const_cast<char*>(
+                nvngfx_shader_selftest_msl_variant(NVNGFX_STAGE_VERTEX, 4)));
+            sd14[0].control = 0;
+            sd14[1].data = reinterpret_cast<uint64_t>(const_cast<char*>(
+                nvngfx_shader_selftest_msl_variant(NVNGFX_STAGE_FRAGMENT, 4)));
+            sd14[1].control = 0;
+            x[0] = kProg14; x[1] = 0;
+            prog_initialize(ctx, x);
+            x[0] = kProg14; x[1] = 2;
+            x[2] = reinterpret_cast<uint64_t>(&sd14[0]);
+            prog_set_shaders(ctx, x);
+            if (x[0] != 1) {
+                std::fprintf(stderr,
+                             "[selftest] draw 14: SetShaders failed\n");
+                rc = 16405;
+                goto done;
+            }
+            x[0] = kTexPool; x[1] = 11; x[2] = kTexGuestLinear; x[3] = 0;
+            tex_pool_register_texture(ctx, x);
+
+            const uint64_t target14 = kTex;
+            const float clear14[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+            x[0] = kCb14;
+            cmdbuf_begin_recording(ctx, x);
+            x[0] = kCb14; x[1] = 1;
+            x[2] = reinterpret_cast<uint64_t>(&target14);
+            x[3] = 0; x[4] = 0; x[5] = 0;
+            cmdbuf_set_render_targets(ctx, x);
+            x[0] = kCb14; x[1] = 0;
+            x[2] = reinterpret_cast<uint64_t>(clear14);
+            x[3] = 0xF;
+            cmdbuf_clear_color(ctx, x);
+            x[0] = kCb14; x[1] = kTexPool;
+            cmdbuf_set_texture_pool(ctx, x);
+            x[0] = kCb14; x[1] = kSampPool;
+            cmdbuf_set_sampler_pool(ctx, x);
+            x[0] = 0; x[1] = 11; x[2] = 9;
+            dev_get_texture_handle(ctx, x);
+            const uint64_t lhandle = x[0];
+            x[0] = kCb14; x[1] = 1; x[2] = 0; x[3] = lhandle;
+            cmdbuf_bind_texture(ctx, x);
+            x[0] = kCb14; x[1] = kProg14; x[2] = 0;
+            cmdbuf_bind_program(ctx, x);
+            x[0] = kCb14; x[1] = 0; x[2] = 0; x[3] = 3;
+            cmdbuf_draw_arrays(ctx, x);
+            x[0] = kCb14;
+            cmdbuf_end_recording(ctx, x);
+
+            CmdBuf* b14 = find<CmdBuf>(kCb14);
+            if (!b14 || !b14->last) {
+                std::fprintf(stderr,
+                             "[selftest] draw 14: nothing committed\n");
+                rc = 16405;
+                goto done;
+            }
+            [b14->last waitUntilCompleted];
+            if (b14->last.status == MTLCommandBufferStatusError) {
+                std::fprintf(stderr,
+                             "[selftest] draw 14 command buffer error: %s\n",
+                             b14->last.error
+                                 ? [[b14->last.error localizedDescription]
+                                       UTF8String]
+                                 : "(no description)");
+                rc = 16405;
+                goto done;
+            }
+            if (!linearTex->uploaded || linearTex->uploadedLevels != 1 ||
+                b14->encoded != 1) {
+                std::fprintf(stderr,
+                             "[selftest] draw 14: linear texture not used "
+                             "(uploaded=%d levels=%u encoded=%u)\n",
+                             linearTex->uploaded ? 1 : 0,
+                             linearTex->uploadedLevels, b14->encoded);
+                rc = 16405;
+                goto done;
+            }
+            {
+                struct {
+                    NSUInteger x, y;
+                    int want[4];
+                    const char* corner;
+                } checks14[2] = {
+                    {1, 1, {255, 0, 0, 255}, "top-left"},
+                    {1, kSide - 2, {0, 0, 255, 255}, "bottom-left"}};
+                for (int i = 0; i < 2; ++i) {
+                    unsigned char px[4] = {0, 0, 0, 0};
+                    if (!read_pixel_at(dev, c->queue, t->mtl, kSide,
+                                       checks14[i].x, checks14[i].y, px) ||
+                        !pixels_near(px, checks14[i].want, 2)) {
+                        std::fprintf(stderr,
+                                     "[selftest] draw 14 %s pixel is "
+                                     "(%u,%u,%u,%u), want (%d,%d,%d,%d); the "
+                                     "linear stride was ignored\n",
+                                     checks14[i].corner, px[0], px[1], px[2],
+                                     px[3], checks14[i].want[0],
+                                     checks14[i].want[1], checks14[i].want[2],
+                                     checks14[i].want[3]);
+                        rc = 16406;
+                        goto done;
+                    }
+                }
+                std::fprintf(stderr,
+                             "[selftest] draw 14: LINEAR texture rows sampled "
+                             "from guest memory at a 32-byte stride\n");
+            }
+        }
+
     done:
         nvngfx_shader_set_msl_passthrough(0);
         forget<CmdBuf>(kCb);
@@ -5920,6 +6127,9 @@ extern "C" int nvngfx_metal_selftest(void) {
         forget<Tex>(0x6F00);
         forget<Program>(0x7000);
         forget<CmdBuf>(0x7100);
+        forget<Tex>(0x7500);
+        forget<Program>(0x7600);
+        forget<CmdBuf>(0x7700);
         forget<Pool>(0x7300);
         g_pool_specs.erase(0x7400);
         std::free(poolRaw2);

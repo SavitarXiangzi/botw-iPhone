@@ -431,6 +431,12 @@ M3.92 补上另外两种层形状：第十二条建 `MTLTextureTypeCube`（`arra
 `BOTW_SELFTEST_CUBE_ARRAY=1` 才执行；模拟器上打印跳过原因后继续。
 布局与 shader 由 `nvn_texlayout_test` / `nvn_shader_test` 覆盖，端到端要等真机。
 
+第十四条把 M3.93 的 LINEAR 布局接到端到端：2×2 RGBA8、`flags = 0x10`、
+`stride = 32`，guest 存储里每行只有 8 字节有效数据、其余是 padding。上排
+红/绿、下排蓝/白，回读左上红、左下蓝；如果上传忽略了 stride（把 8 字节当行距），
+左下会读到 padding 的 0 而变黑。失败码 `16405`（布局 / 建纹理 / 编码）、
+`16406`（像素不对）。
+
 第五条在模拟器里走的是**直连纹理/采样器绑定**：模拟器的
 `MTLTexture.gpuResourceID` 是 0，参数缓冲区的纹理条目在那里没有意义
 （见 `docs/ROADMAP.md` 的 M3.83 / M3.84 段）。所以“Metal 这半边是通的”
