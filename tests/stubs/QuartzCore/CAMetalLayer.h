@@ -14,7 +14,10 @@
 @property (retain) id<MTLDevice> device;
 @property MTLPixelFormat pixelFormat;
 @property BOOL framebufferOnly;
-@property BOOL displaySyncEnabled;
+/* NOTE: displaySyncEnabled is deliberately absent.  It exists on macOS but the
+ * iOS 17 SDK does not declare it, and an earlier version of this stub had it --
+ * which let a real build error through to CI.  Keep this file no looser than
+ * the SDK it stands in for. */
 @property NSUInteger maximumDrawableCount;
 - (id<CAMetalDrawable>)nextDrawable;
 @end

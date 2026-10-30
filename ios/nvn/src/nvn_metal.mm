@@ -257,7 +257,9 @@ void win_initialize(nvngfx_ctx* ctx, uint64_t* x) {
     w->layer.device = c->device;
     w->layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
     w->layer.framebufferOnly = NO;  /* we blit the guest's target in */
-    w->layer.displaySyncEnabled = (spec.presentInterval != 0);
+    /* There is no present-interval property on iOS: CAMetalLayer.displaySyncEnabled
+     * is macOS-only (the iOS 17 SDK rejects it -- CI caught this).  On iOS v-sync
+     * is implicit, so maximumDrawableCount below is the only pacing knob we own. */
     w->numTextures = spec.numTextures;
     w->numActive = spec.numActive ? spec.numActive : spec.numTextures;
     w->presentInterval = spec.presentInterval;
@@ -293,8 +295,9 @@ void win_get_num_textures(nvngfx_ctx*, uint64_t* x) {
 void win_set_present_interval(nvngfx_ctx*, uint64_t* x) {
     Win* w = obj<Win>(x[0]);
     if (!w) return;
+    /* Recorded only.  See win_initialize: iOS has no displaySyncEnabled and the
+     * interval is enforced by the guest's own swapchain, not by Metal. */
     w->presentInterval = static_cast<unsigned>(x[1]);
-    if (w->layer) w->layer.displaySyncEnabled = (w->presentInterval != 0);
 }
 
 void win_set_num_active_textures(nvngfx_ctx*, uint64_t* x) {
