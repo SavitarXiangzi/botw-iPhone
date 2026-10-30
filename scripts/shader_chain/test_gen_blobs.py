@@ -14,6 +14,8 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 GEN = os.path.join(HERE, "gen_blobs.py")
+sys.path.insert(0, HERE)
+import gen_blobs  # noqa: E402  (the decoder functions are under test too)
 
 PS = """#include <metal_stdlib>
 using namespace metal;
@@ -50,16 +52,16 @@ vertex float4 nvngfx_main_vs(uint vid [[vertex_id]])
 BAD = PS.replace("[[id(9)]]", "[[id(64)]]")
 
 EXPECTED_PS = [
-    "{0, NVNGFX_ARG_UBO, 0},",
-    "{1, NVNGFX_ARG_C1, -1},",             # embedded constant segment
-    "{2, NVNGFX_ARG_TEXTURE, 10},",          # tcb handle 0x1C -> c2 0x70 -> slot 10
-    "{3, NVNGFX_ARG_SAMPLER_OF_TEXTURE, 10},",
-    "{4, NVNGFX_ARG_SEPARATE_TEXTURE, 0},",  # tcb handle 0x5A -> c2 0x168 -> separate 0
-    "{5, NVNGFX_ARG_UNSUPPORTED, -1},",      # that handle carries no sampler
-    "{6, NVNGFX_ARG_UNSUPPORTED, -1},",      # bindless: handle in uniform buffer 7
-    "{7, NVNGFX_ARG_UNSUPPORTED, -1},",
-    "{8, NVNGFX_ARG_UNSUPPORTED, -1},",      # image
-    "{9, NVNGFX_ARG_UNSUPPORTED, -1},",      # storage buffer
+    "{0, NVNGFX_ARG_UBO, 0, 0, 0},",
+    "{1, NVNGFX_ARG_C1, -1, 1, 0},",             # embedded constant segment
+    "{2, NVNGFX_ARG_TEXTURE, 10, 2, 0},",        # tcb 0x1C -> c2 0x70 -> slot 10
+    "{3, NVNGFX_ARG_SAMPLER_OF_TEXTURE, 10, 3, 0},",
+    "{4, NVNGFX_ARG_SEPARATE_TEXTURE, 0, 4, 0},", # tcb 0x5A -> c2 0x168 -> separate 0
+    "{5, NVNGFX_ARG_UNSUPPORTED, -1, 5, 0},",     # that handle carries no sampler
+    "{6, NVNGFX_ARG_TEXTURE_IN_UBO, 4, 6, 168},", # c7 word 0x2A -> +0xA8
+    "{7, NVNGFX_ARG_SAMPLER_OF_UBO_TEXTURE, 4, 7, 168},",
+    "{8, NVNGFX_ARG_UNSUPPORTED, -1, 8, 0},",     # image
+    "{9, NVNGFX_ARG_UNSUPPORTED, -1, 9, 0},",     # storage buffer
 ]
 
 failures = 0
@@ -84,6 +86,45 @@ def block(text, name):
 
 
 def main():
+    # Decoder-level cases that need no generated file.  Type 0 is what the
+    # whole measured BOTW shader library uses; type 1 and 3 are included so the
+    # generator is explicit rather than silently treating every bindless name
+    # as type 0.
+    tb, hs = gen_blobs.decode_ubo_tex("fp_t_cb7_2A")
+    check(tb == (4, 168) and hs == (4, 168), "type-0 bindless decode")
+    # cb851977 = 9 | (13 << 16): texture in UBO 6, sampler type-1 word in UBO 9.
+    h1 = (1 << 28) | (0x2C << 14) | 0x2B
+    tb, hs = gen_blobs.decode_ubo_tex("fp_t_cb851977_%X" % h1)
+    check(tb == (6, 172) and hs == (9, 176), "type-1 bindless decode: %r %r" % (tb, hs))
+    h3 = (3 << 28) | (0x104 << 14) | 0x28
+    tb, hs = gen_blobs.decode_ubo_tex("fp_t_cb5_%X" % h3)
+    check(tb == (2, 160) and hs == ("id", 0x104), "type-3 bindless decode: %r %r" % (tb, hs))
+    check(gen_blobs.decode_ubo_tex("fp_t_cb2_1C") is None,
+          "c2 is the driver table, not a bindless UBO handle")
+    check(gen_blobs.classify("sampler", "fp_t_cb5_%XSmplr" % h3) ==
+          ("NVNGFX_ARG_UNSUPPORTED", -1, 0), "type-3 constant sampler is refused")
+    # IDs may differ from declaration order; packed remains the declaration
+    # index because that is the byte offset Metal uses.
+    reordered = """struct spvDescriptorSetBuffer0 {
+    texture2d<float> a [[id(9)]];
+    sampler b [[id(2)]];
+    texture2d<float> c [[id(5)]];
+};
+"""
+    got = gen_blobs.layout(reordered)
+    check([row[0] for row in got] == [2, 5, 9], "layout sorted by id")
+    check([row[3] for row in got] == [1, 2, 0], "packed keeps declaration order")
+    array_msl = """struct spvDescriptorSetBuffer0 {
+    array<texture2d<float>, 4> tex [[id(0)]];
+};
+"""
+    try:
+        gen_blobs.layout(array_msl)
+    except ValueError as e:
+        check("array" in str(e).lower(), "array failure should explain itself: " + str(e))
+    else:
+        check(False, "descriptor array should be refused until packed widths exist")
+
     with tempfile.TemporaryDirectory() as tmp:
         msl = os.path.join(tmp, "msl")
         os.makedirs(msl)
@@ -117,7 +158,9 @@ def main():
                         r'kArgs_aaaaaaaaaaaaaaaa_ps, 10, kC1_aaaaaaaaaaaaaaaa_ps, 16\},',
                         text, re.S) is not None,
               "ps blob row should reference its layout and c1 bytes")
-        check("unsupported=5" in r.stdout, "summary should count 5 unsupported: " + r.stdout)
+        check("unsupported=3" in r.stdout, "summary should count 3 unsupported: " + r.stdout)
+        check("texture_in_ubo=1" in r.stdout and "sampler_of_ubo_texture=1" in r.stdout,
+              "summary should count both bindless halves: " + r.stdout)
         check("c1=1 shader(s), 16 bytes" in r.stdout,
               "summary should count c1 bytes: " + r.stdout)
 
@@ -164,7 +207,7 @@ def main():
     if failures:
         print("test_gen_blobs: %d failure(s)" % failures)
         return 1
-    print("test_gen_blobs: ok (ids, slots, c1, holes, refusals)")
+    print("test_gen_blobs: ok (ids, packed slots, bindless, c1, holes, refusals)")
     return 0
 
 

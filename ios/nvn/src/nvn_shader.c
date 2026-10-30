@@ -169,6 +169,28 @@ static const char* const kFsTextureBlob =
     "    return s0.tex.sample(s0.smp, in.uv) * (*s0.tint);\n"
     "}\n";
 
+/* Variant 7: two bindless resources.  Their ids are sparse (9 / 12), while
+ * their packed positions are 0 / 1, and both handles live in one uniform
+ * buffer word.  The self-test uses this to prove the raw table is written by
+ * declaration order and that the UBO handle is split into pool IDs.  It does
+ * not claim a GPU sample: the x86_64 simulator returns zero for a texture's
+ * gpuResourceID, so the table probe stops before encoding a draw. */
+static const char* const kFsBindless =
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "\n"
+    "struct NvngfxVaryings { float4 position [[position]]; float2 uv; };\n"
+    "\n"
+    "struct spvDescriptorSetBuffer0 {\n"
+    "    texture2d<float> tex [[id(9)]];\n"
+    "    sampler smp [[id(12)]];\n"
+    "};\n"
+    "\n"
+    "fragment float4 nvngfx_main_fs(NvngfxVaryings in [[stage_in]],\n"
+    "                               constant spvDescriptorSetBuffer0& s0 [[buffer(0)]]) {\n"
+    "    return s0.tex.sample(s0.smp, in.uv);\n"
+    "}\n";
+
 /* Variant 6: a c1-only fragment shader.  The argument buffer has one pointer
  * at [[id(0)]], and the bytes behind it come from the sidecar, not from any
  * command-buffer binding.  The self-test fills them with a known colour so a
@@ -229,12 +251,15 @@ static int key_eq(const char* a, const char* b) {
 }
 
 /* A layout must be usable without a second validation pass in the backend:
- * ascending unique ids, a kind whose slot fits the table it names, and -1 for
- * everything unsupported.  A shader whose layout cannot be validated is
- * rejected here rather than dropped later, so a bad generator shows up in
- * nvngfx_shader_set_blobs' return value. */
+ * ascending unique ids for deterministic lookup and diagnostics; packed slots
+ * forming a permutation of 0..num_args-1 because that is the byte layout
+ * Metal derives from declaration order; a kind whose slot fits the table it
+ * names; and -1 for everything unsupported.  A shader whose layout cannot be
+ * validated is rejected here rather than dropped later, so a bad generator
+ * shows up in nvngfx_shader_set_blobs' return value. */
 static int args_valid(const nvngfx_shader_blob* b) {
     unsigned i, has_c1 = 0;
+    unsigned char packed_seen[NVNGFX_MAX_ARGS] = {0};
     if (b->c1_size > NVNGFX_MAX_C1_BYTES) return 0;
     if (b->c1_size != 0 && b->c1 == NULL) return 0;
     if (b->num_args == 0) {
@@ -245,29 +270,40 @@ static int args_valid(const nvngfx_shader_blob* b) {
             const nvngfx_shader_arg* a = &b->args[i];
             if (a->id > NVNGFX_MAX_ARG_ID) return 0;
             if (i > 0 && b->args[i - 1].id >= a->id) return 0;
-            if (a->kind < NVNGFX_ARG_UBO || a->kind > NVNGFX_ARG_UNSUPPORTED)
+            if (a->packed >= b->num_args || packed_seen[a->packed]) return 0;
+            packed_seen[a->packed] = 1;
+            if (a->kind < NVNGFX_ARG_UBO ||
+                a->kind > NVNGFX_ARG_SAMPLER_IN_UBO)
                 return 0;
             if (a->kind == NVNGFX_ARG_C1) {
-                if (a->slot != -1) return 0;
+                if (a->slot != -1 || a->offset != 0) return 0;
                 has_c1 = 1;
                 continue;
             }
             if (a->kind == NVNGFX_ARG_UNSUPPORTED) {
-                if (a->slot != -1) return 0;
+                if (a->slot != -1 || a->offset != 0) return 0;
                 continue;
             }
             if (a->slot < 0) return 0;
             switch (a->kind) {
             case NVNGFX_ARG_UBO:
+                if (a->slot >= NVNGFX_MAX_UBO_SLOTS || a->offset != 0) return 0;
+                break;
+            case NVNGFX_ARG_TEXTURE_IN_UBO:
+            case NVNGFX_ARG_SAMPLER_OF_UBO_TEXTURE:
+            case NVNGFX_ARG_SAMPLER_IN_UBO:
                 if (a->slot >= NVNGFX_MAX_UBO_SLOTS) return 0;
+                if ((a->offset & 3u) != 0) return 0;
                 break;
             case NVNGFX_ARG_TEXTURE:
             case NVNGFX_ARG_SAMPLER_OF_TEXTURE:
             case NVNGFX_ARG_SEPARATE_TEXTURE:
-                if (a->slot >= NVNGFX_MAX_TEXTURE_SLOTS) return 0;
+                if (a->slot >= NVNGFX_MAX_TEXTURE_SLOTS || a->offset != 0)
+                    return 0;
                 break;
             case NVNGFX_ARG_SEPARATE_SAMPLER:
-                if (a->slot >= NVNGFX_MAX_SAMPLER_SLOTS) return 0;
+                if (a->slot >= NVNGFX_MAX_SAMPLER_SLOTS || a->offset != 0)
+                    return 0;
                 break;
             default:
                 return 0;
@@ -381,6 +417,11 @@ const char* nvngfx_shader_selftest_msl_variant(nvngfx_stage stage, int variant) 
     if (variant == 6) {
         if (stage == NVNGFX_STAGE_VERTEX) return kVs;
         if (stage == NVNGFX_STAGE_FRAGMENT) return kFsC1;
+        return NULL;
+    }
+    if (variant == 7) {
+        if (stage == NVNGFX_STAGE_VERTEX) return kVsUv;
+        if (stage == NVNGFX_STAGE_FRAGMENT) return kFsBindless;
         return NULL;
     }
     if (stage == NVNGFX_STAGE_VERTEX) return kVs;

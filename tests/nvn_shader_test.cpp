@@ -110,21 +110,22 @@ int main() {
     CHECK(nvngfx_shader_set_blobs(nullptr, 1) == -1);
 
     /* The argument layout sidecar.  A real fragment shader names 42 entries,
-     * so the interesting cases are a hole in the id range, a kind with no
-     * slot, and a table that has to be refused whole rather than half-used.
-     * C1 is the embedded constant segment: it has no NVN binding slot, but its
-     * bytes must be present (an explicit empty segment is valid). */
+     * so the interesting cases are holes in the id range, a packed slot that
+     * differs from the id, bindless handles in a UBO, and a table that has to
+     * be refused whole rather than half-used.  C1 is the embedded constant
+     * segment: it has no NVN binding slot, but its bytes must be present (an
+     * explicit empty segment is valid). */
     {
         static const unsigned char c1[] = {
             0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x00, 0x40,
             0x00, 0x00, 0x40, 0x3f, 0x00, 0x00, 0x80, 0x3f,
         };
         static const nvngfx_shader_arg layout[] = {
-            {5, NVNGFX_ARG_UBO, 0},
-            {9, NVNGFX_ARG_TEXTURE, 0},
-            {12, NVNGFX_ARG_SAMPLER_OF_TEXTURE, 0},
-            {13, NVNGFX_ARG_C1, -1},
-            {14, NVNGFX_ARG_UNSUPPORTED, -1},
+            {5, NVNGFX_ARG_UBO, 0, 0, 0},
+            {9, NVNGFX_ARG_TEXTURE, 0, 1, 0},
+            {12, NVNGFX_ARG_SAMPLER_OF_TEXTURE, 0, 2, 0},
+            {13, NVNGFX_ARG_C1, -1, 3, 0},
+            {14, NVNGFX_ARG_UNSUPPORTED, -1, 4, 0},
         };
         static const nvngfx_shader_blob with_args[] = {
             {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", layout, 5,
@@ -142,16 +143,60 @@ int main() {
         CHECK(nvngfx_shader_lookup("0011223344556677", NVNGFX_STAGE_FRAGMENT, &why) ==
               with_args[0].msl);
 
-        /* A blob's layout is copied verbatim, holes included. */
+        /* A blob's layout is copied verbatim, holes and packed positions
+         * included.  The backend writes byte 8*packed, not 8*id. */
         nvngfx_shader_arg copied[NVNGFX_MAX_ARGS] = {};
         CHECK(nvngfx_shader_copy_args(b, copied, NVNGFX_MAX_ARGS) == 5);
-        CHECK(copied[0].id == 5 && copied[0].slot == 0);
-        CHECK(copied[1].id == 9 && copied[1].kind == NVNGFX_ARG_TEXTURE);
-        CHECK(copied[3].kind == NVNGFX_ARG_C1 && copied[3].slot == -1);
-        CHECK(copied[4].kind == NVNGFX_ARG_UNSUPPORTED && copied[4].slot == -1);
+        CHECK(copied[0].id == 5 && copied[0].slot == 0 && copied[0].packed == 0);
+        CHECK(copied[1].id == 9 && copied[1].kind == NVNGFX_ARG_TEXTURE &&
+              copied[1].packed == 1);
+        CHECK(copied[2].id == 12 && copied[2].packed == 2);
+        CHECK(copied[3].kind == NVNGFX_ARG_C1 && copied[3].slot == -1 &&
+              copied[3].packed == 3);
+        CHECK(copied[4].kind == NVNGFX_ARG_UNSUPPORTED && copied[4].slot == -1 &&
+              copied[4].packed == 4);
         /* A destination that cannot hold the whole layout gets nothing. */
         CHECK(nvngfx_shader_copy_args(b, copied, 4) == 0);
         CHECK(nvngfx_shader_copy_args(nullptr, copied, NVNGFX_MAX_ARGS) == 0);
+
+        /* Bindless: one UBO handle at byte 0xA8, with both resource halves,
+         * plus a type-1 sampler word in another UBO slot.  The generator's
+         * decoder is tested in test_gen_blobs.py; this pins the ABI fields. */
+        static const nvngfx_shader_arg bindless_layout[] = {
+            {3, NVNGFX_ARG_TEXTURE_IN_UBO, 4, 0, 0xA8},
+            {4, NVNGFX_ARG_SAMPLER_OF_UBO_TEXTURE, 4, 1, 0xA8},
+            {5, NVNGFX_ARG_SAMPLER_IN_UBO, 5, 2, 0x20},
+        };
+        static const nvngfx_shader_blob bindless_blob[] = {
+            {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", bindless_layout, 3,
+             nullptr, 0},
+        };
+        CHECK(nvngfx_shader_set_blobs(bindless_blob, 1) == 0);
+        b = nvngfx_shader_lookup_blob("0011223344556677",
+                                      NVNGFX_STAGE_FRAGMENT, &why);
+        CHECK(b != nullptr && b->args[0].packed == 0 &&
+              b->args[0].offset == 0xA8 &&
+              b->args[1].kind == NVNGFX_ARG_SAMPLER_OF_UBO_TEXTURE);
+        CHECK(b != nullptr && b->args[2].kind == NVNGFX_ARG_SAMPLER_IN_UBO &&
+              b->args[2].slot == 5 && b->args[2].offset == 0x20);
+        CHECK(nvngfx_shader_set_blobs(with_args, 1) == 0);
+
+        /* packed is a permutation independent of id order: sorted-by-id rows
+         * may carry reversed packed values, and are still valid. */
+        static const nvngfx_shader_arg reordered[] = {
+            {5, NVNGFX_ARG_UBO, 0, 1, 0},
+            {9, NVNGFX_ARG_TEXTURE, 0, 0, 0},
+        };
+        static const nvngfx_shader_blob reordered_blob[] = {
+            {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", reordered, 2,
+             nullptr, 0},
+        };
+        CHECK(nvngfx_shader_set_blobs(reordered_blob, 1) == 0);
+        b = nvngfx_shader_lookup_blob("0011223344556677",
+                                      NVNGFX_STAGE_FRAGMENT, &why);
+        CHECK(b != nullptr && b->args[0].id == 5 && b->args[0].packed == 1);
+        CHECK(b != nullptr && b->args[1].id == 9 && b->args[1].packed == 0);
+        CHECK(nvngfx_shader_set_blobs(with_args, 1) == 0);
 
         /* A zero-length c1 is explicit data, not a missing sidecar. */
         static const nvngfx_shader_blob empty_c1[] = {
@@ -165,48 +210,77 @@ int main() {
 
         /* Every way a layout can be wrong; the installed table must survive. */
         static const nvngfx_shader_arg descending[] = {
-            {9, NVNGFX_ARG_TEXTURE, 0},
-            {5, NVNGFX_ARG_UBO, 0},
+            {9, NVNGFX_ARG_TEXTURE, 0, 0, 0},
+            {5, NVNGFX_ARG_UBO, 0, 1, 0},
         };
         static const nvngfx_shader_arg duplicate_id[] = {
-            {5, NVNGFX_ARG_UBO, 0},
-            {5, NVNGFX_ARG_TEXTURE, 0},
+            {5, NVNGFX_ARG_UBO, 0, 0, 0},
+            {5, NVNGFX_ARG_TEXTURE, 0, 1, 0},
+        };
+        static const nvngfx_shader_arg duplicate_packed[] = {
+            {5, NVNGFX_ARG_UBO, 0, 0, 0},
+            {6, NVNGFX_ARG_TEXTURE, 0, 0, 0},
+        };
+        static const nvngfx_shader_arg packed_out_of_range[] = {
+            {5, NVNGFX_ARG_UBO, 0, 1, 0},
         };
         static const nvngfx_shader_arg texture_slot_too_high[] = {
-            {7, NVNGFX_ARG_TEXTURE, NVNGFX_MAX_TEXTURE_SLOTS},
+            {7, NVNGFX_ARG_TEXTURE, NVNGFX_MAX_TEXTURE_SLOTS, 0, 0},
         };
         static const nvngfx_shader_arg id_too_high[] = {
-            {NVNGFX_MAX_ARG_ID + 1, NVNGFX_ARG_UBO, 0},
+            {NVNGFX_MAX_ARG_ID + 1, NVNGFX_ARG_UBO, 0, 0, 0},
         };
         static const nvngfx_shader_arg bad_kind[] = {
-            {1, 0, 0},
+            {1, 0, 0, 0, 0},
         };
         static const nvngfx_shader_arg unsupported_with_slot[] = {
-            {1, NVNGFX_ARG_UNSUPPORTED, 0},
+            {1, NVNGFX_ARG_UNSUPPORTED, 0, 0, 0},
+        };
+        static const nvngfx_shader_arg unsupported_with_offset[] = {
+            {1, NVNGFX_ARG_UNSUPPORTED, -1, 0, 4},
         };
         static const nvngfx_shader_arg c1_with_slot[] = {
-            {1, NVNGFX_ARG_C1, 0},
+            {1, NVNGFX_ARG_C1, 0, 0, 0},
+        };
+        static const nvngfx_shader_arg c1_with_offset[] = {
+            {1, NVNGFX_ARG_C1, -1, 0, 4},
         };
         static const nvngfx_shader_arg c1_without_bytes[] = {
-            {1, NVNGFX_ARG_C1, -1},
+            {1, NVNGFX_ARG_C1, -1, 0, 0},
         };
         static const nvngfx_shader_arg missing_slot[] = {
-            {1, NVNGFX_ARG_UBO, -1},
+            {1, NVNGFX_ARG_UBO, -1, 0, 0},
+        };
+        static const nvngfx_shader_arg ubo_with_offset[] = {
+            {1, NVNGFX_ARG_UBO, 0, 0, 4},
+        };
+        static const nvngfx_shader_arg bindless_slot_too_high[] = {
+            {1, NVNGFX_ARG_TEXTURE_IN_UBO, NVNGFX_MAX_UBO_SLOTS, 0, 0},
+        };
+        static const nvngfx_shader_arg bindless_unaligned[] = {
+            {1, NVNGFX_ARG_SAMPLER_OF_UBO_TEXTURE, 0, 0, 2},
         };
         static const nvngfx_shader_arg too_many[NVNGFX_MAX_ARGS + 1] = {};
         static const nvngfx_shader_blob bad[] = {
             {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", descending, 2, nullptr, 0},
             {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", duplicate_id, 2, nullptr, 0},
+            {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", duplicate_packed, 2, nullptr, 0},
+            {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", packed_out_of_range, 1, nullptr, 0},
             {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", texture_slot_too_high, 1, nullptr, 0},
             {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", id_too_high, 1, nullptr, 0},
             {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", bad_kind, 1, nullptr, 0},
             {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", unsupported_with_slot, 1, nullptr, 0},
+            {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", unsupported_with_offset, 1, nullptr, 0},
             {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", c1_with_slot, 1, c1, sizeof c1},
+            {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", c1_with_offset, 1, c1, sizeof c1},
             {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", c1_without_bytes, 1, nullptr, 0},
             {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", c1_without_bytes, 1, c1,
              NVNGFX_MAX_C1_BYTES + 1},
             {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", c1_without_bytes, 1, nullptr, 1},
             {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", missing_slot, 1, nullptr, 0},
+            {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", ubo_with_offset, 1, nullptr, 0},
+            {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", bindless_slot_too_high, 1, nullptr, 0},
+            {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", bindless_unaligned, 1, nullptr, 0},
             {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", too_many,
              NVNGFX_MAX_ARGS + 1, nullptr, 0},
             {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", layout, 0, nullptr, 0},
@@ -275,6 +349,6 @@ int main() {
         std::printf("nvn_shader_test: %d failure(s)\n", g_failures);
         return 1;
     }
-    std::printf("nvn_shader_test: ok (seam, blob table, c1, SHA-256, shader key)\n");
+    std::printf("nvn_shader_test: ok (seam, blob table, packed slots, bindless, c1, SHA-256, shader key)\n");
     return 0;
 }

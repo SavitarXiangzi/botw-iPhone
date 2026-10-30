@@ -406,6 +406,7 @@ destinationBytesPerImage:(NSUInteger)bpi;
 
 @protocol MTLBuffer <MTLResource>
 - (void*)contents;
+@property (readonly) NSUInteger length;
 /* Metal 3 / iOS 16+: the GPU address an argument buffer entry stores. */
 @property (readonly) unsigned long long gpuAddress;
 @end

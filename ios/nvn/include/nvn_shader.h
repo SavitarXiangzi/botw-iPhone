@@ -66,16 +66,16 @@ const char* nvngfx_shader_to_msl(const void* code, unsigned long long size,
  *     vp_c1 / fp_c1              the embedded c1 segment (blob->c1)
  *     fp_t_tcb_<handle>          combined texture (the c2 handle table)
  *     fp_t_tcb_<handle>Smplr     the sampler carried by that combined handle
- *     fp_t_cb<N>_<handle>        a handle in uniform buffer N (bindless)
+ *     fp_t_cb<N>_<handle>        a texture handle stored in uniform buffer N
+ *     fp_t_cb<N>_<handle>Smplr   the sampler half of that bindless handle
  *     fp_i_... / fp_s<N>         image / storage buffer
  *
  * The generator (scripts/shader_chain/gen_blobs.py) decodes that naming into
  * the table below and ships it next to the MSL, so the backend never has to
  * guess an [[id(k)]] ordering at run time.  Anything the replay layer cannot
- * fill yet -- the c0/c2 driver tables, a handle that lives in a uniform
- * buffer, images, typed buffers -- is recorded as
- * NVNGFX_ARG_UNSUPPORTED, and a draw that needs one is dropped instead of
- * reading an unset word.
+ * fill yet -- the c0/c2 driver tables, images, typed buffers, a type-3
+ * constant sampler -- is recorded as NVNGFX_ARG_UNSUPPORTED, and a draw that
+ * needs one is dropped instead of reading an unset word.
  *
  * Two real Breath of the Wild shaders measured on 2026-10-30: the vertex one
  * has 7 members (highest id 6), the fragment one 42 (highest id 41, of which
@@ -106,13 +106,28 @@ typedef enum nvngfx_arg_kind {
     NVNGFX_ARG_SEPARATE_TEXTURE = 4,   /* slot = separate texture slot r */
     NVNGFX_ARG_SEPARATE_SAMPLER = 5,   /* slot = separate sampler slot r */
     NVNGFX_ARG_C1 = 6,                 /* slot = -1; the data is blob->c1 */
-    NVNGFX_ARG_UNSUPPORTED = 7         /* see above: the draw cannot be filled */
+    NVNGFX_ARG_UNSUPPORTED = 7,        /* see above: the draw cannot be filled */
+    /* Bindless.  slot is the NVN uniform-buffer slot (c[3+slot]); offset is the
+     * byte offset in that buffer.  The 32-bit value there is an NVN handle:
+     * bits 0..19 name the texture and bits 20..31 the sampler. */
+    NVNGFX_ARG_TEXTURE_IN_UBO = 8,     /* use the low 20 bits */
+    NVNGFX_ARG_SAMPLER_OF_UBO_TEXTURE = 9, /* use the high 12 bits of the same word */
+    NVNGFX_ARG_SAMPLER_IN_UBO = 10     /* type-1 handle: sampler word in another UBO */
 } nvngfx_arg_kind;
 
 typedef struct nvngfx_shader_arg {
     unsigned char id;    /* [[id(k)]] in the MSL argument buffer */
     unsigned char kind;  /* nvngfx_arg_kind */
     signed char slot;    /* NVN binding slot, or -1 for C1 / UNSUPPORTED */
+    /* Member position in spvDescriptorSetBuffer0, zero based.  Metal packs an
+     * argument buffer by declaration order, not by [[id(k)]], so a scalar
+     * resource lives at byte 8*packed.  For N entries the packed values are a
+     * permutation of 0..N-1.  This is why sparse ids (5/9/12) no longer leave
+     * holes in the raw table. */
+    unsigned char packed;
+    /* Bindless only: byte offset of the 32-bit handle in uniform buffer
+     * `slot`.  Zero for every other kind. */
+    unsigned short offset;
 } nvngfx_shader_arg;
 
 typedef struct nvngfx_shader_blob {
@@ -136,9 +151,10 @@ typedef struct nvngfx_shader_blob {
 /* Installs a static table.  Nothing is copied.  Returns 0 on success, or
  * -(index + 1) naming the first bad entry (bad key, bad stage, empty MSL, or a
  * duplicate key+stage).  A layout is also checked: ids must be ascending and
- * unique, no id above NVNGFX_MAX_ARG_ID, every kind in range with a slot that
- * fits its table, and C1 / UNSUPPORTED entries must carry slot -1.  A C1
- * entry must also name a blob with c1 data (an empty blob is valid), c1_size
+ * unique, packed slots must be a permutation of 0..num_args-1, no id above
+ * NVNGFX_MAX_ARG_ID, every kind in range with a slot that fits its table,
+ * and C1 / UNSUPPORTED entries must carry slot -1.  A C1 entry must also name
+ * a blob with c1 data (an empty blob is valid), c1_size
  * must not exceed NVNGFX_MAX_C1_BYTES, and a non-zero size needs a pointer.
  * On failure the previous table stays installed: the caller never sees a
  * half-installed table. */
@@ -221,7 +237,10 @@ const char* nvngfx_shader_selftest_msl(nvngfx_stage stage);
  *   4  the same draw with direct `[[texture(0)]]` / `[[sampler(0)]]`
  *      bindings: the non-Metal3 path, where gpuResourceID is zero
  *   5  variant 3 with the ids moved to 5 / 9 / 12, so the self-test can prove
- *      the table's stride and holes come from the layout sidecar */
+ *      the table's stride and holes come from the layout sidecar
+ *   6  a c1-only fragment shader
+ *   7  two bindless resources (ids 9 / 12, packed 0 / 1) whose 32-bit handle
+ *      lives in a uniform buffer */
 const char* nvngfx_shader_selftest_msl_variant(nvngfx_stage stage, int variant);
 
 #ifdef __cplusplus

@@ -89,83 +89,130 @@ def decode_tex(name):
     return t, s, ty
 
 
-def bindless(name):
-    """True for a handle that lives in the game's own uniform buffer.
+def decode_ubo_tex(name):
+    """A bindless handle stored in one of the game's uniform buffers.
 
-    cb2 is the driver's texture handle table, so it decodes like any other
-    combined texture; c3..c16 are the game's uniform buffers, where the replay
-    layer would have to read the handle at run time."""
-    m = re.match(r"[a-z]+_[ti]\w*?_cb(\d+)_", name)
-    return bool(m) and 3 <= int(m.group(1)) <= 16
+    `fp_t_cb7_2A` means the NVN handle at c7 word 0x2A.  Returns
+    (texture, sampler), each (uniform_slot, byte_offset), or None.  Handle
+    type 0 packs texture and sampler in one 32-bit word; type 1 names a second
+    word for the sampler; type 3 has a constant sampler ID instead.
+
+    This is a port of dmsh_build.py's decode_ubo_tex (nxnative, MIT)."""
+    m = re.match(r"[a-z]+_[ti]\w*?_cb(\d+)_([0-9A-F]+)", name)
+    if not m:
+        return None
+    slots, h = int(m.group(1)), int(m.group(2), 16)
+    tb = slots & 0xffff
+    sb = ((slots >> 16) - 1) if slots >> 16 else tb
+    o0, o1, ty = h & 0x3fff, (h >> 14) & 0x3fff, h >> 28
+    if not 3 <= tb <= 16 or ty not in (0, 1, 3) or (ty == 1 and not 3 <= sb <= 16):
+        return None
+    texture = (tb - 3, o0 * 4)
+    if ty == 3:
+        sampler = ("id", o1)
+    elif ty == 1:
+        sampler = (sb - 3, o1 * 4)
+    else:
+        sampler = texture
+    return texture, sampler
 
 
 def classify(msl_type, name):
-    """MSL struct member -> (C kind, slot).  slot is -1 when unsupported."""
+    """MSL struct member -> (C kind, slot, UBO byte offset).
+
+    slot is the NVN binding slot, or -1 when unsupported.  offset is nonzero
+    only for a bindless handle stored in a uniform buffer."""
     m = re.fullmatch(r"[a-z]+_c(\d+)", name)
     if m:
         n = int(m.group(1))
         if 3 <= n <= 16:
-            return "NVNGFX_ARG_UBO", n - 3
+            return "NVNGFX_ARG_UBO", n - 3, 0
         if n == 1:
-            return "NVNGFX_ARG_C1", -1           # filled from blob->c1
-        return "NVNGFX_ARG_UNSUPPORTED", -1      # c0, c2 driver tables
+            return "NVNGFX_ARG_C1", -1, 0       # filled from blob->c1
+        return "NVNGFX_ARG_UNSUPPORTED", -1, 0  # c0, c2 driver tables
     if re.fullmatch(r"[a-z]+_s\d+", name):
-        return "NVNGFX_ARG_UNSUPPORTED", -1      # storage buffer
+        return "NVNGFX_ARG_UNSUPPORTED", -1, 0  # storage buffer
     if re.match(r"[a-z]+_i", name):
-        return "NVNGFX_ARG_UNSUPPORTED", -1      # image
+        return "NVNGFX_ARG_UNSUPPORTED", -1, 0  # image
     base = name[:-5] if name.endswith("Smplr") else name
-    if bindless(base):
-        return "NVNGFX_ARG_UNSUPPORTED", -1      # handle in a uniform buffer
+    ub = decode_ubo_tex(base)
+    if ub:
+        if "texture_buffer" in msl_type:
+            return "NVNGFX_ARG_UNSUPPORTED", -1, 0  # bindless typed buffer
+        tex, samp = ub
+        if name.endswith("Smplr"):
+            if samp[0] == "id":
+                return "NVNGFX_ARG_UNSUPPORTED", -1, 0  # constant sampler ID
+            if samp == tex:
+                return "NVNGFX_ARG_SAMPLER_OF_UBO_TEXTURE", tex[0], tex[1]
+            return "NVNGFX_ARG_SAMPLER_IN_UBO", samp[0], samp[1]
+        return "NVNGFX_ARG_TEXTURE_IN_UBO", tex[0], tex[1]
     d = decode_tex(base)
     if d is None:
-        return "NVNGFX_ARG_UNSUPPORTED", -1
+        return "NVNGFX_ARG_UNSUPPORTED", -1, 0
     t, s, ty = d
     if name.endswith("Smplr"):
         if ty == 3:
-            return "NVNGFX_ARG_UNSUPPORTED", -1  # constant sampler ID
+            return "NVNGFX_ARG_UNSUPPORTED", -1, 0      # constant sampler ID
         if ty == 0:
             # A separate texture's handle carries no sampler bits, so the
             # paired sampler cannot come from the same slot.
             if t is None or t >= SEPTEX_SLOT0:
-                return "NVNGFX_ARG_UNSUPPORTED", -1
-            return "NVNGFX_ARG_SAMPLER_OF_TEXTURE", t
+                return "NVNGFX_ARG_UNSUPPORTED", -1, 0
+            return "NVNGFX_ARG_SAMPLER_OF_TEXTURE", t, 0
         if ty == 1:
-            return ("NVNGFX_ARG_SEPARATE_SAMPLER", s) if s is not None \
-                else ("NVNGFX_ARG_UNSUPPORTED", -1)
-        return "NVNGFX_ARG_UNSUPPORTED", -1
+            return (("NVNGFX_ARG_SEPARATE_SAMPLER", s, 0) if s is not None
+                    else ("NVNGFX_ARG_UNSUPPORTED", -1, 0))
+        return "NVNGFX_ARG_UNSUPPORTED", -1, 0
     if t is None:
-        return "NVNGFX_ARG_UNSUPPORTED", -1
+        return "NVNGFX_ARG_UNSUPPORTED", -1, 0
     if t >= SEPTEX_SLOT0:
-        return "NVNGFX_ARG_SEPARATE_TEXTURE", t - SEPTEX_SLOT0
-    return "NVNGFX_ARG_TEXTURE", t
+        return "NVNGFX_ARG_SEPARATE_TEXTURE", t - SEPTEX_SLOT0, 0
+    return "NVNGFX_ARG_TEXTURE", t, 0
 
 
 def layout(text):
-    """The stage's [[id(k)]] table as a list of (id, kind, slot), sorted by id.
+    """The stage's argument table as (id, kind, slot, packed, offset), by id.
 
-    An empty list means the shader declares no resources (a constant-colour
-    program), which is valid.  Raises ValueError for a table the runtime would
-    refuse: an id twice or above MAX_ARGS, or a slot outside the API range."""
+    packed is the member's declaration index, which is the byte offset Metal
+    actually uses (byte 8*packed).  An empty list means the shader declares no
+    resources (a constant-colour program), which is valid.  Raises ValueError
+    for a table the runtime would refuse: an id twice or above MAX_ARGS, more
+    than MAX_ARGS members, an array occupying several argument slots (not
+    modelled yet), or a slot outside the API range."""
     body = STRUCT.search(text)
     if not body:
         return []
     out = []
+    packed = 0
     for m in MEMBER.finditer(body.group(1)):
         msl_type, name, aid = m.group(1).strip(), m.group(2), int(m.group(3))
+        if packed >= MAX_ARGS:
+            raise ValueError("%s: more than %d argument members" % (name, MAX_ARGS))
         if aid >= MAX_ARGS:
             raise ValueError("%s: [[id(%d)]] exceeds %d" % (name, aid, MAX_ARGS - 1))
-        kind, slot = classify(msl_type, name)
+        if re.match(r"array\s*<", msl_type):
+            raise ValueError("%s: descriptor arrays need packed-slot widths, "
+                             "which are not implemented yet" % name)
+        kind, slot, offset = classify(msl_type, name)
         if kind == "NVNGFX_ARG_C1" and slot != -1:
             raise ValueError("%s: c1 slot must be -1" % name)
-        if kind == "NVNGFX_ARG_UBO" and not 0 <= slot < MAX_UBO_SLOTS:
+        if kind in ("NVNGFX_ARG_UBO", "NVNGFX_ARG_TEXTURE_IN_UBO",
+                    "NVNGFX_ARG_SAMPLER_OF_UBO_TEXTURE",
+                    "NVNGFX_ARG_SAMPLER_IN_UBO") and not 0 <= slot < MAX_UBO_SLOTS:
             raise ValueError("%s: uniform slot %d out of range" % (name, slot))
-        if kind in ("NVNGFX_ARG_TEXTURE", "NVNGFX_ARG_SAMPLER_OF_TEXTURE",
-                    "NVNGFX_ARG_SEPARATE_TEXTURE") and not 0 <= slot < MAX_TEXTURE_SLOTS:
+        if (kind in ("NVNGFX_ARG_TEXTURE", "NVNGFX_ARG_SAMPLER_OF_TEXTURE",
+                     "NVNGFX_ARG_SEPARATE_TEXTURE")
+                and not 0 <= slot < MAX_TEXTURE_SLOTS):
             raise ValueError("%s: texture slot %d out of range" % (name, slot))
         if kind == "NVNGFX_ARG_SEPARATE_SAMPLER" and not 0 <= slot < MAX_SAMPLER_SLOTS:
             raise ValueError("%s: sampler slot %d out of range" % (name, slot))
-        out.append((aid, kind, slot))
-    out.sort()
+        if offset & 3 or offset > 0xffff:
+            raise ValueError("%s: bindless handle offset %d is not a valid byte offset"
+                             % (name, offset))
+        out.append((aid, kind, slot, packed, offset))
+        packed += 1
+    out.sort(key=lambda e: e[0])
     for a, b in zip(out, out[1:]):
         if a[0] == b[0]:
             raise ValueError("[[id(%d)]] appears twice" % a[0])
@@ -224,7 +271,7 @@ def main():
                 errors.append("%s: c1 is %d bytes, maximum is %d"
                               % (name, len(c1), MAX_C1_BYTES))
                 continue
-        if any(kind == "NVNGFX_ARG_C1" for _aid, kind, _slot in args) and not c1_present:
+        if any(kind == "NVNGFX_ARG_C1" for _aid, kind, _slot, _packed, _off in args) and not c1_present:
             errors.append("%s: MSL declares c1 but %s is missing"
                           % (name, os.path.basename(c1_path)))
             continue
@@ -267,8 +314,9 @@ def main():
         if not args:
             continue
         out.append("static const nvngfx_shader_arg kArgs_%s_%s[] = {" % (key, st))
-        for aid, kind, slot in args:
-            out.append("    {%d, %s, %d}," % (aid, kind, slot))
+        for aid, kind, slot, packed_slot, offset in args:
+            out.append("    {%d, %s, %d, %d, %d}," %
+                       (aid, kind, slot, packed_slot, offset))
         out.append("};")
 
     out.append("")
@@ -295,7 +343,7 @@ def main():
     counts = {}
     c1_bytes = 0
     for _k, _s, _t, args, c1, cp in rows:
-        for _aid, kind, _slot in args:
+        for _aid, kind, _slot, _packed, _off in args:
             counts[kind] = counts.get(kind, 0) + 1
         if cp:
             c1_bytes += len(c1 or b"")
