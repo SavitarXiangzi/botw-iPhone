@@ -111,6 +111,36 @@ static void test_sizes() {
         CHECK(L.layer_size == 16384);
         CHECK(L.size == 4 * 16384);
     }
+    {
+        /* 1D array: NVN stores the layer count in height, and the storage is
+         * one 1-row (64 texel) slice per layer, block aligned. */
+        nvngfx_texdesc d = make_desc(0x25, 64, 1, 1);
+        d.target = 3;
+        d.height = 4;
+        CHECK(nvngfx_tex_layout(&d, &L) == 0);
+        CHECK(L.layers == 4);
+        CHECK(L.layer_size == 2048);
+        CHECK(L.size == 4 * 2048);
+    }
+    {
+        /* Cubemap and cubemap array are six faces per cube.  The old shape()
+         * treated a cube array as depth layers, which made every upload stop
+         * after the first cube. */
+        nvngfx_texdesc cube = make_desc(0x25, 64, 64, 1);
+        cube.target = 8;
+        CHECK(nvngfx_tex_layout(&cube, &L) == 0);
+        CHECK(L.layers == 6);
+        CHECK(L.layer_size == 16384);
+        CHECK(L.size == 6 * 16384);
+
+        nvngfx_texdesc array = cube;
+        array.target = 9;
+        array.depth = 2;
+        CHECK(nvngfx_tex_layout(&array, &L) == 0);
+        CHECK(L.layers == 12);
+        CHECK(L.layer_size == 16384);
+        CHECK(L.size == 12 * 16384);
+    }
 }
 
 static void test_bl_offset() {
@@ -130,7 +160,7 @@ static void test_bl_offset() {
 /* Writes `img` (rows x row_bytes) into `storage` through bl_offset, then reads
  * it back with nvngfx_tex_deswizzle and compares. */
 static void round_trip(const char* what, const nvngfx_texdesc& d, unsigned level,
-                       unsigned row_bytes, unsigned rows) {
+                       unsigned row_bytes, unsigned rows, unsigned layer = 0) {
     nvngfx_texlayout L;
     CHECK(nvngfx_tex_layout(&d, &L) == 0);
     std::vector<unsigned char> storage(static_cast<size_t>(L.size), 0xCC);
@@ -141,7 +171,7 @@ static void round_trip(const char* what, const nvngfx_texdesc& d, unsigned level
 
     unsigned th = 0, td = 0;
     unsigned long long base = 0;
-    CHECK(nvngfx_tex_level_geometry(&d, level, 0, nullptr, nullptr, nullptr,
+    CHECK(nvngfx_tex_level_geometry(&d, level, layer, nullptr, nullptr, nullptr,
                                     &base, &th, &td) == 0);
     const unsigned gobs = nvngfx_tex_level_gobs(&d, level);
     const unsigned laid = gobs * 64u;
@@ -154,7 +184,7 @@ static void round_trip(const char* what, const nvngfx_texdesc& d, unsigned level
                         src.data() + static_cast<size_t>(y) * row_bytes + x, n);
         }
     }
-    CHECK(nvngfx_tex_deswizzle(&d, level, 0, storage.data(), dst.data(),
+    CHECK(nvngfx_tex_deswizzle(&d, level, layer, storage.data(), dst.data(),
                                row_bytes) == 0);
     if (std::memcmp(src.data(), dst.data(), img) != 0)
         std::printf("FAIL %s: deswizzle differs\n", what);
@@ -162,7 +192,7 @@ static void round_trip(const char* what, const nvngfx_texdesc& d, unsigned level
     /* And once more in the other direction: swizzle a fresh storage from the
      * same linear bytes and compare it with the hand-built one. */
     std::vector<unsigned char> again(storage.size(), 0xCC);
-    CHECK(nvngfx_tex_swizzle(&d, level, 0, src.data(), row_bytes,
+    CHECK(nvngfx_tex_swizzle(&d, level, layer, src.data(), row_bytes,
                              again.data()) == 0);
     if (std::memcmp(storage.data(), again.data(), storage.size()) != 0)
         std::printf("FAIL %s: swizzle differs\n", what);
@@ -177,6 +207,30 @@ static void test_round_trip() {
      * routine copies block rows. */
     round_trip("bc1 64x64", make_desc(0x42, 64, 64, 1), 0, 128, 16);
     round_trip("rgba8 mip 1", make_desc(0x25, 64, 64, 2), 1, 128, 32);
+
+    /* A non-zero layer must read from its own block-aligned storage, not
+     * from layer 0.  This is the arithmetic the Metal upload loop relies on
+     * for arrays and cube faces. */
+    nvngfx_texdesc array = make_desc(0x25, 64, 64, 1);
+    array.target = 4;
+    array.depth = 2;
+    round_trip("rgba8 2D array layer 1", array, 0, 256, 64, 1);
+
+    /* Cube faces and cube-array faces use the same per-layer arithmetic; the
+     * last face is the one an off-by-one layer count would omit. */
+    nvngfx_texdesc cube = make_desc(0x25, 64, 64, 1);
+    cube.target = 8;
+    round_trip("rgba8 cube face 5", cube, 0, 256, 64, 5);
+    nvngfx_texdesc cubeArray = make_desc(0x25, 64, 64, 1);
+    cubeArray.target = 9;
+    cubeArray.depth = 2;
+    round_trip("rgba8 cube array face 11", cubeArray, 0, 256, 64, 11);
+
+    /* A 1D array's height is its layer count, but each layer has one row. */
+    nvngfx_texdesc oneD = make_desc(0x25, 64, 1, 1);
+    oneD.target = 3;
+    oneD.height = 4;
+    round_trip("rgba8 1D array layer 3", oneD, 0, 256, 1, 3);
 }
 
 static void test_refusals() {
@@ -193,6 +247,10 @@ static void test_refusals() {
     /* A pitch smaller than the level's row is not a buffer to write into. */
     d = make_desc(0x25, 64, 64, 1);
     CHECK(nvngfx_tex_deswizzle(&d, 0, 0, a.data(), b.data(), 128) == -1);
+    /* A layer past the descriptor's own count is not layer 0 by accident. */
+    d.target = 4;
+    d.depth = 2;
+    CHECK(nvngfx_tex_deswizzle(&d, 0, 2, a.data(), b.data(), 256) == -1);
     /* An unknown format has no layout at all. */
     d = make_desc(0x00, 64, 64, 1);
     nvngfx_texlayout L;

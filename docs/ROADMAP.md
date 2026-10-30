@@ -3356,3 +3356,91 @@ BOTW_SELFTEST rc=0
 | 分层 / cubemap / LINEAR / BCn | 纹理路径仍未闭环 |
 | 连续纹理更新、blend/depth、fence | 未接 |
 | 真机 | 没有真机运行记录 |
+
+## M3.91 分层纹理：2D 数组端到端，cube / cube-array 层数修正
+
+覆盖仍是 **131 / 513（25.5%）**。这一轮没有新增 NVN 入口，补的是
+`nvnTextureInitialize` 与首次采样上传之间的分层语义。
+
+### 三个会静默出错的点
+
+1. **cube array 的层数少乘了 6。** `nvngfx_tex_layout()` 的 `shape()` 把
+   `NVN_TEXTURE_TARGET_CUBEMAP_ARRAY` 当成普通的 `depth` 层数组；正确的
+   存储层数是 `depth * 6`（每 cube 六面）。结果是上传只覆盖第一个 cube，
+   `L.size` 也偏小。
+2. **Metal 描述只看 rank。** 之前 `to_metal_texture_type(rank)` 只知道
+   1D/2D/3D；2D array、cube、cube array 全部被建成普通 2D。更隐蔽的是
+   `arrayLength`：Metal 的 cube 是 1 个数组项（六面隐式），cube array 是
+   `depth` 个 cube，而不是总面数。上传循环又必须按总面数逐 slice 寻址，
+   两个计数不能混用。
+3. **暂存区被所有 slice / mip 复用。** 命令缓冲提交后 GPU 才读暂存区；
+   如果每个 `destinationSlice` 都指向同一块 CPU 缓冲，所有 slice 会看到
+   最后一次写入的数据。单层纹理看不出这个问题，数组纹理一定错。
+
+### 修复
+
+- `shape()` 对 target 9 计算 `z = depth * 6`；1D array 仍把 `height` 当层数。
+- `to_metal_texture_type()` 按 target 选出 `1DArray / 2DArray / 2DMS /
+  2DMSArray / Cube / CubeArray / TextureBuffer`，rank 只作 1D/2D/3D 的回退。
+- 新增 `metal_array_length()`：1D array 用 `height`，2D array / MS array /
+  cube array 用 `depth`，cube 固定 1。`nvn_texlayout::layers` 继续表示
+  “上传要写的总 slice 数”，cube 为 6，cube array 为 `depth * 6`。
+- 上传尺寸不再从原始 `width/height` 移位推算，而是由
+  `nvngfx_tex_level_geometry()` 的 block row 反推：这样 1D array 的
+  `height` 不会被误当图片高度，BCn/ASTC 的宽高按 block 对齐，cube array
+  的 slice 数也正确。
+- 暂存缓冲改成每个 `(level, layer)` 独立区间。代价是上传命令缓冲存活期间
+  需要一份完整的 CPU 侧纹理副本；这是正确性优先的临时实现，后续应由
+  GPU deswizzle 取代，而不是在这里省内存。
+
+### 可移植测试
+
+`tests/nvn_texlayout_test.cpp` 新增：
+
+- 1D array `height=4` → 4 层，每层 2048 字节；
+- cube → 6 层；
+- cube array `depth=2` → 12 层；
+- layer 1 / cube face 5 / cube array face 11 / 1D array layer 3 的
+  swizzle-deswizzle 往返，确认层偏移不是永远落在 layer 0；
+- 超出层数的 layer 被拒绝。
+
+`tests/nvn_shader_test.cpp` 固定第十一条自检的 MSL 必须声明
+`texture2d_array<float>`，并同时出现 `in.uv, 0` 与 `in.uv, 1`。
+
+### 自检：第十一条 draw
+
+自检在 guest pool 的 offset 12288 构造一个 2×2 RGBA8 的 2D array：
+
+- layer 0：红色；
+- layer 1：黄色；
+- target 4，`size2d(2,2)`，`setDepth(2)`，1 mip，1 sample。
+
+`tex_initialize()` 必须给出 `MTLTextureType2DArray`、`arrayLength=2`、
+内部总 slice 数 2。片段着色器同时采样两层，`uv.x < 0.5` 取 layer 0，否则取
+layer 1；自检回读左侧 `(255,0,0,255)`、右侧 `(255,255,0,255)`。如果描述仍是
+普通 2D，或两个 slice 复用了暂存区，这个检查都会失败。
+
+失败码：`16399`（布局 / 建纹理 / 命令缓冲 / 上传），`16400`（像素不对）。
+
+### 本地证据
+
+```text
+nvn_texlayout_test: ok (block shapes, sizes, offsets, round trip, refusals)
+nvn_shader_test: ok (seam, blob table, packed slots, bindless, c1, SHA-256, shader key, layered fixture)
+syntax_check_metal: ok (clang++.exe)
+build_abi_test: all tests passed
+```
+
+模拟器里的实际 draw 结果需要在提交后的 iOS job 上确认；没有通过前不把
+M3.91 记成 CI 已验证。
+
+### 仍然没有的
+
+| 缺口 | 后果 |
+|---|---|
+| cube / cube array 的真实 draw 自检 | 目前只验证布局与 Metal 描述，端到端只跑 2D array |
+| LINEAR 存储 | `nvngfx_tex_deswizzle()` 仍拒绝；线性纹理上传会丢 draw |
+| 连续更新 | 首次采样后 guest 再改内存不会重传 |
+| BCn 转码 | Apple GPU 无对应格式时仍无法建立可用纹理 |
+| 暂存内存 | 分层纹理需要完整 CPU 副本，大纹理可能超出 iOS 内存预算 |
+| 真机 | 没有真机运行记录 |

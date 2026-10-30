@@ -96,8 +96,15 @@ enum { MTLResourceStorageModeShared = 0 };
 typedef NSUInteger MTLTextureType;
 enum {
     MTLTextureType1D = 0,
+    MTLTextureType1DArray = 1,
     MTLTextureType2D = 2,
-    MTLTextureType3D = 3,
+    MTLTextureType2DArray = 3,
+    MTLTextureType2DMultisample = 4,
+    MTLTextureTypeCube = 5,
+    MTLTextureTypeCubeArray = 6,
+    MTLTextureType3D = 7,
+    MTLTextureType2DMultisampleArray = 8,
+    MTLTextureTypeTextureBuffer = 9,
 };
 
 typedef NSUInteger MTLTextureUsage;
@@ -321,6 +328,11 @@ typedef void (^MTLDeallocator)(void* pointer, NSUInteger length);
 @protocol MTLTexture <MTLResource>
 @property (readonly) NSUInteger width;
 @property (readonly) NSUInteger height;
+@property (readonly) NSUInteger depth;
+@property (readonly) NSUInteger arrayLength;
+@property (readonly) NSUInteger mipmapLevelCount;
+@property (readonly) NSUInteger sampleCount;
+@property (readonly) MTLTextureType textureType;
 @property (readonly) MTLPixelFormat pixelFormat;
 @property (readonly) MTLResourceID gpuResourceID;
 @end
@@ -424,6 +436,7 @@ destinationBytesPerImage:(NSUInteger)bpi;
 @property NSUInteger width;
 @property NSUInteger height;
 @property NSUInteger depth;
+@property NSUInteger arrayLength;
 @property NSUInteger mipmapLevelCount;
 @property NSUInteger sampleCount;
 @property MTLTextureType textureType;

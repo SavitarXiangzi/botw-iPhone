@@ -63,6 +63,20 @@ int main() {
     CHECK(fs != nullptr && std::strstr(fs, "nvngfx_main_fs") != nullptr);
     CHECK(nvngfx_shader_selftest_msl(NVNGFX_STAGE_COMPUTE) == nullptr);
 
+    /* The layered-texture self-test must declare a 2D array, not a plain
+     * texture2d: a plain declaration would still compile and bind, but it
+     * cannot prove that destinationSlice:1 reached the GPU. */
+    const char* fs_array = nvngfx_shader_selftest_msl_variant(
+        NVNGFX_STAGE_FRAGMENT, 9);
+    CHECK(fs_array != nullptr &&
+          std::strstr(fs_array, "texture2d_array<float>") != nullptr);
+    CHECK(fs_array != nullptr && std::strstr(fs_array, "in.uv, 0") != nullptr);
+    CHECK(fs_array != nullptr && std::strstr(fs_array, "in.uv, 1") != nullptr);
+    CHECK(nvngfx_shader_selftest_msl_variant(NVNGFX_STAGE_VERTEX, 9) ==
+          nvngfx_shader_selftest_msl_variant(NVNGFX_STAGE_VERTEX, 4));
+    CHECK(nvngfx_shader_selftest_msl_variant(NVNGFX_STAGE_COMPUTE, 9) ==
+          nullptr);
+
 
     /* Offline MSL blobs: what the Windows-side chain produces is installed by
      * key, looked up case-insensitively, and a bad table is rejected whole
@@ -349,6 +363,7 @@ int main() {
         std::printf("nvn_shader_test: %d failure(s)\n", g_failures);
         return 1;
     }
-    std::printf("nvn_shader_test: ok (seam, blob table, packed slots, bindless, c1, SHA-256, shader key)\n");
+    std::printf("nvn_shader_test: ok (seam, blob table, packed slots, "
+                "bindless, c1, SHA-256, shader key, layered fixture)\n");
     return 0;
 }

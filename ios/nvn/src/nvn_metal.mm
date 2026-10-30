@@ -30,14 +30,15 @@
  *         on a computer, never in the repository.  Everything else on that
  *         path -- pipeline creation with a real vertex descriptor, buffer
  *         binding, draw encoding, pixel readback -- is executed by
- *         nvngfx_metal_selftest() in CI's iOS Simulator: ten draws, a
+ *         nvngfx_metal_selftest() in CI's iOS Simulator: eleven draws, a
  *         bindless table probe, and a vertex-stage argument-buffer draw whose
  *         shifted pixels are read back.  The ninth builds a block-linear
  *         texture in a guest memory pool and proves that the sampled pixels
  *         came from that storage, not from a host-side upload.  The tenth
  *         computes a guest shader key, loads its MSL from <app>/shaders and
- *         reads back orange.  A sampler state object is also created,
- *         compared and read back.
+ *         reads back orange.  The eleventh uploads a two-layer 2D array and
+ *         reads red from layer 0 and yellow from layer 1.  A sampler state
+ *         object is also created, compared and read back.
  *         MRT / depth attachment / texture views
  *         streaming texture updates and a LINEAR-storage upload path
  *         BCn -> ASTC/ETC2 transcode, compute, sync/fence
@@ -757,10 +758,40 @@ void tex_builder_set_flags(nvngfx_ctx*, uint64_t* x) {
     g_tex_specs[x[0]].flags = static_cast<int>(x[1]);
 }
 
-MTLTextureType to_metal_texture_type(int rank) {
-    if (rank == 1) return MTLTextureType1D;
-    if (rank == 3) return MTLTextureType3D;
+/* NVN's target carries the array / cube shape that `rank` alone cannot
+ * express (see nvngfx_tex_layout's shape()).  Build the matching Metal view so
+ * layer 1 of a 2D array, or a cube face, is addressable as a slice instead of
+ * silently being another `MTLTextureType2D` of the same dimensions. */
+MTLTextureType to_metal_texture_type(const nvngfx_texdesc& d) {
+    const int t = d.target;
+    /* Samples describe the storage, not the shape.  Only the two NVN
+     * multisample targets can become a Metal multisample type; treating a
+     * cube array with samples > 1 as a 2D multisample array would silently
+     * drop four faces. */
+    if (d.samples > 1 && t == 6) return MTLTextureType2DMultisampleArray;
+    if (d.samples > 1 && t == 5) return MTLTextureType2DMultisample;
+    if (t == 10) return MTLTextureTypeTextureBuffer;
+    if (t == 3) return MTLTextureType1DArray;
+    if (t == 4) return MTLTextureType2DArray;
+    if (t == 8) return MTLTextureTypeCube;
+    if (t == 9) return MTLTextureTypeCubeArray;
+    /* `rank` is authoritative when the builder used size2d but left target at
+     * its 1D default (the self-test does exactly this). */
+    if (t == 2 || d.rank == 3) return MTLTextureType3D;
+    if (d.rank == 1) return MTLTextureType1D;
     return MTLTextureType2D;
+}
+
+/* Metal's arrayLength counts arrays, cubes and 2D MS arrays differently from
+ * NVN's raw depth/height: a cube is one entry (six implicit slices) and a cube
+ * array is `depth` cubes (depth * 6 slices).  The upload loop, in contrast,
+ * addresses every slice, so it uses nvngfx_texlayout::layers. */
+NSUInteger metal_array_length(const nvngfx_texdesc& d) {
+    const int t = d.target;
+    if (t == 3) return static_cast<NSUInteger>(d.height > 0 ? d.height : 1);
+    if (t == 4 || t == 6 || t == 9)
+        return static_cast<NSUInteger>(d.depth > 0 ? d.depth : 1);
+    return 1;
 }
 
 /* nvnTextureInitialize(NVNtexture*, const NVNtextureBuilder*) -> NVNboolean
@@ -803,14 +834,36 @@ void tex_initialize(nvngfx_ctx* ctx, uint64_t* x) {
     }
 
     @autoreleasepool {
+        nvngfx_texlayout L = {};
+        unsigned layers = 1;
+        if (nvngfx_tex_layout(&d, &L) == 0 && L.layers)
+            layers = L.layers;
+        else
+            log_once("nvnTextureInitialize.layout", static_cast<unsigned>(d.format));
+        const MTLTextureType type = to_metal_texture_type(d);
+        const bool is3d = type == MTLTextureType3D;
+        const bool is1d = type == MTLTextureType1D ||
+                          type == MTLTextureType1DArray;
+        const bool isMultisample = type == MTLTextureType2DMultisample ||
+                                   type == MTLTextureType2DMultisampleArray;
+
         MTLTextureDescriptor* td = [[MTLTextureDescriptor alloc] init];
         td.pixelFormat = static_cast<MTLPixelFormat>(pf);
         td.width = static_cast<NSUInteger>(d.width);
-        td.height = static_cast<NSUInteger>(d.height);
-        td.depth = d.depth > 1 ? static_cast<NSUInteger>(d.depth) : 1;
-        td.mipmapLevelCount = d.levels > 1 ? static_cast<NSUInteger>(d.levels) : 1;
-        td.sampleCount = d.samples > 1 ? static_cast<NSUInteger>(d.samples) : 1;
-        td.textureType = to_metal_texture_type(d.rank);
+        /* NVN stores a 1D array's layer count in height; Metal keeps the
+         * height 1 and puts the layers in arrayLength. */
+        td.height = is1d ? 1 : static_cast<NSUInteger>(d.height);
+        td.depth = is3d ? static_cast<NSUInteger>(d.depth > 0 ? d.depth : 1) : 1;
+        td.arrayLength = metal_array_length(d);
+        td.mipmapLevelCount = isMultisample
+                                  ? 1
+                                  : (d.levels > 1
+                                         ? static_cast<NSUInteger>(d.levels)
+                                         : 1);
+        td.sampleCount = isMultisample
+                             ? static_cast<NSUInteger>(d.samples > 1 ? d.samples : 1)
+                             : 1;
+        td.textureType = type;
         td.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite |
                    MTLTextureUsageRenderTarget;
         td.storageMode = MTLStorageModePrivate;
@@ -825,7 +878,7 @@ void tex_initialize(nvngfx_ctx* ctx, uint64_t* x) {
         t->pool = d.pool;
         t->offset = static_cast<ptrdiff_t>(d.offset);
         t->desc = d;
-        t->layers = 1;
+        t->layers = layers;
         t->uploadTried = false;
         t->uploaded = false;
         t->rendered = false;
@@ -2480,26 +2533,41 @@ bool tex_upload(Ctx* c, CmdBuf* b, Tex* t) {
         static_cast<const unsigned char*>([p->buffer contents]) + off;
 
     const unsigned levels = t->desc.levels ? static_cast<unsigned>(t->desc.levels) : 1u;
-    /* The largest level decides the staging buffer. */
-    size_t staging = 0;
+    const unsigned layers = L.layers ? L.layers : 1u;
+    /* Every (level, layer) needs its own staging region.  The GPU reads these
+     * bytes when the command buffer executes, so reusing one region would make
+     * every mip/slice observe whichever copy wrote it last.  The price is a
+     * full CPU-side copy of this texture for the lifetime of the command
+     * buffer; a GPU deswizzle path is future work, not an optimisation to
+     * hide here. */
+    size_t stagingTotal = 0, stagingLargest = 0;
     for (unsigned l = 0; l < levels; ++l) {
         unsigned rb = 0, rows = 0, slices = 0;
         if (nvngfx_tex_level_geometry(&t->desc, l, 0, &rb, &rows, &slices,
                                       nullptr, nullptr, nullptr) != 0) {
             log_once("nvnTextureUpload.geometry", l);
+            stagingTotal = 0;
             break;
         }
         const size_t need = static_cast<size_t>(rb) * rows * slices;
-        if (need > staging) staging = need;
+        if (need > stagingLargest) stagingLargest = need;
+        if (layers != 0 &&
+            (need > SIZE_MAX / layers ||
+             need * layers > SIZE_MAX - stagingTotal)) {
+            log_once("nvnTextureUpload.stagingOverflow", l);
+            stagingTotal = 0;
+            break;
+        }
+        stagingTotal += need * layers;
     }
-    if (staging == 0) return false;
+    if (stagingTotal == 0) return false;
     std::fprintf(stderr,
                  "[nvn] texture upload: pool=0x%llx offset=%lld levels=%u "
-                 "staging=%zu bytes\n",
+                 "layers=%u staging=%zu bytes (largest slice=%zu)\n",
                  static_cast<unsigned long long>(t->desc.pool),
-                 t->desc.offset, levels, staging);
+                 t->desc.offset, levels, layers, stagingTotal, stagingLargest);
     std::fflush(stderr);
-    id<MTLBuffer> stg = [c->device newBufferWithLength:staging
+    id<MTLBuffer> stg = [c->device newBufferWithLength:stagingTotal
                                                options:MTLResourceStorageModeShared];
     if (!stg) {
         log_once("nvnTextureUpload.staging", 1);
@@ -2518,7 +2586,7 @@ bool tex_upload(Ctx* c, CmdBuf* b, Tex* t) {
     }
 
     unsigned done = 0;
-    const unsigned layers = L.layers ? L.layers : 1u;
+    size_t levelStage = 0;
     for (unsigned l = 0; l < levels; ++l) {
         unsigned rb = 0, rows = 0, slices = 0;
         if (nvngfx_tex_level_geometry(&t->desc, l, 0, &rb, &rows, &slices,
@@ -2526,28 +2594,34 @@ bool tex_upload(Ctx* c, CmdBuf* b, Tex* t) {
             log_once("nvnTextureUpload.geometry", l);
             break;
         }
-        /* A compressed level's last block may cover fewer texels than its
-         * storage does; the copy size stays the level's real size, while the
-         * source row is allowed to carry the whole block. */
+        /* Derive the copy extent from the layout, not from the raw NVN
+         * width/height.  For a 1D array the raw height is the layer count;
+         * for BCn/ASTC the texel extent must be block aligned; and a cube
+         * array has six times as many slices as its depth.  Row/block counts
+         * already include all three rules. */
+        const unsigned bpb = L.bytes_per_block ? L.bytes_per_block : 1u;
         const unsigned bw = L.block_width ? L.block_width : 1u;
         const unsigned bh = L.block_height ? L.block_height : 1u;
-        const unsigned texelsWide = rb / (L.bytes_per_block ? L.bytes_per_block : 1u);
-        const unsigned lw = (t->width >> l) ? (t->width >> l) : 1u;
-        const unsigned lh = (t->height >> l) ? (t->height >> l) : 1u;
-        if (texelsWide * bw < lw || rows * bh < lh) {
+        const unsigned lw = (rb / bpb) * bw;
+        const unsigned lh = rows * bh;
+        if (lw == 0 || lh == 0) {
             log_once("nvnTextureUpload.blockEdge", l);
             break;
         }
+        const size_t levelBytes = static_cast<size_t>(rb) * rows * slices;
         bool levelComplete = true;
         for (unsigned layer = 0; layer < layers; ++layer) {
-            if (nvngfx_tex_deswizzle(&t->desc, l, layer, base, [stg contents],
+            const size_t at = levelStage + static_cast<size_t>(layer) * levelBytes;
+            unsigned char* const layerBytes =
+                static_cast<unsigned char*>([stg contents]) + at;
+            if (nvngfx_tex_deswizzle(&t->desc, l, layer, base, layerBytes,
                                      rb) != 0) {
                 log_once("nvnTextureUpload.deswizzle", l);
                 levelComplete = false;
                 break;
             }
             [blit copyFromBuffer:stg
-                    sourceOffset:0
+                    sourceOffset:static_cast<NSUInteger>(at)
                sourceBytesPerRow:rb
              sourceBytesPerImage:static_cast<NSUInteger>(rb) * rows
                       sourceSize:MTLSizeMake(lw, lh, slices)
@@ -2557,6 +2631,7 @@ bool tex_upload(Ctx* c, CmdBuf* b, Tex* t) {
                destinationOrigin:MTLOriginMake(0, 0, 0)];
         }
         if (!levelComplete) break;
+        levelStage += levelBytes * layers;
         ++done;
     }
     [blit endEncoding];
@@ -5058,6 +5133,211 @@ extern "C" int nvngfx_metal_selftest(void) {
                 }
             }
         }
+        {
+            /* --- Draw 11: a layered texture from guest memory -------------
+             * The previous guest-texture draw was a single 2D image.  This
+             * one is a two-layer RGBA8 2D array: layer 0 is red, layer 1 is
+             * yellow, and the fragment shader explicitly samples layer 1.
+             * Passing requires the descriptor to be MTLTextureType2DArray,
+             * arrayLength to be 2, both guest slices to be deswizzled, and
+             * Metal to accept destinationSlice:1 during upload. */
+            alignas(16) unsigned char guestArrayBuilder[0x80] = {};
+            const uint64_t kTexGuestArray = 0x6900;
+            const uint64_t kProg11 = 0x6A00;
+            const uint64_t kCb11 = 0x6B00;
+            const uint64_t kB11 = reinterpret_cast<uint64_t>(guestArrayBuilder);
+            const unsigned kArrayOffset = 12288;
+            unsigned char* const vpool11 = reinterpret_cast<unsigned char*>(
+                (reinterpret_cast<uintptr_t>(poolRaw) + 16383u) &
+                ~static_cast<uintptr_t>(16383u));
+
+            nvngfx_texdesc ad;
+            nvngfx_texdesc_defaults(&ad);
+            ad.target = 4;                       /* NVN_TEXTURE_TARGET_2D_ARRAY */
+            ad.format = 0x25;                    /* RGBA8_UNORM */
+            ad.width = 2;
+            ad.height = 2;
+            ad.depth = 2;
+            ad.levels = 1;
+            ad.samples = 1;
+            ad.pool = 0x5400;
+            ad.offset = kArrayOffset;
+            {
+                const unsigned char red[16] = {
+                    255, 0, 0, 255, 255, 0, 0, 255,
+                    255, 0, 0, 255, 255, 0, 0, 255};
+                const unsigned char yellow[16] = {
+                    255, 255, 0, 255, 255, 255, 0, 255,
+                    255, 255, 0, 255, 255, 255, 0, 255};
+                nvngfx_texlayout al;
+                if (nvngfx_tex_layout(&ad, &al) != 0 || al.layers != 2 ||
+                    al.size > 1024 ||
+                    nvngfx_tex_swizzle(&ad, 0, 0, red, 8,
+                                       vpool11 + kArrayOffset) != 0 ||
+                    nvngfx_tex_swizzle(&ad, 0, 1, yellow, 8,
+                                       vpool11 + kArrayOffset) != 0) {
+                    std::fprintf(stderr,
+                                 "[selftest] draw 11: guest array layout failed "
+                                 "(layers=%u size=%llu)\n",
+                                 al.layers,
+                                 static_cast<unsigned long long>(al.size));
+                    rc = 16399;
+                    goto done;
+                }
+            }
+            {
+                x[0] = kB11;
+                tex_builder_set_defaults(ctx, x);
+                x[0] = kB11; x[1] = 4;
+                tex_builder_set_target(ctx, x);
+                x[0] = kB11; x[1] = 0x25;
+                tex_builder_set_format(ctx, x);
+                x[0] = kB11; x[1] = 2; x[2] = 2;
+                tex_builder_set_size2d(ctx, x);
+                x[0] = kB11; x[1] = 2;
+                tex_builder_set_depth(ctx, x);
+                x[0] = kB11; x[1] = 1;
+                tex_builder_set_levels(ctx, x);
+                x[0] = kB11; x[1] = 1;
+                tex_builder_set_samples(ctx, x);
+                x[0] = kB11; x[1] = 0x5400; x[2] = kArrayOffset;
+                tex_builder_set_storage(ctx, x);
+                x[0] = kTexGuestArray; x[1] = kB11;
+                tex_initialize(ctx, x);
+            }
+            Tex* arrayTex = find<Tex>(kTexGuestArray);
+            if (x[0] != 1 || !arrayTex || !arrayTex->mtl ||
+                arrayTex->mtl.textureType != MTLTextureType2DArray ||
+                arrayTex->mtl.arrayLength != 2 ||
+                arrayTex->layers != 2) {
+                std::fprintf(stderr,
+                             "[selftest] draw 11: array texture is not "
+                             "2DArray x2 (type=%lu array=%lu layers=%u)\n",
+                             arrayTex
+                                 ? static_cast<unsigned long>(
+                                       arrayTex->mtl.textureType)
+                                 : 0ul,
+                             arrayTex
+                                 ? static_cast<unsigned long>(
+                                       arrayTex->mtl.arrayLength)
+                                 : 0ul,
+                             arrayTex ? arrayTex->layers : 0u);
+                rc = 16399;
+                goto done;
+            }
+
+            struct { uint64_t data; uint64_t control; } sd11[2];
+            sd11[0].data = reinterpret_cast<uint64_t>(const_cast<char*>(
+                nvngfx_shader_selftest_msl_variant(NVNGFX_STAGE_VERTEX, 9)));
+            sd11[0].control = 0;
+            sd11[1].data = reinterpret_cast<uint64_t>(const_cast<char*>(
+                nvngfx_shader_selftest_msl_variant(NVNGFX_STAGE_FRAGMENT, 9)));
+            sd11[1].control = 0;
+            x[0] = kProg11; x[1] = 0;
+            prog_initialize(ctx, x);
+            x[0] = kProg11; x[1] = 2;
+            x[2] = reinterpret_cast<uint64_t>(&sd11[0]);
+            prog_set_shaders(ctx, x);
+            if (x[0] != 1) {
+                std::fprintf(stderr,
+                             "[selftest] draw 11: SetShaders failed\n");
+                rc = 16399;
+                goto done;
+            }
+            x[0] = kTexPool; x[1] = 7; x[2] = kTexGuestArray; x[3] = 0;
+            tex_pool_register_texture(ctx, x);
+
+            const uint64_t target11 = kTex;
+            const float clear11[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+            x[0] = kCb11;
+            cmdbuf_begin_recording(ctx, x);
+            x[0] = kCb11; x[1] = 1;
+            x[2] = reinterpret_cast<uint64_t>(&target11);
+            x[3] = 0; x[4] = 0; x[5] = 0;
+            cmdbuf_set_render_targets(ctx, x);
+            x[0] = kCb11; x[1] = 0;
+            x[2] = reinterpret_cast<uint64_t>(clear11);
+            x[3] = 0xF;
+            cmdbuf_clear_color(ctx, x);
+            x[0] = kCb11; x[1] = kTexPool;
+            cmdbuf_set_texture_pool(ctx, x);
+            x[0] = kCb11; x[1] = kSampPool;
+            cmdbuf_set_sampler_pool(ctx, x);
+            x[0] = 0; x[1] = 7; x[2] = 9;
+            dev_get_texture_handle(ctx, x);
+            const uint64_t ahandle = x[0];
+            x[0] = kCb11; x[1] = 1; x[2] = 0; x[3] = ahandle;
+            cmdbuf_bind_texture(ctx, x);
+            x[0] = kCb11; x[1] = kProg11; x[2] = 0;
+            cmdbuf_bind_program(ctx, x);
+            x[0] = kCb11; x[1] = 0; x[2] = 0; x[3] = 3;
+            cmdbuf_draw_arrays(ctx, x);
+            x[0] = kCb11;
+            cmdbuf_end_recording(ctx, x);
+
+            CmdBuf* b11 = find<CmdBuf>(kCb11);
+            if (!b11 || !b11->last) {
+                std::fprintf(stderr,
+                             "[selftest] draw 11: nothing committed\n");
+                rc = 16399;
+                goto done;
+            }
+            [b11->last waitUntilCompleted];
+            if (b11->last.status == MTLCommandBufferStatusError) {
+                std::fprintf(stderr,
+                             "[selftest] draw 11 command buffer error: %s\n",
+                             b11->last.error
+                                 ? [[b11->last.error localizedDescription]
+                                       UTF8String]
+                                 : "(no description)");
+                rc = 16399;
+                goto done;
+            }
+            if (!arrayTex->uploaded || arrayTex->uploadedLevels != 1 ||
+                b11->encoded != 1) {
+                std::fprintf(stderr,
+                             "[selftest] draw 11: array not used "
+                             "(uploaded=%d levels=%u encoded=%u)\n",
+                             arrayTex->uploaded ? 1 : 0,
+                             arrayTex->uploadedLevels, b11->encoded);
+                rc = 16399;
+                goto done;
+            }
+            {
+                unsigned char left[4] = {0, 0, 0, 0};
+                unsigned char right[4] = {0, 0, 0, 0};
+                const int wantRed[4] = {255, 0, 0, 255};
+                const int wantYellow[4] = {255, 255, 0, 255};
+                if (!read_pixel_at(dev, c->queue, t->mtl, kSide,
+                                   kSide / 8, kSide / 2, left) ||
+                    !read_pixel_at(dev, c->queue, t->mtl, kSide,
+                                   (7 * kSide) / 8, kSide / 2, right)) {
+                    std::fprintf(stderr,
+                                 "[selftest] draw 11 readback failed\n");
+                    rc = 16400;
+                    goto done;
+                }
+                if (!pixels_near(left, wantRed, 2) ||
+                    !pixels_near(right, wantYellow, 2)) {
+                    std::fprintf(stderr,
+                                 "[selftest] draw 11 layers are "
+                                 "(%u,%u,%u,%u) / (%u,%u,%u,%u), want "
+                                 "(%d,%d,%d,%d) / (%d,%d,%d,%d); both slices "
+                                 "did not reach the shader\n",
+                                 left[0], left[1], left[2], left[3],
+                                 right[0], right[1], right[2], right[3],
+                                 wantRed[0], wantRed[1], wantRed[2], wantRed[3],
+                                 wantYellow[0], wantYellow[1], wantYellow[2],
+                                 wantYellow[3]);
+                    rc = 16400;
+                    goto done;
+                }
+                std::fprintf(stderr,
+                             "[selftest] draw 11: 2D array layers 0/1 sampled "
+                             "from guest memory\n");
+            }
+        }
+
     done:
         nvngfx_shader_set_msl_passthrough(0);
         forget<CmdBuf>(kCb);
@@ -5087,6 +5367,9 @@ extern "C" int nvngfx_metal_selftest(void) {
         forget<Tex>(0x6400);
         forget<Program>(0x6500);
         forget<CmdBuf>(0x6600);
+        forget<Tex>(0x6900);
+        forget<Program>(0x6A00);
+        forget<CmdBuf>(0x6B00);
         g_tex_specs.erase(kTexSrcBuilder);
         g_tex_specs.erase(0x6450);
         g_sampler_specs.erase(kSamplerBuilder5);

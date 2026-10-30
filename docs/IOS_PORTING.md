@@ -404,6 +404,15 @@ CI 现在用 `SIMCTL_CHILD_BOTW_REQUIRE_SHADER_BUNDLE=1` 要求这条必须执�
 `gen_blobs.py --bundle-out <dir>` 可以直接从 `nx_shader.py translate` 的输出
 生成同一种目录。这仍是我们自写的合成 MSL，不是标题 shader。
 
+M3.91 的第十一条 draw 把一块 2×2 RGBA8 的两层 2D 数组放进 guest pool：
+layer 0 全红、layer 1 全黄。运行时先检查 `MTLTexture.textureType == 2DArray`
+和 `arrayLength == 2`，再让片段着色器同时采样两层，左半屏取 layer 0、右半屏
+取 layer 1，最后回读左红右黄。这个布局能抓住两个很容易静默通过的 bug：
+把数组建成普通 2D 纹理，以及所有 slice 复用同一块暂存区（两边都会变成最后一层）。
+通过时的日志应为
+`[selftest] draw 11: 2D array layers 0/1 sampled from guest memory`；
+本地没有 Metal 模拟器，所以这条仍需提交后的 iOS job 确认。
+
 第五条在模拟器里走的是**直连纹理/采样器绑定**：模拟器的
 `MTLTexture.gpuResourceID` 是 0，参数缓冲区的纹理条目在那里没有意义
 （见 `docs/ROADMAP.md` 的 M3.83 / M3.84 段）。所以“Metal 这半边是通的”
@@ -416,7 +425,8 @@ CI 现在用 `SIMCTL_CHILD_BOTW_REQUIRE_SHADER_BUNDLE=1` 要求这条必须执�
 
 - `nvnTextureBuilder*` 的字段偏移验证
 - ✅ 平铺：M3.88 的 Tegra X1 block-linear 尺寸 + 解块，M3.89 接到首次采样上传；
-  仍缺 LINEAR 存储和分层/立方体纹理的完整复制
+  M3.91 接上 2D 数组的端到端上传，并修正 cube / cube-array 的层数与 Metal 描述。
+  仍缺 LINEAR 存储、cube 的真实 draw 自检和连续更新
 - BCn（BC1/BC3/BC4/BC5）在 Apple GPU 上没有对应格式，必须**离线转码**
   成 ASTC/ETC2，或者运行时用 compute 解压。这是个体力活，不是难点。
 

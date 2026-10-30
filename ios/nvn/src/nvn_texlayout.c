@@ -128,7 +128,7 @@ static void shape(const nvngfx_texdesc* d, unsigned* dpl, int* layered,
         if (*z == 0) *z = 1;
         return;
     }
-    if (t == 4 || t == 6 || t == 9) {   /* 2D_ARRAY, MS_ARRAY, CUBEMAP_ARRAY */
+    if (t == 4 || t == 6) {             /* 2D_ARRAY, MS_ARRAY */
         *dpl = 2;
         *layered = 1;
         if (*z == 0) *z = 1;
@@ -137,6 +137,12 @@ static void shape(const nvngfx_texdesc* d, unsigned* dpl, int* layered,
     if (t == 8) {                       /* CUBEMAP: six faces */
         *dpl = 2;
         *z = 6;
+        *layered = 1;
+        return;
+    }
+    if (t == 9) {                       /* CUBEMAP_ARRAY: depth cubes x 6 */
+        *dpl = 2;
+        *z = (*z ? *z : 1u) * 6u;
         *layered = 1;
         return;
     }

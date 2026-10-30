@@ -147,6 +147,27 @@ static const char* const kFsTextureDirect =
     "    return tex.sample(smp, in.uv);\n"
     "}\n";
 
+/* Variant 9: sample both layers of a two-layer 2D array and place layer 0 on
+ * the left half of the target and layer 1 on the right half.  The texture
+ * type is what makes this different from variant 4: Metal has to see
+ * MTLTextureType2DArray and arrayLength 2 before destinationSlice:1 during the
+ * guest upload becomes visible to the shader.  Reading both halves also
+ * catches a staging buffer reused for every slice -- then both halves would
+ * contain the last layer's colour. */
+static const char* const kFsTextureArray =
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "\n"
+    "struct NvngfxVaryings { float4 position [[position]]; float2 uv; };\n"
+    "\n"
+    "fragment float4 nvngfx_main_fs(NvngfxVaryings in [[stage_in]],\n"
+    "                               texture2d_array<float> tex [[texture(0)]],\n"
+    "                               sampler smp [[sampler(0)]]) {\n"
+    "    float4 lo = tex.sample(smp, in.uv, 0);\n"
+    "    float4 hi = tex.sample(smp, in.uv, 1);\n"
+    "    return in.uv.x < 0.5 ? lo : hi;\n"
+    "}\n";
+
 
 /* The same textured draw, but the argument-buffer ids are 5 / 9 / 12 instead
  * of 0 / 1 / 2.  The self-test uses this variant to prove that the fixed
@@ -461,6 +482,11 @@ const char* nvngfx_shader_selftest_msl_variant(nvngfx_stage stage, int variant) 
     if (variant == 8) {
         if (stage == NVNGFX_STAGE_VERTEX) return kVsVertexUbo;
         if (stage == NVNGFX_STAGE_FRAGMENT) return kFsMagenta;
+        return NULL;
+    }
+    if (variant == 9) {
+        if (stage == NVNGFX_STAGE_VERTEX) return kVsUv;
+        if (stage == NVNGFX_STAGE_FRAGMENT) return kFsTextureArray;
         return NULL;
     }
     if (stage == NVNGFX_STAGE_VERTEX) return kVs;
