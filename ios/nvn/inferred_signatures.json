@@ -1,7 +1,7 @@
 {
   "source": "hand-written: derived from the Set/Get naming symmetry, NOT from a header",
   "note": "These entry points are absent from the public nvn_protos.h. Their shapes are inferred from their siblings: the window/device/buffer/texture-builder getters mirror their Set siblings, and the QueueBuilder getters mirror QueueBuilderSet* plus QueueBuilderGetQueueMemorySize. verify_ios.py counts them separately so a guess is never silently folded into the verified set.",
-  "count": 22,
+  "count": 25,
   "procs": [
     {
       "name": "nvnBufferBuilderGetDevice",
@@ -28,6 +28,27 @@
         "const NVNmemoryPoolBuilder*"
       ],
       "arity": 1,
+      "inferred": true
+    },
+    {
+      "name": "nvnProgramSetSampleShading",
+      "ret": "NVNboolean",
+      "params": [
+        "NVNprogram*",
+        "int"
+      ],
+      "arity": 2,
+      "inferred": true
+    },
+    {
+      "name": "nvnProgramSetShadersExt",
+      "ret": "NVNboolean",
+      "params": [
+        "NVNprogram*",
+        "int",
+        "const NVNshaderDataExt*"
+      ],
+      "arity": 3,
       "inferred": true
     },
     {
@@ -119,6 +140,15 @@
         "int"
       ],
       "arity": 2,
+      "inferred": true
+    },
+    {
+      "name": "nvnSamplerBuilderGetDevice",
+      "ret": "NVNdevice*",
+      "params": [
+        "const NVNsamplerBuilder*"
+      ],
+      "arity": 1,
       "inferred": true
     },
     {

@@ -7,8 +7,8 @@
 `nvn*` 字符串（运行时按名解析，所以名字本身就暴露了完整接口面）。
 
 - 接口总数：**513**
-- Metal 后端已实现：**435**（84.8%）
-- 仍未实现：**78**
+- Metal 后端已实现：**440**（85.8%）
+- 仍未实现：**73**
 
 > 只有出现在 `ios/nvn/implemented_metal.txt` 里、且确实在
 > `ios/nvn/src/nvn_metal.mm` 中定义过的名字才算“已实现”。
@@ -22,12 +22,12 @@
 | Texture | 39 | 45 | `######### ` |
 | TextureBuilder | 35 | 43 | `########  ` |
 | Device | 7 | 27 | `###       ` |
-| SamplerBuilder | 24 | 25 | `##########` |
+| SamplerBuilder | 25 | 25 | `##########` |
 | MultisampleState | 22 | 23 | `##########` |
 | QueueBuilder | 19 | 19 | `##########` |
 | BlendState | 13 | 15 | `######### ` |
 | Queue | 15 | 15 | `##########` |
-| Sampler | 14 | 15 | `######### ` |
+| Sampler | 15 | 15 | `##########` |
 | DepthStencilState | 13 | 13 | `##########` |
 | Window | 12 | 12 | `##########` |
 | WindowBuilder | 12 | 12 | `##########` |
@@ -40,7 +40,7 @@
 | BufferBuilder | 7 | 7 | `##########` |
 | ColorState | 7 | 7 | `##########` |
 | Event | 6 | 7 | `######### ` |
-| Program | 3 | 7 | `####      ` |
+| Program | 6 | 7 | `######### ` |
 | Sync | 4 | 6 | `#######   ` |
 | VertexAttribState | 5 | 5 | `##########` |
 | VertexStreamState | 5 | 5 | `##########` |
@@ -383,14 +383,14 @@
 - [x] `nvnPolygonStateSetPolygonMode`
 - [x] `nvnPolygonStateSetPolygonOffsetEnables`
 
-### Program (3/7)
+### Program (6/7)
 
 - [x] `nvnProgramFinalize`
 - [x] `nvnProgramInitialize`
-- [ ] `nvnProgramSetDebugLabel`
-- [ ] `nvnProgramSetSampleShading`
+- [x] `nvnProgramSetDebugLabel`
+- [x] `nvnProgramSetSampleShading`
 - [x] `nvnProgramSetShaders`
-- [ ] `nvnProgramSetShadersExt`
+- [x] `nvnProgramSetShadersExt`
 - [ ] `nvnProgramSetSubroutineLinkage`
 
 ### Queue (15/15)
@@ -433,7 +433,7 @@
 - [x] `nvnQueueBuilderSetQueueMemory`
 - [x] `nvnQueueBuilderSetQueuePriority`
 
-### Sampler (14/15)
+### Sampler (15/15)
 
 - [x] `nvnSamplerCompare`
 - [x] `nvnSamplerFinalize`
@@ -441,7 +441,7 @@
 - [x] `nvnSamplerGetBorderColori`
 - [x] `nvnSamplerGetBorderColorui`
 - [x] `nvnSamplerGetCompare`
-- [ ] `nvnSamplerGetDebugID`
+- [x] `nvnSamplerGetDebugID`
 - [x] `nvnSamplerGetLodBias`
 - [x] `nvnSamplerGetLodClamp`
 - [x] `nvnSamplerGetMaxAnisotropy`
@@ -451,13 +451,13 @@
 - [x] `nvnSamplerInitialize`
 - [x] `nvnSamplerSetDebugLabel`
 
-### SamplerBuilder (24/25)
+### SamplerBuilder (25/25)
 
 - [x] `nvnSamplerBuilderGetBorderColor`
 - [x] `nvnSamplerBuilderGetBorderColori`
 - [x] `nvnSamplerBuilderGetBorderColorui`
 - [x] `nvnSamplerBuilderGetCompare`
-- [ ] `nvnSamplerBuilderGetDevice`
+- [x] `nvnSamplerBuilderGetDevice`
 - [x] `nvnSamplerBuilderGetLodBias`
 - [x] `nvnSamplerBuilderGetLodClamp`
 - [x] `nvnSamplerBuilderGetLodSnap`

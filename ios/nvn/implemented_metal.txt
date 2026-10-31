@@ -232,7 +232,10 @@ nvnPolygonStateSetPolygonMode
 nvnPolygonStateSetPolygonOffsetEnables
 nvnProgramFinalize
 nvnProgramInitialize
+nvnProgramSetDebugLabel
+nvnProgramSetSampleShading
 nvnProgramSetShaders
+nvnProgramSetShadersExt
 nvnQueueAcquireTexture
 nvnQueueBuilderGetCommandFlushThreshold
 nvnQueueBuilderGetCommandMemorySize
@@ -271,6 +274,7 @@ nvnSamplerBuilderGetBorderColor
 nvnSamplerBuilderGetBorderColori
 nvnSamplerBuilderGetBorderColorui
 nvnSamplerBuilderGetCompare
+nvnSamplerBuilderGetDevice
 nvnSamplerBuilderGetLodBias
 nvnSamplerBuilderGetLodClamp
 nvnSamplerBuilderGetLodSnap
@@ -297,6 +301,7 @@ nvnSamplerGetBorderColor
 nvnSamplerGetBorderColori
 nvnSamplerGetBorderColorui
 nvnSamplerGetCompare
+nvnSamplerGetDebugID
 nvnSamplerGetLodBias
 nvnSamplerGetLodClamp
 nvnSamplerGetMaxAnisotropy

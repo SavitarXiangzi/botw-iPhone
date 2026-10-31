@@ -5820,7 +5820,8 @@ git diff --check
 ```
 
 本地已通过（513 procs / 435 implemented / 477 measured + 22 inferred）。
-Window 批次的 CI 结果在推送后补记。
+Window 批次的 CI run `41192204572` 的 `portable` 与 macOS `ios` job 均成功；
+模拟器自测通过 16434 回归，设备 Debug 构建与 Release 拒绝门禁也通过。
 
 ### 5. 仍然没有闭环的部分
 
@@ -5828,3 +5829,86 @@ Window 批次的 CI 结果在推送后补记。
 使用，present interval 也只在 guest 侧记录；这次不能声称“窗口呈现链路已经
 闭环”。真实标题的 draw 仍为 0 条，核心的 Maxwell SASS → MSL 离线翻译和
 通用 texture view 绑定仍未完成。
+
+## M4 续二十四：Program 状态、扩展 shader 记录与 sampler 查询
+
+Window 批次之后，Program 只剩日志桩的入口已经集中在状态记录上。本轮补齐
+5 个低风险入口：
+
+* `nvnProgramSetDebugLabel`：把标签保存在 Program 对象上；
+* `nvnProgramSetShadersExt`：把每 stage 0x18 字节的
+  `{data, control, ext}` 转成普通 `NVNshaderData`，再复用现有
+  `SetShaders`；
+* `nvnProgramSetSampleShading`：记录 mode 并返回 true；
+* `nvnSamplerBuilderGetDevice`：从 builder 侧表回读 device；
+* `nvnSamplerGetDebugID`：返回宿主在 `NVNsamplerInitialize` 时分配的
+  非零 debug id。
+
+Metal 覆盖从 **435/513（84.8%）** 到 **440/513（85.8%）**，未实现 73。
+推断签名从 22 增加到 25；实测签名仍为 477，max arity 8。Program 达到
+**6/7**，只剩 `nvnProgramSetSubroutineLinkage`；Sampler 达到 **15/15**，
+SamplerBuilder 达到 **25/25**。
+
+### 1. SetShadersExt 的实际转换
+
+扩展记录的布局来自公开 nxnative HLE：
+
+```text
+每个 stage 24 字节：
+  0x00  NVNbufferAddress data
+  0x08  const void*      control
+  0x10  uint64_t         ext
+```
+
+本后端不消费 `ext`，但会保留 data/control 并打一条一次性日志。当前
+`Program` 只有 3 个 stage 槽，因此入口接受 0..3；超过 3 仍明确返回失败，
+没有假装支持全部六个 NVN stage。该入口不在公开原型表中，签名记入
+`inferred_signatures.json`。
+
+### 2. SampleShading 的诚实边界
+
+`nvnProgramSetSampleShading(program, mode)` 的 mode 被记录，并返回
+`NVNboolean` true，避免标题把程序判为不可用。**Metal 没有与 NVN mode
+一一对应的独立开关**：fragment shader 只有在读取 sample id 或按 sample
+插值时才会逐 sample 执行。因此本轮没有把 mode 翻译成管线状态，也没有声称
+多重采样着色已经等价。自测只验证记录与返回值。
+
+### 3. Sampler 状态
+
+`nvnSamplerBuilderSetDefaults` 已有的行为保持不变：清空采样器状态，但保留
+builder 的 device；新增 getter 回读该 device。`nvnSamplerInitialize` 分配
+宿主侧 debug id（从 0x30000 起递增），`nvnSamplerGetDebugID` 在对象存在时
+返回它，`Finalize` 后返回 0。这与 buffer / texture 已有的 debug id 语义一致，
+不是 guest 自己写入的字段。
+
+### 4. 模拟器自测
+
+新增失败码 `16435`，覆盖：
+
+1. Program 初始化、debug label 存储、sample shading mode 回读；
+2. 24 字节扩展 shader 记录转换后 `code/control` 与输入一致；
+3. Program Finalize 移除对象；
+4. sampler builder 的 SetDevice / SetDefaults / GetDevice：defaults 后
+   device 仍为原值；
+5. sampler 初始化后 debug id 非零，Finalize 后 getter 返回 0。
+
+### 5. 门禁
+
+```text
+python scripts/syntax_check_metal.py
+python scripts/gen_nvn.py --repo . --check
+python scripts/extract_nvn_signatures.py --check
+python scripts/verify_ios.py
+powershell -ExecutionPolicy Bypass -File scripts/build_abi_test.ps1
+git diff --check
+```
+
+本地已通过（513 procs / 440 implemented / 477 measured + 25 inferred）。
+本批 CI 结果在推送后补记。
+
+### 6. 仍然没有闭环的部分
+
+`nvnProgramSetShadersExt` 只处理最多 3 个 stage；`SetSampleShading` 没有
+改变 Metal 的逐样本行为；sampler debug id 是宿主命名，不是官方语义的精确
+复刻。真实标题的 draw 仍为 0 条，Maxwell SASS → MSL 离线翻译、真实 shader
+绑定和通用 texture view 采样仍未闭环。

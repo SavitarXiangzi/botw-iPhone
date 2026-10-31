@@ -334,6 +334,9 @@ struct Tex {
 struct Sampler {
     nvngfx_sampler state = {};
     uint64_t device = 0;
+    /* Host-side name reported by nvnSamplerGetDebugID, like the buffer and
+     * texture counters.  It is not a value read from the guest object. */
+    uint64_t debugId = 0;
     std::string label;
     id<MTLSamplerState> mtl = nil;
 };
@@ -734,6 +737,7 @@ std::unordered_map<uint64_t, PoolSpec> g_pool_specs;
 std::unordered_map<uint64_t, NvnBufferSpec> g_buffer_specs;
 uint64_t g_next_buffer_debug_id = 0x10000;
 uint64_t g_next_texture_debug_id = 0x20000;
+uint64_t g_next_sampler_debug_id = 0x30000;
 std::unordered_map<uint64_t, int> g_device_flags;
 /* Builder state, keyed by the guest builder address.  The guest owns the
  * struct and its layout is unverified, but that does not matter: every
@@ -2292,6 +2296,11 @@ void sampler_builder_set_defaults(nvngfx_ctx*, uint64_t* x) {
 void sampler_builder_set_device(nvngfx_ctx*, uint64_t* x) {
     if (x[0]) sampler_spec(x[0]).device = x[1];
 }
+/* nvnSamplerBuilderGetDevice.  Absent from the public prototype table; shape
+ * inferred from nvnSamplerBuilderSetDevice (inferred_signatures.json). */
+void sampler_builder_get_device(nvngfx_ctx*, uint64_t* x) {
+    x[0] = sampler_spec_or_default(x[0]).device;
+}
 void sampler_builder_set_minmag(nvngfx_ctx*, uint64_t* x) {
     if (!x[0]) return;
     if (nvngfx_sampler_set_minmag(&sampler_spec(x[0]).state,
@@ -2448,6 +2457,7 @@ void sampler_initialize(nvngfx_ctx* ctx, uint64_t* x) {
     Sampler* s = find_or_add<Sampler>(x[0]);
     s->state = spec.state;
     s->device = spec.device;
+    s->debugId = ++g_next_sampler_debug_id;
     s->mtl = create_sampler_state(c, s->state);
     x[0] = s->mtl ? 1u : 0u;
 }
@@ -2530,6 +2540,13 @@ void sampler_get_reduction(nvngfx_ctx*, uint64_t* x) {
     const nvngfx_sampler* s = sampler_object_state(x[0]);
     x[0] = s ? s->nvn_reduction : 0;
 }
+/* nvnSamplerGetDebugID(const NVNsampler*) -> uint64_t.  Host-side name, just
+ * like nvnBufferGetDebugID / nvnTextureGetDebugID. */
+void sampler_get_debug_id(nvngfx_ctx*, uint64_t* x) {
+    Sampler* s = find<Sampler>(x[0]);
+    x[0] = s ? s->debugId : 0u;
+}
+
 /* nvnSamplerCompare(const NVNsampler*, const NVNsampler*) -> NVNboolean */
 void sampler_compare(nvngfx_ctx*, uint64_t* x) {
     const nvngfx_sampler* a = sampler_object_state(x[0]);
@@ -2909,6 +2926,10 @@ constexpr unsigned kPsoCacheSlots = 16;
  * control section); no guest memory is read here. */
 struct Program {
     unsigned numStages = 0;
+    std::string label;
+    /* nvnProgramSetSampleShading mode.  Stored so a title can round-trip its
+     * own state; Metal has no independent per-program switch. */
+    int sampleShading = 0;
     uint64_t code[3] = {0, 0, 0};
     uint64_t control[3] = {0, 0, 0};
     /* nvngfx_shader_key_from_guest() of each stage, or "" when the control
@@ -4544,6 +4565,33 @@ void prog_initialize(nvngfx_ctx*, uint64_t* x) {
     x[0] = p ? 1u : 0u;
 }
 
+/* nvnProgramSetDebugLabel(NVNprogram*, const char*) */
+void prog_set_debug_label(nvngfx_ctx*, uint64_t* x) {
+    Program* p = find<Program>(x[0]);
+    if (!p) return;
+    const char* label = guest_ptr<const char>(x[1]);
+    p->label = label ? label : "";
+}
+
+/* nvnProgramSetSampleShading(NVNprogram*, int) -> NVNboolean.
+ *
+ * Recorded, not translated.  Metal decides per-sample execution from the
+ * fragment function ([[sample_id]] / sample interpolation); there is no
+ * independent pipeline switch that maps 1:1 to NVN's mode.  Returning true
+ * keeps a title from treating the program as unusable, while the limitation
+ * is reported once. */
+void prog_set_sample_shading(nvngfx_ctx*, uint64_t* x) {
+    Program* p = find<Program>(x[0]);
+    if (!p) {
+        x[0] = 0;
+        return;
+    }
+    const int mode = static_cast<int>(x[1]);
+    p->sampleShading = mode;
+    log_once("nvnProgramSetSampleShading.mode", static_cast<unsigned>(mode));
+    x[0] = 1;
+}
+
 /* Copies a blob's layout into the program.  pso_drop() must not clear it (the
  * layout belongs to the shaders, not to a pipeline), but SetShaders does,
  * because new shaders may describe a different one. */
@@ -4631,6 +4679,40 @@ void prog_set_shaders(nvngfx_ctx*, uint64_t* x) {
     /* New shaders invalidate the cached pipelines. */
     pso_drop(p);
     x[0] = 1;
+}
+
+/* nvnProgramSetShadersExt(NVNprogram*, int, const NVNshaderDataExt*)
+ * -> NVNboolean.
+ *
+ * Newer NVN versions append a 64-bit extension field to each NVNshaderData:
+ * each element is 0x18 bytes, { data, control, ext }.  The host identifies a
+ * stage by its control section and does not consume ext, so convert the
+ * records to the plain { data, control } array and reuse SetShaders.  The
+ * public prototype table does not contain this entry point; its shape comes
+ * from nxnative's HLE and is counted as inferred. */
+void prog_set_shaders_ext(nvngfx_ctx* ctx, uint64_t* x) {
+    const int n = static_cast<int>(x[1]);
+    const uint64_t* sd = guest_ptr<const uint64_t>(x[2]);
+    if (n < 0 || n > 3 || (n > 0 && !sd)) {
+        log_once("nvnProgramSetShadersExt.stageCount", static_cast<unsigned>(n));
+        x[0] = 0;
+        return;
+    }
+    uint64_t plain[6] = {0, 0, 0, 0, 0, 0};
+    for (int i = 0; i < n; ++i) {
+        plain[2 * i] = sd[3 * i];
+        plain[2 * i + 1] = sd[3 * i + 1];
+        if (sd[3 * i + 2]) {
+            log_once("nvnProgramSetShadersExt.ext",
+                     static_cast<unsigned>(sd[3 * i + 2]));
+        }
+    }
+    nvngfx_args args{};
+    args.x[0] = x[0];
+    args.x[1] = static_cast<uint64_t>(n);
+    args.x[2] = reinterpret_cast<uint64_t>(&plain[0]);
+    prog_set_shaders(ctx, args.x);
+    x[0] = args.x[0];
 }
 
 /* nvnProgramFinalize(NVNprogram*) */
@@ -9345,6 +9427,7 @@ const Binding kBindings[] = {
     BIND("nvnSamplerBuilderGetLodClamp", sampler_builder_get_lod_clamp),
     BIND("nvnSamplerBuilderGetLodBias", sampler_builder_get_lod_bias),
     BIND("nvnSamplerBuilderGetCompare", sampler_builder_get_compare),
+    BIND("nvnSamplerBuilderGetDevice", sampler_builder_get_device),
     BIND("nvnSamplerBuilderGetBorderColor", sampler_builder_get_border),
     BIND("nvnSamplerBuilderGetBorderColori", sampler_builder_get_border_i),
     BIND("nvnSamplerBuilderGetBorderColorui", sampler_builder_get_border_ui),
@@ -9359,6 +9442,7 @@ const Binding kBindings[] = {
     BIND("nvnSamplerGetLodClamp", sampler_get_lod_clamp),
     BIND("nvnSamplerGetLodBias", sampler_get_lod_bias),
     BIND("nvnSamplerGetCompare", sampler_get_compare),
+    BIND("nvnSamplerGetDebugID", sampler_get_debug_id),
     BIND("nvnSamplerGetBorderColor", sampler_get_border),
     BIND("nvnSamplerGetBorderColori", sampler_get_border_i),
     BIND("nvnSamplerGetBorderColorui", sampler_get_border_ui),
@@ -9376,7 +9460,10 @@ const Binding kBindings[] = {
     BIND("nvnSamplerPoolRegisterSamplerBuilder", samp_pool_register_builder),
 
     BIND("nvnProgramInitialize", prog_initialize),
+    BIND("nvnProgramSetDebugLabel", prog_set_debug_label),
+    BIND("nvnProgramSetSampleShading", prog_set_sample_shading),
     BIND("nvnProgramSetShaders", prog_set_shaders),
+    BIND("nvnProgramSetShadersExt", prog_set_shaders_ext),
     BIND("nvnProgramFinalize", prog_finalize),
 
     BIND("nvnCommandBufferBeginRecording", cmdbuf_begin_recording),
@@ -17122,6 +17209,116 @@ extern "C" int nvngfx_metal_selftest(void) {
             g_win_specs.erase(kWb);
         }
 
+        {
+            /* Program debug label, sample-shading mode and the extended shader
+             * record (24 bytes per stage: data, control, 64-bit extension).
+             * The extension field is intentionally ignored by the host; the
+             * conversion must still copy data/control into the Program. */
+            const uint64_t kProgramState = 0xA100;
+            struct { uint64_t data; uint64_t control; uint64_t ext; } ext[2];
+            ext[0].data = reinterpret_cast<uint64_t>(const_cast<char*>(
+                nvngfx_shader_selftest_msl(NVNGFX_STAGE_VERTEX)));
+            ext[0].control = 0;
+            ext[0].ext = 0x1234;
+            ext[1].data = reinterpret_cast<uint64_t>(const_cast<char*>(
+                nvngfx_shader_selftest_msl(NVNGFX_STAGE_FRAGMENT)));
+            ext[1].control = 0;
+            ext[1].ext = 0;
+
+            x[0] = kProgramState; x[1] = 0;
+            prog_initialize(ctx, x);
+            const uint64_t progInit = x[0];
+            x[0] = kProgramState;
+            x[1] = reinterpret_cast<uint64_t>("selftest program");
+            prog_set_debug_label(ctx, x);
+            x[0] = kProgramState; x[1] = 2;
+            prog_set_sample_shading(ctx, x);
+            const uint64_t sampleOk = x[0];
+            x[0] = kProgramState; x[1] = 2;
+            x[2] = reinterpret_cast<uint64_t>(&ext[0]);
+            prog_set_shaders_ext(ctx, x);
+            const uint64_t extOk = x[0];
+            Program* progState = find<Program>(kProgramState);
+            if (progInit != 1 || sampleOk != 1 || extOk != 1 ||
+                !progState || progState->label != "selftest program" ||
+                progState->sampleShading != 2 || progState->numStages != 2 ||
+                progState->code[0] != ext[0].data ||
+                progState->code[1] != ext[1].data ||
+                progState->control[0] != 0 || progState->control[1] != 0) {
+                std::fprintf(stderr,
+                             "[selftest] program state: init=%llu sample=%llu "
+                             "ext=%llu label=%s mode=%d stages=%u\n",
+                             static_cast<unsigned long long>(progInit),
+                             static_cast<unsigned long long>(sampleOk),
+                             static_cast<unsigned long long>(extOk),
+                             progState ? progState->label.c_str() : "?",
+                             progState ? progState->sampleShading : -1,
+                             progState ? progState->numStages : 0);
+                rc = 16435;
+                goto done;
+            }
+            x[0] = kProgramState;
+            prog_finalize(ctx, x);
+            if (find<Program>(kProgramState)) {
+                std::fprintf(stderr,
+                             "[selftest] program state: finalize left the "
+                             "program object behind\n");
+                rc = 16435;
+                goto done;
+            }
+
+            /* The sampler builder preserves its device across SetDefaults,
+             * and an initialized sampler receives a nonzero host debug id. */
+            alignas(16) unsigned char samplerBuilderState[0x60] = {};
+            const uint64_t samplerBuilderStateAddr =
+                reinterpret_cast<uint64_t>(samplerBuilderState);
+            x[0] = samplerBuilderStateAddr;
+            sampler_builder_set_defaults(ctx, x);
+            x[0] = samplerBuilderStateAddr; x[1] = 0xCAFE;
+            sampler_builder_set_device(ctx, x);
+            x[0] = samplerBuilderStateAddr;
+            sampler_builder_get_device(ctx, x);
+            const uint64_t samplerDevBefore = x[0];
+            x[0] = samplerBuilderStateAddr;
+            sampler_builder_set_defaults(ctx, x);
+            x[0] = samplerBuilderStateAddr;
+            sampler_builder_get_device(ctx, x);
+            const uint64_t samplerDevAfter = x[0];
+
+            const uint64_t kSamplerStateAddr = 0xA120;
+            x[0] = kSamplerStateAddr; x[1] = samplerBuilderStateAddr;
+            sampler_initialize(ctx, x);
+            const uint64_t samplerInit = x[0];
+            x[0] = kSamplerStateAddr;
+            sampler_get_debug_id(ctx, x);
+            const uint64_t samplerDebug = x[0];
+            x[0] = kSamplerStateAddr;
+            sampler_finalize(ctx, x);
+            x[0] = kSamplerStateAddr;
+            sampler_get_debug_id(ctx, x);
+            const uint64_t samplerDebugAfter = x[0];
+            g_sampler_specs.erase(samplerBuilderStateAddr);
+            forget<Sampler>(kSamplerStateAddr);
+            if (samplerDevBefore != 0xCAFE || samplerDevAfter != 0xCAFE ||
+                samplerInit != 1 || samplerDebug == 0 ||
+                samplerDebugAfter != 0) {
+                std::fprintf(stderr,
+                             "[selftest] sampler state: dev=%#llx/%#llx "
+                             "init=%llu debug=%llu after=%llu\n",
+                             static_cast<unsigned long long>(samplerDevBefore),
+                             static_cast<unsigned long long>(samplerDevAfter),
+                             static_cast<unsigned long long>(samplerInit),
+                             static_cast<unsigned long long>(samplerDebug),
+                             static_cast<unsigned long long>(samplerDebugAfter));
+                rc = 16435;
+                goto done;
+            }
+            std::fprintf(stderr,
+                         "[selftest] program/sampler state: debug label, "
+                         "sample-shading mode, extended shader records, "
+                         "builder device and sampler debug id round-tripped\n");
+        }
+
     done:
         nvngfx_shader_set_msl_passthrough(0);
         forget<CmdBuf>(kCb);
@@ -17129,7 +17326,9 @@ extern "C" int nvngfx_metal_selftest(void) {
         forget<Sampler>(kSampler);
         forget<Sampler>(kSampler2);
         forget<Program>(kProg);
+        forget<Program>(0xA100);
         forget<Program>(0x5600);
+        forget<Sampler>(0xA120);
         forget<CmdBuf>(0x5700);
         forget<Pool>(0x5400);   /* releases the MTLBuffer wrapping the page */
         g_pool_specs.erase(0x5500);
