@@ -5532,7 +5532,20 @@ void cmdbuf_insert_debug_marker_common(uint64_t* x, unsigned nameIndex) {
     }
     if (!guest_cstr(x[nameIndex], &name)) return;
     NSString* text = [NSString stringWithUTF8String:name.c_str()];
-    if (text) [b->cb insertDebugSignpost:text];
+    if (!text) return;
+    /* insertDebugSignpost: belongs to MTLCommandEncoder, not to
+     * MTLCommandBuffer.  Inside a pass it goes on the open encoder; between
+     * passes a throw-away blit encoder carries it so the marker still lands
+     * at the right point in the stream. */
+    if (b->enc) {
+        [b->enc insertDebugSignpost:text];
+        return;
+    }
+    id<MTLBlitCommandEncoder> marker = [b->cb blitCommandEncoder];
+    if (marker) {
+        [marker insertDebugSignpost:text];
+        [marker endEncoding];
+    }
 }
 void cmdbuf_insert_debug_marker(nvngfx_ctx*, uint64_t* x) {
     cmdbuf_insert_debug_marker_common(x, 1);

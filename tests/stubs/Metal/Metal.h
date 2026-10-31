@@ -464,6 +464,7 @@ typedef void (^MTLDeallocator)(void* pointer, NSUInteger length);
 @end
 
 @protocol MTLBlitCommandEncoder
+- (void)insertDebugSignpost:(NSString*)string;
 - (void)copyFromTexture:(id<MTLTexture>)src
             sourceSlice:(NSUInteger)slice
             sourceLevel:(NSUInteger)level
@@ -521,6 +522,7 @@ destinationBytesPerImage:(NSUInteger)bpi;
 @end
 
 @protocol MTLRenderCommandEncoder
+- (void)insertDebugSignpost:(NSString*)string;
 - (void)endEncoding;
 - (void)drawPrimitives:(MTLPrimitiveType)type
            vertexStart:(NSUInteger)start
@@ -586,7 +588,6 @@ destinationBytesPerImage:(NSUInteger)bpi;
 @property (copy) NSString* label;
 - (void)pushDebugGroup:(NSString*)string;
 - (void)popDebugGroup;
-- (void)insertDebugSignpost:(NSString*)string;
 - (id<MTLBlitCommandEncoder>)blitCommandEncoder;
 - (id<MTLComputeCommandEncoder>)computeCommandEncoder;
 - (id<MTLRenderCommandEncoder>)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor*)descriptor;
