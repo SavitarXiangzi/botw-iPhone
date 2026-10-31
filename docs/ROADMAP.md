@@ -5738,7 +5738,7 @@ git diff --check
 ```
 
 本地已通过（513 procs / 422 implemented / 477 measured + 17 inferred）。
-本轮 CI 结果在推送后补记。
+CI 结果（首轮失败与修复后的通过）见本节末尾的「CI 反馈与修复」。
 
 ### 6. 仍然没有闭环的部分
 
@@ -5746,7 +5746,7 @@ GL 名称没有 interop；view 的 swizzle/dsmode 仍未应用到实际采样；
 与 `GetViewOffset` 的语义来自公开实现而非 Nintendo 文档。真实标题的 draw
 仍是 0 条，不能据此声称游戏已经能在 iPhone 上运行。
 
-### 6. CI 反馈与修复
+### 7. CI 反馈与修复
 
 run `41190680145` 的 `portable` job 成功，但 macOS `ios` job 在模拟器自测阶段
 以 `BOTW_SELFTEST rc=16433` 失败。原因不在产品逻辑：本轮新增自测错误地把
@@ -5904,7 +5904,8 @@ git diff --check
 ```
 
 本地已通过（513 procs / 440 implemented / 477 measured + 25 inferred）。
-本批 CI 结果在推送后补记。
+推送后 CI run `41192621627` 的 `portable`（job `124512308077`）与 `ios`
+（job `124512389146`）两个 job 均成功。
 
 ### 6. 仍然没有闭环的部分
 
@@ -6205,9 +6206,33 @@ git diff --check
 ```
 
 本地已通过（513 procs / 476 implemented / 477 measured + 28 inferred）。
-本批 CI 结果在推送后补记。
 
-### 5. 仍然没有闭环的部分
+### 5. 首轮失败与真正的 bug
+
+第一次推送（`3e18afa`）的自测打印 `packed=0 strided=1`：紧凑读回的缓冲区只按
+一行（8 字节）分配，2x2 区域写 16 字节越界，把紧随其后的 `rdst2` 覆盖成了上一轮
+的字节。`bf57b9f` 把两个缓冲区都改成 16 字节，真实故障才露出来：
+
+```text
+[selftest] readtexels: packed=1 strided=0
+BOTW_SELFTEST rc=16438
+```
+
+根因不在布局层，而在 `tex_region_prepare` 对 `imgStride` 的解析：它拿**紧凑图**
+（`tightRow * hblocks` = 16）当默认值和下限，而 `nvngfx_tex_read_region` /
+`nvngfx_tex_write_region` 要求 `image >= row * hblocks`（row = 16 时是 32）。
+于是 `row = 16, image = 0` 这个合法调用先通过 wrapper、再被布局层拒绝。
+
+`7a57edb` 改成先用解析后的 row 推出 image 的最小值；零步长仍表示"没有额外
+padding"。`tests/nvn_texlayout_test.cpp` 的写入测试补了回归：同一块 2x2 用
+`src_row = 16, src_image = 0` 写入，结果必须与原紧凑写入逐字节一致。参考实现
+（nxnative `read_texels`）同样是 `if (!img) img = row * hb`，语义一致。
+
+推送后 CI run `41196818068` 的 `portable`（job `124524545632`）与 `ios`
+（job `124524616070`）两个 job 均成功；iOS 日志里出现
+`nvnTextureReadTexels.ok` 与 `BOTW_SELFTEST rc=0`，模拟器里 `16438` 通过。
+
+### 6. 仍然没有闭环的部分
 
 渲染目标的 GPU 读回（blit + 格式转换）没有接；`ReadTexels` 不做脏页跟踪，读的是
 拷贝那一刻的 guest 存储；`nvnTextureGetSparseTileLayout` /
