@@ -2317,6 +2317,7 @@ NVNformat 是纹理和顶点共用的一套枚举。`nvn_vertex.c` 只接受 Met
 * 管线缓存的键从「program + 颜色格式」扩成「program + 颜色格式 + 顶点布局」
   （布局 id 是 `nvngfx_vertex_layout_id()`，FNV-1a 过打包后的 guest 字）。
   `Program` 留 4 个槽：标题会在几种布局之间来回切，单槽会每次切换重生管线。
+  （该轮当时为 4 槽；后续 M4 续七已扩到 16 槽。）
 * `nvnCommandBufferBindVertexBuffers` 现在**真的读** `NVNbufferRange{address,size}`
   （之前故意只记个数）。
 
@@ -2409,7 +2410,7 @@ NVN 的状态挂在 command buffer 上，不是挂在 render pass 上；自检�
 `BeginRecording` 开第三条，`program` / `attrib` / `stream` / `vb` 都还在。
 `SetRenderTargets` 会让缓存的 `pso` 失效（颜色格式可能变），
 `ensure_pipeline()` 用原来的顶点布局键重建 —— 键没变，命中 `Program` 的
-4 槽缓存。
+4 槽缓存。（该轮当时为 4 槽；后续已扩容到 16 槽。）
 
 ### 自检：三条 draw
 
@@ -4211,7 +4212,7 @@ verify_ios: ok (metal bindings: 196/513)
 ### 还没有的
 
 * 只有 0 号颜色目标进入描述符和 render pass；MRT 要等 pass 支持多附件（M4 续三已补上）；
-* 管线缓存只有 4 个槽，状态组合一多就会反复重编译（真机上每次数毫秒）；
+* 管线缓存当时只有 4 个槽（后续 M4 续七已扩到 16 槽），状态组合一多就会反复重编译（真机上每次数毫秒）；
 * 这一轮结束时 `ClearDepthStencil` 仍是日志占位；下一节已把它接入 load action；
 * 没有真机运行，不能声称画面正确。
 
@@ -4496,4 +4497,48 @@ build_abi_test: all tests passed
 * 模板与颜色清屏的部分通道掩码；
 * `ClearTexture{i,ui}`；
 * guest `DispatchCompute` / image / storage buffer 路径；
+* 没有真机像素验证，不能声称画面正确。
+
+## M4 续七：每 Program 的 PSO 缓存扩到 16 槽
+
+`Program` 过去给每个 program 留 4 个 `MTLRenderPipelineState` 槽。MRT、深度/模板格式、
+采样数、顶点布局与固定功能状态哈希都进缓存键以后，场景在几种常见组合之间来回切时，
+4 槽很快被冲掉，下一次切回就要重新编译管线；真机上每次是毫秒级卡顿。
+
+### 1. 16 槽 MRU
+
+* `kPsoCacheSlots = 16`，`Program::slots` 按这个常量分配；
+* 命中时把该槽移到队首（`pso_lookup()` 内做逐项搬移），未命中时 `pso_store()` 从最后一槽
+  向下移位，淘汰最久未用项；
+* 缓存键仍包含颜色格式数组与附件数量、深度/模板格式、采样数、顶点布局 id 与状态哈希；
+* `pso_drop()` 按新容量释放所有槽，避免 program 销毁时漏掉引用。
+
+### 2. 模拟器自测
+
+新增 `0x8B00` 探针 program：
+
+1. 从 `0x5300` 的真实 draw program 里取一个已有的 `MTLRenderPipelineState` 作为样本；
+2. 用 16 个不同的状态键依次 `pso_store()`，填满全部槽；
+3. 再按原顺序逐一 `pso_lookup()`，16 个键必须全部命中。
+
+旧的 4 槽实现在第 5 次存储时就会丢掉第一个键，测试会直接失败；因此这条用例验证的是
+“容量与 MRU 顺序”，而不是 shader 编译。
+
+### 3. 覆盖与仍然缺的
+
+没有新增 NVN 入口，覆盖率保持 **202/513（39.4%）**，未实现 311；CommandBuffer 域
+**57/144**。门禁输出：
+
+```text
+syntax_check_metal: ok (clang++.exe)
+verify_ios: ok (metal bindings: 202/513)
+build_abi_test: all tests passed
+```
+
+仍未支持：
+
+* 模板与颜色清屏的部分通道掩码；
+* `ClearTexture{i,ui}`；
+* guest `DispatchCompute` / image / storage buffer 路径；
+* 真实标题 shader 的离线 MSL 接入（`nvn_shader_blobs.gen.c` 仍为空表）；
 * 没有真机像素验证，不能声称画面正确。

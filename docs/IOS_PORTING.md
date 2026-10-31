@@ -491,7 +491,9 @@ guest storage，再调用 `nvnTextureFlushTexels` 改成棕/钢蓝/橙/天蓝并
   Polygon / DepthStencil 合成 `nvngfx_pipeline_state`，blend、write mask、深度模板格式、
   alpha-to-coverage 进入 `MTLRenderPipelineDescriptor`，cull / winding / fill、
   `MTLDepthStencilState` 与 polygon offset 在 encoder 逐 draw 应用；缓存键包含颜色/深度/
-  模板格式、采样数、顶点布局与状态哈希。`SetStencilRef` / `SetStencilMask` /
+  模板格式、采样数、顶点布局与状态哈希。每个 `Program` 的管线缓存是
+  16 槽 MRU：命中项移到队首，淘汰最久未用项；模拟器用 16 个不同状态键填满并逐一回查。
+  `SetStencilRef` / `SetStencilMask` /
   `SetStencilValueMask` 已接入：引用值放 encoder，前后脸读/写掩码进深度模板状态缓存键。
   `ClearDepthStencil` 已转成深度/模板附件的 load action，并在 EndRecording 或换 render
   target 前强制落地。`SetDepthClamp` 映射到 `setDepthClipMode:`；`SetDepthRange(s)` 无论标量还是数组形式

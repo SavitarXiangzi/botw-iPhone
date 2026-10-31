@@ -1924,6 +1924,12 @@ const PooledSampler* bound_sampler(const CmdBuf* b, uint64_t handle) {
 /* programs and pipelines                                              */
 /* ------------------------------------------------------------------ */
 
+/* Bounded MRU cache per program.  A title can alternate blend, write-mask,
+ * attachment and vertex-layout variants faster than Metal can compile them;
+ * four slots proved too small.  The bound keeps empty programs cheap while
+ * covering the common transition set. */
+constexpr unsigned kPsoCacheSlots = 16;
+
 /* One guest NVNprogram reduced to what the replay layer needs.  The shader
  * data is recorded exactly as handed over (a guest GPU address plus the
  * control section); no guest memory is read here. */
@@ -1936,9 +1942,9 @@ struct Program {
      * the guest is allowed to free the control section (Unity does). */
     char key[3][17] = {};
     /* Metal bakes the colour format *and* the vertex descriptor into a render
-     * pipeline.  A handful of slots is enough here: a title alternates between
-     * a few layouts, and a single slot would recompile on every switch (which
-     * on a device costs milliseconds).  slots[0] is the most recent. */
+     * pipeline.  slots[0] is the most recent; older entries shift down.  The
+     * 16-slot bound avoids recompiling during common state/layout alternation
+     * without making every Program pay for an unbounded cache. */
     struct PsoSlot {
         id<MTLRenderPipelineState> pso = nil;
         /* MRT bakes each colour format into the pipeline.  The unused tail
@@ -1958,7 +1964,7 @@ struct Program {
         MTLPixelFormat stencilFormat = static_cast<MTLPixelFormat>(0);
         unsigned sampleCount = 1;
     };
-    PsoSlot slots[4];
+    PsoSlot slots[kPsoCacheSlots];
 
     /* Argument-buffer layout: each stage's [[id(k)]] numbering, copied out
      * of the offline blob when one is installed.  A real Breath of the Wild
@@ -2006,7 +2012,7 @@ id<MTLRenderPipelineState> pso_lookup(Program* p, const MTLPixelFormat* colorFor
                                      MTLPixelFormat depthFormat,
                                      MTLPixelFormat stencilFormat,
                                      unsigned sampleCount) {
-    for (unsigned i = 0; i < 4; ++i) {
+    for (unsigned i = 0; i < kPsoCacheSlots; ++i) {
         Program::PsoSlot& s = p->slots[i];
         if (s.pso && s.numColors == numColors &&
             same_color_formats(s.colorFormat, colorFormats) &&
@@ -2029,9 +2035,10 @@ void pso_store(Program* p, id<MTLRenderPipelineState> pso,
                unsigned long long layout, bool hasLayout,
                unsigned long long stateKey, MTLPixelFormat depthFormat,
                MTLPixelFormat stencilFormat, unsigned sampleCount) {
-    /* Shift down; slot 3 falls out.  Releasing the object it held is fine:
-     * the command buffers that used it keep their own reference. */
-    for (unsigned i = 3; i > 0; --i) p->slots[i] = p->slots[i - 1];
+    /* Shift down; the least-recently-used slot falls out.  Releasing the
+     * object it held is fine: command buffers keep their own reference. */
+    for (unsigned i = kPsoCacheSlots - 1; i > 0; --i)
+        p->slots[i] = p->slots[i - 1];
     p->slots[0].pso = pso;
     for (unsigned i = 0; i < NVNGFX_MAX_COLOR_TARGETS; ++i)
         p->slots[0].colorFormat[i] = colorFormats[i];
@@ -2045,7 +2052,7 @@ void pso_store(Program* p, id<MTLRenderPipelineState> pso,
 }
 
 void pso_drop(Program* p) {
-    for (unsigned i = 0; i < 4; ++i) {
+    for (unsigned i = 0; i < kPsoCacheSlots; ++i) {
         p->slots[i].pso = nil;
         for (unsigned j = 0; j < NVNGFX_MAX_COLOR_TARGETS; ++j)
             p->slots[i].colorFormat[j] = static_cast<MTLPixelFormat>(0);
@@ -9304,6 +9311,55 @@ extern "C" int nvngfx_metal_selftest(void) {
                          "[selftest] ClearBuffer wrote 0xA1B2C3D4 to 32 bytes\n");
         }
 
+        {
+            /* --- Per-program PSO cache capacity --------------------------
+             * Fill every MRU slot with a distinct key, then look each one up.
+             * A four-slot cache would have evicted twelve of these keys.  The
+             * pipeline object can be shared here: this checks key retention and
+             * move-to-front ordering, not shader compilation. */
+            const uint64_t kPsoProbe = 0x8B00;
+            Program* const probe = find_or_add<Program>(kPsoProbe);
+            Program* const source = find<Program>(kProg);
+            id<MTLRenderPipelineState> sample = nil;
+            if (source) {
+                for (unsigned i = 0; i < kPsoCacheSlots; ++i) {
+                    if (source->slots[i].pso) {
+                        sample = source->slots[i].pso;
+                        break;
+                    }
+                }
+            }
+            if (!probe || !sample) {
+                std::fprintf(stderr,
+                             "[selftest] PSO cache: no source pipeline\n");
+                rc = 16419;
+                goto done;
+            }
+            MTLPixelFormat formats[NVNGFX_MAX_COLOR_TARGETS] = {
+                MTLPixelFormatRGBA8Unorm};
+            for (unsigned i = 0; i < kPsoCacheSlots; ++i) {
+                pso_store(probe, sample, formats, 1, 0, false,
+                          0x9000ull + i,
+                          static_cast<MTLPixelFormat>(0),
+                          static_cast<MTLPixelFormat>(0), 1);
+            }
+            for (unsigned i = 0; i < kPsoCacheSlots; ++i) {
+                if (!pso_lookup(probe, formats, 1, 0, false,
+                                0x9000ull + i,
+                                static_cast<MTLPixelFormat>(0),
+                                static_cast<MTLPixelFormat>(0), 1)) {
+                    std::fprintf(stderr,
+                                 "[selftest] PSO cache lost key %u of %u\n",
+                                 i, kPsoCacheSlots);
+                    rc = 16419;
+                    goto done;
+                }
+            }
+            std::fprintf(stderr,
+                         "[selftest] PSO cache retained %u distinct keys\n",
+                         kPsoCacheSlots);
+        }
+
     done:
         nvngfx_shader_set_msl_passthrough(0);
         forget<CmdBuf>(kCb);
@@ -9364,6 +9420,7 @@ extern "C" int nvngfx_metal_selftest(void) {
         forget<Program>(0x8500);
         forget<CmdBuf>(0x8900);
         forget<CmdBuf>(0x8A00);
+        forget<Program>(0x8B00);
         forget<Tex>(kTexClearUI);
         forget<Tex>(kTexClearI);
         g_tex_specs.erase(kTexIntBuilder);
