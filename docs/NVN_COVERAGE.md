@@ -7,8 +7,8 @@
 `nvn*` 字符串（运行时按名解析，所以名字本身就暴露了完整接口面）。
 
 - 接口总数：**513**
-- Metal 后端已实现：**481**（93.8%）
-- 仍未实现：**32**
+- Metal 后端已实现：**483**（94.2%）
+- 仍未实现：**30**
 
 > 只有出现在 `ios/nvn/implemented_metal.txt` 里、且确实在
 > `ios/nvn/src/nvn_metal.mm` 中定义过的名字才算“已实现”。
@@ -18,7 +18,7 @@
 
 | 域 | 已实现 | 总数 | 进度 |
 |---|---:|---:|---|
-| CommandBuffer | 120 | 144 | `########  ` |
+| CommandBuffer | 122 | 144 | `########  ` |
 | Texture | 45 | 45 | `##########` |
 | TextureBuilder | 43 | 43 | `##########` |
 | Device | 27 | 27 | `##########` |
@@ -112,7 +112,7 @@
 - [x] `nvnColorStateSetDefaults`
 - [x] `nvnColorStateSetLogicOp`
 
-### CommandBuffer (120/144)
+### CommandBuffer (122/144)
 
 - [x] `nvnCommandBufferAddCommandMemory`
 - [x] `nvnCommandBufferAddControlMemory`
@@ -145,7 +145,7 @@
 - [x] `nvnCommandBufferBindVertexBuffer`
 - [x] `nvnCommandBufferBindVertexBuffers`
 - [x] `nvnCommandBufferBindVertexStreamState`
-- [ ] `nvnCommandBufferCallCommands`
+- [x] `nvnCommandBufferCallCommands`
 - [x] `nvnCommandBufferClearBuffer`
 - [x] `nvnCommandBufferClearColor`
 - [x] `nvnCommandBufferClearColori`
@@ -156,7 +156,7 @@
 - [x] `nvnCommandBufferClearTextureui`
 - [x] `nvnCommandBufferCopyBufferToBuffer`
 - [x] `nvnCommandBufferCopyBufferToTexture`
-- [ ] `nvnCommandBufferCopyCommands`
+- [x] `nvnCommandBufferCopyCommands`
 - [x] `nvnCommandBufferCopyTextureToBuffer`
 - [x] `nvnCommandBufferCopyTextureToTexture`
 - [x] `nvnCommandBufferDiscardColor`

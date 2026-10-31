@@ -330,9 +330,15 @@ BCn 块对齐的拒绝。自测码 `16438`。已经渲染过的纹理其像素�
    但这条链本身已经能跑：`nvngfx_metal_selftest()` 用内置 MSL 走完
    program -> pipeline -> draw -> 回读，并由 CI 用 `simctl` 在模拟器里执行 App 的自检钩子。
 4. MRT 已支持 1–8 个颜色目标（每个目标独立格式、混合、写掩码与清屏）；
-   `setRenderTargets` 的 texture view 参数仍只记日志。`EndRecording` 直接
-   `[cb commit]`；`nvnQueueSubmitCommands` 目前只做 command/control 内存记账，
-   不改变 Metal 的提交顺序。
+   `setRenderTargets` 的 texture view 参数仍只记日志。命令缓冲经 `metal_resolve`
+   分发表进入时，90 个状态/绘制入口由 `BIND_CB` thunk 记成宿主命令段；
+   `EndRecording` 不再一律立即提交，而是返回唯一 `NVNcommandHandle`，
+   `nvnCommandBufferCallCommands` / `CopyCommands` 记录 `OP_CALL` 等价项，
+   `nvnQueueSubmitCommands` 按提交顺序展开并递归执行嵌套段（深度上限 12、
+   有环检测），最后才在拥有者的 `MTLCommandBuffer` 上编码和提交。
+   `nvnDeviceFinalizeCommandHandle` 释放段，上下文销毁时清空剩余段。
+   这仍不是 guest 命令内存解析：记录的是宿主捕获的调用，不是客体写进
+   `AddCommandMemory` 的字节。
 
 5. 顶点缓冲与顶点参数缓冲区已经接通：stream 从 pool 零拷贝绑定，顶点常量在
    `buffer(0)`，stream 从 `NVNGFX_VERTEX_STREAM_BASE`（16）开始。自检 draw 2/3
@@ -725,6 +731,7 @@ constexpr int kEnumsVerified = 0;
 | 缺口 | 现状 | 影响 |
 |---|---|---|
 | 渲染目标绑定 | 1–8 个颜色附件、深度/模板附件、纯深度 pass 与 MRT 已接；通用 texture view 仍只记录 | 通用 view 的绑定仍不完整 |
+| 命令句柄回放 | `CallCommands` / `CopyCommands`、嵌套展开、句柄释放与录制时输入快照已接；实现是宿主调用捕获，不是 guest 命令字节解释器 | 不能观察或原地修补客体的命令记录；持久对象（纹理/程序/池/事件）仍按回放时状态解析；单段 arena 上限 256 MiB |
 | 着色器翻译 | 只留了接口，没有实现 | 客体的 draw 全部停在 `noPipeline` |
 | 纹理创建 | 建 host `MTLTexture`；首次采样时从 guest pool 解块/上传，WriteTexels/FlushTexels 后标脏重传 | 2D/数组/cube/LINEAR 和 BC1–BC5 可采样；BC6H/BC7、通用 texture view 与任意 mapped write 的脏页跟踪仍不完整 |
 | draw 执行 | 有 pipeline 就真的编码 draw；没有就丢弃；实例化、base-vertex 与两种 indirect draw 已接 | 客体仍是 0 条；自检十八条 draw（模拟器执行十七条）加七阶段 instanced / base-vertex / indirect 回归、sampler 状态与 compute dispatch 回归由 CI 执行 |
@@ -763,4 +770,4 @@ Swift 侧同理：`Renderer.swift` / `GameView.swift` 只做了括号与结构�
 | `[nvn] nvnCommandBufferDraw.pipeline: no translator...` | 正常，这条就是当前的墙；自检不经过它 |
 | 屏幕全黑且 `frame` 不动 | `MTKView.delegate` 是 weak，Pump 必须被 Coordinator 强引用（已在 `GameView.swift` 修过一次） |
 | `[nvn] UNVERIFIED xxx = 0x...` | 正常，那是诚实闸门在报未验证的枚举 |
-| `[nvn] not implemented: nvnYyy` | 该入口不在 476 个里，按第 10 节排期 |
+| `[nvn] not implemented: nvnYyy` | 该入口不在 483 个里，按第 10 节排期 |

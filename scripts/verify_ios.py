@@ -10,7 +10,7 @@ Checks
 1. NVN registry  : schema, uniqueness, name shape, count field agreement.
 2. Codegen       : ios/nvn/include/nvn_api.h + src/nvn_dispatch.cpp +
                    docs/NVN_COVERAGE.md are exactly what gen_nvn.py produces.
-3. Tri-set       : registry ∩ BIND(...) in nvn_metal.mm == implemented_metal.txt.
+3. Tri-set       : registry ∩ BIND/BIND_CB in nvn_metal.mm == implemented_metal.txt.
 4. C/C++ lint    : delimiter balance for headers/sources (string- and
                    comment-aware), so a truncated file cannot slip through.
 5. Swift/plist   : delimiter balance, @main present, MetalView wired.
@@ -99,7 +99,12 @@ def check_codegen() -> None:
 
 def check_triset(reg: dict) -> None:
     mm = read("ios/nvn/src/nvn_metal.mm") if rel_exists("ios/nvn/src/nvn_metal.mm") else ""
-    bound = set(re.findall(r"BIND\(\s*\"(nvn[A-Za-z0-9_]+)\"", mm))
+    # Command-buffer entry points are bound through BIND_CB(...), which wraps
+    # the implementation in the record/replay thunk.  Both macros declare the
+    # proc implemented; counting only BIND would falsely report every wrapped
+    # entry as missing.
+    bound = set(re.findall(
+        r"BIND(?:_CB)?\(\s*\"(nvn[A-Za-z0-9_]+)\"", mm))
     impl = set()
     if rel_exists("ios/nvn/implemented_metal.txt"):
         for line in read("ios/nvn/implemented_metal.txt").splitlines():
@@ -112,7 +117,7 @@ def check_triset(reg: dict) -> None:
     if bound - impl:
         fail(f"bound in nvn_metal.mm but not declared implemented: {sorted(bound - impl)[:5]}")
     if impl - bound:
-        fail(f"declared implemented but has no BIND(...): {sorted(impl - bound)[:5]}")
+        fail(f"declared implemented but has no BIND/BIND_CB: {sorted(impl - bound)[:5]}")
     unknown = bound - reg.get("names", set())
     if unknown:
         fail(f"BIND(...) names absent from the registry: {sorted(unknown)[:5]}")

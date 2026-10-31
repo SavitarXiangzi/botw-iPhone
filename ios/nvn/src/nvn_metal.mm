@@ -45,6 +45,10 @@
  *         command buffer initialize / finalize / is-recording, command and
  *           control memory accounting, and guest debug labels, markers and
  *           groups forwarded to the MTLCommandBuffer
+ *         command handles: 90 state/draw entry points captured into replay
+ *           segments, CallCommands / CopyCommands with nested expansion,
+ *           QueueSubmitCommands execution, handle release, and a recording
+ *           arena for transient pointer inputs
  *         per-draw fixed-function state Metal cannot express (point size,
  *           line width, sample mask, primitive restart index, conservative
  *           raster, subpixel bias, tiled cache, ZCull hints, shader scratch)
@@ -463,8 +467,37 @@ struct NvnSync {
     std::string label;
 };
 
+/* One host-side command recorded while a guest command buffer is open.
+ *
+ * NVN's EndRecording returns a reusable command handle; the game can call it
+ * into another command buffer (nvnCommandBufferCallCommands) or submit it
+ * directly.  Encoding straight into Metal at record time cannot be replayed,
+ * so when the guest reaches these entry points through the resolve table we
+ * keep the call and run it when the handle is submitted.
+ *
+ * Pointer arguments split into two categories.  Persistent objects (textures,
+ * programs, pools, events, syncs) stay guest addresses.  Transient input such
+ * as a clear colour, a viewport array, a copy region or UpdateUniformBuffer's
+ * source bytes is copied at recording time; NVN also snapshots those values,
+ * and the caller is free to reuse its stack before the handle is submitted.
+ * `snap[i]` is an offset/length pair into the owning command segment's arena. */
+struct ReplaySnapshot {
+    uint32_t offset = 0;
+    uint32_t size = 0;
+};
+struct ReplayOp {
+    void (*fn)(nvngfx_ctx*, uint64_t*) = nullptr;  /* null: call `handle` */
+    uint64_t handle = 0;
+    uint64_t x[8] = {};
+    uint64_t f[8] = {};
+    ReplaySnapshot snap[8] = {};
+};
+
 struct CmdBuf {
     bool recording = false;
+    /* Guest address used as this object's table key.  Replay substitutes it
+     * for the first argument of every recorded call. */
+    uint64_t guest = 0;
     unsigned draws = 0;
     /* Draws actually handed to Metal, as opposed to draws asked for.
      * A self-test pixel check cannot tell "dropped upstream" from
@@ -644,6 +677,12 @@ struct CmdBuf {
     uint32_t discardColor = 0;      /* bit i = color attachment i */
     bool discardDepth = false;
     bool discardStencil = false;
+    /* Commands captured through the dispatch wrappers during this recording.
+     * EndRecording moves them into g_command_segments; an empty vector means
+     * the guest called the C++ entry points directly (the self-test path), so
+     * the old encode-and-commit path still runs. */
+    std::vector<ReplayOp> replayOps;
+    std::vector<uint8_t> replayArena;
     /* Event signals queued during this recording, published by one Metal
      * completion handler each. */
     std::vector<PendingEventSignal> eventSignals;
@@ -818,6 +857,26 @@ std::unordered_map<uint64_t, nvngfx_texdesc> g_tex_specs;
 std::unordered_map<uint64_t, SamplerSpec> g_sampler_specs;
 std::unordered_map<uint64_t, QueueSpec> g_queue_specs;
 std::unordered_map<uint64_t, EventSpec> g_event_specs;
+/* A finished NVN command recording.  The handle is opaque to the guest; the
+ * owner is the command buffer whose state the recorded calls operate on. */
+struct CommandSegment {
+    uint64_t owner = 0;
+    size_t commandMemorySize = 0;
+    size_t controlMemorySize = 0;
+    std::vector<ReplayOp> ops;
+    std::vector<uint8_t> arena;
+};
+std::unordered_map<uint64_t, CommandSegment> g_command_segments;
+uint64_t g_next_command_handle = 0x4E564E0000000001ull;  /* "NVN" tag */
+unsigned g_command_call_count = 0;
+unsigned g_command_copy_count = 0;
+unsigned g_command_replay_miss = 0;
+unsigned g_command_snapshot_fail = 0;
+uint64_t alloc_command_handle() {
+    uint64_t h = g_next_command_handle++;
+    if (h == 0) h = g_next_command_handle++;
+    return h;
+}
 /* The most recent command buffer committed by EndRecording.  A queue fence
  * captures it so nvnSyncWait can wait for exactly the work submitted before
  * the fence, not for later frames. */
@@ -1054,11 +1113,11 @@ void dev_finalize(nvngfx_ctx*, uint64_t* x) {
     g_dev_specs.erase(x[0]);
 }
 
-/* nvnDeviceFinalizeCommandHandle(device, handle).  A command handle is the
- * guest address this backend already accounted for at EndRecording; no
- * separate host allocation is owned by it. */
+/* nvnDeviceFinalizeCommandHandle(device, handle).  Captured handles own a
+ * host-side command vector; drop it here.  A direct self-test handle is the
+ * command buffer's guest address and has no side table entry. */
 void dev_finalize_command_handle(nvngfx_ctx*, uint64_t* x) {
-    (void)x;
+    g_command_segments.erase(x[1]);
 }
 
 /* nvnDeviceGenerateDebugDomainId(device, const char*) -> int.  The guest
@@ -6834,8 +6893,11 @@ void cmdbuf_begin_recording(nvngfx_ctx* ctx, uint64_t* x) {
     Ctx* c = ctx_of(ctx);
     CmdBuf* b = find_or_add<CmdBuf>(x[0]);
     if (!c || !c->ready || !b || b->recording) return;
+    b->guest = x[0];
     b->cb = [c->queue commandBuffer];
     b->recording = true;
+    b->replayOps.clear();
+    b->replayArena.clear();
     b->draws = 0;
     b->encoded = 0;
     b->numColor = 0;
@@ -6926,15 +6988,40 @@ void cmdbuf_begin_recording(nvngfx_ctx* ctx, uint64_t* x) {
 }
 
 /* nvnCommandBufferEndRecording(NVNcommandBuffer*) -> NVNcommandHandle
- * The Metal work is committed here in queue order, so the handle is the guest
- * command-buffer address: nvnQueueSubmitCommands can use it to account for
- * the recording without replaying it a second time. */
+ * A recording made through the resolve table becomes a command segment and
+ * returns a unique host handle; nvnQueueSubmitCommands expands it later.  A
+ * recording made by direct C++ calls (the portable self-tests and internal
+ * helpers) keeps the old behaviour: commit here and return the command
+ * buffer's guest address, which QueueSubmitCommands only accounts for. */
 void cmdbuf_end_recording(nvngfx_ctx* ctx, uint64_t* x) {
     Ctx* c = ctx_of(ctx);
     const uint64_t cbGuest = x[0];
     CmdBuf* b = find<CmdBuf>(cbGuest);
     if (!b || !b->recording) {
         x[0] = 0;
+        return;
+    }
+    if (!b->replayOps.empty()) {
+        /* The guest called the command-buffer entry points through the
+         * resolve table, so nothing was encoded into b->cb.  A recording is a
+         * command segment until QueueSubmitCommands runs it, exactly like
+         * NVN; the empty Metal command buffer can be dropped. */
+        CommandSegment seg;
+        seg.owner = cbGuest;
+        seg.commandMemorySize = b->commandMemorySize;
+        seg.controlMemorySize = b->controlMemorySize;
+        seg.ops = std::move(b->replayOps);
+        seg.arena = std::move(b->replayArena);
+        b->replayOps.clear();
+        b->replayArena.clear();
+        b->cb = nil;
+        b->enc = nil;
+        b->recording = false;
+        b->eventSignals.clear();
+        b->counterReports.clear();
+        const uint64_t handle = alloc_command_handle();
+        g_command_segments.emplace(handle, std::move(seg));
+        x[0] = handle;
         return;
     }
     /* A clear may be the final command in a replay segment.  It still has to
@@ -6976,9 +7063,65 @@ void cmdbuf_end_recording(nvngfx_ctx* ctx, uint64_t* x) {
     }
     b->eventSignals.clear();
     b->counterReports.clear();
+    b->replayArena.clear();
     b->recording = false;
     g_last_mtl_buffer = b->last;
     x[0] = cbGuest;
+}
+
+/* nvnCommandBufferCallCommands / CopyCommands(cb, int n,
+ * const NVNcommandHandle* handles).  This backend treats both like nxnative's
+ * replay layer: the target records a reference, and when the target is
+ * submitted the referenced segment's calls run at that point in the stream.
+ * A handle that no recording produced is counted and skipped; it is never
+ * dereferenced. */
+void record_command_call(nvngfx_ctx*, uint64_t* x, bool copy) {
+    CmdBuf* b = find<CmdBuf>(x[0]);
+    const int n = static_cast<int>(x[1]);
+    if (!b || !b->recording) {
+        log_once_str(copy ? "nvnCommandBufferCopyCommands.recording"
+                          : "nvnCommandBufferCallCommands.recording",
+                     "the target command buffer is not recording");
+        return;
+    }
+    if (n <= 0) return;
+    const uint64_t* handles = guest_ptr<const uint64_t>(x[2]);
+    if (!handles) {
+        log_once_str(copy ? "nvnCommandBufferCopyCommands.handles"
+                          : "nvnCommandBufferCallCommands.handles",
+                     "handle array is null");
+        return;
+    }
+    const int limit = n > 4096 ? 4096 : n;
+    if (limit != n) {
+        log_once_str(copy ? "nvnCommandBufferCopyCommands.count"
+                          : "nvnCommandBufferCallCommands.count",
+                     "handle count was clamped to 4096");
+    }
+    unsigned recorded = 0;
+    for (int i = 0; i < limit; ++i) {
+        const uint64_t handle = handles[i];
+        if (!handle || g_command_segments.find(handle) == g_command_segments.end()) {
+            ++g_command_replay_miss;
+            log_once(copy ? "nvnCommandBufferCopyCommands.miss"
+                          : "nvnCommandBufferCallCommands.miss",
+                     static_cast<unsigned>(handle));
+            continue;
+        }
+        ReplayOp op;
+        op.handle = handle;
+        b->replayOps.push_back(op);
+        ++recorded;
+    }
+    if (recorded == 0) return;
+    if (copy) ++g_command_copy_count; else ++g_command_call_count;
+}
+
+void cmdbuf_call_commands(nvngfx_ctx* ctx, uint64_t* x) {
+    record_command_call(ctx, x, false);
+}
+void cmdbuf_copy_commands(nvngfx_ctx* ctx, uint64_t* x) {
+    record_command_call(ctx, x, true);
 }
 
 /* ------------------------------------------------------------------ */
@@ -9799,17 +9942,140 @@ void queue_acquire_texture(nvngfx_ctx*, uint64_t* x) {
     x[0] = 0;
 }
 
-/* nvnQueueSubmitCommands(queue, count, handles).  EndRecording already
- * committed the Metal work, so submission only accounts for the command
- * memory each recording was granted.  The handle is the guest command
- * buffer address returned by EndRecording. */
-void queue_submit_commands(nvngfx_ctx*, uint64_t* x) {
+/* Replay a captured command stream into the command buffer that is currently
+ * recording.  Calls are made with the target's guest address as x[0], because
+ * NVN records state on the command buffer being filled, not on the segment's
+ * original owner.  A CALL/COPY expands recursively; the seen stack rejects a
+ * cycle instead of recursing until the host stack dies. */
+bool replay_ops(nvngfx_ctx* ctx, CmdBuf* target,
+                const std::vector<ReplayOp>& ops,
+                const std::vector<uint8_t>& arena, unsigned depth,
+                std::vector<uint64_t>& seen) {
+    if (!ctx || !target || depth > 12) return false;
+    bool ok = true;
+    for (const ReplayOp& op : ops) {
+        if (!op.fn) {
+            auto it = g_command_segments.find(op.handle);
+            if (it == g_command_segments.end()) {
+                ++g_command_replay_miss;
+                log_once("nvnCommandBufferCallCommands.replayMiss",
+                         static_cast<unsigned>(op.handle));
+                ok = false;
+                continue;
+            }
+            if (std::find(seen.begin(), seen.end(), op.handle) != seen.end()) {
+                log_once("nvnCommandBufferCallCommands.cycle",
+                         static_cast<unsigned>(op.handle));
+                ok = false;
+                continue;
+            }
+            seen.push_back(op.handle);
+            ok = replay_ops(ctx, target, it->second.ops, it->second.arena,
+                            depth + 1, seen) && ok;
+            seen.pop_back();
+            continue;
+        }
+        nvngfx_args a{};
+        std::memcpy(a.x, op.x, sizeof a.x);
+        std::memcpy(a.f, op.f, sizeof a.f);
+        a.x[0] = target->guest;
+        bool snapshotsOk = true;
+        for (unsigned i = 1; i < 8; ++i) {
+            const ReplaySnapshot& s = op.snap[i];
+            if (!s.size) continue;
+            if (s.offset > arena.size() || s.size > arena.size() - s.offset) {
+                snapshotsOk = false;
+                break;
+            }
+            a.x[i] = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(
+                arena.data() + s.offset));
+        }
+        if (!snapshotsOk) {
+            ++g_command_replay_miss;
+            log_once("nvnCommandBufferCallCommands.snapshot", 1);
+            ok = false;
+            continue;
+        }
+        /* SetRenderTargets takes an array of pointers to NVNtextureView.
+         * Its snapshot layout is [n pointers][n 16-byte views]; a non-zero
+         * marker in the pointer area means that entry has a copied view.
+         * Rebuild the pointer array on the stack for this call. */
+        if (op.fn == cmdbuf_set_render_targets && op.snap[3].size) {
+            int n = static_cast<int>(a.x[1]);
+            if (n > NVNGFX_MAX_COLOR_TARGETS) n = NVNGFX_MAX_COLOR_TARGETS;
+            const size_t base = op.snap[3].offset;
+            const size_t pointerBytes = static_cast<size_t>(n) * sizeof(uint64_t);
+            const size_t viewBytes = static_cast<size_t>(n) * sizeof(TexView16);
+            if (n > 0 && base <= arena.size() &&
+                pointerBytes <= arena.size() - base &&
+                viewBytes <= arena.size() - base - pointerBytes) {
+                uint64_t views[NVNGFX_MAX_COLOR_TARGETS] = {};
+                for (int i = 0; i < n; ++i) {
+                    uint64_t marker = 0;
+                    std::memcpy(&marker, arena.data() + base +
+                                            static_cast<size_t>(i) * 8, 8);
+                    if (marker)
+                        views[i] = static_cast<uint64_t>(
+                            reinterpret_cast<uintptr_t>(
+                                arena.data() + base + pointerBytes +
+                                static_cast<size_t>(i) * sizeof(TexView16)));
+                }
+                a.x[3] = static_cast<uint64_t>(
+                    reinterpret_cast<uintptr_t>(views));
+            }
+        }
+        op.fn(ctx, a.x);
+    }
+    return ok;
+}
+
+/* A captured segment owns no Metal object until it is submitted.  Start a
+ * normal recording on its owner, replay the calls, then let EndRecording
+ * commit the resulting MTLCommandBuffer.  The temporary `replayOps` is empty
+ * (all calls bypass the capture thunk), so EndRecording takes the immediate
+ * commit path. */
+bool submit_captured_segment(nvngfx_ctx* ctx, uint64_t handle,
+                             const CommandSegment& seg) {
+    CmdBuf* owner = find<CmdBuf>(seg.owner);
+    if (!owner) {
+        log_once("nvnQueueSubmitCommands.owner", static_cast<unsigned>(seg.owner));
+        return false;
+    }
+    if (owner->recording) {
+        log_once("nvnQueueSubmitCommands.recording",
+                 static_cast<unsigned>(seg.owner));
+        return false;
+    }
+    uint64_t begin[8] = {seg.owner, 0, 0, 0, 0, 0, 0, 0};
+    cmdbuf_begin_recording(ctx, begin);
+    if (!owner->recording) return false;
+    std::vector<uint64_t> seen;
+    seen.push_back(handle);
+    const bool replayed = replay_ops(ctx, owner, seg.ops, seg.arena, 0, seen);
+    uint64_t end[8] = {seg.owner, 0, 0, 0, 0, 0, 0, 0};
+    cmdbuf_end_recording(ctx, end);
+    return replayed && owner->last != nil;
+}
+
+/* nvnQueueSubmitCommands(queue, count, handles).  A captured handle is
+ * executed here (not at EndRecording), in submission order.  The old direct
+ * self-test path still has its Metal work committed at EndRecording and is
+ * only accounted here, so both representations remain usable. */
+void queue_submit_commands(nvngfx_ctx* ctx, uint64_t* x) {
     NvnQueue* q = find<NvnQueue>(x[0]);
     if (!q) return;
     const int n = static_cast<int>(x[1]);
     const uint64_t* handles = guest_ptr<const uint64_t>(x[2]);
     if (n <= 0 || !handles) return;
     for (int i = 0; i < n; ++i) {
+        auto it = g_command_segments.find(handles[i]);
+        if (it != g_command_segments.end()) {
+            const CommandSegment& seg = it->second;
+            q->commandUsed += seg.commandMemorySize;
+            q->controlUsed += seg.controlMemorySize;
+            (void)submit_captured_segment(ctx, handles[i], seg);
+            continue;
+        }
         CmdBuf* b = find<CmdBuf>(handles[i]);
         if (!b) continue;
         q->commandUsed += b->commandMemorySize;
@@ -10070,12 +10336,226 @@ void tex_get_view_offset(nvngfx_ctx*, uint64_t* x) {
 /* resolve table                                                       */
 /* ------------------------------------------------------------------ */
 
+/* Command records are host-side; transient pointer inputs are copied here.
+ * A hard cap keeps a corrupt count from turning into an unbounded allocation.
+ * The cap is per recording, not process-wide: EndRecording moves the arena
+ * into the command handle, and DeviceFinalizeCommandHandle releases it. */
+constexpr size_t kReplayArenaMax = 256u * 1024u * 1024u;
+constexpr uint32_t kReplayBadOffset = UINT32_MAX;
+
+uint32_t replay_arena_append(CmdBuf* b, const void* src, size_t n) {
+    if (!b || !src || n == 0) return 0;
+    if (n > UINT32_MAX) return kReplayBadOffset;
+    const size_t off = (b->replayArena.size() + 7u) & ~size_t(7u);
+    if (off > kReplayArenaMax || n > kReplayArenaMax - off)
+        return kReplayBadOffset;
+    b->replayArena.resize(off + n);
+    std::memcpy(b->replayArena.data() + off, src, n);
+    return static_cast<uint32_t>(off);
+}
+
+bool snapshot_replay_arg(CmdBuf* b, ReplayOp& op, unsigned arg,
+                         uint64_t addr, size_t n) {
+    if (!addr || !n) return true;
+    if (arg >= 8 || !guest_range(addr, n)) {
+        log_once_str("nvnCommandBufferReplay.snapshotPointer",
+                     "a recorded pointer is not a guest range");
+        return false;
+    }
+    const uint32_t off = replay_arena_append(b, guest_ptr<const void>(addr), n);
+    if (off == kReplayBadOffset) {
+        log_once_str("nvnCommandBufferReplay.snapshotBudget",
+                     "the recording's replay arena exceeded its cap");
+        return false;
+    }
+    op.snap[arg] = {off, static_cast<uint32_t>(n)};
+    return true;
+}
+
+/* SetRenderTargets' colour-view argument is an array of pointers.  Copy every
+ * pointed-to NVNtextureView and lay the arena out as [n markers][n views].
+ * The replay rebuilds the pointer array, so neither the guest's pointer array
+ * nor the views themselves have to outlive recording. */
+bool snapshot_render_target_views(CmdBuf* b, ReplayOp& op,
+                                  uint64_t addr, int count) {
+    if (!addr || count <= 0) return true;
+    if (count > NVNGFX_MAX_COLOR_TARGETS) count = NVNGFX_MAX_COLOR_TARGETS;
+    const size_t pointerBytes =
+        static_cast<size_t>(count) * sizeof(uint64_t);
+    const size_t viewBytes =
+        static_cast<size_t>(count) * sizeof(TexView16);
+    if (!guest_range(addr, pointerBytes)) {
+        log_once_str("nvnCommandBufferReplay.snapshotViews",
+                     "the view pointer array is not guest memory");
+        return false;
+    }
+    uint64_t src[NVNGFX_MAX_COLOR_TARGETS] = {};
+    std::memcpy(src, guest_ptr<const void>(addr), pointerBytes);
+    for (int i = 0; i < count; ++i) {
+        if (src[i] && !guest_range(src[i], sizeof(TexView16))) {
+            log_once_str("nvnCommandBufferReplay.snapshotViews",
+                         "a texture view pointer is not guest memory");
+            return false;
+        }
+    }
+    const size_t base = (b->replayArena.size() + 7u) & ~size_t(7u);
+    if (base > kReplayArenaMax || pointerBytes > kReplayArenaMax - base ||
+        viewBytes > kReplayArenaMax - base - pointerBytes) {
+        log_once_str("nvnCommandBufferReplay.snapshotBudget",
+                     "the recording's replay arena exceeded its cap");
+        return false;
+    }
+    b->replayArena.resize(base + pointerBytes + viewBytes, 0);
+    uint8_t* const pointerArea = b->replayArena.data() + base;
+    uint8_t* const viewArea = pointerArea + pointerBytes;
+    for (int i = 0; i < count; ++i) {
+        if (!src[i]) continue;
+        const uint64_t marker = static_cast<uint64_t>(i + 1);
+        std::memcpy(pointerArea + static_cast<size_t>(i) * 8,
+                    &marker, sizeof marker);
+        std::memcpy(viewArea + static_cast<size_t>(i) * sizeof(TexView16),
+                    guest_ptr<const void>(src[i]), sizeof(TexView16));
+    }
+    op.snap[3] = {static_cast<uint32_t>(base),
+                  static_cast<uint32_t>(pointerBytes)};
+    return true;
+}
+
+/* Snapshot only arguments whose value NVN copies into command memory.  Object
+ * addresses (textures, programs, pools, events, syncs) remain guest handles;
+ * those objects are lifetime-managed by the title and are not stack values. */
+template <void (*Fn)(nvngfx_ctx*, uint64_t*)>
+bool snapshot_replay_args(CmdBuf* b, ReplayOp& op,
+                          const nvngfx_args& in) {
+    auto snap = [&](unsigned arg, uint64_t addr, size_t n) {
+        return snapshot_replay_arg(b, op, arg, addr, n);
+    };
+
+    if constexpr (Fn == cmdbuf_set_render_targets) {
+        int count = static_cast<int>(in.x[1]);
+        if (count > NVNGFX_MAX_COLOR_TARGETS)
+            count = NVNGFX_MAX_COLOR_TARGETS;
+        if (count > 0 && !snap(2, in.x[2],
+                               static_cast<size_t>(count) * 8))
+            return false;
+        if (!snapshot_render_target_views(b, op, in.x[3], count))
+            return false;
+        return snap(5, in.x[5], sizeof(TexView16));
+    } else if constexpr (Fn == cmdbuf_clear_color ||
+                         Fn == cmdbuf_clear_color_i ||
+                         Fn == cmdbuf_clear_color_ui) {
+        return snap(2, in.x[2], 4 * sizeof(float));
+    } else if constexpr (Fn == cmdbuf_set_blend_color) {
+        return snap(1, in.x[1], 4 * sizeof(float));
+    } else if constexpr (Fn == cmdbuf_bind_blend_state) {
+        return snap(1, in.x[1], 8);
+    } else if constexpr (Fn == cmdbuf_bind_color_state ||
+                         Fn == cmdbuf_bind_channel_state ||
+                         Fn == cmdbuf_bind_polygon_state) {
+        return snap(1, in.x[1], 4);
+    } else if constexpr (Fn == cmdbuf_bind_multisample_state) {
+        /* NVNmultisampleState is ten bytes (nvn_state.h). */
+        return snap(1, in.x[1], 10);
+    } else if constexpr (Fn == cmdbuf_bind_depth_state) {
+        return snap(1, in.x[1], 8);
+    } else if constexpr (Fn == cmdbuf_bind_coverage_table) {
+        return snap(1, in.x[1], 16 * sizeof(float));
+    } else if constexpr (Fn == cmdbuf_bind_vertex_attrib_state) {
+        int n = static_cast<int>(in.x[1]);
+        if (n > NVNGFX_MAX_VERTEX_ATTRIBS) n = NVNGFX_MAX_VERTEX_ATTRIBS;
+        return n <= 0 || snap(2, in.x[2], static_cast<size_t>(n) * 4);
+    } else if constexpr (Fn == cmdbuf_bind_vertex_stream_state) {
+        int n = static_cast<int>(in.x[1]);
+        if (n > NVNGFX_MAX_VERTEX_STREAMS) n = NVNGFX_MAX_VERTEX_STREAMS;
+        return n <= 0 || snap(2, in.x[2], static_cast<size_t>(n) * 8);
+    } else if constexpr (Fn == cmdbuf_bind_textures ||
+                         Fn == cmdbuf_bind_separate_textures ||
+                         Fn == cmdbuf_bind_separate_samplers ||
+                         Fn == cmdbuf_bind_images) {
+        int n = static_cast<int>(in.x[3]);
+        if (n > NVNGFX_MAX_TEXTURE_SLOTS) n = NVNGFX_MAX_TEXTURE_SLOTS;
+        return n <= 0 || snap(4, in.x[4], static_cast<size_t>(n) * 8);
+    } else if constexpr (Fn == cmdbuf_bind_storage_buffers ||
+                         Fn == cmdbuf_bind_uniform_buffers) {
+        int n = static_cast<int>(in.x[3]);
+        if (n > NVNGFX_MAX_UBO_SLOTS) n = NVNGFX_MAX_UBO_SLOTS;
+        return n <= 0 || snap(4, in.x[4], static_cast<size_t>(n) * 16);
+    } else if constexpr (Fn == cmdbuf_bind_vertex_buffers ||
+                         Fn == cmdbuf_bind_tf_buffers) {
+        int n = static_cast<int>(in.x[2]);
+        if (n > NVNGFX_MAX_VERTEX_STREAMS) n = NVNGFX_MAX_VERTEX_STREAMS;
+        return n <= 0 || snap(3, in.x[3], static_cast<size_t>(n) * 16);
+    } else if constexpr (Fn == cmdbuf_clear_texture ||
+                         Fn == cmdbuf_clear_texture_i ||
+                         Fn == cmdbuf_clear_texture_ui) {
+        if (!snap(2, in.x[2], sizeof(TexView16))) return false;
+        if (!snap(3, in.x[3], sizeof(CopyRegion))) return false;
+        return snap(4, in.x[4], 4 * sizeof(float));
+    } else if constexpr (Fn == cmdbuf_copy_buffer_to_texture) {
+        if (!snap(3, in.x[3], sizeof(TexView16))) return false;
+        return snap(4, in.x[4], sizeof(CopyRegion));
+    } else if constexpr (Fn == cmdbuf_copy_texture_to_buffer) {
+        if (!snap(2, in.x[2], sizeof(TexView16))) return false;
+        return snap(3, in.x[3], sizeof(CopyRegion));
+    } else if constexpr (Fn == cmdbuf_copy_texture_to_texture) {
+        if (!snap(2, in.x[2], sizeof(TexView16))) return false;
+        if (!snap(3, in.x[3], sizeof(CopyRegion))) return false;
+        if (!snap(5, in.x[5], sizeof(TexView16))) return false;
+        return snap(6, in.x[6], sizeof(CopyRegion));
+    } else if constexpr (Fn == cmdbuf_update_uniform_buffer) {
+        return snap(5, in.x[5], static_cast<size_t>(in.x[4]));
+    } else if constexpr (Fn == cmdbuf_set_scissors ||
+                         Fn == cmdbuf_set_viewports ||
+                         Fn == cmdbuf_set_viewport_swizzles) {
+        return static_cast<int>(in.x[2]) <= 0 || snap(3, in.x[3], 16);
+    } else if constexpr (Fn == cmdbuf_set_depth_ranges) {
+        return static_cast<int>(in.x[2]) <= 0 || snap(3, in.x[3], 8);
+    }
+    return true;
+}
+
+/* Every command-buffer call that changes state or emits GPU work goes
+ * through this thunk when the guest resolves it by name.  While a recording is
+ * open the call and its transient inputs are appended to the replay log and
+ * no Metal work is encoded; EndRecording turns the log into a command handle.
+ * Calls made directly from this translation unit (the self-test and internal
+ * helpers) bypass the thunk, which keeps the old immediate-encoding path
+ * available for the host tests. */
+template <void (*Fn)(nvngfx_ctx*, uint64_t*)>
+bool capture_cmdbuf_call(nvngfx_ctx*, nvngfx_args* args) {
+    if (!args) return false;
+    CmdBuf* b = find<CmdBuf>(args->x[0]);
+    if (!b || !b->recording) return false;
+    const size_t arenaMark = b->replayArena.size();
+    ReplayOp op;
+    op.fn = Fn;
+    std::memcpy(op.x, args->x, sizeof op.x);
+    std::memcpy(op.f, args->f, sizeof op.f);
+    if (!snapshot_replay_args<Fn>(b, op, *args)) {
+        b->replayArena.resize(arenaMark);
+        ++g_command_snapshot_fail;
+        log_once("nvnCommandBufferReplay.snapshotFailed",
+                 static_cast<unsigned>(reinterpret_cast<uintptr_t>(Fn)));
+        return true;  /* consumed; never replay a dangling guest pointer */
+    }
+    b->replayOps.push_back(op);
+    return true;
+}
+
+template <void (*Fn)(nvngfx_ctx*, uint64_t*)>
+void cmdbuf_capture_thunk(nvngfx_ctx* ctx, nvngfx_args* args) {
+    if (!args || !capture_cmdbuf_call<Fn>(ctx, args)) {
+        if (args) Fn(ctx, args->x);
+    }
+}
+
 struct Binding {
     const char* name;
     nvngfx_proc fn;
 };
 
 #define BIND(name, impl) {name, reinterpret_cast<nvngfx_proc>(impl)}
+#define BIND_CB(name, impl) {name, reinterpret_cast<nvngfx_proc>(&cmdbuf_capture_thunk<impl>)}
 
 const Binding kBindings[] = {
     BIND("nvnDeviceBuilderSetDefaults", dev_builder_set_defaults),
@@ -10331,40 +10811,38 @@ const Binding kBindings[] = {
 
     BIND("nvnCommandBufferBeginRecording", cmdbuf_begin_recording),
     BIND("nvnCommandBufferEndRecording", cmdbuf_end_recording),
-    BIND("nvnCommandBufferSetRenderTargets", cmdbuf_set_render_targets),
-    BIND("nvnCommandBufferDiscardColor", cmdbuf_discard_color),
-    BIND("nvnCommandBufferDiscardDepthStencil", cmdbuf_discard_depth_stencil),
-    BIND("nvnCommandBufferClearColor", cmdbuf_clear_color),
-    BIND("nvnCommandBufferDrawArrays", cmdbuf_draw_arrays),
-    BIND("nvnCommandBufferDrawArraysInstanced", cmdbuf_draw_arrays_instanced),
-    BIND("nvnCommandBufferDrawArraysIndirect", cmdbuf_draw_arrays_indirect),
-    BIND("nvnCommandBufferDrawElements", cmdbuf_draw_elements),
-    BIND("nvnCommandBufferDrawElementsBaseVertex",
-         cmdbuf_draw_elements_base_vertex),
-    BIND("nvnCommandBufferDrawElementsInstanced",
-         cmdbuf_draw_elements_instanced),
-    BIND("nvnCommandBufferDrawElementsIndirect",
-         cmdbuf_draw_elements_indirect),
-    BIND("nvnCommandBufferSetViewport", cmdbuf_set_viewport),
-    BIND("nvnCommandBufferSetScissor", cmdbuf_set_scissor),
-    BIND("nvnCommandBufferBindProgram", cmdbuf_bind_program),
-    BIND("nvnCommandBufferDispatchCompute", cmdbuf_dispatch_compute),
-    BIND("nvnCommandBufferDispatchComputeIndirect",
-         cmdbuf_dispatch_compute_indirect),
-    BIND("nvnCommandBufferBindVertexBuffer", cmdbuf_bind_vertex_buffer),
-    BIND("nvnCommandBufferBindVertexBuffers", cmdbuf_bind_vertex_buffers),
-    BIND("nvnCommandBufferBindVertexAttribState", cmdbuf_bind_vertex_attrib_state),
-    BIND("nvnCommandBufferBindVertexStreamState", cmdbuf_bind_vertex_stream_state),
-    BIND("nvnCommandBufferBindUniformBuffer", cmdbuf_bind_uniform_buffer),
-    BIND("nvnCommandBufferBindUniformBuffers", cmdbuf_bind_uniform_buffers),
-    BIND("nvnCommandBufferSetTexturePool", cmdbuf_set_texture_pool),
-    BIND("nvnCommandBufferSetSamplerPool", cmdbuf_set_sampler_pool),
-    BIND("nvnCommandBufferBindTexture", cmdbuf_bind_texture),
-    BIND("nvnCommandBufferBindTextures", cmdbuf_bind_textures),
-    BIND("nvnCommandBufferBindSeparateTexture", cmdbuf_bind_separate_texture),
-    BIND("nvnCommandBufferBindSeparateTextures", cmdbuf_bind_separate_textures),
-    BIND("nvnCommandBufferBindSeparateSampler", cmdbuf_bind_separate_sampler),
-    BIND("nvnCommandBufferBindSeparateSamplers", cmdbuf_bind_separate_samplers),
+    BIND("nvnCommandBufferCallCommands", cmdbuf_call_commands),
+    BIND("nvnCommandBufferCopyCommands", cmdbuf_copy_commands),
+    BIND_CB("nvnCommandBufferSetRenderTargets", cmdbuf_set_render_targets),
+    BIND_CB("nvnCommandBufferDiscardColor", cmdbuf_discard_color),
+    BIND_CB("nvnCommandBufferDiscardDepthStencil", cmdbuf_discard_depth_stencil),
+    BIND_CB("nvnCommandBufferClearColor", cmdbuf_clear_color),
+    BIND_CB("nvnCommandBufferDrawArrays", cmdbuf_draw_arrays),
+    BIND_CB("nvnCommandBufferDrawArraysInstanced", cmdbuf_draw_arrays_instanced),
+    BIND_CB("nvnCommandBufferDrawArraysIndirect", cmdbuf_draw_arrays_indirect),
+    BIND_CB("nvnCommandBufferDrawElements", cmdbuf_draw_elements),
+    BIND_CB("nvnCommandBufferDrawElementsBaseVertex", cmdbuf_draw_elements_base_vertex),
+    BIND_CB("nvnCommandBufferDrawElementsInstanced", cmdbuf_draw_elements_instanced),
+    BIND_CB("nvnCommandBufferDrawElementsIndirect", cmdbuf_draw_elements_indirect),
+    BIND_CB("nvnCommandBufferSetViewport", cmdbuf_set_viewport),
+    BIND_CB("nvnCommandBufferSetScissor", cmdbuf_set_scissor),
+    BIND_CB("nvnCommandBufferBindProgram", cmdbuf_bind_program),
+    BIND_CB("nvnCommandBufferDispatchCompute", cmdbuf_dispatch_compute),
+    BIND_CB("nvnCommandBufferDispatchComputeIndirect", cmdbuf_dispatch_compute_indirect),
+    BIND_CB("nvnCommandBufferBindVertexBuffer", cmdbuf_bind_vertex_buffer),
+    BIND_CB("nvnCommandBufferBindVertexBuffers", cmdbuf_bind_vertex_buffers),
+    BIND_CB("nvnCommandBufferBindVertexAttribState", cmdbuf_bind_vertex_attrib_state),
+    BIND_CB("nvnCommandBufferBindVertexStreamState", cmdbuf_bind_vertex_stream_state),
+    BIND_CB("nvnCommandBufferBindUniformBuffer", cmdbuf_bind_uniform_buffer),
+    BIND_CB("nvnCommandBufferBindUniformBuffers", cmdbuf_bind_uniform_buffers),
+    BIND_CB("nvnCommandBufferSetTexturePool", cmdbuf_set_texture_pool),
+    BIND_CB("nvnCommandBufferSetSamplerPool", cmdbuf_set_sampler_pool),
+    BIND_CB("nvnCommandBufferBindTexture", cmdbuf_bind_texture),
+    BIND_CB("nvnCommandBufferBindTextures", cmdbuf_bind_textures),
+    BIND_CB("nvnCommandBufferBindSeparateTexture", cmdbuf_bind_separate_texture),
+    BIND_CB("nvnCommandBufferBindSeparateTextures", cmdbuf_bind_separate_textures),
+    BIND_CB("nvnCommandBufferBindSeparateSampler", cmdbuf_bind_separate_sampler),
+    BIND_CB("nvnCommandBufferBindSeparateSamplers", cmdbuf_bind_separate_samplers),
     BIND("nvnVertexAttribStateSetDefaults", vattrib_set_defaults),
     BIND("nvnVertexAttribStateSetFormat", vattrib_set_format),
     BIND("nvnVertexAttribStateSetStreamIndex", vattrib_set_stream),
@@ -10444,29 +10922,29 @@ const Binding kBindings[] = {
     BIND("nvnDepthStencilStateGetStencilFunc", depth_get_stencil_func),
     BIND("nvnDepthStencilStateGetStencilOp", depth_get_stencil_op),
 
-    BIND("nvnCommandBufferBindBlendState", cmdbuf_bind_blend_state),
-    BIND("nvnCommandBufferBindColorState", cmdbuf_bind_color_state),
-    BIND("nvnCommandBufferBindChannelMaskState", cmdbuf_bind_channel_state),
-    BIND("nvnCommandBufferBindMultisampleState", cmdbuf_bind_multisample_state),
-    BIND("nvnCommandBufferBindPolygonState", cmdbuf_bind_polygon_state),
-    BIND("nvnCommandBufferBindDepthStencilState", cmdbuf_bind_depth_state),
-    BIND("nvnCommandBufferBindCoverageModulationTable", cmdbuf_bind_coverage_table),
-    BIND("nvnCommandBufferBindStorageBuffer", cmdbuf_bind_storage_buffer),
-    BIND("nvnCommandBufferBindStorageBuffers", cmdbuf_bind_storage_buffers),
-    BIND("nvnCommandBufferBindImage", cmdbuf_bind_image),
-    BIND("nvnCommandBufferBindImages", cmdbuf_bind_images),
-    BIND("nvnCommandBufferBindTransformFeedbackBuffer", cmdbuf_bind_tf_buffer),
-    BIND("nvnCommandBufferBindTransformFeedbackBuffers", cmdbuf_bind_tf_buffers),
-    BIND("nvnCommandBufferCopyBufferToBuffer", cmdbuf_copy_buffer_to_buffer),
-    BIND("nvnCommandBufferCopyBufferToTexture", cmdbuf_copy_buffer_to_texture),
-    BIND("nvnCommandBufferCopyTextureToBuffer", cmdbuf_copy_texture_to_buffer),
-    BIND("nvnCommandBufferCopyTextureToTexture", cmdbuf_copy_texture_to_texture),
+    BIND_CB("nvnCommandBufferBindBlendState", cmdbuf_bind_blend_state),
+    BIND_CB("nvnCommandBufferBindColorState", cmdbuf_bind_color_state),
+    BIND_CB("nvnCommandBufferBindChannelMaskState", cmdbuf_bind_channel_state),
+    BIND_CB("nvnCommandBufferBindMultisampleState", cmdbuf_bind_multisample_state),
+    BIND_CB("nvnCommandBufferBindPolygonState", cmdbuf_bind_polygon_state),
+    BIND_CB("nvnCommandBufferBindDepthStencilState", cmdbuf_bind_depth_state),
+    BIND_CB("nvnCommandBufferBindCoverageModulationTable", cmdbuf_bind_coverage_table),
+    BIND_CB("nvnCommandBufferBindStorageBuffer", cmdbuf_bind_storage_buffer),
+    BIND_CB("nvnCommandBufferBindStorageBuffers", cmdbuf_bind_storage_buffers),
+    BIND_CB("nvnCommandBufferBindImage", cmdbuf_bind_image),
+    BIND_CB("nvnCommandBufferBindImages", cmdbuf_bind_images),
+    BIND_CB("nvnCommandBufferBindTransformFeedbackBuffer", cmdbuf_bind_tf_buffer),
+    BIND_CB("nvnCommandBufferBindTransformFeedbackBuffers", cmdbuf_bind_tf_buffers),
+    BIND_CB("nvnCommandBufferCopyBufferToBuffer", cmdbuf_copy_buffer_to_buffer),
+    BIND_CB("nvnCommandBufferCopyBufferToTexture", cmdbuf_copy_buffer_to_texture),
+    BIND_CB("nvnCommandBufferCopyTextureToBuffer", cmdbuf_copy_texture_to_buffer),
+    BIND_CB("nvnCommandBufferCopyTextureToTexture", cmdbuf_copy_texture_to_texture),
     BIND("nvnCommandBufferGetCopyRowStride", cmdbuf_get_copy_row_stride),
     BIND("nvnCommandBufferGetCopyImageStride", cmdbuf_get_copy_image_stride),
-    BIND("nvnCommandBufferSetCopyRowStride", cmdbuf_set_copy_row_stride),
-    BIND("nvnCommandBufferSetCopyImageStride", cmdbuf_set_copy_image_stride),
-    BIND("nvnCommandBufferUpdateUniformBuffer", cmdbuf_update_uniform_buffer),
-    BIND("nvnCommandBufferBarrier", cmdbuf_barrier),
+    BIND_CB("nvnCommandBufferSetCopyRowStride", cmdbuf_set_copy_row_stride),
+    BIND_CB("nvnCommandBufferSetCopyImageStride", cmdbuf_set_copy_image_stride),
+    BIND_CB("nvnCommandBufferUpdateUniformBuffer", cmdbuf_update_uniform_buffer),
+    BIND_CB("nvnCommandBufferBarrier", cmdbuf_barrier),
     BIND("nvnCommandBufferInitialize", cmdbuf_initialize),
     BIND("nvnCommandBufferFinalize", cmdbuf_finalize),
     BIND("nvnCommandBufferIsRecording", cmdbuf_is_recording),
@@ -10491,51 +10969,48 @@ const Binding kBindings[] = {
     BIND("nvnCommandBufferPushDebugGroupDynamic", cmdbuf_push_debug_group_dynamic),
     BIND("nvnCommandBufferPopDebugGroup", cmdbuf_pop_debug_group),
     BIND("nvnCommandBufferPopDebugGroupId", cmdbuf_pop_debug_group_id),
-    BIND("nvnCommandBufferSetPointSize", cmdbuf_set_point_size),
-    BIND("nvnCommandBufferSetLineWidth", cmdbuf_set_line_width),
-    BIND("nvnCommandBufferSetPrimitiveRestart", cmdbuf_set_primitive_restart),
-    BIND("nvnCommandBufferSetRasterizerDiscard", cmdbuf_set_rasterizer_discard),
-    BIND("nvnCommandBufferSetSampleMask", cmdbuf_set_sample_mask),
-    BIND("nvnCommandBufferSetConservativeRasterEnable",
-         cmdbuf_set_conservative_raster),
-    BIND("nvnCommandBufferSetConservativeRasterDilate",
-         cmdbuf_set_conservative_dilate),
-    BIND("nvnCommandBufferSetSubpixelPrecisionBias", cmdbuf_set_subpixel_bias),
-    BIND("nvnCommandBufferSetTiledCacheAction", cmdbuf_set_tiled_cache_action),
-    BIND("nvnCommandBufferSetTiledCacheTileSize",
-         cmdbuf_set_tiled_cache_tile_size),
+    BIND_CB("nvnCommandBufferSetPointSize", cmdbuf_set_point_size),
+    BIND_CB("nvnCommandBufferSetLineWidth", cmdbuf_set_line_width),
+    BIND_CB("nvnCommandBufferSetPrimitiveRestart", cmdbuf_set_primitive_restart),
+    BIND_CB("nvnCommandBufferSetRasterizerDiscard", cmdbuf_set_rasterizer_discard),
+    BIND_CB("nvnCommandBufferSetSampleMask", cmdbuf_set_sample_mask),
+    BIND_CB("nvnCommandBufferSetConservativeRasterEnable", cmdbuf_set_conservative_raster),
+    BIND_CB("nvnCommandBufferSetConservativeRasterDilate", cmdbuf_set_conservative_dilate),
+    BIND_CB("nvnCommandBufferSetSubpixelPrecisionBias", cmdbuf_set_subpixel_bias),
+    BIND_CB("nvnCommandBufferSetTiledCacheAction", cmdbuf_set_tiled_cache_action),
+    BIND_CB("nvnCommandBufferSetTiledCacheTileSize", cmdbuf_set_tiled_cache_tile_size),
     BIND("nvnCommandBufferSaveZCullData", cmdbuf_save_zcull),
     BIND("nvnCommandBufferRestoreZCullData", cmdbuf_restore_zcull),
-    BIND("nvnCommandBufferSetShaderScratchMemory", cmdbuf_set_shader_scratch),
-    BIND("nvnCommandBufferClearColori", cmdbuf_clear_color_i),
-    BIND("nvnCommandBufferClearColorui", cmdbuf_clear_color_ui),
-    BIND("nvnCommandBufferClearDepthStencil", cmdbuf_clear_depth_stencil),
-    BIND("nvnCommandBufferClearBuffer", cmdbuf_clear_buffer),
-    BIND("nvnCommandBufferClearTexture", cmdbuf_clear_texture),
-    BIND("nvnCommandBufferClearTexturei", cmdbuf_clear_texture_i),
-    BIND("nvnCommandBufferClearTextureui", cmdbuf_clear_texture_ui),
-    BIND("nvnCommandBufferSetAlphaRef", cmdbuf_set_alpha_ref),
-    BIND("nvnCommandBufferSetBlendColor", cmdbuf_set_blend_color),
-    BIND("nvnCommandBufferSetPolygonOffsetClamp", cmdbuf_set_polygon_offset),
-    BIND("nvnCommandBufferSetDepthBounds", cmdbuf_set_depth_bounds),
-    BIND("nvnCommandBufferSetDepthClamp", cmdbuf_set_depth_clamp),
-    BIND("nvnCommandBufferSetDepthRange", cmdbuf_set_depth_range),
-    BIND("nvnCommandBufferSetDepthRanges", cmdbuf_set_depth_ranges),
-    BIND("nvnCommandBufferSetRenderEnable", cmdbuf_set_render_enable),
-    BIND("nvnCommandBufferSetScissors", cmdbuf_set_scissors),
-    BIND("nvnCommandBufferSetStencilMask", cmdbuf_set_stencil_mask),
-    BIND("nvnCommandBufferSetStencilRef", cmdbuf_set_stencil_ref),
-    BIND("nvnCommandBufferSetStencilValueMask", cmdbuf_set_stencil_value_mask),
-    BIND("nvnCommandBufferSetViewports", cmdbuf_set_viewports),
-    BIND("nvnCommandBufferSetViewportSwizzles", cmdbuf_set_viewport_swizzles),
+    BIND_CB("nvnCommandBufferSetShaderScratchMemory", cmdbuf_set_shader_scratch),
+    BIND_CB("nvnCommandBufferClearColori", cmdbuf_clear_color_i),
+    BIND_CB("nvnCommandBufferClearColorui", cmdbuf_clear_color_ui),
+    BIND_CB("nvnCommandBufferClearDepthStencil", cmdbuf_clear_depth_stencil),
+    BIND_CB("nvnCommandBufferClearBuffer", cmdbuf_clear_buffer),
+    BIND_CB("nvnCommandBufferClearTexture", cmdbuf_clear_texture),
+    BIND_CB("nvnCommandBufferClearTexturei", cmdbuf_clear_texture_i),
+    BIND_CB("nvnCommandBufferClearTextureui", cmdbuf_clear_texture_ui),
+    BIND_CB("nvnCommandBufferSetAlphaRef", cmdbuf_set_alpha_ref),
+    BIND_CB("nvnCommandBufferSetBlendColor", cmdbuf_set_blend_color),
+    BIND_CB("nvnCommandBufferSetPolygonOffsetClamp", cmdbuf_set_polygon_offset),
+    BIND_CB("nvnCommandBufferSetDepthBounds", cmdbuf_set_depth_bounds),
+    BIND_CB("nvnCommandBufferSetDepthClamp", cmdbuf_set_depth_clamp),
+    BIND_CB("nvnCommandBufferSetDepthRange", cmdbuf_set_depth_range),
+    BIND_CB("nvnCommandBufferSetDepthRanges", cmdbuf_set_depth_ranges),
+    BIND_CB("nvnCommandBufferSetRenderEnable", cmdbuf_set_render_enable),
+    BIND_CB("nvnCommandBufferSetScissors", cmdbuf_set_scissors),
+    BIND_CB("nvnCommandBufferSetStencilMask", cmdbuf_set_stencil_mask),
+    BIND_CB("nvnCommandBufferSetStencilRef", cmdbuf_set_stencil_ref),
+    BIND_CB("nvnCommandBufferSetStencilValueMask", cmdbuf_set_stencil_value_mask),
+    BIND_CB("nvnCommandBufferSetViewports", cmdbuf_set_viewports),
+    BIND_CB("nvnCommandBufferSetViewportSwizzles", cmdbuf_set_viewport_swizzles),
 
-    BIND("nvnCommandBufferFenceSync", cmdbuf_fence_sync),
-    BIND("nvnCommandBufferSignalEvent", cmdbuf_signal_event),
-    BIND("nvnCommandBufferReportCounter", cmdbuf_report_counter),
-    BIND("nvnCommandBufferReportValue", cmdbuf_report_value),
-    BIND("nvnCommandBufferResetCounter", cmdbuf_reset_counter),
-    BIND("nvnCommandBufferWaitEvent", cmdbuf_wait_event),
-    BIND("nvnCommandBufferWaitSync", cmdbuf_wait_sync),
+    BIND_CB("nvnCommandBufferFenceSync", cmdbuf_fence_sync),
+    BIND_CB("nvnCommandBufferSignalEvent", cmdbuf_signal_event),
+    BIND_CB("nvnCommandBufferReportCounter", cmdbuf_report_counter),
+    BIND_CB("nvnCommandBufferReportValue", cmdbuf_report_value),
+    BIND_CB("nvnCommandBufferResetCounter", cmdbuf_reset_counter),
+    BIND_CB("nvnCommandBufferWaitEvent", cmdbuf_wait_event),
+    BIND_CB("nvnCommandBufferWaitSync", cmdbuf_wait_sync),
 
     BIND("nvnEventBuilderSetDefaults", event_builder_set_defaults),
     BIND("nvnEventBuilderSetStorage", event_builder_set_storage),
@@ -11012,6 +11487,187 @@ extern "C" int nvngfx_metal_selftest(void) {
                 goto done;
             }
             std::fprintf(stderr, "[selftest] draw 1 ([[vertex_id]]) produced the expected pixel\n");
+
+        {
+            /* --- Command handles: record once, call into another buffer ----
+             * These calls go through metal_resolve(), the same table the game
+             * uses, so the capture thunk is exercised rather than the direct
+             * C++ functions above.  The source segment must not commit; the
+             * nested segment adds one CALL and the target adds another.  Only
+             * QueueSubmitCommands should make the draw happen, and the pixel
+             * proves the expanded stream ran in the target's command buffer. */
+            const uint64_t kSegSrc = 0xB100;
+            const uint64_t kSegNest = 0xB140;
+            const uint64_t kSegDst = 0xB180;
+            const uint64_t kReplayQueue = 0xB1C0;
+            nvngfx_proc const setTargets =
+                metal_resolve(nullptr, "nvnCommandBufferSetRenderTargets");
+            nvngfx_proc const clearProc =
+                metal_resolve(nullptr, "nvnCommandBufferClearColor");
+            nvngfx_proc const bindProc =
+                metal_resolve(nullptr, "nvnCommandBufferBindProgram");
+            nvngfx_proc const drawProc =
+                metal_resolve(nullptr, "nvnCommandBufferDrawArrays");
+            if (!setTargets || !clearProc || !bindProc || !drawProc) {
+                std::fprintf(stderr,
+                             "[selftest] command replay: a wrapped entry point "
+                             "is missing\n");
+                rc = 16441;
+                goto done;
+            }
+
+            nvngfx_args a{};
+            /* Both of these are deliberately mutable: they are stack values
+             * whose lifetime ends before submission.  A correct recorder
+             * snapshots them, so changing them after EndRecording must not
+             * affect the submitted segment. */
+            uint64_t colourTarget = kTex;
+            float blue[4] = {0.0f, 0.0f, 1.0f, 1.0f};
+            a.x[0] = kSegSrc;
+            cmdbuf_begin_recording(ctx, a.x);
+            a = nvngfx_args{};
+            a.x[0] = kSegSrc; a.x[1] = 1;
+            a.x[2] = reinterpret_cast<uint64_t>(&colourTarget);
+            a.x[3] = 0; a.x[4] = 0; a.x[5] = 0;
+            setTargets(ctx, &a);
+            a = nvngfx_args{};
+            a.x[0] = kSegSrc; a.x[1] = 0;
+            a.x[2] = reinterpret_cast<uint64_t>(blue); a.x[3] = 0xF;
+            clearProc(ctx, &a);
+            a = nvngfx_args{};
+            a.x[0] = kSegSrc; a.x[1] = kProg; a.x[2] = 0;
+            bindProc(ctx, &a);
+            a = nvngfx_args{};
+            a.x[0] = kSegSrc; a.x[1] = 0; a.x[2] = 0; a.x[3] = 3;
+            drawProc(ctx, &a);
+            a = nvngfx_args{};
+            a.x[0] = kSegSrc;
+            cmdbuf_end_recording(ctx, a.x);
+            const uint64_t srcHandle = a.x[0];
+            colourTarget = 0xD00D;
+            blue[0] = 1.0f;
+            blue[1] = 0.0f;
+            blue[2] = 0.0f;
+            CmdBuf* const src = find<CmdBuf>(kSegSrc);
+            if (!srcHandle || !src || src->last || src->draws != 0 ||
+                src->encoded != 0 ||
+                g_command_segments.find(srcHandle) == g_command_segments.end()) {
+                std::fprintf(stderr,
+                             "[selftest] command replay: source committed early "
+                             "(handle=%llx last=%d draws=%u encoded=%u)\n",
+                             static_cast<unsigned long long>(srcHandle),
+                             src && src->last ? 1 : 0,
+                             src ? src->draws : 0u,
+                             src ? src->encoded : 0u);
+                rc = 16441;
+                goto done;
+            }
+
+            a = nvngfx_args{};
+            a.x[0] = kSegNest;
+            cmdbuf_begin_recording(ctx, a.x);
+            uint64_t one[1] = {srcHandle};
+            a = nvngfx_args{};
+            a.x[0] = kSegNest; a.x[1] = 1;
+            a.x[2] = reinterpret_cast<uint64_t>(&one[0]);
+            cmdbuf_call_commands(ctx, a.x);
+            a = nvngfx_args{};
+            a.x[0] = kSegNest;
+            cmdbuf_end_recording(ctx, a.x);
+            const uint64_t nestHandle = a.x[0];
+
+            a = nvngfx_args{};
+            a.x[0] = kSegDst;
+            cmdbuf_begin_recording(ctx, a.x);
+            one[0] = nestHandle;
+            a = nvngfx_args{};
+            a.x[0] = kSegDst; a.x[1] = 1;
+            a.x[2] = reinterpret_cast<uint64_t>(&one[0]);
+            cmdbuf_call_commands(ctx, a.x);
+            a = nvngfx_args{};
+            a.x[0] = kSegDst;
+            cmdbuf_end_recording(ctx, a.x);
+            const uint64_t dstHandle = a.x[0];
+            CmdBuf* const dst = find<CmdBuf>(kSegDst);
+            if (!nestHandle || !dstHandle || !dst || dst->last) {
+                std::fprintf(stderr,
+                             "[selftest] command replay: target committed before "
+                             "submission (handles=%llx/%llx last=%d)\n",
+                             static_cast<unsigned long long>(nestHandle),
+                             static_cast<unsigned long long>(dstHandle),
+                             dst && dst->last ? 1 : 0);
+                rc = 16441;
+                goto done;
+            }
+
+            (void)find_or_add<NvnQueue>(kReplayQueue);
+            uint64_t submitHandle = dstHandle;
+            a = nvngfx_args{};
+            a.x[0] = kReplayQueue; a.x[1] = 1;
+            a.x[2] = reinterpret_cast<uint64_t>(&submitHandle);
+            queue_submit_commands(ctx, a.x);
+            if (!dst->last) {
+                std::fprintf(stderr,
+                             "[selftest] command replay: submit produced no "
+                             "Metal command buffer\n");
+                rc = 16441;
+                goto done;
+            }
+            [dst->last waitUntilCompleted];
+            if (dst->last.status == MTLCommandBufferStatusError ||
+                dst->draws != 1 || dst->encoded != 1) {
+                std::fprintf(stderr,
+                             "[selftest] command replay: status=%ld draws=%u "
+                             "encoded=%u fullscreenCalls=%u copies=%u "
+                             "misses=%u snapshotFailures=%u\n",
+                             static_cast<long>(dst->last.status), dst->draws,
+                             dst->encoded, g_command_call_count,
+                             g_command_copy_count, g_command_replay_miss,
+                             g_command_snapshot_fail);
+                rc = 16441;
+                goto done;
+            }
+            unsigned char segPx[4] = {0, 0, 0, 0};
+            const int segWant[4] = {64, 128, 191, 255};
+            if (!read_center_pixel(dev, c->queue, t->mtl, kSide, segPx) ||
+                !pixels_near(segPx, segWant, 2)) {
+                std::fprintf(stderr,
+                             "[selftest] command replay: pixel is "
+                             "(%u,%u,%u,%u), want (%d,%d,%d,%d)\n",
+                             segPx[0], segPx[1], segPx[2], segPx[3],
+                             segWant[0], segWant[1], segWant[2], segWant[3]);
+                rc = 16441;
+                goto done;
+            }
+            if (g_command_call_count != 2 || g_command_copy_count != 0 ||
+                g_command_replay_miss != 0 || g_command_snapshot_fail != 0) {
+                std::fprintf(stderr,
+                             "[selftest] command replay: counters calls=%u "
+                             "copies=%u misses=%u snapshotFailures=%u\n",
+                             g_command_call_count, g_command_copy_count,
+                             g_command_replay_miss, g_command_snapshot_fail);
+                rc = 16441;
+                goto done;
+            }
+            uint64_t fin[8] = {0, srcHandle, 0, 0, 0, 0, 0, 0};
+            dev_finalize_command_handle(ctx, fin);
+            fin[1] = nestHandle;
+            dev_finalize_command_handle(ctx, fin);
+            fin[1] = dstHandle;
+            dev_finalize_command_handle(ctx, fin);
+            if (!g_command_segments.empty()) {
+                std::fprintf(stderr,
+                             "[selftest] command replay: %zu handles survived "
+                             "DeviceFinalizeCommandHandle\n",
+                             g_command_segments.size());
+                rc = 16441;
+                goto done;
+            }
+            std::fprintf(stderr,
+                         "[selftest] command replay: nested CallCommands "
+                         "submitted once, record-time snapshots ignored the "
+                         "later stack writes, and the pixel is correct\n");
+        }
         }
 
         {
@@ -18900,6 +19556,10 @@ extern "C" int nvngfx_metal_present_clear(nvngfx_ctx* ctx, float r, float g, flo
 }
 
 extern "C" void nvngfx_metal_destroy(nvngfx_ctx* ctx) {
+    /* Command handles and their capture arenas are host resources, not
+     * guest memory.  Release them with the context so a destroyed title does
+     * not leave a growing map behind. */
+    g_command_segments.clear();
     delete reinterpret_cast<Ctx*>(ctx);
 }
 

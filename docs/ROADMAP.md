@@ -6322,6 +6322,106 @@ git diff --check
 * `nvnBlendStateGet/SetAdvancedNormalizedDst`、
   `nvnMultisampleStateGetSampleLocationsGrid`、`nvnEventBuilderGetStorage` 仍然故意
   不绑定：前两者在实测状态布局里没有对应字段，后者没有公开原型，任何返回值都是猜的。
-* 标题实际用到而尚未实现的入口仍然只有 `nvnCommandBufferCallCommands`
+* 标题实际用到而尚未实现的入口当时只剩 `nvnCommandBufferCallCommands`
   （nxnative 的 1.9.0 usage 里约 790 万次）；真正的下一堵墙是把“录制时立即编码”
-  改成可重放的命令流。真实标题 draw 依然为 0 条。
+  改成可重放的命令流。该入口已在“续二十九”接上，真实标题 draw 仍然为 0 条。
+
+## M4 续二十九：命令句柄、CallCommands 与录制时快照
+
+这一批把最后一个“标题实际调用、后端却完全没有入口”的缺口接上了：
+`nvnCommandBufferCallCommands`（1.9.0 usage 里约 790 万次）和同形的
+`nvnCommandBufferCopyCommands`。覆盖从 **481/513（93.8%）** 到
+**483/513（94.1%）**，未实现 30；CommandBuffer 从 **119/144** 到
+**122/144**。
+
+### 1. 命令段不是“立即提交”
+
+旧路径在 `EndRecording` 里直接 `[cb commit]`，所以句柄没有可重放的内容。
+现在经 `metal_resolve` 分发表进入的 90 个状态/绘制入口由 `BIND_CB` thunk
+捕获：
+
+```text
+BeginRecording
+  BindProgram / SetRenderTargets / Draw...   -> ReplayOp
+  CallCommands(handle)                       -> ReplayOp{handle}
+EndRecording                                 -> 唯一 NVNcommandHandle
+QueueSubmitCommands                          -> 展开并在 owner 上编码、提交
+DeviceFinalizeCommandHandle                  -> 释放命令段
+```
+
+`CallCommands` 和 `CopyCommands` 都记录成与 nxnative 相同的 `OP_CALL`
+等价项；`QueueSubmitCommands` 在提交顺序里递归展开嵌套段，深度上限 12，
+并用 `seen` 栈拒绝循环。未知句柄只计数、记日志并跳过，绝不解引用。
+上下文销毁会清空剩余命令段。
+
+**直连 C++ 入口的自检路径仍然保留**：没有经过捕获 thunk 的录制仍在
+`EndRecording` 立即编码/提交并返回 guest command-buffer 地址，所以原有
+宿主回归不需要全部改写。这是兼容路径，不是客体的正常入口。
+
+### 2. 录制时快照
+
+命令段延迟到 `QueueSubmitCommands` 才执行。若只复制参数寄存器，清屏颜色、
+视口数组、绑定数组、render-target view、拷贝区域和 `UpdateUniformBuffer`
+的源指针到提交时可能已经指向被复用的栈或临时缓冲。
+
+每个命令段现在带一个 `arena`。录制时按入口语义复制短生命周期的输入：
+
+* `ClearColor{i,ui}` / `SetBlendColor`：4 个分量；
+* 六类状态对象：blend 8 字节、color/channel/polygon 4 字节、
+  multisample 10 字节、depth/stencil 8 字节；coverage table 16 个 float；
+* vertex attrib/stream、texture/image/sampler、uniform/storage/vertex/TF
+  buffer 数组；
+* `SetRenderTargets` 的颜色 texture 指针数组、每个 `NVNtextureView`
+  的 16 字节副本，以及深度 view；
+* `ClearTexture*`、`CopyBufferToTexture`、`CopyTextureToBuffer`、
+  `CopyTextureToTexture` 的 view / region / clear value；
+* `SetViewports` / `SetScissors` / `SetViewportSwizzles` / `SetDepthRanges`
+  的第一个元素（当前 Metal 路径只消费这一个）；
+* `UpdateUniformBuffer` 的整个源数据区。
+
+回放时把对应 `x[i]` 改指到 arena。纹理、程序、池、事件、sync 等持久对象的
+guest 地址不复制，它们由标题管理生命周期。单段 arena 上限 256 MiB；超限或
+指针不在 guest 范围时该命令不进入回放，`g_command_snapshot_fail` 计数并打
+一次性日志，避免带着悬空指针执行。
+
+### 3. 自检
+
+新增失败码 `16441`，通过 `metal_resolve()` 取得真实分发表入口，覆盖：
+
+1. 源段 `0xB100` 录制 render target / 蓝色 clear / program / draw，
+   `EndRecording` 后不得提交 Metal、不得产生 draw；
+2. 嵌套段 `0xB140` 只记录 `CallCommands(src)`，目标段 `0xB180`
+   再调用嵌套段；只有 `QueueSubmitCommands` 展开一次；
+3. 在 `EndRecording` 后把栈上的蓝色数组改成红色、把颜色目标地址改成
+   无效值；回放仍必须使用录制时快照，最终像素为蓝色、draw/encoded 各 1；
+4. `CallCommands` 计数 2、`CopyCommands` 0、未命中 0、快照失败 0；
+5. 三个句柄经 `DeviceFinalizeCommandHandle` 释放后不残留。
+
+### 4. 门禁
+
+```text
+python scripts/syntax_check_metal.py --require
+python scripts/gen_nvn.py --repo . --check
+python scripts/extract_nvn_signatures.py --check
+python scripts/shader_chain/test_gen_blobs.py
+python scripts/verify_ios.py
+powershell -ExecutionPolicy Bypass -File scripts/build_abi_test.ps1
+git diff --check
+```
+
+本机（Windows，无 Metal 运行时）已通过类型检查和全部便携门禁；
+`16441` 的实际 Metal 执行要等 macOS CI 的 iOS Simulator job。
+
+### 5. 仍然没有闭环的部分
+
+* 这是**宿主调用捕获**，不是 guest 命令内存解释器。客体若在录制后原地修补
+  `AddCommandMemory` 里的命令字节，本后端看不到；`GetCommandMemoryUsed`
+  仍是 0（命令不写 guest 内存）。
+* 持久对象（纹理、program、pool、event、sync）在回放时解析，而不是在录制时
+  冻结；状态对象的标量已快照，但对象生命周期仍必须覆盖提交。
+* `BindTexturesDeferred` 还不在注册表里。BOTW 的组合纹理路径会使用它，
+  语义是“提交/回放时再读 handle 指针”，与普通 `BindTextures` 的录制时
+  复制相反；下一步要把它作为显式 NOPROTO 入口加进注册表，并让捕获路径
+  保留指针而不是快照。
+* 真实标题仍没有离线 MSL blob，`draw` 依然为 0；`16441` 通过只证明宿主
+  回放链正确，不证明游戏已经出画面。
