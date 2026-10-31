@@ -4237,7 +4237,7 @@ verify_ios: ok (metal bindings: 196/513)
 
 `ClearColor` 目前仍只支持 0 号目标和完整 `0xF` 掩码；其他组合明确 `log_once`。
 `ClearDepthStencil` 的模板清屏目前只接受 `0xFF` / `0xFFFFFFFF` 完整掩码，部分掩码无法
-用 Metal load action 表达。
+用 Metal load action 表达（该轮当时未支持；后续 M4 续十已用独立 depth/stencil-only pass 实现）。
 
 ### 2. 三个模板命令入口
 
@@ -4590,7 +4590,7 @@ build_abi_test: all tests passed
 
 仍未支持：
 
-* 模板清屏的部分通道掩码；
+* 模板清屏的部分通道掩码（该轮当时未支持；后续 M4 续十已实现）；
 * `ClearTexture{i,ui}`（该轮当时未支持；后续 M4 续九已实现）；
 * guest `DispatchCompute` / image / storage buffer 路径；
 * 真实标题 shader 的离线 MSL 接入（`nvn_shader_blobs.gen.c` 仍为空表）；
@@ -4640,7 +4640,48 @@ build_abi_test: all tests passed
 
 仍未支持：
 
-* 模板清屏的部分通道掩码；
+* 模板清屏的部分通道掩码（该轮当时未支持；后续 M4 续十已实现）；
+* 1D / 3D / depth-stencil 的 `ClearTexture{i,ui}`；
+* guest `DispatchCompute` / image / storage buffer 路径；
+* 真实标题 shader 的离线 MSL 接入（`nvn_shader_blobs.gen.c` 仍为空表）；
+* 没有真机像素验证，不能声称画面正确。
+
+## M4 续十：模板部分通道掩码清屏
+
+上一轮的 `ClearDepthStencil` 只把完整模板掩码 `0xFF` 映射成附件的
+`MTLLoadActionClear`；部分掩码无法用 load action 表达。本轮补上 8 位模板写掩码路径。
+
+### 1. 独立 depth/stencil-only pass
+
+* `clear_stencil_state()` 按 8 位写掩码缓存 `MTLDepthStencilState`；深度比较 `ALWAYS`、
+  不写深度，模板比较 `ALWAYS`，失败与 z-fail 操作为 `KEEP`，z-pass 操作为 `REPLACE`，
+  读掩码 `0xFF`，前后脸使用同一规则；
+* `clear_stencil_pipeline()` 创建无颜色附件、`fragment void` 的管线，缓存键为深度格式、
+  模板格式和采样数；
+* `encode_partial_stencil_clear()` 先结束当前 encoder，再开一个仅含 depth/stencil 附件的
+  pass：模板用 `Load` 保留旧值，全屏三角形以 `REPLACE` 和写掩码修改选中的位；若同一次
+  调用还要求清深度，深度附件改用 `Clear`。写回后标记纹理已渲染；
+* 完整 `0xFF` 仍走原来的 pending clear + load action，避免为常见整字节清屏引入额外 draw。
+
+### 2. 模拟器自测
+
+* 先把模板整字节清成 `0xF0`，再用 mask `0x0F` 和值 `0x5A` 做部分清屏，预期字节 `0xFA`；
+* 随后用模板测试 `EQUAL 0xFA` 画一条全屏三角形；只有高半字节被保留且低半字节被更新时，
+  颜色目标才会出现预期像素。回读中心像素验证结果。
+
+### 3. 覆盖与边界
+
+没有新增 NVN 入口，覆盖率保持 **202/513（39.4%）**，未实现 311；CommandBuffer 域
+**57/144**。本地门禁输出：
+
+```text
+syntax_check_metal: ok (clang++.exe)
+verify_ios: ok (metal bindings: 202/513)
+build_abi_test: all tests passed
+```
+
+仍未支持：
+
 * 1D / 3D / depth-stencil 的 `ClearTexture{i,ui}`；
 * guest `DispatchCompute` / image / storage buffer 路径；
 * 真实标题 shader 的离线 MSL 接入（`nvn_shader_blobs.gen.c` 仍为空表）；

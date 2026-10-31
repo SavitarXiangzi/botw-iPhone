@@ -495,8 +495,9 @@ guest storage，再调用 `nvnTextureFlushTexels` 改成棕/钢蓝/橙/天蓝并
   16 槽 MRU：命中项移到队首，淘汰最久未用项；模拟器用 16 个不同状态键填满并逐一回查。
   `SetStencilRef` / `SetStencilMask` /
   `SetStencilValueMask` 已接入：引用值放 encoder，前后脸读/写掩码进深度模板状态缓存键。
-  `ClearDepthStencil` 已转成深度/模板附件的 load action，并在 EndRecording 或换 render
-  target 前强制落地。`SetDepthClamp` 映射到 `setDepthClipMode:`；`SetDepthRange(s)` 无论标量还是数组形式
+  `ClearDepthStencil` 的完整掩码转成深度/模板附件的 load action，并在 EndRecording 或换
+  render target 前强制落地；8 位模板部分掩码走独立 depth/stencil-only pass，加载旧模板后以
+  ALWAYS/REPLACE + 写掩码的全屏三角形修改选中的位。`SetDepthClamp` 映射到 `setDepthClipMode:`；`SetDepthRange(s)` 无论标量还是数组形式
   都落到同一个单 viewport 状态；`SetDepthBounds`
   只记录状态，Metal 没有深度边界测试，非默认范围会明确上报。MRT 已支持 1–8 个颜色附件：
   管线缓存键含每个目标的格式，描述符按目标填混合/写掩码，render pass 按目标挂载并允许各自的
@@ -515,8 +516,9 @@ guest storage，再调用 `nvnTextureFlushTexels` 改成棕/钢蓝/橙/天蓝并
   `ClearTextureui` 已支持 2D / 2D array / cube / cube array / 2D MSAA 颜色纹理的
   完整级别、region、mask 与完整多 mip 清屏；模拟器回读完整、区域、mask、整数、
   cube 六面和 mip 1。显式 region 仅接受单 level 视图，1D / 3D / depth-stencil
-  明确拒绝；模板清屏的部分通道掩码仍无法用 load action 表达，会明确上报而不是
-  错误清除。
+  明确拒绝。模板部分掩码无法用 load action 表达，现由独立的 depth/stencil-only pass
+  处理：模板附件 `Load` 保留旧值，全屏三角形用 `REPLACE` 和 8 位写掩码更新。模拟器先清
+  `0xF0`，再以 mask `0x0F` 写入 `0x5A`，最后用 `EQUAL 0xFA` 的 draw 和新像素回读确认结果。
 - ✅ Sampler：M3.82 完成 builder、object、getter 和真实的
   `MTLSamplerState`；M3.83 完成 sampler pool、`BindSeparateSampler(s)` 与
   参数缓冲区/直连绑定两条路径。M3.84 已把真实 shader 的 `[[id(k)]]` 顺序

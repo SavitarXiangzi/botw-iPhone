@@ -13,9 +13,10 @@
  *         memory pool -> zero-copy MTLBuffer over guest memory
  *         command buffer -> MTLCommandBuffer, viewport / scissor / drawArrays
  *         render targets + one render pass (1-8 colour attachments) +
- *           ClearColor / ClearColori / ClearColorui / ClearDepthStencil as
- *           load actions, and ClearTexture{i,ui} as per-level/slice attachment
- *           passes, flushed even without a draw
+ *           ClearColor / ClearColori / ClearColorui / ClearDepthStencil full masks as
+ *           load actions, ClearDepthStencil partial 8-bit stencil masks as a
+ *           depth/stencil-only REPLACE pass, and ClearTexture{i,ui} as
+ *           per-level/slice attachment passes, flushed even without a draw
  *         ClearBuffer -> host compute kernel over a pool span
  *         texture objects, built from the values nvnTextureBuilderSet* was
  *           given (no guest struct offsets are read)
@@ -35,9 +36,9 @@
  *         path -- pipeline creation with a real vertex descriptor, buffer
  *         binding, draw encoding, pixel readback -- is executed by
  *         nvngfx_metal_selftest() in CI's iOS Simulator: eighteen draws,
- *         six clear-only regressions (full / partial-mask / integer
+ *         seven clear-only regressions (full / partial-mask / integer
  *         ClearColor, ClearTexture full-region-mask-uint-cube-mip, depth /
- *         stencil and MRT clears), a
+ *         stencil / partial-stencil and MRT clears), a
  *         buffer-fill compute probe, a bindless table probe, and a vertex-stage
  *         argument-buffer draw whose shifted pixels are read back.  The ninth
  *         builds a block-linear texture in a guest memory pool and proves that
@@ -162,6 +163,8 @@ void log_once_str(const char* what, const char* msg) {
  * write masks select the requested channels.  The shader is host-owned and
  * its output type follows each attachment's component class. */
 constexpr unsigned kClearPsoSlots = 8;
+constexpr unsigned kClearStencilPsoSlots = 4;
+constexpr unsigned kClearStencilDssSlots = 8;
 
 struct ClearPsoEntry {
     bool used = false;
@@ -172,6 +175,23 @@ struct ClearPsoEntry {
     unsigned stencilFormat = 0;
     unsigned sampleCount = 0;
     id<MTLRenderPipelineState> pso = nil;
+};
+
+/* A partial stencil clear is a depth/stencil-only full-screen draw.  The
+ * pipeline varies only by attachment formats and sample count; the write mask
+ * lives in the depth/stencil state. */
+struct ClearStencilPsoEntry {
+    bool used = false;
+    unsigned depthFormat = 0;
+    unsigned stencilFormat = 0;
+    unsigned sampleCount = 0;
+    id<MTLRenderPipelineState> pso = nil;
+};
+
+struct ClearStencilDssEntry {
+    bool used = false;
+    unsigned writeMask = 0;
+    id<MTLDepthStencilState> dss = nil;
 };
 
 struct Ctx {
@@ -194,6 +214,12 @@ struct Ctx {
     unsigned clearPsoNext = 0;
     id<MTLDepthStencilState> clearDss = nil;
     bool clearDssTried = false;
+    ClearStencilPsoEntry clearStencilPso[kClearStencilPsoSlots];
+    unsigned clearStencilPsoCount = 0;
+    unsigned clearStencilPsoNext = 0;
+    ClearStencilDssEntry clearStencilDss[kClearStencilDssSlots];
+    unsigned clearStencilDssCount = 0;
+    unsigned clearStencilDssNext = 0;
 };
 
 struct Win {
@@ -3385,6 +3411,140 @@ id<MTLDepthStencilState> clear_depth_stencil(Ctx* c) {
     return c->clearDss;
 }
 
+/* Partial stencil clearing needs a state whose pass operation replaces the
+ * selected bits.  Keep the state tiny and keyed by the 8-bit write mask; a
+ * stencil-only draw still uses ALWAYS/KEEP for compare and fail paths. */
+id<MTLDepthStencilState> clear_stencil_state(Ctx* c, unsigned writeMask) {
+    if (!c) return nil;
+    writeMask &= 0xFFu;
+    for (unsigned e = 0; e < c->clearStencilDssCount; ++e) {
+        ClearStencilDssEntry& k = c->clearStencilDss[e];
+        if (k.used && k.writeMask == writeMask) return k.dss;
+    }
+
+    @autoreleasepool {
+        MTLDepthStencilDescriptor* d = [[MTLDepthStencilDescriptor alloc] init];
+        d.depthCompareFunction = MTLCompareFunctionAlways;
+        d.depthWriteEnabled = NO;
+        MTLStencilDescriptor* s = [[MTLStencilDescriptor alloc] init];
+        s.stencilCompareFunction = MTLCompareFunctionAlways;
+        s.stencilFailureOperation = MTLStencilOperationKeep;
+        s.depthFailureOperation = MTLStencilOperationKeep;
+        s.depthStencilPassOperation = MTLStencilOperationReplace;
+        s.readMask = 0xFFu;
+        s.writeMask = writeMask;
+        d.frontFaceStencil = s;
+        d.backFaceStencil = s;
+        id<MTLDepthStencilState> dss =
+            [c->device newDepthStencilStateWithDescriptor:d];
+        if (!dss) {
+            log_once("nvnClear.partialStencilState", writeMask);
+            return nil;
+        }
+
+        unsigned slot;
+        if (c->clearStencilDssCount < kClearStencilDssSlots) {
+            slot = c->clearStencilDssCount++;
+        } else {
+            slot = c->clearStencilDssNext;
+            c->clearStencilDssNext =
+                (c->clearStencilDssNext + 1) % kClearStencilDssSlots;
+        }
+        ClearStencilDssEntry& e = c->clearStencilDss[slot];
+        e.used = true;
+        e.writeMask = writeMask;
+        e.dss = dss;
+        return dss;
+    }
+}
+
+/* A stencil clear has no colour outputs, so this pipeline intentionally has
+ * no colour attachments and a void fragment stage.  It can be used in a
+ * dedicated depth/stencil-only pass without touching a bound colour target. */
+id<MTLRenderPipelineState> clear_stencil_pipeline(Ctx* c,
+                                                   MTLPixelFormat depthFormat,
+                                                   MTLPixelFormat stencilFormat,
+                                                   unsigned sampleCount) {
+    if (!c || !c->device || !stencilFormat) return nil;
+    for (unsigned e = 0; e < c->clearStencilPsoCount; ++e) {
+        ClearStencilPsoEntry& k = c->clearStencilPso[e];
+        if (k.used && k.depthFormat == static_cast<unsigned>(depthFormat) &&
+            k.stencilFormat == static_cast<unsigned>(stencilFormat) &&
+            k.sampleCount == sampleCount) {
+            return k.pso;
+        }
+    }
+
+    @autoreleasepool {
+        static const char* const kSource =
+            "#include <metal_stdlib>\n"
+            "using namespace metal;\n"
+            "struct NvngfxClearStencilVOut { float4 position [[position]]; };\n"
+            "vertex NvngfxClearStencilVOut nvngfx_clear_stencil_vs("
+            "uint vid [[vertex_id]]) {\n"
+            "    float2 p = float2(vid == 1 ? 3.0 : -1.0,\n"
+            "                      vid == 2 ? 3.0 : -1.0);\n"
+            "    NvngfxClearStencilVOut o; o.position = float4(p, 0.0, 1.0);\n"
+            "    return o;\n"
+            "}\n"
+            "fragment void nvngfx_clear_stencil_fs() {}\n";
+        NSError* err = nil;
+        id<MTLLibrary> lib =
+            [c->device newLibraryWithSource:[NSString stringWithUTF8String:kSource]
+                                    options:nil
+                                      error:&err];
+        if (!lib) {
+            log_once_str("nvnClear.partialStencilLibrary",
+                         err ? [[err localizedDescription] UTF8String]
+                             : "nil library");
+            return nil;
+        }
+        id<MTLFunction> vfn =
+            [lib newFunctionWithName:@"nvngfx_clear_stencil_vs"];
+        id<MTLFunction> ffn =
+            [lib newFunctionWithName:@"nvngfx_clear_stencil_fs"];
+        if (!vfn || !ffn) {
+            log_once_str("nvnClear.partialStencilFunction",
+                         "MSL did not define the stencil clear functions");
+            return nil;
+        }
+
+        MTLRenderPipelineDescriptor* pd =
+            [[MTLRenderPipelineDescriptor alloc] init];
+        pd.vertexFunction = vfn;
+        pd.fragmentFunction = ffn;
+        if (depthFormat) pd.depthAttachmentPixelFormat = depthFormat;
+        pd.stencilAttachmentPixelFormat = stencilFormat;
+        pd.rasterSampleCount = sampleCount ? sampleCount : 1;
+
+        err = nil;
+        id<MTLRenderPipelineState> pso =
+            [c->device newRenderPipelineStateWithDescriptor:pd error:&err];
+        if (!pso) {
+            log_once_str("nvnClear.partialStencilPipeline",
+                         err ? [[err localizedDescription] UTF8String]
+                             : "nil pipeline");
+            return nil;
+        }
+
+        unsigned slot;
+        if (c->clearStencilPsoCount < kClearStencilPsoSlots) {
+            slot = c->clearStencilPsoCount++;
+        } else {
+            slot = c->clearStencilPsoNext;
+            c->clearStencilPsoNext =
+                (c->clearStencilPsoNext + 1) % kClearStencilPsoSlots;
+        }
+        ClearStencilPsoEntry& e = c->clearStencilPso[slot];
+        e.used = true;
+        e.depthFormat = static_cast<unsigned>(depthFormat);
+        e.stencilFormat = static_cast<unsigned>(stencilFormat);
+        e.sampleCount = sampleCount;
+        e.pso = pso;
+        return pso;
+    }
+}
+
 id<MTLRenderPipelineState> clear_pipeline(Ctx* c,
                                           const MTLPixelFormat* colorFormats,
                                           const unsigned* masks,
@@ -3618,6 +3778,75 @@ void end_encoder(CmdBuf* b) {
         [b->enc endEncoding];
         b->enc = nil;
     }
+}
+
+/* Applies a masked stencil clear in its own depth/stencil-only pass.  A
+ * normal load action cannot express "clear only these bits": it replaces the
+ * whole plane.  The pass loads the old stencil, draws one full-screen triangle
+ * with ALWAYS / REPLACE and a stencil write mask, and stores the result. */
+bool encode_partial_stencil_clear(Ctx* c, CmdBuf* b, Tex* dt,
+                                  bool clearDepth, double depthValue,
+                                  uint32_t stencilValue, unsigned mask) {
+    if (!c || !b || !b->cb || !dt || !dt->mtl) return false;
+    const MTLPixelFormat pf = dt->mtl.pixelFormat;
+    const bool hasDepth = mtl_format_has_depth(pf);
+    const bool hasStencil = mtl_format_has_stencil(pf);
+    if (!hasStencil) {
+        log_once("nvnCommandBufferClearDepthStencil.noStencil", 1);
+        return false;
+    }
+    if (clearDepth && !hasDepth)
+        log_once("nvnCommandBufferClearDepthStencil.noDepth", 1);
+    clearDepth = clearDepth && hasDepth;
+
+    const unsigned samples = static_cast<unsigned>(dt->mtl.sampleCount);
+    id<MTLRenderPipelineState> pso = clear_stencil_pipeline(
+        c, hasDepth ? pf : static_cast<MTLPixelFormat>(0), pf, samples);
+    id<MTLDepthStencilState> dss = clear_stencil_state(c, mask);
+    if (!pso || !dss) return false;
+
+    end_encoder(b);
+    @autoreleasepool {
+        MTLRenderPassDescriptor* rpd =
+            [MTLRenderPassDescriptor renderPassDescriptor];
+        if (hasDepth) {
+            rpd.depthAttachment.texture = dt->mtl;
+            rpd.depthAttachment.loadAction =
+                clearDepth ? MTLLoadActionClear : MTLLoadActionLoad;
+            if (clearDepth) rpd.depthAttachment.clearDepth = depthValue;
+            rpd.depthAttachment.storeAction = MTLStoreActionStore;
+        }
+        rpd.stencilAttachment.texture = dt->mtl;
+        rpd.stencilAttachment.loadAction = MTLLoadActionLoad;
+        rpd.stencilAttachment.storeAction = MTLStoreActionStore;
+
+        id<MTLRenderCommandEncoder> enc =
+            [b->cb renderCommandEncoderWithDescriptor:rpd];
+        if (!enc) {
+            log_once("nvnCommandBufferClearDepthStencil.stencilEncoder", 1);
+            return false;
+        }
+        const NSUInteger w = dt->mtl.width;
+        const NSUInteger h = dt->mtl.height;
+        const MTLViewport vp = {0.0, 0.0, static_cast<double>(w),
+                                static_cast<double>(h), 0.0, 1.0};
+        const MTLScissorRect sc = {0, 0, w, h};
+        [enc setViewport:vp];
+        [enc setScissorRect:sc];
+        [enc setRenderPipelineState:pso];
+        [enc setDepthStencilState:dss];
+        [enc setStencilFrontReferenceValue:stencilValue
+                       backReferenceValue:stencilValue];
+        [enc setCullMode:MTLCullModeNone];
+        [enc setFrontFacingWinding:MTLWindingClockwise];
+        [enc setTriangleFillMode:MTLTriangleFillModeFill];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangle
+                vertexStart:0
+                vertexCount:3];
+        [enc endEncoding];
+    }
+    dt->rendered = true;
+    return true;
 }
 
 /* Opens the render pass for the targets recorded by SetRenderTargets.
@@ -4965,11 +5194,12 @@ void cmdbuf_clear_color_ui(nvngfx_ctx*, uint64_t* x) {
  *                                  int stencil, int stencilMask)
  *
  * NVN has one depth/stencil texture, whose format decides which planes exist.
- * Metal clears a plane through its attachment load action, so the clear is
- * recorded here and folded into the next pass.  Stencil clear is all-or-nothing
- * in Metal; a partial mask is reported instead of clearing bits that were
- * meant to survive. */
-void cmdbuf_clear_depth_stencil(nvngfx_ctx*, uint64_t* x) {
+ * A full stencil mask is a Metal load action.  A partial stencil mask cannot
+ * be expressed that way, so it becomes a dedicated depth/stencil-only pass:
+ * load old contents, draw one full-screen triangle with ALWAYS / REPLACE and
+ * the requested write mask. */
+void cmdbuf_clear_depth_stencil(nvngfx_ctx* ctx, uint64_t* x) {
+    Ctx* c = ctx_of(ctx);
     CmdBuf* b = find_or_add<CmdBuf>(x[0]);
     if (!b) return;
     nvngfx_args* a = reinterpret_cast<nvngfx_args*>(x);
@@ -4980,28 +5210,47 @@ void cmdbuf_clear_depth_stencil(nvngfx_ctx*, uint64_t* x) {
     const bool hasDepth = mtl_format_has_depth(df);
     const bool hasStencil = mtl_format_has_stencil(df);
     const bool clearDepth = (x[2] & 0xFFFFFFFFu) != 0;
-    const unsigned stencilMask = static_cast<unsigned>(x[4]);
-    bool queued = false;
+    /* NVN's stencil clear mask is an 8-bit bitmask.  Low eight bits are the
+     * useful part; the SDK's int spelling also passes -1 for a full clear. */
+    const unsigned stencilMask = static_cast<unsigned>(x[4]) & 0xFFu;
+    const uint32_t stencilValue = static_cast<uint32_t>(x[3]) & 0xFFu;
+    const bool partialStencil = stencilMask != 0 && stencilMask != 0xFFu;
 
-    if (clearDepth) {
-        if (!hasDepth) {
-            log_once("nvnCommandBufferClearDepthStencil.noDepth", 1);
-        } else {
-            b->clearDepth = static_cast<double>(nvngfx_arg_f32(a, 0));
-            b->pendingDepthClear = true;
-            queued = true;
+    if (clearDepth && !hasDepth)
+        log_once("nvnCommandBufferClearDepthStencil.noDepth", 1);
+    if (stencilMask && !hasStencil)
+        log_once("nvnCommandBufferClearDepthStencil.noStencil", 1);
+
+    if (partialStencil && hasStencil) {
+        if (!c || !b->recording || !b->cb) {
+            log_once("nvnCommandBufferClearDepthStencil.notRecording", 1);
+            return;
         }
+        /* Land older pending clears before the dedicated stencil pass.  In
+         * particular, a full stencil clear must not be folded into a later
+         * load action after this partial clear. */
+        if (!flush_pending_clears(c, b)) {
+            log_once("nvnCommandBufferClearDepthStencil.pending", 1);
+            return;
+        }
+        if (!encode_partial_stencil_clear(c, b, dt, clearDepth && hasDepth,
+                                          static_cast<double>(nvngfx_arg_f32(a, 0)),
+                                          stencilValue, stencilMask)) {
+            log_once("nvnCommandBufferClearDepthStencil.partial", 1);
+        }
+        return;
     }
-    if (stencilMask) {
-        /* 0xFF is the normal full-stencil mask.  Treat -1 as full as well,
-         * because the SDK type is int and both spell "all eight bits". */
-        if (!hasStencil || (stencilMask != 0xFFu && stencilMask != 0xFFFFFFFFu)) {
-            log_once("nvnCommandBufferClearDepthStencil.stencilMask", stencilMask);
-        } else {
-            b->clearStencil = static_cast<uint32_t>(x[3]) & 0xFFu;
-            b->pendingStencilClear = true;
-            queued = true;
-        }
+
+    bool queued = false;
+    if (clearDepth && hasDepth) {
+        b->clearDepth = static_cast<double>(nvngfx_arg_f32(a, 0));
+        b->pendingDepthClear = true;
+        queued = true;
+    }
+    if (stencilMask && hasStencil) {
+        b->clearStencil = stencilValue;
+        b->pendingStencilClear = true;
+        queued = true;
     }
     if (queued) end_encoder(b);
 }
@@ -9393,6 +9642,110 @@ extern "C" int nvngfx_metal_selftest(void) {
         }
 
         {
+            /* --- Partial stencil clear ---------------------------------
+             * Clear the whole plane to 0xF0, then replace only the low nibble
+             * with 0x5A: the expected byte is 0xFA.  A following EQUAL test
+             * draw reaches the colour target only if both the preserved high
+             * nibble and the newly written low nibble are exactly right. */
+            const uint64_t kCbStencilPartial = 0x9900;
+            const uint64_t partialTarget = kTex;
+            const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+
+            x[0] = kCbStencilPartial;
+            cmdbuf_begin_recording(ctx, x);
+            x[0] = kCbStencilPartial; x[1] = 1;
+            x[2] = reinterpret_cast<uint64_t>(&partialTarget);
+            x[3] = 0; x[4] = kTexDepth; x[5] = 0;
+            cmdbuf_set_render_targets(ctx, x);
+            x[0] = kCbStencilPartial; x[1] = 0;
+            x[2] = reinterpret_cast<uint64_t>(black); x[3] = 0xF;
+            cmdbuf_clear_color(ctx, x);
+
+            nvngfx_args fullStencil{};
+            fullStencil.x[0] = kCbStencilPartial;
+            fullStencil.x[1] = 0;       /* depth value is unused */
+            fullStencil.x[2] = 0;       /* do not clear depth */
+            fullStencil.x[3] = 0xF0;
+            fullStencil.x[4] = 0xFF;
+            cmdbuf_clear_depth_stencil(ctx, fullStencil.x);
+
+            nvngfx_args maskedStencil{};
+            maskedStencil.x[0] = kCbStencilPartial;
+            maskedStencil.x[1] = 0;
+            maskedStencil.x[2] = 0;
+            maskedStencil.x[3] = 0x5A;
+            maskedStencil.x[4] = 0x0F;
+            cmdbuf_clear_depth_stencil(ctx, maskedStencil.x);
+
+            x[0] = kDepthState;
+            depth_set_defaults(ctx, x);
+            x[0] = kDepthState; x[1] = 0;
+            depth_set_test(ctx, x);
+            x[0] = kDepthState; x[1] = 0;
+            depth_set_write(ctx, x);
+            x[0] = kDepthState; x[1] = 1;
+            depth_set_stencil_test(ctx, x);
+            x[0] = kDepthState; x[1] = 3;
+            x[2] = NVNGFX_CMP_EQUAL;
+            depth_set_stencil_func(ctx, x);
+            x[0] = kDepthState; x[1] = 3;
+            x[2] = NVNGFX_STENCIL_KEEP;
+            x[3] = NVNGFX_STENCIL_KEEP;
+            x[4] = NVNGFX_STENCIL_KEEP;
+            depth_set_stencil_op(ctx, x);
+            x[0] = kCbStencilPartial; x[1] = kDepthState;
+            cmdbuf_bind_depth_state(ctx, x);
+            x[0] = kCbStencilPartial; x[1] = 3; x[2] = 0xFA;
+            cmdbuf_set_stencil_ref(ctx, x);
+            x[0] = kCbStencilPartial; x[1] = 3; x[2] = 0x00;
+            cmdbuf_set_stencil_mask(ctx, x);
+            x[0] = kCbStencilPartial; x[1] = 3; x[2] = 0xFF;
+            cmdbuf_set_stencil_value_mask(ctx, x);
+            x[0] = kCbStencilPartial; x[1] = 0; x[2] = 0;
+            x[3] = static_cast<uint64_t>(kSide);
+            x[4] = static_cast<uint64_t>(kSide);
+            cmdbuf_set_viewport(ctx, x);
+            x[0] = kCbStencilPartial; x[1] = kProg; x[2] = 0;
+            cmdbuf_bind_program(ctx, x);
+            x[0] = kCbStencilPartial; x[1] = 0; x[2] = 0; x[3] = 3;
+            cmdbuf_draw_arrays(ctx, x);
+            x[0] = kCbStencilPartial;
+            cmdbuf_end_recording(ctx, x);
+
+            CmdBuf* bsp = find<CmdBuf>(kCbStencilPartial);
+            if (!bsp || !bsp->last) {
+                std::fprintf(stderr,
+                             "[selftest] partial stencil clear did not commit\n");
+                rc = 16423;
+                goto done;
+            }
+            [bsp->last waitUntilCompleted];
+            if (bsp->last.status == MTLCommandBufferStatusError) {
+                std::fprintf(stderr,
+                             "[selftest] partial stencil clear error: %s\n",
+                             bsp->last.error
+                                 ? [[bsp->last.error localizedDescription] UTF8String]
+                                 : "(no description)");
+                rc = 16423;
+                goto done;
+            }
+            unsigned char pxs[4] = {0, 0, 0, 0};
+            const int wantStencilColor[4] = {64, 128, 191, 255};
+            if (!read_center_pixel(dev, c->queue, t->mtl, kSide, pxs) ||
+                !pixels_near(pxs, wantStencilColor, 2)) {
+                std::fprintf(stderr,
+                             "[selftest] partial stencil result pixel is "
+                             "(%u,%u,%u,%u), want stencil 0xFA to pass\n",
+                             pxs[0], pxs[1], pxs[2], pxs[3]);
+                rc = 16423;
+                goto done;
+            }
+            std::fprintf(stderr,
+                         "[selftest] partial stencil mask wrote 0xFA and "
+                         "preserved the unselected nibble\n");
+        }
+
+        {
             /* --- MRT: two colour attachments, two shader outputs ----------
              * Declaring attachment 1 is not enough; the fragment shader writes
              * a different constant to each colour slot and both textures are
@@ -10548,6 +10901,7 @@ extern "C" int nvngfx_metal_selftest(void) {
         forget<Tex>(0x8F00);
         g_tex_specs.erase(0x8C00);
         forget<CmdBuf>(0x9300);
+        forget<CmdBuf>(0x9900);
         forget<Tex>(0x9200);
         forget<Tex>(0x9400);
         forget<Tex>(0x9600);
