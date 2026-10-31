@@ -5071,3 +5071,81 @@ Actions run `41181832245` 的 macOS `ios` job 也已通过，模拟器输出确�
 image through row/image strides 32/128 -> 24/96 -> tight
 BOTW_SELFTEST rc=0
 ```
+
+## M4 续十五：command buffer 生命周期、内存记账与调试标记
+
+标题启动时会按 NVN 的惯例初始化命令缓冲、给它补命令内存，并在录制里插入 debug
+group；这些入口此前全是日志桩。本轮补齐 23 个：
+
+* CommandBuffer：97/144（+23）
+
+Metal 覆盖从 **248/513（48.3%）** 到 **271/513（52.8%）**，未实现 242。
+
+### 1. Initialize / Finalize / IsRecording
+
+`nvnCommandBufferInitialize` 在宿主侧登记对象并返回 1；设备未就绪或对象正在录制
+时返回 0，而不是悄悄重置一个仍持有 Metal 命令缓冲的会话。`Finalize` 先检查是否
+仍在录制：是则记一条日志并提交已经编码的工作，再删除宿主对象，避免 Metal 命令
+缓冲永远不提交。
+
+`IsRecording` 直接回答记录位：`BeginRecording` 之后为真、`EndRecording` 之后为假。
+
+### 2. 命令内存与 control memory 只记账
+
+回放后端把命令直接编码进 `MTLCommandBuffer`，从不写 guest 的命令内存。因此：
+
+* `AddCommandMemory` / `AddControlMemory` 只累加 size，绝不写、也不解引用那段内存；
+* `GetCommandMemorySize` / `Free` 返回累计值，`Used` 恒为 0——客体按“Free 快用完
+  就结束录制”的习惯只会把整段留在一个 command buffer 里，正是这个后端想要的；
+* pool 为空的调用是标题分配器耗尽后的“宿主补段”请求，接受并计入补段数，不解
+  引用空指针（参考实现在这里崩过一次）；size 为 0 的调用直接忽略。
+* 负数 offset、size 为 0、累加溢出都明确拒绝或饱和，并各记一条日志。
+
+### 3. memory callback 只保存、不回调
+
+`SetMemoryCallback` / `SetMemoryCallbackData` / `GetMemoryCallback` 存取指针。回调
+永远不会被调用：这个后端不需要 guest 再补命令内存，假装“内存不够”会诱使客体重复
+扩容。第一次注册时记一条日志说明这一点。
+
+### 4. debug label / marker / group
+
+名称从 guest 内存读取，最多 255 字节。录制期间：
+
+* `SetDebugLabel` → `MTLCommandBuffer.label`
+* `InsertDebugMarker{,Static,Dynamic}` → `insertDebugSignpost:`
+* `PushDebugGroup{,Static,Dynamic}` → `pushDebugGroup:`，并压入宿主侧栈
+* `PopDebugGroup` / `PopDebugGroupId` → `popDebugGroup:`；id 不匹配会记日志但仍弹
+  一层，保证 Metal 的 push/pop 成对
+
+空栈 pop 只记一次日志，不会下溢。每次 `BeginRecording` 清空 group 栈，并把 label
+重新设到新的 `MTLCommandBuffer` 上。
+
+### 5. 模拟器自测
+
+新增失败码 `16426` 的回归：
+
+1. Initialize 返回 1、IsRecording 为 0；
+2. 两次 AddCommandMemory（4096 + 2048）与一次 AddControlMemory（64）后，
+   Size / Used / Free 为 6144 / 0 / 6144，control size 为 64；
+3. 空 pool 的补段调用被接受且不改变计数；
+4. memory callback 地址原样取回；
+5. 空栈 pop 被记录；
+6. 开始录制，SetDebugLabel、两层 push、一个 marker、按 id / 普通各 pop 一次，
+   EndRecording 后检查 `MTLCommandBufferStatusError`；
+7. Finalize 删除对象，之后的 IsRecording 与查询不会把它复活。
+
+这一组证明的是宿主侧记账与 Metal 调试通道，不是标题命令流。
+
+### 6. 门禁
+
+```text
+python scripts/syntax_check_metal.py
+python scripts/gen_nvn.py --repo . --check
+python scripts/extract_nvn_signatures.py --check
+python scripts/verify_ios.py
+powershell -ExecutionPolicy Bypass -File scripts/build_abi_test.ps1
+git diff --check
+```
+
+本地已通过（513 procs / 271 implemented / 477 measured + 6 inferred）。
+CI 结果待补。

@@ -42,6 +42,9 @@
  *           CopyBufferToBuffer in the same Metal command buffer, and
  *           buffer <-> texture / texture -> texture blits with the
  *           command buffer's copy row/image strides
+ *         command buffer initialize / finalize / is-recording, command and
+ *           control memory accounting, and guest debug labels, markers and
+ *           groups forwarded to the MTLCommandBuffer
  *         present (blit fast path, cleared-drawable fallback)
  *
  *   TODO  a guest draw still stops at "noPipeline" whenever the offline blob
@@ -367,6 +370,11 @@ constexpr unsigned kComputeSamplerSlots = 16;
 constexpr unsigned kComputeUniformSlots = 16;
 constexpr unsigned kComputeStorageSlots = 15;
 
+struct DebugGroup {
+    uint32_t id = 0;
+    std::string name;
+};
+
 struct CmdBuf {
     bool recording = false;
     unsigned draws = 0;
@@ -532,6 +540,19 @@ struct CmdBuf {
      * value is the byte stride between block rows / images. */
     ptrdiff_t copyRowStride = 0;
     ptrdiff_t copyImageStride = 0;
+    /* Command / control memory granted through AddCommandMemory and
+     * AddControlMemory.  The replay backend encodes straight into Metal, so
+     * these spans are accounted but never written: Used stays 0 and Free is
+     * the whole grant, which is what a guest sizing its segments needs. */
+    size_t commandMemorySize = 0;
+    size_t controlMemorySize = 0;
+    unsigned commandMemorySegments = 0;
+    uint64_t memoryCallback = 0;
+    uint64_t memoryCallbackData = 0;
+    /* Guest debug names forwarded to the Metal command buffer.  Groups are
+     * per recording; the label survives begin/end. */
+    std::string debugLabel;
+    std::vector<DebugGroup> debugGroups;
 };
 
 /* Builder specs are gathered in a side table keyed by the guest's builder
@@ -5283,6 +5304,14 @@ void cmdbuf_begin_recording(nvngfx_ctx* ctx, uint64_t* x) {
         b->tfSize[i] = 0;
     }
     for (unsigned i = 0; i < 4; ++i) b->viewportSwizzle[i] = 0;
+    /* A debug group cannot span recordings: Metal's push/pop pairs have to
+     * balance inside one command buffer.  The label is per command buffer,
+     * so it is re-applied to the new one. */
+    b->debugGroups.clear();
+    if (!b->debugLabel.empty() && b->cb) {
+        NSString* label = [NSString stringWithUTF8String:b->debugLabel.c_str()];
+        if (label) [b->cb setLabel:label];
+    }
 }
 
 /* nvnCommandBufferEndRecording(NVNcommandBuffer*) -> NVNcommandHandle
@@ -5307,6 +5336,272 @@ void cmdbuf_end_recording(nvngfx_ctx* ctx, uint64_t* x) {
     }
     b->recording = false;
     x[0] = 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* command buffer lifecycle, memory accounting and debug names          */
+/* ------------------------------------------------------------------ */
+
+/* Reads a NUL-terminated guest string into `out`, truncated to 255 bytes.
+ * The length is the guest's responsibility, exactly like the proc-name
+ * pointer nvnDeviceGetProcAddress already trusts; the cap only keeps a
+ * corrupt pointer from turning into an unbounded scan. */
+bool guest_cstr(uint64_t addr, std::string* out) {
+    if (!out) return false;
+    out->clear();
+    if (!guest_range(addr, 1)) {
+        log_once("nvn.guestString.pointer", static_cast<unsigned>(addr >> 32));
+        return false;
+    }
+    const char* p = guest_ptr<const char>(addr);
+    for (unsigned i = 0; i < 255; ++i) {
+        if (!p[i]) return true;
+        out->push_back(p[i]);
+    }
+    return true;
+}
+
+/* nvnCommandBufferInitialize(NVNcommandBuffer*, NVNdevice*) -> NVNboolean.
+ * The guest object stays a table key; the device argument is not stored
+ * because this backend has one Metal device per context. */
+void cmdbuf_initialize(nvngfx_ctx* ctx, uint64_t* x) {
+    Ctx* c = ctx_of(ctx);
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    if (!c || !c->ready || !b) {
+        log_once_str("nvnCommandBufferInitialize.device",
+                     "Metal device is not ready");
+        x[0] = 0;
+        return;
+    }
+    if (b->recording) {
+        log_once_str("nvnCommandBufferInitialize.recording",
+                     "initialize while recording; EndRecording first");
+        x[0] = 0;
+        return;
+    }
+    /* Re-initialising starts with no grants and no names. */
+    b->commandMemorySize = 0;
+    b->controlMemorySize = 0;
+    b->commandMemorySegments = 0;
+    b->memoryCallback = 0;
+    b->memoryCallbackData = 0;
+    b->debugLabel.clear();
+    b->debugGroups.clear();
+    x[0] = 1;
+}
+
+/* nvnCommandBufferFinalize(NVNcommandBuffer*) */
+void cmdbuf_finalize(nvngfx_ctx* ctx, uint64_t* x) {
+    CmdBuf* b = find<CmdBuf>(x[0]);
+    if (!b) return;
+    if (b->recording) {
+        /* NVN requires EndRecording first.  Committing here keeps the Metal
+         * work already encoded from leaking when the guest skips it. */
+        log_once_str("nvnCommandBufferFinalize.recording",
+                     "finalize while recording; committing the recording");
+        uint64_t end[8] = {x[0], 0, 0, 0, 0, 0, 0, 0};
+        cmdbuf_end_recording(ctx, end);
+    }
+    forget<CmdBuf>(x[0]);
+}
+
+/* nvnCommandBufferIsRecording(const NVNcommandBuffer*) -> NVNboolean */
+void cmdbuf_is_recording(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find<CmdBuf>(x[0]);
+    x[0] = (b && b->recording) ? 1u : 0u;
+}
+
+/* nvnCommandBufferAddCommandMemory(cb, const NVNmemoryPool* pool,
+ *     ptrdiff_t offset, size_t size).  The replay backend encodes directly
+ * into Metal, so the span is never written and never dereferenced.  A title
+ * whose own allocator ran out calls this with an empty pool; that is a legal
+ * host-supplied segment and must not crash. */
+void cmdbuf_add_command_memory(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    if (!b) return;
+    const ptrdiff_t offset = static_cast<ptrdiff_t>(x[2]);
+    const size_t size = static_cast<size_t>(x[3]);
+    if (size == 0) {
+        log_once_str("nvnCommandBufferAddCommandMemory.size",
+                     "empty command memory segment");
+        return;
+    }
+    if (!x[1]) {
+        log_once("nvnCommandBufferAddCommandMemory.host", 0);
+        ++b->commandMemorySegments;
+        return;
+    }
+    if (offset < 0) {
+        log_once_str("nvnCommandBufferAddCommandMemory.offset",
+                     "negative segment offset");
+        return;
+    }
+    if (b->commandMemorySize > SIZE_MAX - size) {
+        log_once_str("nvnCommandBufferAddCommandMemory.overflow",
+                     "command memory accounting overflowed");
+        b->commandMemorySize = SIZE_MAX;
+        return;
+    }
+    b->commandMemorySize += size;
+    ++b->commandMemorySegments;
+}
+
+/* nvnCommandBufferAddControlMemory(cb, void* memory, size_t size) */
+void cmdbuf_add_control_memory(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    if (!b) return;
+    const size_t size = static_cast<size_t>(x[2]);
+    if (!x[1] || size == 0) {
+        log_once_str("nvnCommandBufferAddControlMemory.range",
+                     "control memory pointer or size is empty");
+        return;
+    }
+    if (b->controlMemorySize > SIZE_MAX - size) {
+        log_once_str("nvnCommandBufferAddControlMemory.overflow",
+                     "control memory accounting overflowed");
+        b->controlMemorySize = SIZE_MAX;
+        return;
+    }
+    b->controlMemorySize += size;
+}
+
+/* GetCommandMemory{Size,Used,Free} and the ControlMemory pair.  Nothing is
+ * consumed, so Used is 0 and Free equals Size: a guest that ends a recording
+ * when Free runs low keeps everything in one recording, which is exactly what
+ * this backend wants. */
+void cmdbuf_get_command_memory_size(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find<CmdBuf>(x[0]);
+    x[0] = b ? static_cast<uint64_t>(b->commandMemorySize) : 0u;
+}
+void cmdbuf_get_command_memory_used(nvngfx_ctx*, uint64_t* x) { x[0] = 0; }
+void cmdbuf_get_command_memory_free(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find<CmdBuf>(x[0]);
+    x[0] = b ? static_cast<uint64_t>(b->commandMemorySize) : 0u;
+}
+void cmdbuf_get_control_memory_size(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find<CmdBuf>(x[0]);
+    x[0] = b ? static_cast<uint64_t>(b->controlMemorySize) : 0u;
+}
+void cmdbuf_get_control_memory_used(nvngfx_ctx*, uint64_t* x) { x[0] = 0; }
+void cmdbuf_get_control_memory_free(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find<CmdBuf>(x[0]);
+    x[0] = b ? static_cast<uint64_t>(b->controlMemorySize) : 0u;
+}
+
+/* nvnCommandBufferSetMemoryCallback(cb, PFN...) and its getter.  The callback
+ * is stored but never invoked: this backend never needs the guest to supply
+ * command memory, so pretending to run out would be a lie. */
+void cmdbuf_set_memory_callback(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    if (!b) return;
+    b->memoryCallback = x[1];
+    if (x[1]) log_once("nvnCommandBufferSetMemoryCallback.notInvoked", 0);
+}
+void cmdbuf_get_memory_callback(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find<CmdBuf>(x[0]);
+    x[0] = b ? b->memoryCallback : 0u;
+}
+/* nvnCommandBufferSetMemoryCallbackData(cb, void*) */
+void cmdbuf_set_memory_callback_data(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    if (b) b->memoryCallbackData = x[1];
+}
+
+/* nvnCommandBufferSetDebugLabel(cb, const char*) */
+void cmdbuf_set_debug_label(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    std::string name;
+    if (!b || !guest_cstr(x[1], &name)) return;
+    b->debugLabel = name;
+    if (b->recording && b->cb) {
+        NSString* label = [NSString stringWithUTF8String:name.c_str()];
+        if (label) [b->cb setLabel:label];
+    }
+}
+
+/* Shared body of InsertDebugMarker{,Static,Dynamic}.  The id only labels the
+ * string for the guest; Metal records the text as a signpost either way. */
+void cmdbuf_insert_debug_marker_common(uint64_t* x, unsigned nameIndex) {
+    CmdBuf* b = find<CmdBuf>(x[0]);
+    std::string name;
+    if (!b) return;
+    if (!b->recording || !b->cb) {
+        log_once_str("nvnCommandBufferInsertDebugMarker.recording",
+                     "debug marker outside a recording");
+        return;
+    }
+    if (!guest_cstr(x[nameIndex], &name)) return;
+    NSString* text = [NSString stringWithUTF8String:name.c_str()];
+    if (text) [b->cb insertDebugSignpost:text];
+}
+void cmdbuf_insert_debug_marker(nvngfx_ctx*, uint64_t* x) {
+    cmdbuf_insert_debug_marker_common(x, 1);
+}
+void cmdbuf_insert_debug_marker_static(nvngfx_ctx*, uint64_t* x) {
+    cmdbuf_insert_debug_marker_common(x, 2);
+}
+void cmdbuf_insert_debug_marker_dynamic(nvngfx_ctx*, uint64_t* x) {
+    cmdbuf_insert_debug_marker_common(x, 2);
+}
+
+/* PushDebugGroup{,Static,Dynamic} all carry (cb, id, const char*). */
+void cmdbuf_push_debug_group_common(uint64_t* x) {
+    CmdBuf* b = find<CmdBuf>(x[0]);
+    std::string name;
+    if (!b) return;
+    if (!b->recording || !b->cb) {
+        log_once_str("nvnCommandBufferPushDebugGroup.recording",
+                     "debug group outside a recording");
+        return;
+    }
+    if (!guest_cstr(x[2], &name)) return;
+    NSString* text = [NSString stringWithUTF8String:name.c_str()];
+    if (text) [b->cb pushDebugGroup:text];
+    DebugGroup g;
+    g.id = static_cast<uint32_t>(x[1]);
+    g.name = name;
+    b->debugGroups.push_back(g);
+}
+void cmdbuf_push_debug_group(nvngfx_ctx*, uint64_t* x) {
+    cmdbuf_push_debug_group_common(x);
+}
+void cmdbuf_push_debug_group_static(nvngfx_ctx*, uint64_t* x) {
+    cmdbuf_push_debug_group_common(x);
+}
+void cmdbuf_push_debug_group_dynamic(nvngfx_ctx*, uint64_t* x) {
+    cmdbuf_push_debug_group_common(x);
+}
+
+/* nvnCommandBufferPopDebugGroup(cb) */
+void cmdbuf_pop_debug_group(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find<CmdBuf>(x[0]);
+    if (!b) return;
+    if (b->debugGroups.empty()) {
+        log_once_str("nvnCommandBufferPopDebugGroup.empty",
+                     "pop without a matching push");
+        return;
+    }
+    if (b->recording && b->cb) [b->cb popDebugGroup];
+    b->debugGroups.pop_back();
+}
+
+/* nvnCommandBufferPopDebugGroupId(cb, uint32_t id).  A mismatched id means
+ * the guest lost track of its own stack; report it and still pop one level so
+ * Metal's push/pop pairs stay balanced. */
+void cmdbuf_pop_debug_group_id(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find<CmdBuf>(x[0]);
+    if (!b) return;
+    if (b->debugGroups.empty()) {
+        log_once_str("nvnCommandBufferPopDebugGroupId.empty",
+                     "pop without a matching push");
+        return;
+    }
+    const uint32_t id = static_cast<uint32_t>(x[1]);
+    if (b->debugGroups.back().id != id) {
+        log_once("nvnCommandBufferPopDebugGroupId.mismatch", id);
+    }
+    if (b->recording && b->cb) [b->cb popDebugGroup];
+    b->debugGroups.pop_back();
 }
 
 /* nvnCommandBufferSetRenderTargets(NVNcommandBuffer*, int n,
@@ -7633,6 +7928,29 @@ const Binding kBindings[] = {
     BIND("nvnCommandBufferSetCopyImageStride", cmdbuf_set_copy_image_stride),
     BIND("nvnCommandBufferUpdateUniformBuffer", cmdbuf_update_uniform_buffer),
     BIND("nvnCommandBufferBarrier", cmdbuf_barrier),
+    BIND("nvnCommandBufferInitialize", cmdbuf_initialize),
+    BIND("nvnCommandBufferFinalize", cmdbuf_finalize),
+    BIND("nvnCommandBufferIsRecording", cmdbuf_is_recording),
+    BIND("nvnCommandBufferAddCommandMemory", cmdbuf_add_command_memory),
+    BIND("nvnCommandBufferAddControlMemory", cmdbuf_add_control_memory),
+    BIND("nvnCommandBufferGetCommandMemorySize", cmdbuf_get_command_memory_size),
+    BIND("nvnCommandBufferGetCommandMemoryUsed", cmdbuf_get_command_memory_used),
+    BIND("nvnCommandBufferGetCommandMemoryFree", cmdbuf_get_command_memory_free),
+    BIND("nvnCommandBufferGetControlMemorySize", cmdbuf_get_control_memory_size),
+    BIND("nvnCommandBufferGetControlMemoryUsed", cmdbuf_get_control_memory_used),
+    BIND("nvnCommandBufferGetControlMemoryFree", cmdbuf_get_control_memory_free),
+    BIND("nvnCommandBufferSetMemoryCallback", cmdbuf_set_memory_callback),
+    BIND("nvnCommandBufferGetMemoryCallback", cmdbuf_get_memory_callback),
+    BIND("nvnCommandBufferSetMemoryCallbackData", cmdbuf_set_memory_callback_data),
+    BIND("nvnCommandBufferSetDebugLabel", cmdbuf_set_debug_label),
+    BIND("nvnCommandBufferInsertDebugMarker", cmdbuf_insert_debug_marker),
+    BIND("nvnCommandBufferInsertDebugMarkerStatic", cmdbuf_insert_debug_marker_static),
+    BIND("nvnCommandBufferInsertDebugMarkerDynamic", cmdbuf_insert_debug_marker_dynamic),
+    BIND("nvnCommandBufferPushDebugGroup", cmdbuf_push_debug_group),
+    BIND("nvnCommandBufferPushDebugGroupStatic", cmdbuf_push_debug_group_static),
+    BIND("nvnCommandBufferPushDebugGroupDynamic", cmdbuf_push_debug_group_dynamic),
+    BIND("nvnCommandBufferPopDebugGroup", cmdbuf_pop_debug_group),
+    BIND("nvnCommandBufferPopDebugGroupId", cmdbuf_pop_debug_group_id),
     BIND("nvnCommandBufferClearColori", cmdbuf_clear_color_i),
     BIND("nvnCommandBufferClearColorui", cmdbuf_clear_color_ui),
     BIND("nvnCommandBufferClearDepthStencil", cmdbuf_clear_depth_stencil),
@@ -7767,6 +8085,10 @@ bool pixels_near(const unsigned char px[4], const int want[4], int tolerance) {
     }
     return true;
 }
+
+/* Only the address is stored by the command-buffer memory-callback test. */
+[[maybe_unused]] static void selftest_memory_callback(void*, int, size_t,
+                                                      void*) {}
 
 extern "C" int nvngfx_metal_selftest(void) {
     /* NVN objects live in guest memory, and guest memory is host memory here.
@@ -13155,6 +13477,165 @@ extern "C" int nvngfx_metal_selftest(void) {
                          "[selftest] buffer/texture copies: B2T/T2B/T2T "
                          "round-tripped a 4x4 RGBA8 image through row/image "
                          "strides 32/128 -> 24/96 -> tight\n");
+        }
+
+        {
+            /* --- Command buffer lifecycle, memory accounting, debug names -
+             * The replay backend never writes into the guest's command
+             * memory, so the accounting has to answer the Add* calls without
+             * pretending to consume them.  Debug groups must survive a real
+             * commit, and an unbalanced pop must not underflow the stack. */
+            const uint64_t kCbLife = 0x9F80;
+            alignas(16) unsigned char lifeControl[64] = {};
+            alignas(16) char lifeGroupA[] = "selftest group A";
+            alignas(16) char lifeGroupB[] = "selftest group B";
+            alignas(16) char lifeMarker[] = "selftest marker";
+            alignas(16) char lifeLabel[] = "selftest command buffer";
+            const uint64_t lifeControlAddr =
+                reinterpret_cast<uint64_t>(lifeControl);
+
+            x[0] = kCbLife;
+            cmdbuf_initialize(ctx, x);
+            if (x[0] != 1) {
+                std::fprintf(stderr,
+                             "[selftest] lifecycle: initialize returned "
+                             "%llu\n",
+                             static_cast<unsigned long long>(x[0]));
+                rc = 16426;
+                goto done;
+            }
+            x[0] = kCbLife;
+            cmdbuf_is_recording(ctx, x);
+            if (x[0] != 0) {
+                std::fprintf(stderr,
+                             "[selftest] lifecycle: a fresh buffer already "
+                             "reports recording\n");
+                rc = 16426;
+                goto done;
+            }
+
+            x[0] = kCbLife; x[1] = kCubePool; x[2] = 0; x[3] = 4096;
+            cmdbuf_add_command_memory(ctx, x);
+            x[0] = kCbLife; x[1] = kCubePool; x[2] = 4096; x[3] = 2048;
+            cmdbuf_add_command_memory(ctx, x);
+            x[0] = kCbLife; x[1] = lifeControlAddr; x[2] = 64;
+            cmdbuf_add_control_memory(ctx, x);
+            /* An empty pool is how a title asks for a host segment. */
+            x[0] = kCbLife; x[1] = 0; x[2] = 0; x[3] = 0;
+            cmdbuf_add_command_memory(ctx, x);
+
+            x[0] = kCbLife; cmdbuf_get_command_memory_size(ctx, x);
+            const uint64_t lifeSize = x[0];
+            x[0] = kCbLife; cmdbuf_get_command_memory_used(ctx, x);
+            const uint64_t lifeUsed = x[0];
+            x[0] = kCbLife; cmdbuf_get_command_memory_free(ctx, x);
+            const uint64_t lifeFree = x[0];
+            x[0] = kCbLife; cmdbuf_get_control_memory_size(ctx, x);
+            const uint64_t lifeControlSize = x[0];
+            if (lifeSize != 6144 || lifeUsed != 0 || lifeFree != 6144 ||
+                lifeControlSize != 64) {
+                std::fprintf(stderr,
+                             "[selftest] lifecycle: memory accounting is "
+                             "%llu/%llu/%llu plus %llu control, want "
+                             "6144/0/6144 plus 64\n",
+                             static_cast<unsigned long long>(lifeSize),
+                             static_cast<unsigned long long>(lifeUsed),
+                             static_cast<unsigned long long>(lifeFree),
+                             static_cast<unsigned long long>(lifeControlSize));
+                rc = 16426;
+                goto done;
+            }
+
+            x[0] = kCbLife;
+            x[1] = reinterpret_cast<uint64_t>(&selftest_memory_callback);
+            cmdbuf_set_memory_callback(ctx, x);
+            x[0] = kCbLife;
+            cmdbuf_get_memory_callback(ctx, x);
+            if (x[0] !=
+                reinterpret_cast<uint64_t>(&selftest_memory_callback)) {
+                std::fprintf(stderr,
+                             "[selftest] lifecycle: the memory callback did "
+                             "not round-trip\n");
+                rc = 16426;
+                goto done;
+            }
+
+            /* Popping an empty stack must be reported, not underflow. */
+            x[0] = kCbLife;
+            cmdbuf_pop_debug_group(ctx, x);
+
+            x[0] = kCbLife;
+            cmdbuf_begin_recording(ctx, x);
+            x[0] = kCbLife;
+            cmdbuf_is_recording(ctx, x);
+            if (x[0] != 1) {
+                std::fprintf(stderr,
+                             "[selftest] lifecycle: begin recording did not "
+                             "start\n");
+                rc = 16426;
+                goto done;
+            }
+            x[0] = kCbLife; x[1] = reinterpret_cast<uint64_t>(lifeLabel);
+            cmdbuf_set_debug_label(ctx, x);
+            x[0] = kCbLife; x[1] = 11;
+            x[2] = reinterpret_cast<uint64_t>(lifeGroupA);
+            cmdbuf_push_debug_group(ctx, x);
+            x[0] = kCbLife; x[1] = 12;
+            x[2] = reinterpret_cast<uint64_t>(lifeGroupB);
+            cmdbuf_push_debug_group_static(ctx, x);
+            x[0] = kCbLife; x[1] = 13;
+            x[2] = reinterpret_cast<uint64_t>(lifeMarker);
+            cmdbuf_insert_debug_marker_static(ctx, x);
+            x[0] = kCbLife; x[1] = 12;
+            cmdbuf_pop_debug_group_id(ctx, x);
+            x[0] = kCbLife;
+            cmdbuf_pop_debug_group(ctx, x);
+            x[0] = kCbLife;
+            cmdbuf_end_recording(ctx, x);
+
+            CmdBuf* const blife = find<CmdBuf>(kCbLife);
+            if (!blife || !blife->last) {
+                std::fprintf(stderr,
+                             "[selftest] lifecycle: nothing committed\n");
+                rc = 16426;
+                goto done;
+            }
+            [blife->last waitUntilCompleted];
+            if (blife->last.status == MTLCommandBufferStatusError) {
+                std::fprintf(stderr,
+                             "[selftest] lifecycle command buffer error: "
+                             "%s\n",
+                             blife->last.error
+                                 ? [[blife->last.error localizedDescription]
+                                       UTF8String]
+                                 : "(no description)");
+                rc = 16426;
+                goto done;
+            }
+
+            x[0] = kCbLife;
+            cmdbuf_finalize(ctx, x);
+            if (find<CmdBuf>(kCbLife)) {
+                std::fprintf(stderr,
+                             "[selftest] lifecycle: finalize left the "
+                             "object behind\n");
+                rc = 16426;
+                goto done;
+            }
+            x[0] = kCbLife;
+            cmdbuf_is_recording(ctx, x);
+            if (x[0] != 0 || find<CmdBuf>(kCbLife)) {
+                std::fprintf(stderr,
+                             "[selftest] lifecycle: a query after finalize "
+                             "resurrected the object\n");
+                rc = 16426;
+                goto done;
+            }
+            std::fprintf(stderr,
+                         "[selftest] lifecycle: initialize/is-recording, "
+                         "command and control memory accounting, the memory "
+                         "callback and three debug entry points survived a "
+                         "commit\n");
         }
 
         {

@@ -583,6 +583,10 @@ destinationBytesPerImage:(NSUInteger)bpi;
 @class MTLRenderPassDescriptor;
 
 @protocol MTLCommandBuffer
+@property (copy) NSString* label;
+- (void)pushDebugGroup:(NSString*)string;
+- (void)popDebugGroup;
+- (void)insertDebugSignpost:(NSString*)string;
 - (id<MTLBlitCommandEncoder>)blitCommandEncoder;
 - (id<MTLComputeCommandEncoder>)computeCommandEncoder;
 - (id<MTLRenderCommandEncoder>)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor*)descriptor;
