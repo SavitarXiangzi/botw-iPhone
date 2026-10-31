@@ -6041,3 +6041,103 @@ git diff --check
 与 Metal 默认一致，但仍需验证）；fast-clear 注册不改变清屏路径；debug
 callback 与 walk callback 不会被宿主调用。真实标题的 draw 依然为 0 条，
 Maxwell SASS -> MSL 翻译器仍未开始。
+
+## M4 续二十六：存储类、虚拟内存池映射与 packaged texture data
+
+这一批不是按字母序挑的：把 nxnative 记录的 BOTW 1.9.0 usage 按调用次数排一遍，
+剩下的 47 个入口里**只有三个**真的被这个标题调用：
+
+```text
+nvnCommandBufferCallCommands        7,905,218
+nvnTextureBuilderGetStorageClass       34,788
+nvnMemoryPoolMapVirtual                     1
+```
+
+其余 44 个在该 profile 里是 0 次。所以本轮把后面两个连同它们的家族补齐，让
+“这个标题用到的入口”只剩 `CallCommands` 一个缺口。
+
+新增 8 个入口：`nvnMemoryPoolMapVirtual`、`nvnTextureBuilderGetStorageClass` /
+`GetRawStorageClass`、`nvnTextureGetStorageClass` / `GetRawStorageClass`、
+`nvnTextureBuilderSetPackagedTextureData` / `GetPackagedTextureData` /
+`GetPackagedTextureLayout`。Metal 覆盖从 **466/513（90.8%）** 到
+**474/513（92.4%）**，未实现 39。MemoryPool 达到 **10/10**，Texture 42/45，
+TextureBuilder 42/43（只剩 `GetSparseTileLayout`）。推断签名从 25 增到 28。
+
+### 1. storage class 为什么返回常量
+
+`NVNstorageClass` 在公开头里只是 `typedef int`，没有可对照的枚举值；nxnative 的
+HLE 对 `GetStorageClass` 返回 0、对 `GetRawStorageClass` 返回 1（它的调用点就是
+拿 1 比较），BotW 在这套返回值下能启动。本后端照抄这两个值，并在注释里写明来源，
+不编造一个“映射到 Metal 存储模式”的对应关系——Metal 没有和它同构的概念。
+
+映射请求自带的 storage class 只写进一次性日志，不折进 getter：否则 builder、
+对象与映射三方会互相矛盾，而矛盾比常量更难查。
+
+### 2. 虚拟内存池与 MapVirtual
+
+`NVNmappingRequest` 在公开头里是 opaque 的 `char dummy[1]`。0x28 字节的形状取自
+nxnative（MIT）：五段 8 字节 `{物理池, 物理偏移, 虚拟偏移, 大小, storage class}`。
+
+* `nvnMemoryPoolInitialize` 现在接受带 `NVN_MEMORY_POOL_FLAGS_VIRTUAL`（`0x200`）
+  但没有存储的池：它先只记尺寸，不建 `MTLBuffer`，返回 true。标题可以在映射之前
+  就在这个池里创建纹理和 buffer。
+* `nvnMemoryPoolMapVirtual` 只在**所有请求指向同一个物理池、`物理偏移 - 虚拟偏移`
+  处处相同、且请求区间无重叠地恰好铺满 `[0, size)`** 时接受：此时虚拟池的存储
+  直接指向物理池对应偏移，语义与“同一组物理页”没有区别，`GetBufferAddress`
+  立刻给出别名后的地址。
+* 真正的稀疏映射（多个物理池、分段、有洞）**明确返回 NVNboolean 0 并打日志**。
+  本后端没有页表，硬接只会让客体读到错误的字节；失败可见比静默近似好。
+
+这与 nxnative 的取舍一致：它先只支持“单段连续”，后来才为真稀疏池加了
+`vm_remap` 与 4 KiB 页表。本后端停在第一步，边界写在文档里而不是注释里。
+
+### 3. Packaged texture data
+
+`nvnTextureBuilderSetPackagedTextureData(builder, data)` 记下 guest 指针；
+`nvnTextureInitialize` 按 `nvngfx_tex_layout` 算出的 `size` 把这批字节直接
+`memcpy` 进池的 `[offset, offset + size)`——packaged 纹理的数据本来就是按最终
+布局写好的，不需要再走解块/重排。池不够长、指针不是 guest 内存、layout 算不出来
+三种情况各自打一条日志并跳过拷贝，不截断。
+
+`GetPackagedTextureLayout(builder, out)` 把 8 字节原样写回。这个入口在公开原型表
+里没有原型，形状按 Set 兄弟推断（同一个 8 字节结构、指针写出），记入
+`inferred_signatures.json`；同一文件里也补了两个 raw storage class getter 的
+`int` 返回类型（同样没有原型）。现在推断签名 28 条，和实测 477 条分开统计。
+
+### 4. 模拟器自测
+
+新增失败码 `16437`，覆盖：
+
+1. 用 16 KiB 对齐的静态缓冲建一个物理池；
+2. 同一个尺寸、`flags = 0x200`、**没有存储** 的虚拟池：`Initialize` 返回 1，
+   `GetBufferAddress` 返回 0；
+3. 半段映射必须被拒绝（0），整段映射成功（1），别名后的地址等于物理池地址；
+4. packaged layout 的 8 字节原样回读，packaged data 指针原样回读；
+5. `nvnTextureInitialize` 之后池的前 64 字节等于 packaged 数据；
+6. builder / 对象两条路径的 storage class 分别是 0 / 1。
+
+`alignas(16384)` 在函数内静态变量上超过 clang 的上限（8192），所以 16 KiB 对齐
+是在一块 32 KiB 静态数组里手工做的——Metal 的 no-copy buffer 需要页对齐，
+这一点不能靠“看起来对齐”糊过去。
+
+### 5. 门禁
+
+```text
+python scripts/syntax_check_metal.py
+python scripts/gen_nvn.py --repo . --check
+python scripts/extract_nvn_signatures.py --check
+python scripts/verify_ios.py
+powershell -ExecutionPolicy Bypass -File scripts/build_abi_test.ps1
+git diff --check
+```
+
+本地已通过（513 procs / 474 implemented / 477 measured + 28 inferred）。
+本批 CI 结果在推送后补记。
+
+### 6. 仍然没有闭环的部分
+
+`MapVirtual` 只支持单段别名，真稀疏池会失败；storage class 是参考实现的常量而非
+测量值；packaged layout 的 getter 形状是推断的；`nvnTextureGetSparseTileLayout`
+与两个 `ReadTexels` 仍未实现。标题真正用到而尚未实现的入口现在只剩
+`nvnCommandBufferCallCommands`——它需要先把“录制时立即编码”改成可重放的命令流，
+是下一堵墙。真实标题的 draw 依然为 0 条。

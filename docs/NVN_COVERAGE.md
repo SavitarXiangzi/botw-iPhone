@@ -7,8 +7,8 @@
 `nvn*` 字符串（运行时按名解析，所以名字本身就暴露了完整接口面）。
 
 - 接口总数：**513**
-- Metal 后端已实现：**466**（90.8%）
-- 仍未实现：**47**
+- Metal 后端已实现：**474**（92.4%）
+- 仍未实现：**39**
 
 > 只有出现在 `ios/nvn/implemented_metal.txt` 里、且确实在
 > `ios/nvn/src/nvn_metal.mm` 中定义过的名字才算“已实现”。
@@ -19,8 +19,8 @@
 | 域 | 已实现 | 总数 | 进度 |
 |---|---:|---:|---|
 | CommandBuffer | 117 | 144 | `########  ` |
-| Texture | 40 | 45 | `######### ` |
-| TextureBuilder | 37 | 43 | `######### ` |
+| Texture | 42 | 45 | `######### ` |
+| TextureBuilder | 42 | 43 | `##########` |
 | Device | 27 | 27 | `##########` |
 | SamplerBuilder | 25 | 25 | `##########` |
 | MultisampleState | 22 | 23 | `##########` |
@@ -32,7 +32,7 @@
 | Window | 12 | 12 | `##########` |
 | WindowBuilder | 12 | 12 | `##########` |
 | Buffer | 11 | 11 | `##########` |
-| MemoryPool | 9 | 10 | `######### ` |
+| MemoryPool | 10 | 10 | `##########` |
 | PolygonState | 9 | 9 | `##########` |
 | MemoryPoolBuilder | 8 | 8 | `##########` |
 | SamplerPool | 8 | 8 | `##########` |
@@ -321,7 +321,7 @@
 - [x] `nvnEventInitialize`
 - [x] `nvnEventSignal`
 
-### MemoryPool (9/10)
+### MemoryPool (10/10)
 
 - [x] `nvnMemoryPoolFinalize`
 - [x] `nvnMemoryPoolFlushMappedRange`
@@ -331,7 +331,7 @@
 - [x] `nvnMemoryPoolInitialize`
 - [x] `nvnMemoryPoolInvalidateMappedRange`
 - [x] `nvnMemoryPoolMap`
-- [ ] `nvnMemoryPoolMapVirtual`
+- [x] `nvnMemoryPoolMapVirtual`
 - [x] `nvnMemoryPoolSetDebugLabel`
 
 ### MemoryPoolBuilder (8/8)
@@ -499,7 +499,7 @@
 - [x] `nvnSyncSetDebugLabel`
 - [x] `nvnSyncWait`
 
-### Texture (40/45)
+### Texture (42/45)
 
 - [x] `nvnTextureCompare`
 - [x] `nvnTextureFinalize`
@@ -513,10 +513,10 @@
 - [x] `nvnTextureGetLevels`
 - [x] `nvnTextureGetMemoryOffset`
 - [x] `nvnTextureGetMemoryPool`
-- [ ] `nvnTextureGetRawStorageClass`
+- [x] `nvnTextureGetRawStorageClass`
 - [x] `nvnTextureGetSamples`
 - [ ] `nvnTextureGetSparseTileLayout`
-- [ ] `nvnTextureGetStorageClass`
+- [x] `nvnTextureGetStorageClass`
 - [x] `nvnTextureGetStorageSize`
 - [x] `nvnTextureGetStride`
 - [x] `nvnTextureGetSwizzle`
@@ -547,7 +547,7 @@
 - [x] `nvnTextureWriteTexels`
 - [x] `nvnTextureWriteTexelsStrided`
 
-### TextureBuilder (37/43)
+### TextureBuilder (42/43)
 
 - [x] `nvnTextureBuilderGetDepth`
 - [x] `nvnTextureBuilderGetDepthStencilMode`
@@ -559,13 +559,13 @@
 - [x] `nvnTextureBuilderGetLevels`
 - [x] `nvnTextureBuilderGetMemoryOffset`
 - [x] `nvnTextureBuilderGetMemoryPool`
-- [ ] `nvnTextureBuilderGetPackagedTextureData`
-- [ ] `nvnTextureBuilderGetPackagedTextureLayout`
-- [ ] `nvnTextureBuilderGetRawStorageClass`
+- [x] `nvnTextureBuilderGetPackagedTextureData`
+- [x] `nvnTextureBuilderGetPackagedTextureLayout`
+- [x] `nvnTextureBuilderGetRawStorageClass`
 - [x] `nvnTextureBuilderGetSamples`
 - [ ] `nvnTextureBuilderGetSparseTileLayout`
 - [x] `nvnTextureBuilderGetStorageAlignment`
-- [ ] `nvnTextureBuilderGetStorageClass`
+- [x] `nvnTextureBuilderGetStorageClass`
 - [x] `nvnTextureBuilderGetStorageSize`
 - [x] `nvnTextureBuilderGetStride`
 - [x] `nvnTextureBuilderGetSwizzle`
@@ -581,7 +581,7 @@
 - [x] `nvnTextureBuilderSetGLTextureName`
 - [x] `nvnTextureBuilderSetHeight`
 - [x] `nvnTextureBuilderSetLevels`
-- [ ] `nvnTextureBuilderSetPackagedTextureData`
+- [x] `nvnTextureBuilderSetPackagedTextureData`
 - [x] `nvnTextureBuilderSetPackagedTextureLayout`
 - [x] `nvnTextureBuilderSetSamples`
 - [x] `nvnTextureBuilderSetSize1D`

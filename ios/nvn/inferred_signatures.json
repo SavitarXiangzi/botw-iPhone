@@ -1,7 +1,7 @@
 {
   "source": "hand-written: derived from the Set/Get naming symmetry, NOT from a header",
-  "note": "These entry points are absent from the public nvn_protos.h. Their shapes are inferred from their siblings: the window/device/buffer/texture-builder getters mirror their Set siblings, and the QueueBuilder getters mirror QueueBuilderSet* plus QueueBuilderGetQueueMemorySize. verify_ios.py counts them separately so a guess is never silently folded into the verified set.",
-  "count": 25,
+  "note": "These entry points are absent from the public nvn_protos.h. Their shapes are inferred from their siblings: the window/device/buffer/texture-builder getters mirror their Set siblings, and the QueueBuilder getters mirror QueueBuilderSet* plus QueueBuilderGetQueueMemorySize. verify_ios.py counts them separately so a guess is never silently folded into the verified set. The packaged-texture-layout getter has no prototype either; its shape (8-byte struct written through a pointer) mirrors its Set sibling. The two raw-storage-class getters use the return type nxnative's HLE gives them (int); neither appears in the public prototype table.",
+  "count": 28,
   "procs": [
     {
       "name": "nvnBufferBuilderGetDevice",
@@ -156,6 +156,34 @@
       "ret": "NVNdevice*",
       "params": [
         "const NVNtextureBuilder*"
+      ],
+      "arity": 1,
+      "inferred": true
+    },
+    {
+      "name": "nvnTextureBuilderGetPackagedTextureLayout",
+      "ret": "void",
+      "params": [
+        "const NVNtextureBuilder*",
+        "NVNpackagedTextureLayout*"
+      ],
+      "arity": 2,
+      "inferred": true
+    },
+    {
+      "name": "nvnTextureBuilderGetRawStorageClass",
+      "ret": "int",
+      "params": [
+        "const NVNtextureBuilder*"
+      ],
+      "arity": 1,
+      "inferred": true
+    },
+    {
+      "name": "nvnTextureGetRawStorageClass",
+      "ret": "int",
+      "params": [
+        "const NVNtexture*"
       ],
       "arity": 1,
       "inferred": true

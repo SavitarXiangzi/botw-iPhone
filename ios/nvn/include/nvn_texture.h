@@ -48,12 +48,19 @@ typedef struct {
     unsigned gl_name;
     int dsmode;
     unsigned char swz[4];      /* channel swizzle, R/G/B/A order */
-    /* SetPackagedTextureLayout's first byte (0 when the guest never called
-     * it): low nibble = log2 block height, high nibble = log2 block depth.
-     * The setter is not wired yet, so this stays 0 and the automatic block
+    /* SetPackagedTextureLayout's first byte, kept as (byte + 1) so 0 means
+     * "the guest never called it": low nibble = block height exponent,
+     * high nibble = block depth exponent.  While it is 0 the automatic block
      * height rule applies -- the same default nxnative uses when a title does
      * not package a layout. */
     unsigned char pkg_block_h;
+    /* The raw 8 bytes of the last SetPackagedTextureLayout, so the getter can
+     * return what the guest wrote instead of a value derived from byte 0. */
+    unsigned char pkg_layout[8];
+    /* SetPackagedTextureData's guest pointer (0 = not set).  Initialize copies
+     * layout.size bytes from it into the texture's pool storage, because a
+     * packaged texture's data is written by the guest in the final layout. */
+    unsigned long long pkg_data;
 } nvngfx_texdesc;
 
 /* Zeroes the struct and applies NVN's builder defaults. */

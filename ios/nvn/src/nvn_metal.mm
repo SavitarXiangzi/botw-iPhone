@@ -130,6 +130,7 @@
 #include "nvn_texture.h"
 #include "nvn_vertex.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -268,12 +269,21 @@ struct Win {
     std::string label;
 };
 
+/* NVN_MEMORY_POOL_FLAGS_VIRTUAL.  The flag values are the ones nxnative's
+ * public nvn.h lists for NVNmemoryPoolFlags. */
+constexpr uint32_t kVirtualPoolFlag = 0x200;
+
 struct Pool {
     void* storage = nullptr;
     size_t size = 0;
     uint32_t flags = 0;
     std::string label;
     id<MTLBuffer> buffer = nil;
+    /* A virtual pool (NVN_MEMORY_POOL_FLAGS_VIRTUAL, 0x200) is an address
+     * range with no memory behind it until nvnMemoryPoolMapVirtual aliases a
+     * physical pool into it. */
+    bool virtualPool = false;
+    unsigned virtualMappings = 0;
 };
 
 /* An NVN buffer is a view of [pool.storage + offset, + size).  The guest owns
@@ -1502,7 +1512,8 @@ void pool_initialize(nvngfx_ctx* ctx, uint64_t* x) {
     PoolSpec spec;
     auto it = g_pool_specs.find(x[1]);
     if (it != g_pool_specs.end()) spec = it->second;
-    if (!spec.storage || !spec.size) {
+    const bool virtualPool = (spec.flags & kVirtualPoolFlag) != 0;
+    if (!spec.size || (!spec.storage && !virtualPool)) {
         std::fprintf(stderr, "[nvn] nvnMemoryPoolInitialize without storage\n");
         x[0] = 0;
         return;
@@ -1512,6 +1523,17 @@ void pool_initialize(nvngfx_ctx* ctx, uint64_t* x) {
     p->storage = spec.storage;
     p->size = spec.size;
     p->flags = spec.flags;
+    p->virtualPool = virtualPool;
+    p->virtualMappings = 0;
+
+    /* A virtual pool only owns an address range.  It has to exist without an
+     * MTLBuffer because the guest is allowed to create buffers and textures in
+     * it before mapping anything; storage appears at MapVirtual. */
+    if (!p->storage) {
+        log_once("nvnMemoryPoolInitialize.virtual", p->flags);
+        x[0] = 1;
+        return;
+    }
 
     /* Unified memory: wrap, never copy. */
     if ((reinterpret_cast<uintptr_t>(p->storage) & 0xFFF) != 0) {
@@ -1555,6 +1577,139 @@ void pool_get_flags(nvngfx_ctx*, uint64_t* x) {
 void pool_map(nvngfx_ctx*, uint64_t* x) {
     Pool* p = find<Pool>(x[0]);
     x[0] = p ? reinterpret_cast<uint64_t>(p->storage) : 0;
+}
+
+/* nvnMemoryPoolMapVirtual(NVNmemoryPool*, int n, const NVNmappingRequest*)
+ * -> NVNboolean.
+ *
+ * NVNmappingRequest is opaque in the public header.  The 0x28-byte shape is
+ * nxnative's (MIT): {physical pool, physical offset, virtual offset, size,
+ * storage class}, five 8-byte fields in that order.
+ *
+ * This backend builds no page tables.  A mapping is accepted only when every
+ * request names one physical pool with the same
+ * (physical offset - virtual offset) and the requests describe the whole
+ * virtual range without overlapping; the virtual pool then aliases that
+ * storage, which is indistinguishable from one set of physical pages.  A
+ * genuinely sparse mapping is refused with NVNboolean 0 and a log instead of
+ * being approximated -- reading the wrong bytes silently is worse. */
+void pool_map_virtual(nvngfx_ctx* ctx, uint64_t* x) {
+    Ctx* c = ctx_of(ctx);
+    Pool* p = find<Pool>(x[0]);
+    const int n = static_cast<int>(x[1]);
+    if (!p) {
+        log_once_str("nvnMemoryPoolMapVirtual.pool", "pool is not initialized");
+        x[0] = 0;
+        return;
+    }
+    if (!c || !c->ready || n <= 0) {
+        x[0] = 0;
+        return;
+    }
+    if (!p->virtualPool) {
+        log_once("nvnMemoryPoolMapVirtual.notVirtual", p->flags);
+        x[0] = 0;
+        return;
+    }
+    if (!guest_range(x[2], sizeof(uint64_t) * 5 * static_cast<size_t>(n))) {
+        log_once_str("nvnMemoryPoolMapVirtual.request",
+                     "the request list is not guest memory");
+        x[0] = 0;
+        return;
+    }
+
+    const uint64_t* req = guest_ptr<const uint64_t>(x[2]);
+    Pool* phys = nullptr;
+    int64_t delta = 0;
+    std::vector<std::pair<uint64_t, uint64_t>> spans;
+
+    for (int i = 0; i < n; ++i) {
+        const uint64_t physGuest = req[i * 5 + 0];
+        const int64_t poff = static_cast<int64_t>(req[i * 5 + 1]);
+        const int64_t voff = static_cast<int64_t>(req[i * 5 + 2]);
+        const uint64_t size = req[i * 5 + 3];
+        const int storageClass = static_cast<int>(req[i * 5 + 4]);
+
+        Pool* q = find<Pool>(physGuest);
+        if (!q || !q->storage) {
+            log_once_str("nvnMemoryPoolMapVirtual.physical",
+                         "a request names a physical pool without storage");
+            x[0] = 0;
+            return;
+        }
+        if (size == 0 || poff < 0 || voff < 0 ||
+            static_cast<uint64_t>(poff) > q->size ||
+            size > q->size - static_cast<uint64_t>(poff) ||
+            static_cast<uint64_t>(voff) > p->size ||
+            size > p->size - static_cast<uint64_t>(voff)) {
+            log_once_str("nvnMemoryPoolMapVirtual.range",
+                         "a request does not fit its pool");
+            x[0] = 0;
+            return;
+        }
+        const int64_t d = poff - voff;
+        if (!phys) {
+            phys = q;
+            delta = d;
+        } else if (phys != q || d != delta) {
+            log_once_str("nvnMemoryPoolMapVirtual.nonContiguous",
+                         "requests need more than one physical base");
+            x[0] = 0;
+            return;
+        }
+        spans.emplace_back(static_cast<uint64_t>(voff),
+                           static_cast<uint64_t>(voff) + size);
+        log_once("nvnMemoryPoolMapVirtual.storageClass",
+                 static_cast<unsigned>(storageClass));
+    }
+
+    /* The union must be exactly [0, size): no holes (unmapped pages the alias
+     * would fill with unrelated bytes) and no overlaps. */
+    std::sort(spans.begin(), spans.end());
+    uint64_t next = 0;
+    for (const auto& s : spans) {
+        if (s.first != next) {
+            log_once_str("nvnMemoryPoolMapVirtual.partial",
+                         "requests do not cover the virtual range exactly");
+            x[0] = 0;
+            return;
+        }
+        next = s.second;
+    }
+    if (next != p->size) {
+        log_once_str("nvnMemoryPoolMapVirtual.partial",
+                     "requests do not cover the virtual range exactly");
+        x[0] = 0;
+        return;
+    }
+
+    unsigned char* base = static_cast<unsigned char*>(phys->storage) + delta;
+    if ((reinterpret_cast<uintptr_t>(base) & 0xFFFu) != 0) {
+        log_once("nvnMemoryPoolMapVirtual.alignment",
+                 static_cast<unsigned>(reinterpret_cast<uintptr_t>(base) & 0xFFFu));
+    }
+    id<MTLBuffer> buf = nil;
+    @try {
+        buf = [c->device newBufferWithBytesNoCopy:base
+                                           length:p->size
+                                          options:MTLResourceStorageModeShared
+                                      deallocator:nil];
+    } @catch (NSException* e) {
+        (void)e;
+        buf = nil;
+    }
+    if (!buf) {
+        log_once_str("nvnMemoryPoolMapVirtual.buffer",
+                     "Metal refused the aliased range");
+        x[0] = 0;
+        return;
+    }
+    p->buffer = buf;
+    p->storage = base;
+    ++p->virtualMappings;
+    log_once("nvnMemoryPoolMapVirtual.mapped",
+             static_cast<unsigned>(p->virtualMappings));
+    x[0] = 1;
 }
 
 /* Mapped range maintenance is a coherency hint.  Unified shared storage is
@@ -1804,24 +1959,63 @@ void tex_builder_set_dsmode(nvngfx_ctx*, uint64_t* x) {
 
 /* nvnTextureBuilderSetPackagedTextureLayout(builder, const
  * NVNpackagedTextureLayout*).  The 8-byte layout's first byte encodes the
- * block height (low nibble) and depth (high nibble) as log2 exponent + 1;
- * nvngfx_tex_layout already consumes pkg_block_h, so storing this makes the
- * guest's packaged layout change the storage geometry. */
+ * block height (low nibble) and depth (high nibble); nvngfx_tex_layout
+ * consumes pkg_block_h, so storing this makes the guest's packaged layout
+ * change the storage geometry.  All 8 bytes are kept so the getter can hand
+ * back exactly what the guest wrote. */
 void tex_builder_set_packaged_layout(nvngfx_ctx*, uint64_t* x) {
     if (!x[0]) return;
     nvngfx_texdesc& d = g_tex_specs[x[0]];
-    if (!x[1]) {
+    std::memset(d.pkg_layout, 0, sizeof d.pkg_layout);
+    if (!x[1] || !guest_range(x[1], sizeof d.pkg_layout)) {
         d.pkg_block_h = 0;
         return;
     }
     const unsigned char* p = guest_ptr<const unsigned char>(x[1]);
-    if (!p) {
-        d.pkg_block_h = 0;
-        return;
-    }
+    std::memcpy(d.pkg_layout, p, sizeof d.pkg_layout);
     const unsigned v = p[0];
     d.pkg_block_h = static_cast<unsigned char>(v == 0xFFu ? 0u : v + 1u);
 }
+
+/* Defined with the rest of the builder getters below; the packaged getters
+ * need it before that point. */
+const nvngfx_texdesc& tex_spec_or_default(uint64_t builder);
+
+/* nvnTextureBuilderGetPackagedTextureLayout(builder, NVNpackagedTextureLayout*)
+ * -- no prototype exists in the public table, so its shape is inferred from
+ * the Set sibling above: same 8-byte struct, written through a pointer. */
+void tex_builder_get_packaged_layout(nvngfx_ctx*, uint64_t* x) {
+    const nvngfx_texdesc& d = tex_spec_or_default(x[0]);
+    if (!x[1] || !guest_range(x[1], sizeof d.pkg_layout)) return;
+    std::memcpy(guest_ptr<void>(x[1]), d.pkg_layout, sizeof d.pkg_layout);
+}
+
+/* nvnTextureBuilderSetPackagedTextureData(builder, const void*).  The pointer
+ * is guest storage holding the image already written in the layout the guest
+ * also described; nvnTextureInitialize copies it into the pool. */
+void tex_builder_set_packaged_data(nvngfx_ctx*, uint64_t* x) {
+    if (!x[0]) return;
+    g_tex_specs[x[0]].pkg_data = x[1];
+}
+
+/* nvnTextureBuilderGetPackagedTextureData(const NVNtextureBuilder*) -> ptr */
+void tex_builder_get_packaged_data(nvngfx_ctx*, uint64_t* x) {
+    x[0] = tex_spec_or_default(x[0]).pkg_data;
+}
+
+/* nvnTextureBuilderGetStorageClass / nvnTextureGetStorageClass -> 0 and
+ * nvnTextureBuilderGetRawStorageClass / nvnTextureGetRawStorageClass -> 1.
+ *
+ * NVNstorageClass is `typedef int` in the public header with no enumerators,
+ * so there is no measured value to copy.  These are the answers nxnative's
+ * HLE gives (0 for the class, 1 for the raw class, which its call sites
+ * compare against 1), and BotW boots against them.  The mapping request's own
+ * storage class is logged by nvnMemoryPoolMapVirtual instead of being folded
+ * into these getters, so the two cannot silently disagree. */
+void tex_builder_get_storage_class(nvngfx_ctx*, uint64_t* x) { x[0] = 0; }
+void tex_get_storage_class(nvngfx_ctx*, uint64_t* x) { x[0] = 0; }
+void tex_builder_get_raw_storage_class(nvngfx_ctx*, uint64_t* x) { x[0] = 1; }
+void tex_get_raw_storage_class(nvngfx_ctx*, uint64_t* x) { x[0] = 1; }
 
 /* nvnTextureBuilderGetZCullStorageSize(builder) -> size_t.  Metal allocates
  * no ZCull storage, so zero is the truthful answer, not a placeholder. */
@@ -2084,6 +2278,32 @@ void tex_initialize(nvngfx_ctx* ctx, uint64_t* x) {
             t->mtl = nil;
         }
         x[0] = t->mtl ? 1u : 0u;
+
+        /* A packaged texture arrives with its data already laid out.  Copy it
+         * into the pool now, exactly as nxnative does, so the first sample
+         * sees the guest's bytes instead of an empty pool.  The layout size is
+         * the authority on how many bytes move; a short pool is refused and
+         * reported rather than truncated. */
+        if (d.pkg_data && d.pool && x[0]) {
+            Pool* pool = find<Pool>(d.pool);
+            nvngfx_texlayout L = {};
+            if (!pool || !pool->storage || nvngfx_tex_layout(&d, &L) != 0) {
+                log_once_str("nvnTextureInitialize.packagedPool",
+                             "packaged data without a usable pool or layout");
+            } else if (static_cast<uint64_t>(d.offset) > pool->size ||
+                       L.size > pool->size - static_cast<uint64_t>(d.offset)) {
+                log_once_str("nvnTextureInitialize.packagedRange",
+                             "packaged data does not fit the pool range");
+            } else if (guest_range(d.pkg_data, static_cast<size_t>(L.size))) {
+                std::memcpy(static_cast<unsigned char*>(pool->storage) +
+                                static_cast<size_t>(d.offset),
+                            guest_ptr<const void>(d.pkg_data),
+                            static_cast<size_t>(L.size));
+            } else {
+                log_once_str("nvnTextureInitialize.packagedPointer",
+                             "packaged texture data is not guest memory");
+            }
+        }
     }
 }
 
@@ -9719,6 +9939,7 @@ const Binding kBindings[] = {
     BIND("nvnMemoryPoolGetBufferAddress", pool_get_buffer_address),
     BIND("nvnMemoryPoolGetFlags", pool_get_flags),
     BIND("nvnMemoryPoolMap", pool_map),
+    BIND("nvnMemoryPoolMapVirtual", pool_map_virtual),
     BIND("nvnMemoryPoolFlushMappedRange", pool_flush_mapped_range),
     BIND("nvnMemoryPoolInvalidateMappedRange", pool_invalidate_mapped_range),
     BIND("nvnMemoryPoolSetDebugLabel", pool_set_debug_label),
@@ -9779,6 +10000,11 @@ const Binding kBindings[] = {
     BIND("nvnTextureBuilderSetDepthStencilMode", tex_builder_set_dsmode),
     BIND("nvnTextureBuilderSetPackagedTextureLayout", tex_builder_set_packaged_layout),
     BIND("nvnTextureBuilderGetZCullStorageSize", tex_builder_get_zcull_storage_size),
+    BIND("nvnTextureBuilderGetPackagedTextureLayout", tex_builder_get_packaged_layout),
+    BIND("nvnTextureBuilderSetPackagedTextureData", tex_builder_set_packaged_data),
+    BIND("nvnTextureBuilderGetPackagedTextureData", tex_builder_get_packaged_data),
+    BIND("nvnTextureBuilderGetStorageClass", tex_builder_get_storage_class),
+    BIND("nvnTextureBuilderGetRawStorageClass", tex_builder_get_raw_storage_class),
     BIND("nvnTextureBuilderGetDepthStencilMode", tex_builder_get_dsmode),
     BIND("nvnTextureInitialize", tex_initialize),
     BIND("nvnTextureWriteTexels", tex_write_texels),
@@ -9797,6 +10023,8 @@ const Binding kBindings[] = {
     BIND("nvnTextureGetTextureAddress", tex_get_texture_address),
     BIND("nvnTextureGetStorageSize", tex_get_storage_size),
     BIND("nvnTextureGetZCullStorageSize", tex_get_zcull_storage_size),
+    BIND("nvnTextureGetStorageClass", tex_get_storage_class),
+    BIND("nvnTextureGetRawStorageClass", tex_get_raw_storage_class),
     BIND("nvnTextureGetSwizzle", tex_get_swizzle),
     BIND("nvnTextureGetDepthStencilMode", tex_get_dsmode),
     BIND("nvnTextureCompare", tex_compare),
@@ -18006,6 +18234,172 @@ extern "C" int nvngfx_metal_selftest(void) {
                          "timestamps, debug ids, packaged layout and the two "
                          "frame counter reports round-tripped\n");
         }
+
+            /* Storage classes, packaged texture data and virtual pools. */
+            {
+                /* 16 KiB alignment is what Metal needs for a no-copy buffer;
+                 * alignas(16384) on a function-static is over clang's limit,
+                 * so align inside a larger static array. */
+                alignas(16) static unsigned char vphysRaw[32768];
+                unsigned char* const vphys = reinterpret_cast<unsigned char*>(
+                    (reinterpret_cast<uintptr_t>(vphysRaw) + 16383u) &
+                    ~static_cast<uintptr_t>(16383u));
+                std::memset(vphysRaw, 0, sizeof vphysRaw);
+
+                alignas(16) unsigned char physBuilder[0x40] = {};
+                alignas(16) unsigned char virtBuilder[0x40] = {};
+                alignas(16) unsigned char pkgBuilder2[0x80] = {};
+                alignas(16) unsigned char pkgObject[0x80] = {};
+                alignas(16) unsigned char request[0x28] = {};
+                alignas(16) unsigned char layout[8] = {3, 0, 0, 0, 0, 0, 0, 0};
+                unsigned char pkg[64];
+                for (int i = 0; i < 64; ++i) {
+                    pkg[i] = static_cast<unsigned char>(0x40 + i);
+                }
+
+                const uint64_t kPhysPool = 0xA500;
+                const uint64_t kVirtualPool = 0xA540;
+                const uint64_t kPkgBuilder2 = reinterpret_cast<uint64_t>(pkgBuilder2);
+                const uint64_t kPkgObject = reinterpret_cast<uint64_t>(pkgObject);
+
+                x[0] = reinterpret_cast<uint64_t>(physBuilder);
+                pool_builder_set_defaults(ctx, x);
+                x[0] = reinterpret_cast<uint64_t>(physBuilder);
+                x[1] = reinterpret_cast<uint64_t>(vphys);
+                x[2] = 16384;
+                pool_builder_set_storage(ctx, x);
+                x[0] = kPhysPool;
+                x[1] = reinterpret_cast<uint64_t>(physBuilder);
+                pool_initialize(ctx, x);
+                if (x[0] != 1) {
+                    std::fprintf(stderr, "[selftest] storage: physical pool init failed\n");
+                    rc = 16437;
+                    goto done;
+                }
+
+                /* A virtual pool has a size but no storage: Initialize must
+                 * accept it, and it reports no address until it is mapped. */
+                x[0] = reinterpret_cast<uint64_t>(virtBuilder);
+                pool_builder_set_defaults(ctx, x);
+                x[0] = reinterpret_cast<uint64_t>(virtBuilder);
+                x[1] = 0;
+                x[2] = 16384;
+                pool_builder_set_storage(ctx, x);
+                x[0] = reinterpret_cast<uint64_t>(virtBuilder);
+                x[1] = 0x200;   /* NVN_MEMORY_POOL_FLAGS_VIRTUAL */
+                pool_builder_set_flags(ctx, x);
+                x[0] = kVirtualPool;
+                x[1] = reinterpret_cast<uint64_t>(virtBuilder);
+                pool_initialize(ctx, x);
+                const uint64_t virtualInit = x[0];
+                x[0] = kVirtualPool;
+                pool_get_buffer_address(ctx, x);
+                const uint64_t unmappedAddress = x[0];
+
+                uint64_t* req = reinterpret_cast<uint64_t*>(request);
+                req[0] = kPhysPool;
+                req[1] = 0;
+                req[2] = 0;
+                req[3] = 16384 / 2;
+                req[4] = 0;
+                x[0] = kVirtualPool;
+                x[1] = 1;
+                x[2] = reinterpret_cast<uint64_t>(request);
+                pool_map_virtual(ctx, x);
+                const uint64_t partialMap = x[0];
+
+                req[3] = 16384;
+                x[0] = kVirtualPool;
+                x[1] = 1;
+                x[2] = reinterpret_cast<uint64_t>(request);
+                pool_map_virtual(ctx, x);
+                const uint64_t fullMap = x[0];
+                x[0] = kVirtualPool;
+                pool_get_buffer_address(ctx, x);
+                const uint64_t mappedAddress = x[0];
+
+                /* Packaged layout/data round trip, and the copy Initialize
+                 * makes into the pool. */
+                x[0] = kPkgBuilder2;
+                tex_builder_set_defaults(ctx, x);
+                x[0] = kPkgBuilder2; x[1] = 0;
+                tex_builder_set_target(ctx, x);
+                x[0] = kPkgBuilder2; x[1] = 0x25;
+                tex_builder_set_format(ctx, x);
+                x[0] = kPkgBuilder2; x[1] = 4; x[2] = 4;
+                tex_builder_set_size2d(ctx, x);
+                x[0] = kPkgBuilder2; x[1] = 1;
+                tex_builder_set_levels(ctx, x);
+                x[0] = kPkgBuilder2; x[1] = kPhysPool; x[2] = 0;
+                tex_builder_set_storage(ctx, x);
+                x[0] = kPkgBuilder2;
+                x[1] = reinterpret_cast<uint64_t>(layout);
+                tex_builder_set_packaged_layout(ctx, x);
+                x[0] = kPkgBuilder2;
+                x[1] = reinterpret_cast<uint64_t>(pkg);
+                tex_builder_set_packaged_data(ctx, x);
+
+                unsigned char layoutBack[8] = {0};
+                x[0] = kPkgBuilder2;
+                x[1] = reinterpret_cast<uint64_t>(layoutBack);
+                tex_builder_get_packaged_layout(ctx, x);
+                x[0] = kPkgBuilder2;
+                tex_builder_get_packaged_data(ctx, x);
+                const uint64_t pkgBack = x[0];
+
+                x[0] = kPkgObject;
+                x[1] = kPkgBuilder2;
+                tex_initialize(ctx, x);
+                const uint64_t pkgInit = x[0];
+                const bool pkgCopied = std::memcmp(vphys, pkg, sizeof pkg) == 0;
+
+                x[0] = kPkgBuilder2;
+                tex_builder_get_storage_class(ctx, x);
+                const uint64_t builderClass = x[0];
+                x[0] = kPkgBuilder2;
+                tex_builder_get_raw_storage_class(ctx, x);
+                const uint64_t builderRaw = x[0];
+                x[0] = kPkgObject;
+                tex_get_storage_class(ctx, x);
+                const uint64_t textureClass = x[0];
+                x[0] = kPkgObject;
+                tex_get_raw_storage_class(ctx, x);
+                const uint64_t textureRaw = x[0];
+
+                if (virtualInit != 1 || unmappedAddress != 0 ||
+                    partialMap != 0 || fullMap != 1 ||
+                    mappedAddress != reinterpret_cast<uint64_t>(vphys) ||
+                    pkgBack != reinterpret_cast<uint64_t>(pkg) ||
+                    std::memcmp(layoutBack, layout, sizeof layout) != 0 ||
+                    pkgInit != 1 || !pkgCopied ||
+                    builderClass != 0 || builderRaw != 1 ||
+                    textureClass != 0 || textureRaw != 1) {
+                    std::fprintf(stderr,
+                                 "[selftest] storage: virtual=%llu unmapped=%llx "
+                                 "partial=%llu full=%llu addr=%llx pkg=%llx "
+                                 "copied=%d class=%llu/%llu/%llu/%llu\n",
+                                 static_cast<unsigned long long>(virtualInit),
+                                 static_cast<unsigned long long>(unmappedAddress),
+                                 static_cast<unsigned long long>(partialMap),
+                                 static_cast<unsigned long long>(fullMap),
+                                 static_cast<unsigned long long>(mappedAddress),
+                                 static_cast<unsigned long long>(pkgBack),
+                                 static_cast<int>(pkgCopied),
+                                 static_cast<unsigned long long>(builderClass),
+                                 static_cast<unsigned long long>(builderRaw),
+                                 static_cast<unsigned long long>(textureClass),
+                                 static_cast<unsigned long long>(textureRaw));
+                    rc = 16437;
+                    goto done;
+                }
+                forget<Tex>(kPkgObject);
+                g_tex_specs.erase(kPkgBuilder2);
+                forget<Pool>(kVirtualPool);
+                forget<Pool>(kPhysPool);
+                std::fprintf(stderr,
+                             "[selftest] storage/packaged: virtual pool alias, "
+                             "packaged layout/data round trip, storage classes\n");
+            }
 
     done:
         nvngfx_shader_set_msl_passthrough(0);
