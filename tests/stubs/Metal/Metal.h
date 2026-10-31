@@ -594,6 +594,7 @@ destinationBytesPerImage:(NSUInteger)bpi;
 - (id<MTLRenderCommandEncoder>)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor*)descriptor;
 - (void)presentDrawable:(id)drawable;
 - (void)commit;
+- (void)addCompletedHandler:(void (^)(id<MTLCommandBuffer>))block;
 - (void)waitUntilCompleted;
 @property (readonly) MTLCommandBufferStatus status;
 @property (readonly) NSError* error;

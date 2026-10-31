@@ -1,13 +1,154 @@
 {
- "source": "hand-written: derived from the Set/Get naming symmetry, NOT from a header",
- "note": "These six entry points are absent from the public nvn_protos.h. Their shapes are inferred from their siblings (WindowGetNumTextures mirroring WindowSetNumActiveTextures, DeviceBuilderGetFlags mirroring DeviceBuilderSetFlags, and the two *BuilderGetDevice getters mirroring their SetDevice siblings). verify_ios.py counts them separately so a guess is never silently folded into the verified set.",
- "count": 6,
- "procs": [
-  {"name": "nvnBufferBuilderGetDevice", "ret": "NVNdevice*", "params": ["const NVNbufferBuilder*"], "arity": 1, "inferred": true},
-  {"name": "nvnDeviceBuilderGetFlags", "ret": "int", "params": ["const NVNdeviceBuilder*"], "arity": 1, "inferred": true},
-  {"name": "nvnMemoryPoolBuilderGetDevice", "ret": "NVNdevice*", "params": ["const NVNmemoryPoolBuilder*"], "arity": 1, "inferred": true},
-  {"name": "nvnWindowBuilderSetNumActiveTextures", "ret": "void", "params": ["NVNwindowBuilder*", "int"], "arity": 2, "inferred": true},
-  {"name": "nvnWindowGetNumTextures", "ret": "int", "params": ["const NVNwindow*"], "arity": 1, "inferred": true},
-  {"name": "nvnWindowSetNumActiveTextures", "ret": "void", "params": ["NVNwindow*", "int"], "arity": 2, "inferred": true}
- ]
+  "source": "hand-written: derived from the Set/Get naming symmetry, NOT from a header",
+  "note": "These entry points are absent from the public nvn_protos.h. Their shapes are inferred from their siblings: the window/device/buffer getters mirror their Set siblings, and the QueueBuilder getters mirror QueueBuilderSet* plus QueueBuilderGetQueueMemorySize. verify_ios.py counts them separately so a guess is never silently folded into the verified set.",
+  "count": 16,
+  "procs": [
+    {
+      "name": "nvnBufferBuilderGetDevice",
+      "ret": "NVNdevice*",
+      "params": [
+        "const NVNbufferBuilder*"
+      ],
+      "arity": 1,
+      "inferred": true
+    },
+    {
+      "name": "nvnDeviceBuilderGetFlags",
+      "ret": "int",
+      "params": [
+        "const NVNdeviceBuilder*"
+      ],
+      "arity": 1,
+      "inferred": true
+    },
+    {
+      "name": "nvnMemoryPoolBuilderGetDevice",
+      "ret": "NVNdevice*",
+      "params": [
+        "const NVNmemoryPoolBuilder*"
+      ],
+      "arity": 1,
+      "inferred": true
+    },
+    {
+      "name": "nvnQueueBuilderGetCommandFlushThreshold",
+      "ret": "size_t",
+      "params": [
+        "const NVNqueueBuilder*"
+      ],
+      "arity": 1,
+      "inferred": true
+    },
+    {
+      "name": "nvnQueueBuilderGetCommandMemorySize",
+      "ret": "size_t",
+      "params": [
+        "const NVNqueueBuilder*"
+      ],
+      "arity": 1,
+      "inferred": true
+    },
+    {
+      "name": "nvnQueueBuilderGetComputeMemorySize",
+      "ret": "size_t",
+      "params": [
+        "const NVNqueueBuilder*"
+      ],
+      "arity": 1,
+      "inferred": true
+    },
+    {
+      "name": "nvnQueueBuilderGetControlMemorySize",
+      "ret": "size_t",
+      "params": [
+        "const NVNqueueBuilder*"
+      ],
+      "arity": 1,
+      "inferred": true
+    },
+    {
+      "name": "nvnQueueBuilderGetDevice",
+      "ret": "NVNdevice*",
+      "params": [
+        "const NVNqueueBuilder*"
+      ],
+      "arity": 1,
+      "inferred": true
+    },
+    {
+      "name": "nvnQueueBuilderGetFlags",
+      "ret": "int",
+      "params": [
+        "const NVNqueueBuilder*"
+      ],
+      "arity": 1,
+      "inferred": true
+    },
+    {
+      "name": "nvnQueueBuilderGetMemory",
+      "ret": "void*",
+      "params": [
+        "const NVNqueueBuilder*"
+      ],
+      "arity": 1,
+      "inferred": true
+    },
+    {
+      "name": "nvnQueueBuilderGetMemorySize",
+      "ret": "size_t",
+      "params": [
+        "const NVNqueueBuilder*"
+      ],
+      "arity": 1,
+      "inferred": true
+    },
+    {
+      "name": "nvnQueueBuilderGetQueuePriority",
+      "ret": "int",
+      "params": [
+        "const NVNqueueBuilder*"
+      ],
+      "arity": 1,
+      "inferred": true
+    },
+    {
+      "name": "nvnQueueBuilderSetQueuePriority",
+      "ret": "void",
+      "params": [
+        "NVNqueueBuilder*",
+        "int"
+      ],
+      "arity": 2,
+      "inferred": true
+    },
+    {
+      "name": "nvnWindowBuilderSetNumActiveTextures",
+      "ret": "void",
+      "params": [
+        "NVNwindowBuilder*",
+        "int"
+      ],
+      "arity": 2,
+      "inferred": true
+    },
+    {
+      "name": "nvnWindowGetNumTextures",
+      "ret": "int",
+      "params": [
+        "const NVNwindow*"
+      ],
+      "arity": 1,
+      "inferred": true
+    },
+    {
+      "name": "nvnWindowSetNumActiveTextures",
+      "ret": "void",
+      "params": [
+        "NVNwindow*",
+        "int"
+      ],
+      "arity": 2,
+      "inferred": true
+    }
+  ]
 }

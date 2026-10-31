@@ -7,8 +7,8 @@
 `nvn*` 字符串（运行时按名解析，所以名字本身就暴露了完整接口面）。
 
 - 接口总数：**513**
-- Metal 后端已实现：**316**（61.6%）
-- 仍未实现：**197**
+- Metal 后端已实现：**363**（70.8%）
+- 仍未实现：**150**
 
 > 只有出现在 `ios/nvn/implemented_metal.txt` 里、且确实在
 > `ios/nvn/src/nvn_metal.mm` 中定义过的名字才算“已实现”。
@@ -18,15 +18,15 @@
 
 | 域 | 已实现 | 总数 | 进度 |
 |---|---:|---:|---|
-| CommandBuffer | 110 | 144 | `########  ` |
+| CommandBuffer | 114 | 144 | `########  ` |
 | Texture | 22 | 45 | `#####     ` |
 | TextureBuilder | 28 | 43 | `#######   ` |
 | Device | 7 | 27 | `###       ` |
 | SamplerBuilder | 24 | 25 | `##########` |
 | MultisampleState | 12 | 23 | `#####     ` |
-| QueueBuilder | 0 | 19 | `          ` |
+| QueueBuilder | 19 | 19 | `##########` |
 | BlendState | 4 | 15 | `###       ` |
-| Queue | 1 | 15 | `#         ` |
+| Queue | 15 | 15 | `##########` |
 | Sampler | 14 | 15 | `######### ` |
 | DepthStencilState | 7 | 13 | `#####     ` |
 | Window | 6 | 12 | `#####     ` |
@@ -39,9 +39,9 @@
 | TexturePool | 7 | 8 | `######### ` |
 | BufferBuilder | 7 | 7 | `##########` |
 | ColorState | 4 | 7 | `######    ` |
-| Event | 0 | 7 | `          ` |
+| Event | 6 | 7 | `######### ` |
 | Program | 3 | 7 | `####      ` |
-| Sync | 0 | 6 | `          ` |
+| Sync | 4 | 6 | `#######   ` |
 | VertexAttribState | 5 | 5 | `##########` |
 | VertexStreamState | 5 | 5 | `##########` |
 | ChannelMaskState | 2 | 3 | `#######   ` |
@@ -112,7 +112,7 @@
 - [x] `nvnColorStateSetDefaults`
 - [x] `nvnColorStateSetLogicOp`
 
-### CommandBuffer (110/144)
+### CommandBuffer (114/144)
 
 - [x] `nvnCommandBufferAddCommandMemory`
 - [x] `nvnCommandBufferAddControlMemory`
@@ -176,7 +176,7 @@
 - [ ] `nvnCommandBufferDrawTransformFeedback`
 - [x] `nvnCommandBufferEndRecording`
 - [ ] `nvnCommandBufferEndTransformFeedback`
-- [ ] `nvnCommandBufferFenceSync`
+- [x] `nvnCommandBufferFenceSync`
 - [x] `nvnCommandBufferFinalize`
 - [x] `nvnCommandBufferGetCommandMemoryFree`
 - [x] `nvnCommandBufferGetCommandMemorySize`
@@ -252,12 +252,12 @@
 - [x] `nvnCommandBufferSetViewport`
 - [x] `nvnCommandBufferSetViewportSwizzles`
 - [x] `nvnCommandBufferSetViewports`
-- [ ] `nvnCommandBufferSignalEvent`
+- [x] `nvnCommandBufferSignalEvent`
 - [ ] `nvnCommandBufferTiledDownsample`
 - [ ] `nvnCommandBufferTiledDownsampleTextureView`
 - [x] `nvnCommandBufferUpdateUniformBuffer`
-- [ ] `nvnCommandBufferWaitEvent`
-- [ ] `nvnCommandBufferWaitSync`
+- [x] `nvnCommandBufferWaitEvent`
+- [x] `nvnCommandBufferWaitSync`
 
 ### DepthStencilState (7/13)
 
@@ -311,15 +311,15 @@
 - [x] `nvnDeviceBuilderSetDefaults`
 - [x] `nvnDeviceBuilderSetFlags`
 
-### Event (0/7)
+### Event (6/7)
 
 - [ ] `nvnEventBuilderGetStorage`
-- [ ] `nvnEventBuilderSetDefaults`
-- [ ] `nvnEventBuilderSetStorage`
-- [ ] `nvnEventFinalize`
-- [ ] `nvnEventGetValue`
-- [ ] `nvnEventInitialize`
-- [ ] `nvnEventSignal`
+- [x] `nvnEventBuilderSetDefaults`
+- [x] `nvnEventBuilderSetStorage`
+- [x] `nvnEventFinalize`
+- [x] `nvnEventGetValue`
+- [x] `nvnEventInitialize`
+- [x] `nvnEventSignal`
 
 ### MemoryPool (9/10)
 
@@ -393,45 +393,45 @@
 - [ ] `nvnProgramSetShadersExt`
 - [ ] `nvnProgramSetSubroutineLinkage`
 
-### Queue (1/15)
+### Queue (15/15)
 
-- [ ] `nvnQueueAcquireTexture`
-- [ ] `nvnQueueFenceSync`
-- [ ] `nvnQueueFinalize`
-- [ ] `nvnQueueFinish`
-- [ ] `nvnQueueFlush`
-- [ ] `nvnQueueGetError`
-- [ ] `nvnQueueGetTotalCommandMemoryUsed`
-- [ ] `nvnQueueGetTotalComputeMemoryUsed`
-- [ ] `nvnQueueGetTotalControlMemoryUsed`
-- [ ] `nvnQueueInitialize`
+- [x] `nvnQueueAcquireTexture`
+- [x] `nvnQueueFenceSync`
+- [x] `nvnQueueFinalize`
+- [x] `nvnQueueFinish`
+- [x] `nvnQueueFlush`
+- [x] `nvnQueueGetError`
+- [x] `nvnQueueGetTotalCommandMemoryUsed`
+- [x] `nvnQueueGetTotalComputeMemoryUsed`
+- [x] `nvnQueueGetTotalControlMemoryUsed`
+- [x] `nvnQueueInitialize`
 - [x] `nvnQueuePresentTexture`
-- [ ] `nvnQueueResetMemoryUsageCounts`
-- [ ] `nvnQueueSetDebugLabel`
-- [ ] `nvnQueueSubmitCommands`
-- [ ] `nvnQueueWaitSync`
+- [x] `nvnQueueResetMemoryUsageCounts`
+- [x] `nvnQueueSetDebugLabel`
+- [x] `nvnQueueSubmitCommands`
+- [x] `nvnQueueWaitSync`
 
-### QueueBuilder (0/19)
+### QueueBuilder (19/19)
 
-- [ ] `nvnQueueBuilderGetCommandFlushThreshold`
-- [ ] `nvnQueueBuilderGetCommandMemorySize`
-- [ ] `nvnQueueBuilderGetComputeMemorySize`
-- [ ] `nvnQueueBuilderGetControlMemorySize`
-- [ ] `nvnQueueBuilderGetDevice`
-- [ ] `nvnQueueBuilderGetFlags`
-- [ ] `nvnQueueBuilderGetMemory`
-- [ ] `nvnQueueBuilderGetMemorySize`
-- [ ] `nvnQueueBuilderGetQueueMemorySize`
-- [ ] `nvnQueueBuilderGetQueuePriority`
-- [ ] `nvnQueueBuilderSetCommandFlushThreshold`
-- [ ] `nvnQueueBuilderSetCommandMemorySize`
-- [ ] `nvnQueueBuilderSetComputeMemorySize`
-- [ ] `nvnQueueBuilderSetControlMemorySize`
-- [ ] `nvnQueueBuilderSetDefaults`
-- [ ] `nvnQueueBuilderSetDevice`
-- [ ] `nvnQueueBuilderSetFlags`
-- [ ] `nvnQueueBuilderSetQueueMemory`
-- [ ] `nvnQueueBuilderSetQueuePriority`
+- [x] `nvnQueueBuilderGetCommandFlushThreshold`
+- [x] `nvnQueueBuilderGetCommandMemorySize`
+- [x] `nvnQueueBuilderGetComputeMemorySize`
+- [x] `nvnQueueBuilderGetControlMemorySize`
+- [x] `nvnQueueBuilderGetDevice`
+- [x] `nvnQueueBuilderGetFlags`
+- [x] `nvnQueueBuilderGetMemory`
+- [x] `nvnQueueBuilderGetMemorySize`
+- [x] `nvnQueueBuilderGetQueueMemorySize`
+- [x] `nvnQueueBuilderGetQueuePriority`
+- [x] `nvnQueueBuilderSetCommandFlushThreshold`
+- [x] `nvnQueueBuilderSetCommandMemorySize`
+- [x] `nvnQueueBuilderSetComputeMemorySize`
+- [x] `nvnQueueBuilderSetControlMemorySize`
+- [x] `nvnQueueBuilderSetDefaults`
+- [x] `nvnQueueBuilderSetDevice`
+- [x] `nvnQueueBuilderSetFlags`
+- [x] `nvnQueueBuilderSetQueueMemory`
+- [x] `nvnQueueBuilderSetQueuePriority`
 
 ### Sampler (14/15)
 
@@ -490,14 +490,14 @@
 - [x] `nvnSamplerPoolRegisterSamplerBuilder`
 - [x] `nvnSamplerPoolSetDebugLabel`
 
-### Sync (0/6)
+### Sync (4/6)
 
 - [ ] `nvnSyncCreateGLSync`
-- [ ] `nvnSyncFinalize`
-- [ ] `nvnSyncInitialize`
+- [x] `nvnSyncFinalize`
+- [x] `nvnSyncInitialize`
 - [ ] `nvnSyncInitializeFromFencedGLSync`
-- [ ] `nvnSyncSetDebugLabel`
-- [ ] `nvnSyncWait`
+- [x] `nvnSyncSetDebugLabel`
+- [x] `nvnSyncWait`
 
 ### Texture (22/45)
 

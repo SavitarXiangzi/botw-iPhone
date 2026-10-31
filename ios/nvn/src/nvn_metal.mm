@@ -130,12 +130,14 @@
 #include "nvn_texture.h"
 #include "nvn_vertex.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <set>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -383,6 +385,56 @@ struct DebugGroup {
     std::string name;
 };
 
+/* A command-buffer event signal is published from the completion handler, so
+ * CPU reads see it only after the GPU has finished the recording. */
+struct PendingEventSignal {
+    uint64_t address = 0;
+    bool add = false;
+    uint32_t value = 0;
+};
+
+/* The queue builder is a guest object whose layout we never read.  These are
+ * the values the setters recorded; QueueSpec defaults follow the device
+ * defaults used by nxnative/D2R (64 KiB command, 256 KiB compute, 16 KiB
+ * control, 4 KiB flush threshold). */
+struct QueueSpec {
+    uint64_t device = 0;
+    int flags = 0;
+    int priority = 0;
+    size_t commandSize = 65536;
+    size_t computeSize = 262144;
+    size_t controlSize = 16384;
+    size_t flushThreshold = 4096;
+    void* memory = nullptr;
+    size_t memorySize = 0;
+};
+
+struct NvnQueue {
+    uint64_t device = 0;
+    unsigned submits = 0;
+    size_t commandUsed = 0;
+    size_t computeUsed = 0;
+    size_t controlUsed = 0;
+    std::string label;
+};
+
+struct EventSpec {
+    uint64_t pool = 0;
+    ptrdiff_t offset = 0;
+};
+
+struct NvnEvent {
+    uint64_t address = 0;
+    std::string label;
+};
+
+struct NvnSync {
+    uint64_t device = 0;
+    __strong id<MTLCommandBuffer> fence = nil;
+    bool fenced = false;
+    std::string label;
+};
+
 struct CmdBuf {
     bool recording = false;
     unsigned draws = 0;
@@ -557,6 +609,9 @@ struct CmdBuf {
     unsigned commandMemorySegments = 0;
     uint64_t memoryCallback = 0;
     uint64_t memoryCallbackData = 0;
+    /* Event signals queued during this recording, published by one Metal
+     * completion handler each. */
+    std::vector<PendingEventSignal> eventSignals;
     /* Guest debug names forwarded to the Metal command buffer.  Groups are
      * per recording; the label survives begin/end. */
     std::string debugLabel;
@@ -678,6 +733,12 @@ std::unordered_map<uint64_t, int> g_device_flags;
  * field we need arrives through a setter we implement ourselves. */
 std::unordered_map<uint64_t, nvngfx_texdesc> g_tex_specs;
 std::unordered_map<uint64_t, SamplerSpec> g_sampler_specs;
+std::unordered_map<uint64_t, QueueSpec> g_queue_specs;
+std::unordered_map<uint64_t, EventSpec> g_event_specs;
+/* The most recent command buffer committed by EndRecording.  A queue fence
+ * captures it so nvnSyncWait can wait for exactly the work submitted before
+ * the fence, not for later frames. */
+__strong id<MTLCommandBuffer> g_last_mtl_buffer = nil;
 /* Pool numbering is process-wide, like nxnative's dpool_add: finalizing a
  * pool does not give its range to the next one, because a command buffer
  * recorded earlier may still refer to those slots. */
@@ -711,6 +772,18 @@ bool guest_write(uint64_t addr, size_t n) {
     }
     std::memset(reinterpret_cast<void*>(static_cast<uintptr_t>(addr)), 0, n);
     return true;
+}
+
+/* NVN event storage is a guest uint32_t.  Completion handlers and the CPU
+ * both touch it, so use volatile accesses; a 32-bit aligned store is atomic
+ * on every Apple CPU Metal supports. */
+void event_signal_raw(uint64_t address, bool add, uint32_t value) {
+    if (!guest_range(address, sizeof(uint32_t))) {
+        log_once("nvnEvent.signal.pointer", static_cast<unsigned>(address >> 32));
+        return;
+    }
+    volatile uint32_t* p = guest_ptr<volatile uint32_t>(address);
+    *p = add ? static_cast<uint32_t>(*p + value) : value;
 }
 
 /* Reads a NUL-terminated guest string into `out`, truncated to 255 bytes.
@@ -5601,15 +5674,17 @@ void cmdbuf_begin_recording(nvngfx_ctx* ctx, uint64_t* x) {
     b->shaderScratchPool = 0;
     b->shaderScratchOffset = 0;
     b->shaderScratchSize = 0;
+    b->eventSignals.clear();
 }
 
 /* nvnCommandBufferEndRecording(NVNcommandBuffer*) -> NVNcommandHandle
- * The handle is what the guest submits through nvnQueueSubmitCommands.  We do
- * not record a command stream, so 0 ("nothing to submit") is the honest value;
- * the Metal work is already committed here, in queue order. */
+ * The Metal work is committed here in queue order, so the handle is the guest
+ * command-buffer address: nvnQueueSubmitCommands can use it to account for
+ * the recording without replaying it a second time. */
 void cmdbuf_end_recording(nvngfx_ctx* ctx, uint64_t* x) {
     Ctx* c = ctx_of(ctx);
-    CmdBuf* b = find<CmdBuf>(x[0]);
+    const uint64_t cbGuest = x[0];
+    CmdBuf* b = find<CmdBuf>(cbGuest);
     if (!b || !b->recording) {
         x[0] = 0;
         return;
@@ -5619,12 +5694,26 @@ void cmdbuf_end_recording(nvngfx_ctx* ctx, uint64_t* x) {
     flush_pending_clears(c, b);
     end_encoder(b);
     if (b->cb) {
+        /* Event signals are CPU-visible only after the GPU finished the
+         * recording.  Capturing values by copy keeps the completion handler
+         * independent of this CmdBuf, which may be finalized before it runs. */
+        for (const PendingEventSignal& sig : b->eventSignals) {
+            const uint64_t address = sig.address;
+            const bool add = sig.add;
+            const uint32_t value = sig.value;
+            [b->cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+                (void)done;
+                event_signal_raw(address, add, value);
+            }];
+        }
         [b->cb commit];
         b->last = b->cb;
         b->cb = nil;
     }
+    b->eventSignals.clear();
     b->recording = false;
-    x[0] = 0;
+    g_last_mtl_buffer = b->last;
+    x[0] = cbGuest;
 }
 
 /* ------------------------------------------------------------------ */
@@ -8065,6 +8154,348 @@ void cmdbuf_set_viewport_swizzles(nvngfx_ctx*, uint64_t* x) {
 }
 
 /* ------------------------------------------------------------------ */
+/* events, sync and queue                                              */
+/* ------------------------------------------------------------------ */
+
+/* nvnEventBuilderSetDefaults(NVNeventBuilder*) */
+void event_builder_set_defaults(nvngfx_ctx*, uint64_t* x) {
+    if (x[0]) (void)guest_write(x[0], 0x10);
+    g_event_specs[x[0]] = EventSpec{};
+}
+
+/* nvnEventBuilderSetStorage(NVNeventBuilder*, const NVNmemoryPool*, int64_t) */
+void event_builder_set_storage(nvngfx_ctx*, uint64_t* x) {
+    EventSpec& s = g_event_specs[x[0]];
+    s.pool = x[1];
+    s.offset = static_cast<ptrdiff_t>(x[2]);
+}
+
+/* nvnEventInitialize(NVNevent*, const NVNeventBuilder*) -> NVNboolean */
+void event_initialize(nvngfx_ctx*, uint64_t* x) {
+    EventSpec spec;
+    auto it = g_event_specs.find(x[1]);
+    if (it != g_event_specs.end()) spec = it->second;
+    Pool* p = spec.pool ? find<Pool>(spec.pool) : nullptr;
+    if (!p || !p->storage || spec.offset < 0 ||
+        static_cast<size_t>(spec.offset) > p->size ||
+        p->size - static_cast<size_t>(spec.offset) < sizeof(uint32_t)) {
+        log_once("nvnEventInitialize.storage", static_cast<unsigned>(spec.pool));
+        x[0] = 0;
+        return;
+    }
+    NvnEvent* e = find_or_add<NvnEvent>(x[0]);
+    e->address = reinterpret_cast<uint64_t>(p->storage) +
+                 static_cast<uint64_t>(spec.offset);
+    x[0] = 1;
+}
+
+/* nvnEventGetValue(const NVNevent*) -> uint32_t */
+void event_get_value(nvngfx_ctx*, uint64_t* x) {
+    NvnEvent* e = find<NvnEvent>(x[0]);
+    x[0] = (e && guest_range(e->address, sizeof(uint32_t)))
+               ? static_cast<uint64_t>(*guest_ptr<volatile uint32_t>(e->address))
+               : 0u;
+}
+
+/* nvnEventSignal(NVNevent*, NVNeventSignalMode, uint32_t) */
+void event_signal(nvngfx_ctx*, uint64_t* x) {
+    NvnEvent* e = find<NvnEvent>(x[0]);
+    if (!e) return;
+    event_signal_raw(e->address, static_cast<int>(x[1]) == 1,
+                     static_cast<uint32_t>(x[2]));
+}
+
+void event_finalize(nvngfx_ctx*, uint64_t* x) { forget<NvnEvent>(x[0]); }
+
+/* nvnCommandBufferSignalEvent(cb, event, mode, location, flags, value)
+ * Location and flags only describe where in the pipeline the signal lands.
+ * Publishing from the completion handler is the conservative CPU-visible
+ * point: a later CPU read cannot observe the value before the GPU work that
+ * preceded the signal has finished. */
+void cmdbuf_signal_event(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find<CmdBuf>(x[0]);
+    NvnEvent* e = find<NvnEvent>(x[1]);
+    if (!b || !b->recording || !e) {
+        log_once("nvnCommandBufferSignalEvent.state", b ? 1u : 0u);
+        return;
+    }
+    PendingEventSignal sig;
+    sig.address = e->address;
+    sig.add = static_cast<int>(x[2]) == 1;
+    sig.value = static_cast<uint32_t>(x[5]);
+    b->eventSignals.push_back(sig);
+}
+
+/* In a single Metal queue, commands execute in recording order.  A wait for
+ * an earlier signal in the same stream is therefore already ordered; there is
+ * no device-side counter to poll here. */
+void cmdbuf_wait_event(nvngfx_ctx*, uint64_t* x) {
+    (void)x;
+    log_once("nvnCommandBufferWaitEvent.ordered", 1);
+}
+
+void cmdbuf_wait_sync(nvngfx_ctx*, uint64_t* x) {
+    (void)x;
+    log_once("nvnCommandBufferWaitSync.ordered", 1);
+}
+
+/* nvnSyncInitialize(NVNsync*, NVNdevice*) -> NVNboolean */
+void sync_initialize(nvngfx_ctx*, uint64_t* x) {
+    NvnSync* s = find_or_add<NvnSync>(x[0]);
+    s->device = x[1];
+    s->fence = nil;
+    s->fenced = false;
+    s->label.clear();
+    x[0] = 1;
+}
+
+void sync_finalize(nvngfx_ctx*, uint64_t* x) { forget<NvnSync>(x[0]); }
+
+void sync_set_debug_label(nvngfx_ctx*, uint64_t* x) {
+    NvnSync* s = find<NvnSync>(x[0]);
+    if (!s) return;
+    std::string label;
+    if (guest_cstr(x[1], &label)) s->label = std::move(label);
+}
+
+/* nvnCommandBufferFenceSync(cb, sync, condition, flags).  Both NVN fence
+ * conditions collapse to "all GPU commands recorded so far"; this backend
+ * has one command queue, so the latest committed buffer is the fence. */
+void cmdbuf_fence_sync(nvngfx_ctx*, uint64_t* x) {
+    NvnSync* s = find_or_add<NvnSync>(x[1]);
+    CmdBuf* b = find<CmdBuf>(x[0]);
+    s->fence = b ? (b->cb ? b->cb : b->last) : g_last_mtl_buffer;
+    s->fenced = true;
+}
+
+/* nvnQueueFenceSync(queue, sync, condition, flags) */
+void queue_fence_sync(nvngfx_ctx*, uint64_t* x) {
+    NvnSync* s = find_or_add<NvnSync>(x[1]);
+    s->fence = g_last_mtl_buffer;
+    s->fenced = true;
+}
+
+/* Timeout is in nanoseconds, as on NVN.  An unfenced sync never signals, so a
+ * finite wait sleeps to its deadline; an infinite wait is capped and reported
+ * instead of hanging the host forever. */
+static constexpr uint64_t kSyncWaitForever = 3600000000000ull;  /* 1 hour */
+
+uint32_t sync_wait_impl(const NvnSync* s, uint64_t timeout) {
+    if (!s) return 3;  /* NVN_SYNC_WAIT_RESULT_FAILED */
+    if (!s->fenced) {
+        if (timeout == 0) return 2;  /* TIMEOUT_EXPIRED */
+        if (timeout >= kSyncWaitForever) {
+            log_once("nvnSyncWait.unfencedInfinite", 1);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        } else {
+            std::this_thread::sleep_for(std::chrono::nanoseconds(timeout));
+        }
+        return 2;
+    }
+    id<MTLCommandBuffer> fence = s->fence;
+    if (!fence) return 0;  /* ALREADY_SIGNALED: no work was submitted */
+    if (fence.status == MTLCommandBufferStatusCompleted) return 0;
+    if (fence.status == MTLCommandBufferStatusError) return 3;
+    if (timeout == 0) return 2;
+    if (timeout >= kSyncWaitForever) {
+        [fence waitUntilCompleted];
+        return fence.status == MTLCommandBufferStatusError ? 3u : 1u;
+    }
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::nanoseconds(timeout);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (fence.status == MTLCommandBufferStatusCompleted) return 1;
+        if (fence.status == MTLCommandBufferStatusError) return 3;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return fence.status == MTLCommandBufferStatusCompleted ? 1u : 2u;
+}
+
+/* nvnSyncWait(const NVNsync*, uint64_t timeout) -> NVNsyncWaitResult */
+void sync_wait(nvngfx_ctx*, uint64_t* x) {
+    x[0] = sync_wait_impl(find<NvnSync>(x[0]), x[1]);
+}
+
+/* ---------------------------- QueueBuilder ---------------------------- */
+
+void queue_builder_set_defaults(nvngfx_ctx*, uint64_t* x) {
+    QueueSpec spec;
+    auto it = g_queue_specs.find(x[0]);
+    if (it != g_queue_specs.end()) spec.device = it->second.device;
+    if (x[0]) (void)guest_write(x[0], 0x40);
+    g_queue_specs[x[0]] = spec;
+}
+
+void queue_builder_set_device(nvngfx_ctx*, uint64_t* x) {
+    g_queue_specs[x[0]].device = x[1];
+}
+void queue_builder_set_flags(nvngfx_ctx*, uint64_t* x) {
+    g_queue_specs[x[0]].flags = static_cast<int>(x[1]);
+}
+void queue_builder_set_priority(nvngfx_ctx*, uint64_t* x) {
+    g_queue_specs[x[0]].priority = static_cast<int>(x[1]);
+}
+void queue_builder_set_command_size(nvngfx_ctx*, uint64_t* x) {
+    g_queue_specs[x[0]].commandSize = static_cast<size_t>(x[1]);
+}
+void queue_builder_set_compute_size(nvngfx_ctx*, uint64_t* x) {
+    g_queue_specs[x[0]].computeSize = static_cast<size_t>(x[1]);
+}
+void queue_builder_set_control_size(nvngfx_ctx*, uint64_t* x) {
+    g_queue_specs[x[0]].controlSize = static_cast<size_t>(x[1]);
+}
+void queue_builder_set_flush_threshold(nvngfx_ctx*, uint64_t* x) {
+    g_queue_specs[x[0]].flushThreshold = static_cast<size_t>(x[1]);
+}
+void queue_builder_set_memory(nvngfx_ctx*, uint64_t* x) {
+    QueueSpec& s = g_queue_specs[x[0]];
+    s.memory = guest_ptr<void>(x[1]);
+    s.memorySize = static_cast<size_t>(x[2]);
+}
+
+const QueueSpec& queue_spec_or_default(uint64_t builder) {
+    static const QueueSpec fallback;
+    auto it = g_queue_specs.find(builder);
+    return it == g_queue_specs.end() ? fallback : it->second;
+}
+
+void queue_builder_get_device(nvngfx_ctx*, uint64_t* x) {
+    x[0] = queue_spec_or_default(x[0]).device;
+}
+void queue_builder_get_flags(nvngfx_ctx*, uint64_t* x) {
+    x[0] = static_cast<uint64_t>(
+        static_cast<uint32_t>(queue_spec_or_default(x[0]).flags));
+}
+void queue_builder_get_priority(nvngfx_ctx*, uint64_t* x) {
+    x[0] = static_cast<uint64_t>(
+        static_cast<uint32_t>(queue_spec_or_default(x[0]).priority));
+}
+void queue_builder_get_command_size(nvngfx_ctx*, uint64_t* x) {
+    x[0] = queue_spec_or_default(x[0]).commandSize;
+}
+void queue_builder_get_compute_size(nvngfx_ctx*, uint64_t* x) {
+    x[0] = queue_spec_or_default(x[0]).computeSize;
+}
+void queue_builder_get_control_size(nvngfx_ctx*, uint64_t* x) {
+    x[0] = queue_spec_or_default(x[0]).controlSize;
+}
+void queue_builder_get_flush_threshold(nvngfx_ctx*, uint64_t* x) {
+    x[0] = queue_spec_or_default(x[0]).flushThreshold;
+}
+void queue_builder_get_memory(nvngfx_ctx*, uint64_t* x) {
+    x[0] = reinterpret_cast<uint64_t>(queue_spec_or_default(x[0]).memory);
+}
+void queue_builder_get_memory_size(nvngfx_ctx*, uint64_t* x) {
+    x[0] = queue_spec_or_default(x[0]).memorySize;
+}
+void queue_builder_get_queue_memory_size(nvngfx_ctx*, uint64_t* x) {
+    const QueueSpec& s = queue_spec_or_default(x[0]);
+    const size_t sum = s.commandSize + s.computeSize + s.controlSize;
+    x[0] = (sum + 4095u) & ~static_cast<size_t>(4095u);
+}
+
+/* ------------------------------- queue -------------------------------- */
+
+void queue_initialize(nvngfx_ctx*, uint64_t* x) {
+    QueueSpec spec = queue_spec_or_default(x[1]);
+    NvnQueue* q = find_or_add<NvnQueue>(x[0]);
+    q->device = spec.device;
+    q->submits = 0;
+    q->commandUsed = q->computeUsed = q->controlUsed = 0;
+    q->label.clear();
+    x[0] = 1;
+}
+
+void queue_finalize(nvngfx_ctx*, uint64_t* x) { forget<NvnQueue>(x[0]); }
+void queue_flush(nvngfx_ctx*, uint64_t* x) { (void)x; }
+
+/* nvnQueueFinish: wait for every command buffer this backend has committed.
+ * Present blits are not CmdBuf objects, but the queue's own guest command
+ * stream is fully covered. */
+void queue_finish(nvngfx_ctx*, uint64_t*) {
+    for (auto& kv : table<CmdBuf>()) {
+        CmdBuf* b = kv.second;
+        if (!b || !b->last) continue;
+        if (b->last.status != MTLCommandBufferStatusCompleted)
+            [b->last waitUntilCompleted];
+    }
+    if (g_last_mtl_buffer &&
+        g_last_mtl_buffer.status != MTLCommandBufferStatusCompleted)
+        [g_last_mtl_buffer waitUntilCompleted];
+}
+
+/* NVNqueueErrorInfo has no verified layout.  No error is reported, so the
+ * result alone is authoritative and the out-struct is left untouched. */
+void queue_get_error(nvngfx_ctx*, uint64_t* x) { x[0] = 0; }
+
+void queue_get_total_command(nvngfx_ctx*, uint64_t* x) {
+    NvnQueue* q = find<NvnQueue>(x[0]);
+    x[0] = q ? q->commandUsed : 0u;
+}
+void queue_get_total_compute(nvngfx_ctx*, uint64_t* x) {
+    NvnQueue* q = find<NvnQueue>(x[0]);
+    x[0] = q ? q->computeUsed : 0u;
+}
+void queue_get_total_control(nvngfx_ctx*, uint64_t* x) {
+    NvnQueue* q = find<NvnQueue>(x[0]);
+    x[0] = q ? q->controlUsed : 0u;
+}
+void queue_reset_memory_usage(nvngfx_ctx*, uint64_t* x) {
+    NvnQueue* q = find<NvnQueue>(x[0]);
+    if (!q) return;
+    q->commandUsed = q->computeUsed = q->controlUsed = 0;
+}
+
+void queue_set_debug_label(nvngfx_ctx*, uint64_t* x) {
+    NvnQueue* q = find<NvnQueue>(x[0]);
+    if (!q) return;
+    std::string label;
+    if (guest_cstr(x[1], &label)) q->label = std::move(label);
+}
+
+/* nvnQueueAcquireTexture(queue, window, int* index).  The guest's active
+ * texture array and round-robin cursor live on Win, exactly like
+ * nvnWindowAcquireTexture; this variant has no sync out-parameter. */
+void queue_acquire_texture(nvngfx_ctx*, uint64_t* x) {
+    Win* w = find<Win>(x[1]);
+    int* outIndex = guest_ptr<int>(x[2]);
+    if (!w || w->numTextures == 0) {
+        log_once("nvnQueueAcquireTexture.error", 1);
+        x[0] = 1;
+        return;
+    }
+    const unsigned index = w->cursor % w->numTextures;
+    w->cursor = (w->cursor + 1) % w->numTextures;
+    if (outIndex) *outIndex = static_cast<int>(index);
+    x[0] = 0;
+}
+
+/* nvnQueueSubmitCommands(queue, count, handles).  EndRecording already
+ * committed the Metal work, so submission only accounts for the command
+ * memory each recording was granted.  The handle is the guest command
+ * buffer address returned by EndRecording. */
+void queue_submit_commands(nvngfx_ctx*, uint64_t* x) {
+    NvnQueue* q = find<NvnQueue>(x[0]);
+    if (!q) return;
+    const int n = static_cast<int>(x[1]);
+    const uint64_t* handles = guest_ptr<const uint64_t>(x[2]);
+    if (n <= 0 || !handles) return;
+    for (int i = 0; i < n; ++i) {
+        CmdBuf* b = find<CmdBuf>(handles[i]);
+        if (!b) continue;
+        q->commandUsed += b->commandMemorySize;
+        q->controlUsed += b->controlMemorySize;
+    }
+    q->submits += static_cast<unsigned>(n);
+}
+
+/* nvnQueueWaitSync(queue, sync) -> NVNboolean */
+void queue_wait_sync(nvngfx_ctx*, uint64_t* x) {
+    const uint32_t r = sync_wait_impl(find<NvnSync>(x[1]), kSyncWaitForever);
+    x[0] = (r == 0 || r == 1) ? 1u : 0u;
+}
+
+/* ------------------------------------------------------------------ */
 /* queue                                                               */
 /* ------------------------------------------------------------------ */
 
@@ -8470,6 +8901,57 @@ const Binding kBindings[] = {
     BIND("nvnCommandBufferSetViewports", cmdbuf_set_viewports),
     BIND("nvnCommandBufferSetViewportSwizzles", cmdbuf_set_viewport_swizzles),
 
+    BIND("nvnCommandBufferFenceSync", cmdbuf_fence_sync),
+    BIND("nvnCommandBufferSignalEvent", cmdbuf_signal_event),
+    BIND("nvnCommandBufferWaitEvent", cmdbuf_wait_event),
+    BIND("nvnCommandBufferWaitSync", cmdbuf_wait_sync),
+
+    BIND("nvnEventBuilderSetDefaults", event_builder_set_defaults),
+    BIND("nvnEventBuilderSetStorage", event_builder_set_storage),
+    BIND("nvnEventInitialize", event_initialize),
+    BIND("nvnEventGetValue", event_get_value),
+    BIND("nvnEventSignal", event_signal),
+    BIND("nvnEventFinalize", event_finalize),
+
+    BIND("nvnSyncInitialize", sync_initialize),
+    BIND("nvnSyncFinalize", sync_finalize),
+    BIND("nvnSyncSetDebugLabel", sync_set_debug_label),
+    BIND("nvnSyncWait", sync_wait),
+
+    BIND("nvnQueueBuilderSetDefaults", queue_builder_set_defaults),
+    BIND("nvnQueueBuilderSetDevice", queue_builder_set_device),
+    BIND("nvnQueueBuilderSetFlags", queue_builder_set_flags),
+    BIND("nvnQueueBuilderSetQueuePriority", queue_builder_set_priority),
+    BIND("nvnQueueBuilderSetCommandMemorySize", queue_builder_set_command_size),
+    BIND("nvnQueueBuilderSetComputeMemorySize", queue_builder_set_compute_size),
+    BIND("nvnQueueBuilderSetControlMemorySize", queue_builder_set_control_size),
+    BIND("nvnQueueBuilderSetCommandFlushThreshold", queue_builder_set_flush_threshold),
+    BIND("nvnQueueBuilderSetQueueMemory", queue_builder_set_memory),
+    BIND("nvnQueueBuilderGetDevice", queue_builder_get_device),
+    BIND("nvnQueueBuilderGetFlags", queue_builder_get_flags),
+    BIND("nvnQueueBuilderGetQueuePriority", queue_builder_get_priority),
+    BIND("nvnQueueBuilderGetCommandMemorySize", queue_builder_get_command_size),
+    BIND("nvnQueueBuilderGetComputeMemorySize", queue_builder_get_compute_size),
+    BIND("nvnQueueBuilderGetControlMemorySize", queue_builder_get_control_size),
+    BIND("nvnQueueBuilderGetCommandFlushThreshold", queue_builder_get_flush_threshold),
+    BIND("nvnQueueBuilderGetMemory", queue_builder_get_memory),
+    BIND("nvnQueueBuilderGetMemorySize", queue_builder_get_memory_size),
+    BIND("nvnQueueBuilderGetQueueMemorySize", queue_builder_get_queue_memory_size),
+
+    BIND("nvnQueueInitialize", queue_initialize),
+    BIND("nvnQueueFinalize", queue_finalize),
+    BIND("nvnQueueFlush", queue_flush),
+    BIND("nvnQueueFinish", queue_finish),
+    BIND("nvnQueueGetError", queue_get_error),
+    BIND("nvnQueueGetTotalCommandMemoryUsed", queue_get_total_command),
+    BIND("nvnQueueGetTotalComputeMemoryUsed", queue_get_total_compute),
+    BIND("nvnQueueGetTotalControlMemoryUsed", queue_get_total_control),
+    BIND("nvnQueueResetMemoryUsageCounts", queue_reset_memory_usage),
+    BIND("nvnQueueSetDebugLabel", queue_set_debug_label),
+    BIND("nvnQueueAcquireTexture", queue_acquire_texture),
+    BIND("nvnQueueSubmitCommands", queue_submit_commands),
+    BIND("nvnQueueFenceSync", queue_fence_sync),
+    BIND("nvnQueueWaitSync", queue_wait_sync),
     BIND("nvnQueuePresentTexture", queue_present_texture),
 };
 
@@ -14842,6 +15324,288 @@ extern "C" int nvngfx_metal_selftest(void) {
             std::fprintf(stderr,
                          "[selftest] PSO cache retained %u distinct keys\n",
                          kPsoCacheSlots);
+        }
+
+        {
+            /* --- Queue builder, queue lifecycle, sync and events ---------
+             * The builder is another guest object we never dereference: every
+             * getter must answer what the setters recorded.  A fence is tied
+             * to the command buffer committed at EndRecording, and an event
+             * signal is published from that buffer's completion handler. */
+            alignas(16) unsigned char qb[0x80] = {};
+            alignas(16) unsigned char queueObj[0x40] = {};
+            alignas(16) unsigned char syncObj[0x40] = {};
+            alignas(16) unsigned char eventObj[0x40] = {};
+            alignas(16) unsigned char eventCb[0x40] = {};
+            alignas(16) uint32_t eventValue = 0;
+            alignas(16) unsigned char queueMemory[0x40] = {};
+            const uint64_t kQb = reinterpret_cast<uint64_t>(qb);
+            const uint64_t kQueue = reinterpret_cast<uint64_t>(queueObj);
+            const uint64_t kSync = reinterpret_cast<uint64_t>(syncObj);
+            const uint64_t kEvent = reinterpret_cast<uint64_t>(eventObj);
+            const uint64_t kEventCb = reinterpret_cast<uint64_t>(eventCb);
+            const uint64_t kEventPool = 0xBEEF;
+            const uint64_t kEventWin = 0xBEF0;
+
+            x[0] = kQb;
+            queue_builder_set_defaults(ctx, x);
+            uint64_t qv[8] = {};
+            auto qbGet = [&](void (*fn)(nvngfx_ctx*, uint64_t*)) {
+                qv[0] = kQb;
+                fn(ctx, qv);
+                return qv[0];
+            };
+            if (qbGet(queue_builder_get_command_size) != 65536 ||
+                qbGet(queue_builder_get_compute_size) != 262144 ||
+                qbGet(queue_builder_get_control_size) != 16384 ||
+                qbGet(queue_builder_get_flush_threshold) != 4096 ||
+                qbGet(queue_builder_get_queue_memory_size) != 344064) {
+                std::fprintf(stderr,
+                             "[selftest] queue/sync: builder defaults are "
+                             "wrong\n");
+                rc = 16430;
+                goto done;
+            }
+
+            x[0] = kQb; x[1] = 0xCAFE;
+            queue_builder_set_device(ctx, x);
+            x[0] = kQb; x[1] = 3;
+            queue_builder_set_flags(ctx, x);
+            x[0] = kQb; x[1] = 1;
+            queue_builder_set_priority(ctx, x);
+            x[0] = kQb; x[1] = 0x1000;
+            queue_builder_set_command_size(ctx, x);
+            x[0] = kQb; x[1] = 0x2000;
+            queue_builder_set_compute_size(ctx, x);
+            x[0] = kQb; x[1] = 0x1000;
+            queue_builder_set_control_size(ctx, x);
+            x[0] = kQb; x[1] = 0x80;
+            queue_builder_set_flush_threshold(ctx, x);
+            x[0] = kQb;
+            x[1] = reinterpret_cast<uint64_t>(queueMemory);
+            x[2] = sizeof(queueMemory);
+            queue_builder_set_memory(ctx, x);
+            if (qbGet(queue_builder_get_device) != 0xCAFE ||
+                qbGet(queue_builder_get_flags) != 3 ||
+                qbGet(queue_builder_get_priority) != 1 ||
+                qbGet(queue_builder_get_command_size) != 0x1000 ||
+                qbGet(queue_builder_get_compute_size) != 0x2000 ||
+                qbGet(queue_builder_get_control_size) != 0x1000 ||
+                qbGet(queue_builder_get_flush_threshold) != 0x80 ||
+                qbGet(queue_builder_get_queue_memory_size) != 0x4000 ||
+                qbGet(queue_builder_get_memory) !=
+                    reinterpret_cast<uint64_t>(queueMemory) ||
+                qbGet(queue_builder_get_memory_size) != sizeof(queueMemory)) {
+                std::fprintf(stderr,
+                             "[selftest] queue/sync: builder getters did not "
+                             "round-trip the setters\n");
+                rc = 16430;
+                goto done;
+            }
+
+            x[0] = kQueue; x[1] = kQb;
+            queue_initialize(ctx, x);
+            if (x[0] != 1) {
+                std::fprintf(stderr,
+                             "[selftest] queue/sync: queue initialize failed\n");
+                rc = 16430;
+                goto done;
+            }
+            alignas(16) char queueLabel[] = "selftest queue";
+            x[0] = kQueue;
+            x[1] = reinterpret_cast<uint64_t>(queueLabel);
+            queue_set_debug_label(ctx, x);
+            NvnQueue* qst = find<NvnQueue>(kQueue);
+            if (!qst || qst->device != 0xCAFE ||
+                qst->label != "selftest queue") {
+                std::fprintf(stderr,
+                             "[selftest] queue/sync: queue state did not "
+                             "record device/label\n");
+                rc = 16430;
+                goto done;
+            }
+            x[0] = kQueue;
+            queue_get_error(ctx, x);
+            if (x[0] != 0 || qbGet(queue_builder_get_memory) == 0) {
+                std::fprintf(stderr,
+                             "[selftest] queue/sync: queue error or memory "
+                             "getter is wrong\n");
+                rc = 16430;
+                goto done;
+            }
+
+            Pool* evPool = find_or_add<Pool>(kEventPool);
+            evPool->storage = &eventValue;
+            evPool->size = sizeof(eventValue);
+            x[0] = kQb;
+            event_builder_set_defaults(ctx, x);
+            x[0] = kQb; x[1] = kEventPool; x[2] = 0;
+            event_builder_set_storage(ctx, x);
+            x[0] = kEvent; x[1] = kQb;
+            event_initialize(ctx, x);
+            if (x[0] != 1) {
+                std::fprintf(stderr,
+                             "[selftest] queue/sync: event initialize failed\n");
+                rc = 16430;
+                goto done;
+            }
+            x[0] = kEvent; x[1] = 0; x[2] = 7;
+            event_signal(ctx, x);
+            x[0] = kEvent;
+            event_get_value(ctx, x);
+            if (x[0] != 7) {
+                std::fprintf(stderr,
+                             "[selftest] queue/sync: event write got %llu\n",
+                             static_cast<unsigned long long>(x[0]));
+                rc = 16430;
+                goto done;
+            }
+            x[0] = kEvent; x[1] = 1; x[2] = 5;
+            event_signal(ctx, x);
+            x[0] = kEvent;
+            event_get_value(ctx, x);
+            if (x[0] != 12) {
+                std::fprintf(stderr,
+                             "[selftest] queue/sync: event add got %llu\n",
+                             static_cast<unsigned long long>(x[0]));
+                rc = 16430;
+                goto done;
+            }
+
+            x[0] = kSync; x[1] = 0xCAFE;
+            sync_initialize(ctx, x);
+            if (x[0] != 1) {
+                std::fprintf(stderr,
+                             "[selftest] queue/sync: sync initialize failed\n");
+                rc = 16430;
+                goto done;
+            }
+            x[0] = kSync; x[1] = 0;
+            sync_wait(ctx, x);
+            if (x[0] != 2) {
+                std::fprintf(stderr,
+                             "[selftest] queue/sync: unfenced wait got %llu\n",
+                             static_cast<unsigned long long>(x[0]));
+                rc = 16430;
+                goto done;
+            }
+
+            x[0] = kEventCb;
+            cmdbuf_initialize(ctx, x);
+            if (x[0] != 1) {
+                std::fprintf(stderr,
+                             "[selftest] queue/sync: command buffer initialize "
+                             "failed\n");
+                rc = 16430;
+                goto done;
+            }
+            x[0] = kEventCb; x[1] = kEventPool; x[2] = 0; x[3] = 0x1000;
+            cmdbuf_add_command_memory(ctx, x);
+            x[0] = kEventCb; x[1] = reinterpret_cast<uint64_t>(queueMemory);
+            x[2] = 0x400;
+            cmdbuf_add_control_memory(ctx, x);
+            x[0] = kEventCb;
+            cmdbuf_begin_recording(ctx, x);
+            x[0] = kEventCb; x[1] = kSync;
+            cmdbuf_fence_sync(ctx, x);
+            x[0] = kEventCb; x[1] = kEvent; x[2] = 0; x[3] = 0; x[4] = 0;
+            x[5] = 9;
+            cmdbuf_signal_event(ctx, x);
+            x[0] = kEventCb;
+            cmdbuf_end_recording(ctx, x);
+            const uint64_t handle = x[0];
+            if (handle != kEventCb) {
+                std::fprintf(stderr,
+                             "[selftest] queue/sync: EndRecording handle %llx\n",
+                             static_cast<unsigned long long>(handle));
+                rc = 16430;
+                goto done;
+            }
+            x[0] = kQueue; x[1] = 1; x[2] =
+                reinterpret_cast<uint64_t>(&handle);
+            queue_submit_commands(ctx, x);
+            if (qst->submits != 1 || qst->commandUsed != 0x1000 ||
+                qst->controlUsed != 0x400) {
+                std::fprintf(stderr,
+                             "[selftest] queue/sync: submit accounting "
+                             "%u/%llu/%llu\n", qst->submits,
+                             static_cast<unsigned long long>(qst->commandUsed),
+                             static_cast<unsigned long long>(qst->controlUsed));
+                rc = 16430;
+                goto done;
+            }
+            x[0] = kSync; x[1] = 5000000000ull;
+            sync_wait(ctx, x);
+            if (x[0] != 0 && x[0] != 1) {
+                std::fprintf(stderr,
+                             "[selftest] queue/sync: fenced wait got %llu\n",
+                             static_cast<unsigned long long>(x[0]));
+                rc = 16430;
+                goto done;
+            }
+            x[0] = kEvent;
+            event_get_value(ctx, x);
+            if (x[0] != 9) {
+                std::fprintf(stderr,
+                             "[selftest] queue/sync: GPU event signal got %llu\n",
+                             static_cast<unsigned long long>(x[0]));
+                rc = 16430;
+                goto done;
+            }
+            x[0] = kQueue; x[1] = 0;
+            queue_reset_memory_usage(ctx, x);
+            if (qst->commandUsed != 0 || qst->controlUsed != 0) {
+                std::fprintf(stderr,
+                             "[selftest] queue/sync: memory reset failed\n");
+                rc = 16430;
+                goto done;
+            }
+
+            Win* qw = find_or_add<Win>(kEventWin);
+            qw->numTextures = 2;
+            int acquired = -1;
+            x[0] = kQueue; x[1] = kEventWin;
+            x[2] = reinterpret_cast<uint64_t>(&acquired);
+            queue_acquire_texture(ctx, x);
+            if (x[0] != 0 || acquired != 0) {
+                std::fprintf(stderr,
+                             "[selftest] queue/sync: acquire got %llu/%d\n",
+                             static_cast<unsigned long long>(x[0]), acquired);
+                rc = 16430;
+                goto done;
+            }
+            x[0] = kQueue; x[1] = kEventWin;
+            x[2] = reinterpret_cast<uint64_t>(&acquired);
+            queue_acquire_texture(ctx, x);
+            if (x[0] != 0 || acquired != 1) {
+                std::fprintf(stderr,
+                             "[selftest] queue/sync: acquire cursor got %d\n",
+                             acquired);
+                rc = 16430;
+                goto done;
+            }
+            queue_finish(ctx, x);
+            x[0] = kEventCb;
+            cmdbuf_finalize(ctx, x);
+            x[0] = kEvent;
+            event_finalize(ctx, x);
+            x[0] = kSync;
+            sync_finalize(ctx, x);
+            x[0] = kQueue;
+            queue_finalize(ctx, x);
+            forget<Win>(kEventWin);
+            forget<Pool>(kEventPool);
+            if (find<NvnQueue>(kQueue) || find<NvnSync>(kSync) ||
+                find<NvnEvent>(kEvent) || find<CmdBuf>(kEventCb)) {
+                std::fprintf(stderr,
+                             "[selftest] queue/sync: finalize left an object\n");
+                rc = 16430;
+                goto done;
+            }
+            std::fprintf(stderr,
+                         "[selftest] queue/sync: 19 builder entries, queue "
+                         "lifecycle/accounting, sync waits, CPU and "
+                         "command-buffer events all round-tripped\n");
         }
 
     done:
