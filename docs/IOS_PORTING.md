@@ -3,7 +3,7 @@
 本文是 `ios/` 目录的操作手册。它描述的是**已经写进仓库的东西**和
 **机器能验证的事实**，不是你付钱就能玩到游戏的承诺。当前状态一句话：
 
-> iOS 侧的壳、C ABI、513 个 NVN 入口点的分发表、422 个 Metal 后端入口，
+> iOS 侧的壳、C ABI、513 个 NVN 入口点的分发表、435 个 Metal 后端入口，
 > 都能在非 Apple 主机上编译并跑通自测；纹理能建、渲染目标能绑、encoder
 > 能开，program -> pipeline -> draw -> 回读这条链已经在 **CI 的 iOS 模拟器**
 > 里跑通了十八条合成 draw（模拟器实际执行十七条）与七阶段 instanced / base-vertex / indirect draw 回归，其中包括从 guest 内存池
@@ -28,16 +28,16 @@ ios/BotW/BotWBridge.h         Swift/ObjC 桥接头，只 #import botw_core.h
 ios/project.yml               XcodeGen 工程描述（不提交 .xcodeproj）
 ios/nvn/registry.json         513 个入口点，从标题自己的 getproc 字符串提取
 ios/nvn/signatures.json       477 个参数形状（公开 nxnative 原型表，MIT）
-ios/nvn/inferred_signatures.json  17 个按命名对称性推断的形状，单独标注
+ios/nvn/inferred_signatures.json  22 个按命名对称性推断的形状，单独标注
 ios/nvn/include/nvn_api.h     生成：名字表 + 函数指针 ABI
 ios/nvn/src/nvn_dispatch.cpp  生成：二分查找 + 缺失上报
 ios/nvn/include/nvn_backend.h 后端接口（null / metal 二选一）
 ios/nvn/src/nvn_null.cpp      空后端，任何主机都能编译
-ios/nvn/src/nvn_metal.mm      Metal 后端（422 个入口，含大量 TODO）
+ios/nvn/src/nvn_metal.mm      Metal 后端（435 个入口，含大量 TODO）
 ios/nvn/src/nvn_texture.c     157 项 NVNformat -> MTLPixelFormat 表（附 lossy 标记）
 ios/nvn/include/nvn_texture.h 纹理描述结构 + 表查询接口
 ios/nvn/src/nvn_shader.c      着色器翻译的唯一接口：现在只会说"没有翻译器"
-ios/nvn/implemented_metal.txt 422 行，和 BIND(...) 列表由门禁强制相等
+ios/nvn/implemented_metal.txt 435 行，和 BIND(...) 列表由门禁强制相等
 ios/nvn/shaders/              空目录 + 路线说明（见该目录 README）
 docs/NVN_COVERAGE.md          生成的逐域覆盖表
 scripts/                      提取、生成、校验、编译脚本
@@ -80,7 +80,7 @@ nvn_shader_test: ok (seam, blob table, packed slots, bindless, c1, SHA-256, shad
 nvn_vertex_test: ok (packing, 26 formats, layout id)  exit=0
 nvn_texlayout_test: ok (block shapes, sizes, offsets, round trip, linear, write region, refusals)  exit=0
 syntax_check_metal: ok (clang++.exe)
-verify_ios: ok (metal bindings: 422/513)
+verify_ios: ok (metal bindings: 435/513)
 build_abi_test: all tests passed
 ```
 
@@ -193,7 +193,7 @@ typedef void (*nvngfx_proc)(nvngfx_ctx* ctx, nvngfx_args* args);
 参数形状从哪来：`scripts/extract_nvn_signatures.py` 解析公开项目
 [nxnative](https://github.com/seedds/nxnative) 的 `dm/gfx/nvn/nvn_protos.h`
 （MIT），只保留**名字 / 返回类型 / 参数类型**，头文件本身不入库。477 个入口有
-源码可依；剩下 17 个（`nvnDeviceBuilderGetFlags`、10 个 QueueBuilder 入口等）在
+源码可依；剩下 22 个（`nvnDeviceBuilderGetFlags`、10 个 QueueBuilder 入口等）在
 `ios/nvn/inferred_signatures.json` 里单独标注为"按命名对称性推断"，
 `verify_ios.py` 分开计数，不会被悄悄算进已验证的一类。
 
@@ -224,7 +224,7 @@ iOS 是统一内存，guest 堆本来就是宿主可读的，所以
 
 ---
 
-## 6. 已经实现的 422 个入口点
+## 6. 已经实现的 435 个入口点
 
 按域分布（完整明细见 `docs/NVN_COVERAGE.md`）：
 
@@ -237,7 +237,7 @@ iOS 是统一内存，guest 堆本来就是宿主可读的，所以
 | SamplerBuilder | 24/25 | 状态 setter/getter 与 Metal 采样器创建 |
 | Sampler | 14/15 | builder -> `MTLSamplerState` |
 | SamplerPool / TexturePool | 8/8 + 8/8 | 注册、句柄、pool 绑定与 `GetMemoryPool` |
-| Window / WindowBuilder | 6/12 + 5/12 | CAMetalLayer、acquire、present interval、active textures |
+| Window / WindowBuilder | 12/12 + 12/12 | CAMetalLayer、acquire、present interval、active textures；builder 的 device / native window / 纹理列表可回读，window 侧 native window / present interval / active count / crop / debug label 可读写 |
 | MemoryPool / MemoryPoolBuilder | 9/10 + 8/8 | storage/flags/device、initialize(零拷贝)、地址/映射/尺寸查询、mapped-range coherency 空操作 |
 | Buffer / BufferBuilder | 11/11 + 7/7 | builder storage(pool, offset, size) -> 地址/映射/尺寸/调试 ID；buffer 是 pool 的视图，不另拷贝 |
 | Queue | 15/15 | initialize / finalize、flush、finish、getError、submitCommands 记账、acquireTexture 轮转、fenceSync、debug label、memory usage reset；presentTexture 仍走 blit 快路径 |
@@ -251,12 +251,17 @@ iOS 是统一内存，guest 堆本来就是宿主可读的，所以
 | DepthStencilState / PolygonState | 13/13 + 9/9 | 默认值、深度/模板/剔除/偏移 setter 与全部 getter；双面 stencil func/op 可分别回读 |
 | MultisampleState / ChannelMaskState | 22/23 + 3/3 | 默认值、采样数、coverage 相关 setter、写掩码与 10 个单字节 getter；SampleLocationsGrid 因状态里没有网格尺寸保留 |
 
-上表是主要域；完整 29 个域共 **422/513**，逐项状态见 `docs/NVN_COVERAGE.md`。
+上表是主要域；完整 29 个域共 **435/513**，逐项状态见 `docs/NVN_COVERAGE.md`。
 
 纹理侧最近两批：14 个 `NVNtextureView` 状态入口（16 字节实测布局，7 个 setter / 6 个 getter /
 字段比较）；texture builder 的 device / swizzle / GL 名称 / depth-stencil mode 三组读写、
 `nvnTextureGetDepthStencilMode`、`nvnTextureGetViewOffset`、`nvnTextureCompare`，以及 texture /
 sampler descriptor pool 的 `GetMemoryPool`。自测码 `16432`（view）与 `16433`（texture state）。
+
+Window / WindowBuilder 侧补齐 13 个入口：builder 的 device / native window / present interval /
+纹理列表与 active count 可回读，`SetDefaults` 会清空纹理列表但保留 device；window 侧的
+native window / present interval / active count / crop / debug label 可读写。`GetCrop` 未设置时
+返回第一个交换链纹理的尺寸；`SetCrop` 目前只记录，present blit 还没有消费它。自测码 `16434`。
 
 **必须说清楚的七件事**，否则这张表会误导人：
 
@@ -653,7 +658,7 @@ constexpr int kEnumsVerified = 0;
 
 ---
 
-## 10. 剩余 91 个入口点的优先级
+## 10. 剩余 78 个入口点的优先级
 
 不要按字母序做。按“挡住第一个 draw call 的”排序：
 
@@ -721,4 +726,4 @@ Swift 侧同理：`Renderer.swift` / `GameView.swift` 只做了括号与结构�
 | `[nvn] nvnCommandBufferDraw.pipeline: no translator...` | 正常，这条就是当前的墙；自检不经过它 |
 | 屏幕全黑且 `frame` 不动 | `MTKView.delegate` 是 weak，Pump 必须被 Coordinator 强引用（已在 `GameView.swift` 修过一次） |
 | `[nvn] UNVERIFIED xxx = 0x...` | 正常，那是诚实闸门在报未验证的枚举 |
-| `[nvn] not implemented: nvnYyy` | 该入口不在 422 个里，按第 10 节排期 |
+| `[nvn] not implemented: nvnYyy` | 该入口不在 435 个里，按第 10 节排期 |

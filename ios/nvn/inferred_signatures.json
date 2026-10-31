@@ -1,7 +1,7 @@
 {
   "source": "hand-written: derived from the Set/Get naming symmetry, NOT from a header",
   "note": "These entry points are absent from the public nvn_protos.h. Their shapes are inferred from their siblings: the window/device/buffer/texture-builder getters mirror their Set siblings, and the QueueBuilder getters mirror QueueBuilderSet* plus QueueBuilderGetQueueMemorySize. verify_ios.py counts them separately so a guess is never silently folded into the verified set.",
-  "count": 17,
+  "count": 22,
   "procs": [
     {
       "name": "nvnBufferBuilderGetDevice",
@@ -131,6 +131,43 @@
       "inferred": true
     },
     {
+      "name": "nvnWindowBuilderGetDevice",
+      "ret": "NVNdevice*",
+      "params": [
+        "const NVNwindowBuilder*"
+      ],
+      "arity": 1,
+      "inferred": true
+    },
+    {
+      "name": "nvnWindowBuilderGetNumActiveTextures",
+      "ret": "int",
+      "params": [
+        "const NVNwindowBuilder*"
+      ],
+      "arity": 1,
+      "inferred": true
+    },
+    {
+      "name": "nvnWindowBuilderGetNumTextures",
+      "ret": "int",
+      "params": [
+        "const NVNwindowBuilder*"
+      ],
+      "arity": 1,
+      "inferred": true
+    },
+    {
+      "name": "nvnWindowBuilderGetTexture",
+      "ret": "NVNtexture*",
+      "params": [
+        "const NVNwindowBuilder*",
+        "int"
+      ],
+      "arity": 2,
+      "inferred": true
+    },
+    {
       "name": "nvnWindowBuilderSetNumActiveTextures",
       "ret": "void",
       "params": [
@@ -138,6 +175,15 @@
         "int"
       ],
       "arity": 2,
+      "inferred": true
+    },
+    {
+      "name": "nvnWindowGetNumActiveTextures",
+      "ret": "int",
+      "params": [
+        "const NVNwindow*"
+      ],
+      "arity": 1,
       "inferred": true
     },
     {

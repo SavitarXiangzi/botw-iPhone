@@ -5745,3 +5745,86 @@ git diff --check
 GL 名称没有 interop；view 的 swizzle/dsmode 仍未应用到实际采样；`Compare`
 与 `GetViewOffset` 的语义来自公开实现而非 Nintendo 文档。真实标题的 draw
 仍是 0 条，不能据此声称游戏已经能在 iPhone 上运行。
+
+### 6. CI 反馈与修复
+
+run `41190680145` 的 `portable` job 成功，但 macOS `ios` job 在模拟器自测阶段
+以 `BOTW_SELFTEST rc=16433` 失败。原因不在产品逻辑：本轮新增自测错误地把
+`nvnTextureBuilderGetSwizzle` 和 `nvnTextureGetSwizzle` 的 **void** 返回值
+当作 `NVNboolean` 读取，断言了 `x[0]`。提交 `f0d2e35` 只修自测，调用后改为
+只检查四个 swizzle 输出指针。
+
+修复推送后的 run `41191476518` 的 `portable` 与 macOS `ios` job 均成功；模拟器
+自测通过 16433 回归，设备 Debug 构建与 Release 拒绝门禁也通过。这个修复不改变
+texture builder / view 状态的产品代码，也不改变 422 implemented 的覆盖数字。
+
+## M4 续二十三：Window / WindowBuilder 状态
+
+Window 侧此前只实现了少数 setter，builder 和 window 的查询入口仍会落到日志桩。
+本轮补齐 13 个低风险入口，不触碰 present 像素：
+
+* WindowBuilder：`SetDevice` / `GetDevice`、`GetNativeWindow`、
+  `GetPresentInterval`、`GetNumTextures`、`GetNumActiveTextures`、
+  `GetTexture`；
+* Window：`GetNumActiveTextures`、`GetNativeWindow`、`GetPresentInterval`、
+  `SetDebugLabel`、`SetCrop` / `GetCrop`。
+
+Metal 覆盖从 **422/513（82.3%）** 到 **435/513（84.8%）**，未实现 78。
+推断签名从 17 增加到 22；实测签名仍为 477，max arity 8。
+
+### 1. Builder 默认值与持久字段
+
+`nvnWindowBuilderSetDefaults` 清空记录的纹理列表、native window 和 active
+count，把 present interval 恢复为 1，但保留先前 `SetDevice` 记录的 device。
+这与 nxnative 的 builder 行为一致，也避免复用的 builder 把上一个窗口的
+交换链纹理带进来。
+
+builder getter 从 setter 记录的 `WinSpec` 回读；没有调用过 `SetDefaults` 的
+builder 按默认状态回答：interval 1、无纹理。`GetTexture` 对负索引和越界索引
+返回 0。`nvnWindowBuilderGetDevice`、`GetNumTextures`、`GetNumActiveTextures`
+和 `GetTexture` 不在公开原型表中，签名按 setter/兄弟入口推断，并单独记入
+`inferred_signatures.json`，没有混进实测集合。
+
+### 2. Window 状态与 crop 边界
+
+`nvnWindowInitialize` 现在把 builder 的 native window、纹理列表、active count
+和 present interval 复制到 window 对象；复用同一个 window 地址时会重置
+crop、debug label 和交换链游标。window getter 回读这些记录值。
+
+`nvnWindowSetCrop` 记录 `x/y/width/height`，`nvnWindowGetCrop` 在没有设置过
+有效 crop 时返回第一个交换链纹理的尺寸（测试纹理为 64×64，因此默认值是
+`0,0,64,64`）。**crop 目前只记录，present blit 还没有消费它**，不能声称
+窗口裁剪已经真正影响上屏。debug label 也只保存在宿主对象上，CAMetalLayer
+没有对应的跨帧调试名称。
+
+### 3. 模拟器自测
+
+新增失败码 `16434`，覆盖：
+
+1. 未默认化的 builder 返回 interval 1、无纹理；
+2. `SetDevice` 后 `SetDefaults` 保留 device、清空纹理并把 interval 归 1；
+3. native window、present interval、纹理列表、active count 与逐个纹理索引回读；
+4. window 初始化后的 getter 回读；
+5. crop 的 `1,2,3,4` 往返与未设置时的 `0,0,64,64` 默认值；
+6. debug label 存储和读取。
+
+### 4. 门禁
+
+```text
+python scripts/syntax_check_metal.py
+python scripts/gen_nvn.py --repo . --check
+python scripts/extract_nvn_signatures.py --check
+python scripts/verify_ios.py
+powershell -ExecutionPolicy Bypass -File scripts/build_abi_test.ps1
+git diff --check
+```
+
+本地已通过（513 procs / 435 implemented / 477 measured + 22 inferred）。
+Window 批次的 CI 结果在推送后补记。
+
+### 5. 仍然没有闭环的部分
+
+窗口 crop 没有进入 present blit，native window 仍不能被当作 CAMetalLayer
+使用，present interval 也只在 guest 侧记录；这次不能声称“窗口呈现链路已经
+闭环”。真实标题的 draw 仍为 0 条，核心的 Maxwell SASS → MSL 离线翻译和
+通用 texture view 绑定仍未完成。

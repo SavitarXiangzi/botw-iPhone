@@ -255,11 +255,17 @@ struct Ctx {
 
 struct Win {
     CAMetalLayer* layer = nil;
+    uint64_t nativeWindow = 0;
     unsigned numTextures = 0;
     unsigned numActive = 0;
     unsigned presentInterval = 1;
     unsigned cursor = 0;
     uint64_t textures[4] = {0, 0, 0, 0};   /* guest NVNtexture addresses */
+    /* nvnWindowSetCrop: x, y, width, height.  Zero width/height means "no
+     * crop set"; GetCrop then reports the first texture's size, as NVN
+     * starts a window out.  The present path does not consume this yet. */
+    int crop[4] = {0, 0, 0, 0};
+    std::string label;
 };
 
 struct Pool {
@@ -641,6 +647,7 @@ struct CmdBuf {
  * yet.  Keeping the mapping here means only one place has to change once the
  * real offsets are known. */
 struct WinSpec {
+    uint64_t device = 0;
     uint64_t nativeWindow = 0;
     unsigned presentInterval = 1;
     unsigned numActive = 0;
@@ -915,9 +922,22 @@ void dev_get_proc_address(nvngfx_ctx*, uint64_t* x) {
 /* window                                                              */
 /* ------------------------------------------------------------------ */
 
-/* nvnWindowBuilderSetDefaults(NVNwindowBuilder*) */
+/* nvnWindowBuilderSetDefaults(NVNwindowBuilder*).  Resets the recorded
+ * builder state (nxnative: memset except the device, interval 1) so a reused
+ * builder does not keep an earlier window's textures. */
 void win_builder_set_defaults(nvngfx_ctx*, uint64_t* x) {
-    if (x[0]) (void)guest_write(x[0], 0x40);
+    if (!x[0]) return;
+    (void)guest_write(x[0], 0x40);
+    WinSpec& s = g_win_specs[x[0]];
+    const uint64_t device = s.device;
+    s = WinSpec();
+    s.device = device;
+    s.presentInterval = 1;
+}
+
+/* nvnWindowBuilderSetDevice(NVNwindowBuilder*, NVNdevice*) */
+void win_builder_set_device(nvngfx_ctx*, uint64_t* x) {
+    if (x[0]) g_win_specs[x[0]].device = x[1];
 }
 
 /* nvnWindowBuilderSetNativeWindow(NVNwindowBuilder*, NVNnativeWindow) */
@@ -943,6 +963,50 @@ void win_builder_set_present_interval(nvngfx_ctx*, uint64_t* x) {
  * NOTE: inferred shape, see ios/nvn/inferred_signatures.json. */
 void win_builder_set_num_active_textures(nvngfx_ctx*, uint64_t* x) {
     g_win_specs[x[0]].numActive = static_cast<unsigned>(x[1]);
+}
+
+/* Builder getters answer from the setter-recorded state.  A builder that was
+ * never defaulted reads as NVN's default: interval 1, no textures. */
+const WinSpec& win_spec_or_default(uint64_t builder) {
+    static const WinSpec fallback = [] {
+        WinSpec s;
+        s.presentInterval = 1;
+        return s;
+    }();
+    auto it = g_win_specs.find(builder);
+    return it == g_win_specs.end() ? fallback : it->second;
+}
+
+/* nvnWindowBuilderGetDevice.  Absent from the public prototype table; shape
+ * inferred from nvnBufferBuilderGetDevice (listed in
+ * inferred_signatures.json). */
+void win_builder_get_device(nvngfx_ctx*, uint64_t* x) {
+    auto it = g_win_specs.find(x[0]);
+    x[0] = it == g_win_specs.end() ? 0 : it->second.device;
+}
+void win_builder_get_native_window(nvngfx_ctx*, uint64_t* x) {
+    x[0] = win_spec_or_default(x[0]).nativeWindow;
+}
+void win_builder_get_present_interval(nvngfx_ctx*, uint64_t* x) {
+    x[0] = static_cast<uint64_t>(
+        static_cast<uint32_t>(win_spec_or_default(x[0]).presentInterval));
+}
+void win_builder_get_num_textures(nvngfx_ctx*, uint64_t* x) {
+    x[0] = static_cast<uint64_t>(
+        static_cast<uint32_t>(win_spec_or_default(x[0]).numTextures));
+}
+void win_builder_get_num_active(nvngfx_ctx*, uint64_t* x) {
+    x[0] = static_cast<uint64_t>(
+        static_cast<uint32_t>(win_spec_or_default(x[0]).numActive));
+}
+/* nvnWindowBuilderGetTexture(builder, int index) -> NVNtexture*.  The index
+ * is checked against the count SetTextures recorded; -1/out of range is 0. */
+void win_builder_get_texture(nvngfx_ctx*, uint64_t* x) {
+    const WinSpec& s = win_spec_or_default(x[0]);
+    const int index = static_cast<int>(x[1]);
+    x[0] = (index >= 0 && index < static_cast<int>(s.numTextures))
+               ? s.textures[index]
+               : 0u;
 }
 
 /* nvnWindowInitialize(NVNwindow*, const NVNwindowBuilder*) -> NVNboolean */
@@ -972,10 +1036,15 @@ void win_initialize(nvngfx_ctx* ctx, uint64_t* x) {
     /* There is no present-interval property on iOS: CAMetalLayer.displaySyncEnabled
      * is macOS-only (the iOS 17 SDK rejects it -- CI caught this).  On iOS v-sync
      * is implicit, so maximumDrawableCount below is the only pacing knob we own. */
+    w->nativeWindow = spec.nativeWindow;
     w->numTextures = spec.numTextures;
     w->numActive = spec.numActive ? spec.numActive : spec.numTextures;
     w->presentInterval = spec.presentInterval;
     for (unsigned i = 0; i < 4; ++i) w->textures[i] = spec.textures[i];
+    /* A reused window object starts with no crop, no label and image 0. */
+    for (unsigned i = 0; i < 4; ++i) w->crop[i] = 0;
+    w->label.clear();
+    w->cursor = 0;
 
     /* Keep the drawable count to the active texture count so the CPU can run
      * ahead exactly as far as the guest's own swapchain allows. */
@@ -1008,6 +1077,60 @@ void win_acquire_texture(nvngfx_ctx*, uint64_t* x) {
 void win_get_num_textures(nvngfx_ctx*, uint64_t* x) {
     Win* w = find<Win>(x[0]);
     x[0] = w ? w->numTextures : 0u;
+}
+
+/* nvnWindowGetNumActiveTextures (inferred shape, see
+ * inferred_signatures.json). */
+void win_get_num_active(nvngfx_ctx*, uint64_t* x) {
+    Win* w = find<Win>(x[0]);
+    x[0] = w ? static_cast<uint64_t>(w->numActive) : 0u;
+}
+
+void win_get_native_window(nvngfx_ctx*, uint64_t* x) {
+    Win* w = find<Win>(x[0]);
+    x[0] = w ? w->nativeWindow : 0u;
+}
+
+void win_get_present_interval(nvngfx_ctx*, uint64_t* x) {
+    Win* w = find<Win>(x[0]);
+    x[0] = w ? static_cast<uint64_t>(
+                   static_cast<uint32_t>(w->presentInterval))
+             : 0u;
+}
+
+/* nvnWindowSetDebugLabel(NVNwindow*, const char*).  Stored on the object;
+ * CAMetalLayer has no debug name that survives a frame, so nothing else is
+ * changed. */
+void win_set_debug_label(nvngfx_ctx*, uint64_t* x) {
+    Win* w = find<Win>(x[0]);
+    if (!w) return;
+    const char* label = guest_ptr<const char>(x[1]);
+    w->label = label ? label : "";
+}
+
+/* nvnWindowSetCrop(window, x, y, width, height) / GetCrop(window, rect*).
+ * Stored, not yet applied by the present blit.  Before any SetCrop, GetCrop
+ * reports the first swapchain texture's size (nxnative's rule). */
+void win_set_crop(nvngfx_ctx*, uint64_t* x) {
+    Win* w = find<Win>(x[0]);
+    if (!w) return;
+    for (unsigned i = 0; i < 4; ++i)
+        w->crop[i] = static_cast<int>(x[1 + i]);
+}
+
+void win_get_crop(nvngfx_ctx*, uint64_t* x) {
+    Win* w = find<Win>(x[0]);
+    int* out = guest_ptr<int>(x[1]);
+    if (!w || !out) return;
+    if (w->crop[2] > 0 && w->crop[3] > 0) {
+        for (unsigned i = 0; i < 4; ++i) out[i] = w->crop[i];
+        return;
+    }
+    const Tex* t = w->numTextures ? find<Tex>(w->textures[0]) : nullptr;
+    out[0] = 0;
+    out[1] = 0;
+    out[2] = t ? static_cast<int>(t->width) : 0;
+    out[3] = t ? static_cast<int>(t->height) : 0;
 }
 
 /* nvnWindowSetPresentInterval(NVNwindow*, int) */
@@ -9058,13 +9181,26 @@ const Binding kBindings[] = {
     BIND("nvnDeviceGetImageHandle", dev_get_image_handle),
 
     BIND("nvnWindowBuilderSetDefaults", win_builder_set_defaults),
+    BIND("nvnWindowBuilderSetDevice", win_builder_set_device),
     BIND("nvnWindowBuilderSetNativeWindow", win_builder_set_native_window),
     BIND("nvnWindowBuilderSetTextures", win_builder_set_textures),
     BIND("nvnWindowBuilderSetPresentInterval", win_builder_set_present_interval),
     BIND("nvnWindowBuilderSetNumActiveTextures", win_builder_set_num_active_textures),
+    BIND("nvnWindowBuilderGetDevice", win_builder_get_device),
+    BIND("nvnWindowBuilderGetNativeWindow", win_builder_get_native_window),
+    BIND("nvnWindowBuilderGetPresentInterval", win_builder_get_present_interval),
+    BIND("nvnWindowBuilderGetNumTextures", win_builder_get_num_textures),
+    BIND("nvnWindowBuilderGetNumActiveTextures", win_builder_get_num_active),
+    BIND("nvnWindowBuilderGetTexture", win_builder_get_texture),
     BIND("nvnWindowInitialize", win_initialize),
     BIND("nvnWindowAcquireTexture", win_acquire_texture),
     BIND("nvnWindowGetNumTextures", win_get_num_textures),
+    BIND("nvnWindowGetNumActiveTextures", win_get_num_active),
+    BIND("nvnWindowGetNativeWindow", win_get_native_window),
+    BIND("nvnWindowGetPresentInterval", win_get_present_interval),
+    BIND("nvnWindowSetDebugLabel", win_set_debug_label),
+    BIND("nvnWindowSetCrop", win_set_crop),
+    BIND("nvnWindowGetCrop", win_get_crop),
     BIND("nvnWindowSetPresentInterval", win_set_present_interval),
     BIND("nvnWindowSetNumActiveTextures", win_set_num_active_textures),
     BIND("nvnWindowFinalize", win_finalize),
@@ -16786,6 +16922,204 @@ extern "C" int nvngfx_metal_selftest(void) {
             forget<Tex>(kXtbCopy);
             forget<Tex>(kXtbOther);
             g_tex_specs.erase(kXtb);
+        }
+
+        {
+            /* --- window builder / window state ------------------------- */
+            alignas(16) unsigned char wb[0x40] = {};
+            alignas(16) unsigned char wo[0x40] = {};
+            alignas(16) unsigned char wo2[0x40] = {};
+            const uint64_t kWb = reinterpret_cast<uint64_t>(wb);
+            const uint64_t kWo = reinterpret_cast<uint64_t>(wo);
+            const uint64_t kWo2 = reinterpret_cast<uint64_t>(wo2);
+            uint64_t z[8] = {};
+            const uint64_t wt[2] = {kTex, kTexSrc};
+            int crop[4] = {-1, -1, -1, -1};
+
+            z[0] = kWb;
+            win_builder_set_defaults(ctx, z);
+            z[0] = kWb;
+            win_builder_get_present_interval(ctx, z);
+            const uint64_t defInterval = z[0];
+            z[0] = kWb;
+            win_builder_get_num_textures(ctx, z);
+            const uint64_t defTextures = z[0];
+            z[0] = kWb;
+            win_builder_get_num_active(ctx, z);
+            const uint64_t defActive = z[0];
+            z[0] = kWb; z[1] = 0;
+            win_builder_get_texture(ctx, z);
+            const uint64_t defTexture = z[0];
+
+            z[0] = kWb; z[1] = 0xBEEF;
+            win_builder_set_device(ctx, z);
+            z[0] = kWb; z[1] = 0x1234;
+            win_builder_set_native_window(ctx, z);
+            z[0] = kWb; z[1] = 2;
+            z[2] = reinterpret_cast<uint64_t>(&wt[0]);
+            win_builder_set_textures(ctx, z);
+            z[0] = kWb; z[1] = 2;
+            win_builder_set_present_interval(ctx, z);
+            z[0] = kWb; z[1] = 2;
+            win_builder_set_num_active_textures(ctx, z);
+
+            z[0] = kWb;
+            win_builder_get_device(ctx, z);
+            const uint64_t wbDevice = z[0];
+            z[0] = kWb;
+            win_builder_get_native_window(ctx, z);
+            const uint64_t wbNative = z[0];
+            z[0] = kWb;
+            win_builder_get_present_interval(ctx, z);
+            const uint64_t wbInterval = z[0];
+            z[0] = kWb;
+            win_builder_get_num_textures(ctx, z);
+            const uint64_t wbTextures = z[0];
+            z[0] = kWb;
+            win_builder_get_num_active(ctx, z);
+            const uint64_t wbActive = z[0];
+            z[0] = kWb; z[1] = 0;
+            win_builder_get_texture(ctx, z);
+            const uint64_t wbTex0 = z[0];
+            z[0] = kWb; z[1] = 1;
+            win_builder_get_texture(ctx, z);
+            const uint64_t wbTex1 = z[0];
+            z[0] = kWb; z[1] = 2;
+            win_builder_get_texture(ctx, z);
+            const uint64_t wbTex2 = z[0];
+            z[0] = kWb; z[1] = -1;
+            win_builder_get_texture(ctx, z);
+            const uint64_t wbTexNeg = z[0];
+
+            if (defInterval != 1 || defTextures != 0 || defActive != 0 ||
+                defTexture != 0 || wbDevice != 0xBEEF ||
+                wbNative != 0x1234 || wbInterval != 2 ||
+                wbTextures != 2 || wbActive != 2 || wbTex0 != kTex ||
+                wbTex1 != kTexSrc || wbTex2 != 0 || wbTexNeg != 0) {
+                std::fprintf(stderr,
+                             "[selftest] window state: builder getters failed "
+                             "(def=%llu/%llu/%llu/%llu dev=%#llx native=%#llx "
+                             "int=%llu n=%llu/%llu tex=%#llx/%#llx/%#llx/%#llx)\n",
+                             static_cast<unsigned long long>(defInterval),
+                             static_cast<unsigned long long>(defTextures),
+                             static_cast<unsigned long long>(defActive),
+                             static_cast<unsigned long long>(defTexture),
+                             static_cast<unsigned long long>(wbDevice),
+                             static_cast<unsigned long long>(wbNative),
+                             static_cast<unsigned long long>(wbInterval),
+                             static_cast<unsigned long long>(wbTextures),
+                             static_cast<unsigned long long>(wbActive),
+                             static_cast<unsigned long long>(wbTex0),
+                             static_cast<unsigned long long>(wbTex1),
+                             static_cast<unsigned long long>(wbTex2),
+                             static_cast<unsigned long long>(wbTexNeg));
+                rc = 16434;
+                goto done;
+            }
+
+            /* Defaults clear the recorded textures but keep the device. */
+            z[0] = kWb;
+            win_builder_set_defaults(ctx, z);
+            z[0] = kWb;
+            win_builder_get_device(ctx, z);
+            const uint64_t wbDevice2 = z[0];
+            z[0] = kWb;
+            win_builder_get_num_textures(ctx, z);
+            const uint64_t wbTextures2 = z[0];
+            z[0] = kWb;
+            win_builder_get_native_window(ctx, z);
+            const uint64_t wbNative2 = z[0];
+            z[0] = kWb;
+            win_builder_get_present_interval(ctx, z);
+            const uint64_t wbInterval2 = z[0];
+            if (wbDevice2 != 0xBEEF || wbTextures2 != 0 || wbNative2 != 0 ||
+                wbInterval2 != 1) {
+                std::fprintf(stderr,
+                             "[selftest] window state: defaults did not reset "
+                             "the builder (dev=%#llx tex=%llu native=%#llx "
+                             "int=%llu)\n",
+                             static_cast<unsigned long long>(wbDevice2),
+                             static_cast<unsigned long long>(wbTextures2),
+                             static_cast<unsigned long long>(wbNative2),
+                             static_cast<unsigned long long>(wbInterval2));
+                rc = 16434;
+                goto done;
+            }
+
+            z[0] = kWb; z[1] = 0x1234;
+            win_builder_set_native_window(ctx, z);
+            z[0] = kWb; z[1] = 2;
+            z[2] = reinterpret_cast<uint64_t>(&wt[0]);
+            win_builder_set_textures(ctx, z);
+            z[0] = kWb; z[1] = 2;
+            win_builder_set_present_interval(ctx, z);
+            z[0] = kWb; z[1] = 1;
+            win_builder_set_num_active_textures(ctx, z);
+            z[0] = kWo; z[1] = kWb;
+            win_initialize(ctx, z);
+            const uint64_t winOk = z[0];
+            z[0] = kWo;
+            win_get_num_textures(ctx, z);
+            const uint64_t winTex = z[0];
+            z[0] = kWo;
+            win_get_num_active(ctx, z);
+            const uint64_t winActive = z[0];
+            z[0] = kWo;
+            win_get_native_window(ctx, z);
+            const uint64_t winNative = z[0];
+            z[0] = kWo;
+            win_get_present_interval(ctx, z);
+            const uint64_t winInterval = z[0];
+            z[0] = kWo; z[1] = 1; z[2] = 2; z[3] = 3; z[4] = 4;
+            win_set_crop(ctx, z);
+            z[0] = kWo; z[1] = reinterpret_cast<uint64_t>(&crop[0]);
+            win_get_crop(ctx, z);
+            z[0] = kWo; z[1] = reinterpret_cast<uint64_t>("selftest window");
+            win_set_debug_label(ctx, z);
+            Win* winObj = find<Win>(kWo);
+            if (winOk != 1 || winTex != 2 || winActive != 1 ||
+                winNative != 0x1234 || winInterval != 2 ||
+                crop[0] != 1 || crop[1] != 2 || crop[2] != 3 ||
+                crop[3] != 4 || !winObj || winObj->label != "selftest window") {
+                std::fprintf(stderr,
+                             "[selftest] window state: window getters failed "
+                             "(init=%llu tex=%llu active=%llu native=%#llx "
+                             "int=%llu crop=%d,%d,%d,%d label=%s)\n",
+                             static_cast<unsigned long long>(winOk),
+                             static_cast<unsigned long long>(winTex),
+                             static_cast<unsigned long long>(winActive),
+                             static_cast<unsigned long long>(winNative),
+                             static_cast<unsigned long long>(winInterval),
+                             crop[0], crop[1], crop[2], crop[3],
+                             winObj ? winObj->label.c_str() : "?");
+                rc = 16434;
+                goto done;
+            }
+
+            /* No crop: the default is the first swapchain texture's size. */
+            z[0] = kWo2; z[1] = kWb;
+            win_initialize(ctx, z);
+            const uint64_t win2Ok = z[0];
+            crop[0] = crop[1] = crop[2] = crop[3] = -1;
+            z[0] = kWo2; z[1] = reinterpret_cast<uint64_t>(&crop[0]);
+            win_get_crop(ctx, z);
+            if (win2Ok != 1 || crop[0] != 0 || crop[1] != 0 ||
+                crop[2] != 64 || crop[3] != 64) {
+                std::fprintf(stderr,
+                             "[selftest] window state: default crop is "
+                             "%d,%d,%d,%d, want 0,0,64,64 (init=%llu)\n",
+                             crop[0], crop[1], crop[2], crop[3],
+                             static_cast<unsigned long long>(win2Ok));
+                rc = 16434;
+                goto done;
+            }
+            std::fprintf(stderr,
+                         "[selftest] window state: builder defaults, device "
+                         "preservation, texture list, window getters, crop "
+                         "and debug label round-tripped\n");
+            forget<Win>(kWo);
+            forget<Win>(kWo2);
+            g_win_specs.erase(kWb);
         }
 
     done:

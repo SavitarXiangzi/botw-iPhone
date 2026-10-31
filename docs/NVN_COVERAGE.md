@@ -7,8 +7,8 @@
 `nvn*` 字符串（运行时按名解析，所以名字本身就暴露了完整接口面）。
 
 - 接口总数：**513**
-- Metal 后端已实现：**422**（82.3%）
-- 仍未实现：**91**
+- Metal 后端已实现：**435**（84.8%）
+- 仍未实现：**78**
 
 > 只有出现在 `ios/nvn/implemented_metal.txt` 里、且确实在
 > `ios/nvn/src/nvn_metal.mm` 中定义过的名字才算“已实现”。
@@ -29,8 +29,8 @@
 | Queue | 15 | 15 | `##########` |
 | Sampler | 14 | 15 | `######### ` |
 | DepthStencilState | 13 | 13 | `##########` |
-| Window | 6 | 12 | `#####     ` |
-| WindowBuilder | 5 | 12 | `####      ` |
+| Window | 12 | 12 | `##########` |
+| WindowBuilder | 12 | 12 | `##########` |
 | Buffer | 11 | 11 | `##########` |
 | MemoryPool | 9 | 10 | `######### ` |
 | PolygonState | 9 | 9 | `##########` |
@@ -620,31 +620,31 @@
 - [x] `nvnVertexStreamStateSetDivisor`
 - [x] `nvnVertexStreamStateSetStride`
 
-### Window (6/12)
+### Window (12/12)
 
 - [x] `nvnWindowAcquireTexture`
 - [x] `nvnWindowFinalize`
-- [ ] `nvnWindowGetCrop`
-- [ ] `nvnWindowGetNativeWindow`
-- [ ] `nvnWindowGetNumActiveTextures`
+- [x] `nvnWindowGetCrop`
+- [x] `nvnWindowGetNativeWindow`
+- [x] `nvnWindowGetNumActiveTextures`
 - [x] `nvnWindowGetNumTextures`
-- [ ] `nvnWindowGetPresentInterval`
+- [x] `nvnWindowGetPresentInterval`
 - [x] `nvnWindowInitialize`
-- [ ] `nvnWindowSetCrop`
-- [ ] `nvnWindowSetDebugLabel`
+- [x] `nvnWindowSetCrop`
+- [x] `nvnWindowSetDebugLabel`
 - [x] `nvnWindowSetNumActiveTextures`
 - [x] `nvnWindowSetPresentInterval`
 
-### WindowBuilder (5/12)
+### WindowBuilder (12/12)
 
-- [ ] `nvnWindowBuilderGetDevice`
-- [ ] `nvnWindowBuilderGetNativeWindow`
-- [ ] `nvnWindowBuilderGetNumActiveTextures`
-- [ ] `nvnWindowBuilderGetNumTextures`
-- [ ] `nvnWindowBuilderGetPresentInterval`
-- [ ] `nvnWindowBuilderGetTexture`
+- [x] `nvnWindowBuilderGetDevice`
+- [x] `nvnWindowBuilderGetNativeWindow`
+- [x] `nvnWindowBuilderGetNumActiveTextures`
+- [x] `nvnWindowBuilderGetNumTextures`
+- [x] `nvnWindowBuilderGetPresentInterval`
+- [x] `nvnWindowBuilderGetTexture`
 - [x] `nvnWindowBuilderSetDefaults`
-- [ ] `nvnWindowBuilderSetDevice`
+- [x] `nvnWindowBuilderSetDevice`
 - [x] `nvnWindowBuilderSetNativeWindow`
 - [x] `nvnWindowBuilderSetNumActiveTextures`
 - [x] `nvnWindowBuilderSetPresentInterval`
