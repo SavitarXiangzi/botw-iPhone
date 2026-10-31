@@ -7,8 +7,8 @@
 `nvn*` 字符串（运行时按名解析，所以名字本身就暴露了完整接口面）。
 
 - 接口总数：**513**
-- Metal 后端已实现：**396**（77.2%）
-- 仍未实现：**117**
+- Metal 后端已实现：**410**（79.9%）
+- 仍未实现：**103**
 
 > 只有出现在 `ios/nvn/implemented_metal.txt` 里、且确实在
 > `ios/nvn/src/nvn_metal.mm` 中定义过的名字才算“已实现”。
@@ -19,7 +19,7 @@
 | 域 | 已实现 | 总数 | 进度 |
 |---|---:|---:|---|
 | CommandBuffer | 114 | 144 | `########  ` |
-| Texture | 22 | 45 | `#####     ` |
+| Texture | 36 | 45 | `########  ` |
 | TextureBuilder | 28 | 43 | `#######   ` |
 | Device | 7 | 27 | `###       ` |
 | SamplerBuilder | 24 | 25 | `##########` |
@@ -499,7 +499,7 @@
 - [x] `nvnSyncSetDebugLabel`
 - [x] `nvnSyncWait`
 
-### Texture (22/45)
+### Texture (36/45)
 
 - [ ] `nvnTextureCompare`
 - [x] `nvnTextureFinalize`
@@ -530,20 +530,20 @@
 - [ ] `nvnTextureReadTexels`
 - [ ] `nvnTextureReadTexelsStrided`
 - [x] `nvnTextureSetDebugLabel`
-- [ ] `nvnTextureViewCompare`
-- [ ] `nvnTextureViewGetDepthStencilMode`
-- [ ] `nvnTextureViewGetFormat`
-- [ ] `nvnTextureViewGetLayers`
-- [ ] `nvnTextureViewGetLevels`
-- [ ] `nvnTextureViewGetSwizzle`
-- [ ] `nvnTextureViewGetTarget`
-- [ ] `nvnTextureViewSetDefaults`
-- [ ] `nvnTextureViewSetDepthStencilMode`
-- [ ] `nvnTextureViewSetFormat`
-- [ ] `nvnTextureViewSetLayers`
-- [ ] `nvnTextureViewSetLevels`
-- [ ] `nvnTextureViewSetSwizzle`
-- [ ] `nvnTextureViewSetTarget`
+- [x] `nvnTextureViewCompare`
+- [x] `nvnTextureViewGetDepthStencilMode`
+- [x] `nvnTextureViewGetFormat`
+- [x] `nvnTextureViewGetLayers`
+- [x] `nvnTextureViewGetLevels`
+- [x] `nvnTextureViewGetSwizzle`
+- [x] `nvnTextureViewGetTarget`
+- [x] `nvnTextureViewSetDefaults`
+- [x] `nvnTextureViewSetDepthStencilMode`
+- [x] `nvnTextureViewSetFormat`
+- [x] `nvnTextureViewSetLayers`
+- [x] `nvnTextureViewSetLevels`
+- [x] `nvnTextureViewSetSwizzle`
+- [x] `nvnTextureViewSetTarget`
 - [x] `nvnTextureWriteTexels`
 - [x] `nvnTextureWriteTexelsStrided`
 

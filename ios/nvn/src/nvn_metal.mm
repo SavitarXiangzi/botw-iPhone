@@ -8755,6 +8755,144 @@ void queue_present_texture(nvngfx_ctx* ctx, uint64_t* x) {
     c->presents++;
 }
 
+/* ------------------------- NVNtextureView ---------------------------
+ * 16 measured bytes (nxnative nvn_obj.h): bit 0 set_levels, bit 1
+ * set_layers, bit 2 set_format, bit 3 set_target, bit 4 set_swizzle,
+ * bit 5 set_dsmode, bits 6-7 dsmode.  The setters write the guest object
+ * in place; the getters answer from those bytes, so a guest copy of a
+ * view keeps working.  Reserved bytes are ignored. */
+bool read_view16(uint64_t addr, TexView16* v) {
+    if (!v || !guest_range(addr, sizeof(TexView16))) return false;
+    std::memcpy(v, guest_ptr<const void>(addr), sizeof *v);
+    return true;
+}
+bool write_view16(uint64_t addr, const TexView16* v) {
+    if (!v || !guest_range(addr, sizeof(TexView16))) return false;
+    std::memcpy(guest_ptr<void>(addr), v, sizeof *v);
+    return true;
+}
+
+void tex_view_set_defaults(nvngfx_ctx*, uint64_t* x) {
+    (void)guest_write(x[0], sizeof(TexView16));
+}
+void tex_view_set_levels(nvngfx_ctx*, uint64_t* x) {
+    TexView16 v;
+    if (!read_view16(x[0], &v)) return;
+    v.bits |= 0x01u;
+    v.baseLevel = static_cast<uint8_t>(x[1]);
+    v.numLevels = static_cast<uint8_t>(x[2]);
+    write_view16(x[0], &v);
+}
+void tex_view_set_layers(nvngfx_ctx*, uint64_t* x) {
+    TexView16 v;
+    if (!read_view16(x[0], &v)) return;
+    v.bits |= 0x02u;
+    v.minLayer = static_cast<uint16_t>(x[1]);
+    v.numLayers = static_cast<uint16_t>(x[2]);
+    write_view16(x[0], &v);
+}
+void tex_view_set_format(nvngfx_ctx*, uint64_t* x) {
+    TexView16 v;
+    if (!read_view16(x[0], &v)) return;
+    v.bits |= 0x04u;
+    v.format = static_cast<uint16_t>(x[1]);
+    write_view16(x[0], &v);
+}
+void tex_view_set_target(nvngfx_ctx*, uint64_t* x) {
+    TexView16 v;
+    if (!read_view16(x[0], &v)) return;
+    v.bits |= 0x08u;
+    v.target = static_cast<uint8_t>(x[1]);
+    write_view16(x[0], &v);
+}
+void tex_view_set_swizzle(nvngfx_ctx*, uint64_t* x) {
+    TexView16 v;
+    if (!read_view16(x[0], &v)) return;
+    v.bits |= 0x10u;
+    v.swizzle[0] = static_cast<uint8_t>(x[1]);
+    v.swizzle[1] = static_cast<uint8_t>(x[2]);
+    v.swizzle[2] = static_cast<uint8_t>(x[3]);
+    v.swizzle[3] = static_cast<uint8_t>(x[4]);
+    write_view16(x[0], &v);
+}
+void tex_view_set_dsmode(nvngfx_ctx*, uint64_t* x) {
+    TexView16 v;
+    if (!read_view16(x[0], &v)) return;
+    v.bits |= 0x20u;
+    v.bits = static_cast<uint8_t>((v.bits & ~0xC0u) |
+                                  ((x[1] & 3u) << 6));
+    write_view16(x[0], &v);
+}
+
+void tex_view_get_levels(nvngfx_ctx*, uint64_t* x) {
+    TexView16 v;
+    if (!read_view16(x[0], &v)) { x[0] = 0; return; }
+    int* base = guest_ptr<int>(x[1]);
+    int* n = guest_ptr<int>(x[2]);
+    if (base) *base = v.baseLevel;
+    if (n) *n = v.numLevels;
+    x[0] = (v.bits & 0x01u) ? 1u : 0u;
+}
+void tex_view_get_layers(nvngfx_ctx*, uint64_t* x) {
+    TexView16 v;
+    if (!read_view16(x[0], &v)) { x[0] = 0; return; }
+    int* min = guest_ptr<int>(x[1]);
+    int* n = guest_ptr<int>(x[2]);
+    if (min) *min = v.minLayer;
+    if (n) *n = v.numLayers;
+    x[0] = (v.bits & 0x02u) ? 1u : 0u;
+}
+void tex_view_get_format(nvngfx_ctx*, uint64_t* x) {
+    TexView16 v;
+    if (!read_view16(x[0], &v)) { x[0] = 0; return; }
+    int* f = guest_ptr<int>(x[1]);
+    if (f) *f = v.format;
+    x[0] = (v.bits & 0x04u) ? 1u : 0u;
+}
+void tex_view_get_target(nvngfx_ctx*, uint64_t* x) {
+    TexView16 v;
+    if (!read_view16(x[0], &v)) { x[0] = 0; return; }
+    int* t = guest_ptr<int>(x[1]);
+    if (t) *t = v.target;
+    x[0] = (v.bits & 0x08u) ? 1u : 0u;
+}
+void tex_view_get_swizzle(nvngfx_ctx*, uint64_t* x) {
+    TexView16 v;
+    if (!read_view16(x[0], &v)) { x[0] = 0; return; }
+    static const unsigned kIdentity[4] = {2, 3, 4, 5};  /* R G B A */
+    int* out[4] = {guest_ptr<int>(x[1]), guest_ptr<int>(x[2]),
+                   guest_ptr<int>(x[3]), guest_ptr<int>(x[4])};
+    for (unsigned i = 0; i < 4; ++i) {
+        if (!out[i]) continue;
+        *out[i] = static_cast<int>((v.bits & 0x10u) ? v.swizzle[i]
+                                                   : kIdentity[i]);
+    }
+    x[0] = (v.bits & 0x10u) ? 1u : 0u;
+}
+void tex_view_get_dsmode(nvngfx_ctx*, uint64_t* x) {
+    TexView16 v;
+    if (!read_view16(x[0], &v)) { x[0] = 0; return; }
+    int* mode = guest_ptr<int>(x[1]);
+    if (mode) *mode = (v.bits >> 6) & 3;
+    x[0] = (v.bits & 0x20u) ? 1u : 0u;
+}
+/* nvnTextureViewCompare: compare the meaningful fields, not the reserved
+ * bytes (a guest may copy a view through storage it never initialized). */
+void tex_view_compare(nvngfx_ctx*, uint64_t* x) {
+    TexView16 a, b;
+    if (!read_view16(x[0], &a) || !read_view16(x[1], &b)) {
+        x[0] = 0;
+        return;
+    }
+    const bool same =
+        a.bits == b.bits && a.target == b.target &&
+        a.baseLevel == b.baseLevel && a.numLevels == b.numLevels &&
+        a.format == b.format && a.minLayer == b.minLayer &&
+        a.numLayers == b.numLayers &&
+        std::memcmp(a.swizzle, b.swizzle, sizeof a.swizzle) == 0;
+    x[0] = same ? 1u : 0u;
+}
+
 /* ------------------------------------------------------------------ */
 /* resolve table                                                       */
 /* ------------------------------------------------------------------ */
@@ -8878,6 +9016,20 @@ const Binding kBindings[] = {
     BIND("nvnTextureInvalidateTexels", tex_invalidate_texels),
     BIND("nvnTextureWriteTexelsStrided", tex_write_texels_strided),
     BIND("nvnTextureFlushTexels", tex_flush_texels),
+    BIND("nvnTextureViewSetDefaults", tex_view_set_defaults),
+    BIND("nvnTextureViewSetLevels", tex_view_set_levels),
+    BIND("nvnTextureViewSetLayers", tex_view_set_layers),
+    BIND("nvnTextureViewSetFormat", tex_view_set_format),
+    BIND("nvnTextureViewSetTarget", tex_view_set_target),
+    BIND("nvnTextureViewSetSwizzle", tex_view_set_swizzle),
+    BIND("nvnTextureViewSetDepthStencilMode", tex_view_set_dsmode),
+    BIND("nvnTextureViewGetLevels", tex_view_get_levels),
+    BIND("nvnTextureViewGetLayers", tex_view_get_layers),
+    BIND("nvnTextureViewGetFormat", tex_view_get_format),
+    BIND("nvnTextureViewGetTarget", tex_view_get_target),
+    BIND("nvnTextureViewGetSwizzle", tex_view_get_swizzle),
+    BIND("nvnTextureViewGetDepthStencilMode", tex_view_get_dsmode),
+    BIND("nvnTextureViewCompare", tex_view_compare),
 
     BIND("nvnTexturePoolInitialize", tex_pool_initialize),
     BIND("nvnTexturePoolFinalize", tex_pool_finalize),
@@ -16113,6 +16265,157 @@ extern "C" int nvngfx_metal_selftest(void) {
                          "[selftest] state getters: blend (incl. advanced), "
                          "color, channel mask, multisample, polygon and "
                          "depth/stencil answered what their setters stored\n");
+        }
+
+        {
+            /* --- NVNtextureView: 16-byte measured layout ---------------- */
+            alignas(16) unsigned char va[16];
+            alignas(16) unsigned char vb[16];
+            std::memset(va, 0xAA, sizeof va);
+            std::memset(vb, 0xAA, sizeof vb);
+            const uint64_t kva = reinterpret_cast<uint64_t>(va);
+            const uint64_t kvb = reinterpret_cast<uint64_t>(vb);
+            uint64_t v[8] = {};
+            int i0 = -1, i1 = -1;
+            int sw[4] = {-1, -1, -1, -1};
+
+            v[0] = kva;
+            tex_view_set_defaults(ctx, v);
+            bool zeroed = true;
+            for (unsigned i = 0; i < sizeof va; ++i)
+                if (va[i] != 0) zeroed = false;
+            v[0] = kva; v[1] = reinterpret_cast<uint64_t>(&i0);
+            v[2] = reinterpret_cast<uint64_t>(&i1);
+            tex_view_get_levels(ctx, v);
+            const uint64_t ld = v[0];
+            v[0] = kva;
+            v[1] = reinterpret_cast<uint64_t>(&sw[0]);
+            v[2] = reinterpret_cast<uint64_t>(&sw[1]);
+            v[3] = reinterpret_cast<uint64_t>(&sw[2]);
+            v[4] = reinterpret_cast<uint64_t>(&sw[3]);
+            tex_view_get_swizzle(ctx, v);
+            const uint64_t sd = v[0];
+            int dm = -1;
+            v[0] = kva; v[1] = reinterpret_cast<uint64_t>(&dm);
+            tex_view_get_dsmode(ctx, v);
+            if (!zeroed || ld != 0 || i0 != 0 || i1 != 0 || sd != 0 ||
+                sw[0] != 2 || sw[1] != 3 || sw[2] != 4 || sw[3] != 5 ||
+                v[0] != 0 || dm != 0) {
+                std::fprintf(stderr,
+                             "[selftest] texture view: defaults are wrong "
+                             "(%d/%llu/%d/%d/%llu/%d/%d/%d/%d/%llu/%d)\n",
+                             zeroed ? 1 : 0,
+                             static_cast<unsigned long long>(ld), i0, i1,
+                             static_cast<unsigned long long>(sd),
+                             sw[0], sw[1], sw[2], sw[3],
+                             static_cast<unsigned long long>(v[0]), dm);
+                rc = 16432;
+                goto done;
+            }
+
+            v[0] = kva; v[1] = 1; v[2] = 2; tex_view_set_levels(ctx, v);
+            v[0] = kva; v[1] = 3; v[2] = 4; tex_view_set_layers(ctx, v);
+            v[0] = kva; v[1] = 0x25; tex_view_set_format(ctx, v);
+            v[0] = kva; v[1] = 4; tex_view_set_target(ctx, v);
+            v[0] = kva; v[1] = 5; v[2] = 4; v[3] = 3; v[4] = 2;
+            tex_view_set_swizzle(ctx, v);
+            v[0] = kva; v[1] = 1; tex_view_set_dsmode(ctx, v);
+            if (va[0] != 0x7Fu) {
+                std::fprintf(stderr,
+                             "[selftest] texture view: flag/dsmode byte is "
+                             "0x%02x, expected 0x7f\n", va[0]);
+                rc = 16432;
+                goto done;
+            }
+
+            i0 = i1 = -1;
+            v[0] = kva; v[1] = reinterpret_cast<uint64_t>(&i0);
+            v[2] = reinterpret_cast<uint64_t>(&i1);
+            tex_view_get_levels(ctx, v);
+            const uint64_t lr = v[0];
+            int l0 = i0, l1 = i1;
+            i0 = i1 = -1;
+            v[0] = kva; v[1] = reinterpret_cast<uint64_t>(&i0);
+            v[2] = reinterpret_cast<uint64_t>(&i1);
+            tex_view_get_layers(ctx, v);
+            const uint64_t yr = v[0];
+            int y0 = i0, y1 = i1;
+            int fmt = -1;
+            v[0] = kva; v[1] = reinterpret_cast<uint64_t>(&fmt);
+            tex_view_get_format(ctx, v);
+            const uint64_t fr = v[0];
+            int tgt = -1;
+            v[0] = kva; v[1] = reinterpret_cast<uint64_t>(&tgt);
+            tex_view_get_target(ctx, v);
+            const uint64_t tr = v[0];
+            sw[0] = sw[1] = sw[2] = sw[3] = -1;
+            v[0] = kva;
+            v[1] = reinterpret_cast<uint64_t>(&sw[0]);
+            v[2] = reinterpret_cast<uint64_t>(&sw[1]);
+            v[3] = reinterpret_cast<uint64_t>(&sw[2]);
+            v[4] = reinterpret_cast<uint64_t>(&sw[3]);
+            tex_view_get_swizzle(ctx, v);
+            const uint64_t sr = v[0];
+            dm = -1;
+            v[0] = kva; v[1] = reinterpret_cast<uint64_t>(&dm);
+            tex_view_get_dsmode(ctx, v);
+            const uint64_t dr = v[0];
+            if (lr != 1 || l0 != 1 || l1 != 2 ||
+                yr != 1 || y0 != 3 || y1 != 4 ||
+                fr != 1 || fmt != 0x25 || tr != 1 || tgt != 4 ||
+                sr != 1 || sw[0] != 5 || sw[1] != 4 || sw[2] != 3 ||
+                sw[3] != 2 || dr != 1 || dm != 1) {
+                std::fprintf(stderr,
+                             "[selftest] texture view: getters did not "
+                             "round-trip the setters\n");
+                rc = 16432;
+                goto done;
+            }
+            /* Null outputs are skipped, not dereferenced. */
+            v[0] = kva; v[1] = v[2] = v[3] = v[4] = 0;
+            tex_view_get_swizzle(ctx, v);
+            if (v[0] != 1) {
+                std::fprintf(stderr,
+                             "[selftest] texture view: null swizzle outputs "
+                             "changed the result\n");
+                rc = 16432;
+                goto done;
+            }
+            /* Compare the meaningful fields; reserved bytes are ignored. */
+            std::memcpy(vb, va, sizeof vb);
+            v[0] = kva; v[1] = kvb;
+            tex_view_compare(ctx, v);
+            if (v[0] != 1) {
+                std::fprintf(stderr,
+                             "[selftest] texture view: equal copies compared "
+                             "different\n");
+                rc = 16432;
+                goto done;
+            }
+            vb[15] ^= 0xFFu;
+            v[0] = kva; v[1] = kvb;
+            tex_view_compare(ctx, v);
+            if (v[0] != 1) {
+                std::fprintf(stderr,
+                             "[selftest] texture view: reserved bytes changed "
+                             "the comparison\n");
+                rc = 16432;
+                goto done;
+            }
+            vb[2] = 9;
+            v[0] = kva; v[1] = kvb;
+            tex_view_compare(ctx, v);
+            if (v[0] != 0) {
+                std::fprintf(stderr,
+                             "[selftest] texture view: different levels "
+                             "compared equal\n");
+                rc = 16432;
+                goto done;
+            }
+            std::fprintf(stderr,
+                         "[selftest] texture view: 16-byte layout, six "
+                         "setters, six getters and field-wise compare "
+                         "round-tripped\n");
         }
 
     done:
