@@ -290,6 +290,10 @@ struct NvnBuffer {
 
 struct Tex {
     unsigned width = 0, height = 0, depth = 1, levels = 1, layers = 1;
+    /* A host-side name reported by nvnTextureGetDebugID.  It is ours, not a
+     * value read from the guest object. */
+    uint64_t debugId = 0;
+    std::string label;
     uint32_t format = 0;
     uint32_t target = 0;
     /* The guest stores a BCn format that iOS Metal cannot create.  This
@@ -667,6 +671,7 @@ std::unordered_map<uint64_t, WinSpec> g_win_specs;
 std::unordered_map<uint64_t, PoolSpec> g_pool_specs;
 std::unordered_map<uint64_t, NvnBufferSpec> g_buffer_specs;
 uint64_t g_next_buffer_debug_id = 0x10000;
+uint64_t g_next_texture_debug_id = 0x20000;
 std::unordered_map<uint64_t, int> g_device_flags;
 /* Builder state, keyed by the guest builder address.  The guest owns the
  * struct and its layout is unverified, but that does not matter: every
@@ -705,6 +710,25 @@ bool guest_write(uint64_t addr, size_t n) {
         return false;
     }
     std::memset(reinterpret_cast<void*>(static_cast<uintptr_t>(addr)), 0, n);
+    return true;
+}
+
+/* Reads a NUL-terminated guest string into `out`, truncated to 255 bytes.
+ * The length is the guest's responsibility, exactly like the proc-name
+ * pointer nvnDeviceGetProcAddress already trusts; the cap only keeps a
+ * corrupt pointer from turning into an unbounded scan. */
+bool guest_cstr(uint64_t addr, std::string* out) {
+    if (!out) return false;
+    out->clear();
+    if (!guest_range(addr, 1)) {
+        log_once("nvn.guestString.pointer", static_cast<unsigned>(addr >> 32));
+        return false;
+    }
+    const char* p = guest_ptr<const char>(addr);
+    for (unsigned i = 0; i < 255; ++i) {
+        if (!p[i]) return true;
+        out->push_back(p[i]);
+    }
     return true;
 }
 
@@ -1388,6 +1412,7 @@ void tex_initialize(nvngfx_ctx* ctx, uint64_t* x) {
         td.storageMode = MTLStorageModePrivate;
 
         Tex* t = find_or_add<Tex>(x[0]);
+        t->debugId = ++g_next_texture_debug_id;
         t->width = static_cast<unsigned>(d.width);
         t->height = static_cast<unsigned>(d.height);
         t->depth = static_cast<unsigned>(d.depth);
@@ -1619,6 +1644,154 @@ void tex_flush_texels(nvngfx_ctx*, uint64_t* x) {
     log_once_str("nvnTextureFlushTexels",
                  "guest-visible texture writes will be re-uploaded on the next sample");
 }
+
+/* ------------------------------------------------------------------ */
+/* texture queries                                                     */
+/* ------------------------------------------------------------------ */
+
+/* Getters answer from the descriptor the guest supplied through
+ * nvnTextureBuilderSet*, so a value it set comes back unchanged, including
+ * one that came from the builder defaults.  A finalised texture has no entry
+ * and every getter returns 0. */
+void tex_get_width(nvngfx_ctx*, uint64_t* x) {
+    Tex* t = find<Tex>(x[0]);
+    x[0] = t ? static_cast<uint64_t>(t->width) : 0u;
+}
+void tex_get_height(nvngfx_ctx*, uint64_t* x) {
+    Tex* t = find<Tex>(x[0]);
+    x[0] = t ? static_cast<uint64_t>(t->height) : 0u;
+}
+void tex_get_depth(nvngfx_ctx*, uint64_t* x) {
+    Tex* t = find<Tex>(x[0]);
+    x[0] = t ? static_cast<uint64_t>(t->depth) : 0u;
+}
+void tex_get_levels(nvngfx_ctx*, uint64_t* x) {
+    Tex* t = find<Tex>(x[0]);
+    x[0] = t ? static_cast<uint64_t>(t->levels) : 0u;
+}
+void tex_get_samples(nvngfx_ctx*, uint64_t* x) {
+    Tex* t = find<Tex>(x[0]);
+    x[0] = t ? static_cast<uint64_t>(static_cast<uint32_t>(t->desc.samples)) : 0u;
+}
+void tex_get_format(nvngfx_ctx*, uint64_t* x) {
+    Tex* t = find<Tex>(x[0]);
+    x[0] = t ? static_cast<uint64_t>(t->format) : 0u;
+}
+void tex_get_target(nvngfx_ctx*, uint64_t* x) {
+    Tex* t = find<Tex>(x[0]);
+    x[0] = t ? static_cast<uint64_t>(t->target) : 0u;
+}
+void tex_get_flags(nvngfx_ctx*, uint64_t* x) {
+    Tex* t = find<Tex>(x[0]);
+    x[0] = t ? static_cast<uint64_t>(static_cast<uint32_t>(t->desc.flags)) : 0u;
+}
+void tex_get_memory_pool(nvngfx_ctx*, uint64_t* x) {
+    Tex* t = find<Tex>(x[0]);
+    x[0] = t ? t->desc.pool : 0u;
+}
+void tex_get_memory_offset(nvngfx_ctx*, uint64_t* x) {
+    Tex* t = find<Tex>(x[0]);
+    x[0] = t ? static_cast<uint64_t>(t->desc.offset) : 0u;
+}
+void tex_get_stride(nvngfx_ctx*, uint64_t* x) {
+    Tex* t = find<Tex>(x[0]);
+    x[0] = t ? static_cast<uint64_t>(t->desc.stride) : 0u;
+}
+void tex_get_debug_id(nvngfx_ctx*, uint64_t* x) {
+    Tex* t = find<Tex>(x[0]);
+    x[0] = t ? t->debugId : 0u;
+}
+
+/* nvnTextureGetTextureAddress(const NVNtexture*) -> NVNtextureAddress.
+ * Texel (0,0,0) of level 0, which is the pool base plus the descriptor's
+ * offset; a texture with no pool has no guest address. */
+void tex_get_texture_address(nvngfx_ctx*, uint64_t* x) {
+    Tex* t = find<Tex>(x[0]);
+    if (!t || !t->desc.pool) { x[0] = 0; return; }
+    x[0] = t->desc.pool + static_cast<uint64_t>(t->desc.offset);
+}
+
+/* nvnTextureGetStorageSize(const NVNtexture*) -> int.  The guest asks for the
+ * byte size the layout would occupy, which is what nvngfx_tex_layout already
+ * computes for the upload path. */
+void tex_get_storage_size(nvngfx_ctx*, uint64_t* x) {
+    Tex* t = find<Tex>(x[0]);
+    if (!t) { x[0] = 0; return; }
+    nvngfx_texlayout L = {};
+    if (nvngfx_tex_layout(&t->desc, &L) != 0) {
+        log_once("nvnTextureGetStorageSize.layout",
+                 static_cast<unsigned>(t->format));
+        x[0] = 0;
+        return;
+    }
+    if (L.size > 0x7FFFFFFFull) {
+        log_once("nvnTextureGetStorageSize.overflow",
+                 static_cast<unsigned>(L.size >> 32));
+        x[0] = 0x7FFFFFFFull;
+        return;
+    }
+    x[0] = L.size;
+}
+
+/* nvnTextureGetSwizzle(tex, r, g, b, a).  Four out-pointers, each an
+ * NVNtextureSwizzle.  The stored values are exactly what the builder gave
+ * (the defaults are R/G/B/A). */
+void tex_get_swizzle(nvngfx_ctx*, uint64_t* x) {
+    Tex* t = find<Tex>(x[0]);
+    for (unsigned i = 0; i < 4; ++i) {
+        if (!x[1 + i]) continue;
+        if (!guest_range(x[1 + i], sizeof(int))) {
+            log_once("nvnTextureGetSwizzle.pointer", i);
+            continue;
+        }
+        *guest_ptr<int>(x[1 + i]) =
+            t ? static_cast<int>(t->desc.swz[i]) : 0;
+    }
+}
+
+/* nvnTextureSetDebugLabel(NVNtexture*, const char*) */
+void tex_set_debug_label(nvngfx_ctx*, uint64_t* x) {
+    Tex* t = find<Tex>(x[0]);
+    if (!t) return;
+    std::string name;
+    if (!guest_cstr(x[1], &name)) return;
+    t->label = name;
+    if (t->mtl) {
+        NSString* label = [NSString stringWithUTF8String:name.c_str()];
+        if (label) t->mtl.label = label;
+    }
+}
+
+/* nvnTextureFinalize(NVNtexture*).  Texture-pool slots that still name this
+ * texture resolve to null afterwards, so a stale handle drops the draw
+ * instead of reading a deleted object. */
+void tex_finalize(nvngfx_ctx*, uint64_t* x) {
+    forget<Tex>(x[0]);
+}
+
+/* nvnTextureInvalidateTexels(tex, view, region).  The named contents become
+ * undefined.  This backend invalidates the whole one-shot upload: a texture
+ * that only lives in the guest pool is re-uploaded on the next sample, which
+ * is a legal choice for undefined data; one it has rendered into keeps its
+ * Metal contents instead of resurrecting stale guest bytes.  Partial regions
+ * are not tracked, and that is reported. */
+void tex_invalidate_texels(nvngfx_ctx*, uint64_t* x) {
+    Tex* t = find<Tex>(x[0]);
+    if (!t) return;
+    if (x[1] || x[2]) {
+        log_once_str("nvnTextureInvalidateTexels.region",
+                     "partial invalidation is applied to the whole texture");
+    }
+    if (t->rendered) {
+        log_once_str("nvnTextureInvalidateTexels.rendered",
+                     "a rendered texture keeps its host contents");
+        return;
+    }
+    t->uploadTried = false;
+    t->uploaded = false;
+    t->dirty = false;
+}
+
 
 /* ------------------------------------------------------------------ */
 /* samplers                                                            */
@@ -5379,25 +5552,6 @@ void cmdbuf_end_recording(nvngfx_ctx* ctx, uint64_t* x) {
 /* command buffer lifecycle, memory accounting and debug names          */
 /* ------------------------------------------------------------------ */
 
-/* Reads a NUL-terminated guest string into `out`, truncated to 255 bytes.
- * The length is the guest's responsibility, exactly like the proc-name
- * pointer nvnDeviceGetProcAddress already trusts; the cap only keeps a
- * corrupt pointer from turning into an unbounded scan. */
-bool guest_cstr(uint64_t addr, std::string* out) {
-    if (!out) return false;
-    out->clear();
-    if (!guest_range(addr, 1)) {
-        log_once("nvn.guestString.pointer", static_cast<unsigned>(addr >> 32));
-        return false;
-    }
-    const char* p = guest_ptr<const char>(addr);
-    for (unsigned i = 0; i < 255; ++i) {
-        if (!p[i]) return true;
-        out->push_back(p[i]);
-    }
-    return true;
-}
-
 /* nvnCommandBufferInitialize(NVNcommandBuffer*, NVNdevice*) -> NVNboolean.
  * The guest object stays a table key; the device argument is not stored
  * because this backend has one Metal device per context. */
@@ -7978,6 +8132,24 @@ const Binding kBindings[] = {
     BIND("nvnTextureBuilderSetFlags", tex_builder_set_flags),
     BIND("nvnTextureInitialize", tex_initialize),
     BIND("nvnTextureWriteTexels", tex_write_texels),
+    BIND("nvnTextureGetWidth", tex_get_width),
+    BIND("nvnTextureGetHeight", tex_get_height),
+    BIND("nvnTextureGetDepth", tex_get_depth),
+    BIND("nvnTextureGetLevels", tex_get_levels),
+    BIND("nvnTextureGetSamples", tex_get_samples),
+    BIND("nvnTextureGetFormat", tex_get_format),
+    BIND("nvnTextureGetTarget", tex_get_target),
+    BIND("nvnTextureGetFlags", tex_get_flags),
+    BIND("nvnTextureGetMemoryPool", tex_get_memory_pool),
+    BIND("nvnTextureGetMemoryOffset", tex_get_memory_offset),
+    BIND("nvnTextureGetStride", tex_get_stride),
+    BIND("nvnTextureGetDebugID", tex_get_debug_id),
+    BIND("nvnTextureGetTextureAddress", tex_get_texture_address),
+    BIND("nvnTextureGetStorageSize", tex_get_storage_size),
+    BIND("nvnTextureGetSwizzle", tex_get_swizzle),
+    BIND("nvnTextureSetDebugLabel", tex_set_debug_label),
+    BIND("nvnTextureFinalize", tex_finalize),
+    BIND("nvnTextureInvalidateTexels", tex_invalidate_texels),
     BIND("nvnTextureWriteTexelsStrided", tex_write_texels_strided),
     BIND("nvnTextureFlushTexels", tex_flush_texels),
 
@@ -13986,6 +14158,147 @@ extern "C" int nvngfx_metal_selftest(void) {
                          "mask, conservative raster, subpixel bias, tiled "
                          "cache and scratch memory were recorded, and "
                          "rasterizer discard consumed one draw\n");
+        }
+
+        {
+            /* --- Texture object queries --------------------------------
+             * Every getter must answer from what the guest set through the
+             * builder, not from a zeroed struct.  Finalize must remove the
+             * object, and InvalidateTexels must drop the one-shot upload so
+             * the next sample re-reads the guest pool. */
+            alignas(16) unsigned char texQueryBuilder[0x80] = {};
+            alignas(16) unsigned char texQueryObject[0x80] = {};
+            const uint64_t kTexQueryObj =
+                reinterpret_cast<uint64_t>(texQueryObject);
+            const uint64_t kTexQueryBuilder =
+                reinterpret_cast<uint64_t>(texQueryBuilder);
+            alignas(16) char texQueryLabel[] = "selftest texture";
+            nvngfx_texdesc want;
+            nvngfx_texdesc_defaults(&want);
+            want.width = 4;
+            want.height = 4;
+            want.depth = 1;
+            want.levels = 1;
+            want.format = 0x25;
+            want.target = 0;
+
+            x[0] = kTexQueryBuilder;
+            tex_builder_set_defaults(ctx, x);
+            x[0] = kTexQueryBuilder; x[1] = 0x25;
+            tex_builder_set_format(ctx, x);
+            x[0] = kTexQueryBuilder;
+            x[1] = 4; x[2] = 4;
+            tex_builder_set_size2d(ctx, x);
+            x[0] = kTexQueryObj;
+            x[1] = kTexQueryBuilder;
+            tex_initialize(ctx, x);
+            if (x[0] != 1) {
+                std::fprintf(stderr,
+                             "[selftest] texture queries: initialize failed\n");
+                rc = 16428;
+                goto done;
+            }
+
+            uint64_t q[8] = {};
+            auto texQuery = [&](void (*fn)(nvngfx_ctx*, uint64_t*)) {
+                q[0] = kTexQueryObj;
+                fn(ctx, q);
+                return q[0];
+            };
+            const uint64_t qWidth = texQuery(tex_get_width);
+            const uint64_t qHeight = texQuery(tex_get_height);
+            const uint64_t qDepth = texQuery(tex_get_depth);
+            const uint64_t qLevels = texQuery(tex_get_levels);
+            const uint64_t qSamples = texQuery(tex_get_samples);
+            const uint64_t qFormat = texQuery(tex_get_format);
+            const uint64_t qTarget = texQuery(tex_get_target);
+            const uint64_t qFlags = texQuery(tex_get_flags);
+            const uint64_t qPool = texQuery(tex_get_memory_pool);
+            const uint64_t qOffset = texQuery(tex_get_memory_offset);
+            const uint64_t qStride = texQuery(tex_get_stride);
+            const uint64_t qDebug = texQuery(tex_get_debug_id);
+            const uint64_t qAddress = texQuery(tex_get_texture_address);
+            const uint64_t qStorage = texQuery(tex_get_storage_size);
+            alignas(16) int swzOut[4] = {-9, -9, -9, -9};
+            q[0] = kTexQueryObj;
+            q[1] = reinterpret_cast<uint64_t>(&swzOut[0]);
+            q[2] = reinterpret_cast<uint64_t>(&swzOut[1]);
+            q[3] = reinterpret_cast<uint64_t>(&swzOut[2]);
+            q[4] = reinterpret_cast<uint64_t>(&swzOut[3]);
+            tex_get_swizzle(ctx, q);
+
+            nvngfx_texlayout wantLayout = {};
+            const int wantLayoutOk = nvngfx_tex_layout(&want, &wantLayout);
+            if (qWidth != 4 || qHeight != 4 || qDepth != 1 ||
+                qLevels != 1 || qSamples != 1 || qFormat != 0x25 ||
+                qTarget != 0 || qFlags != 0 || qPool != 0 || qOffset != 0 ||
+                qStride != 0 || qDebug == 0 || qAddress != 0 ||
+                wantLayoutOk != 0 || qStorage != wantLayout.size ||
+                swzOut[0] != 2 || swzOut[1] != 3 || swzOut[2] != 4 ||
+                swzOut[3] != 5) {
+                std::fprintf(stderr,
+                             "[selftest] texture queries: got %llu/%llu/%llu "
+                             "levels %llu samples %llu format 0x%llx target "
+                             "%llu flags %llu pool %llu offset %llu stride "
+                             "%llu debug %llu address %llu size %llu swizzle "
+                             "%d/%d/%d/%d\n",
+                             static_cast<unsigned long long>(qWidth),
+                             static_cast<unsigned long long>(qHeight),
+                             static_cast<unsigned long long>(qDepth),
+                             static_cast<unsigned long long>(qLevels),
+                             static_cast<unsigned long long>(qSamples),
+                             static_cast<unsigned long long>(qFormat),
+                             static_cast<unsigned long long>(qTarget),
+                             static_cast<unsigned long long>(qFlags),
+                             static_cast<unsigned long long>(qPool),
+                             static_cast<unsigned long long>(qOffset),
+                             static_cast<unsigned long long>(qStride),
+                             static_cast<unsigned long long>(qDebug),
+                             static_cast<unsigned long long>(qAddress),
+                             static_cast<unsigned long long>(qStorage),
+                             swzOut[0], swzOut[1], swzOut[2], swzOut[3]);
+                rc = 16428;
+                goto done;
+            }
+            x[0] = kTexQueryObj;
+            x[1] = reinterpret_cast<uint64_t>(texQueryLabel);
+            tex_set_debug_label(ctx, x);
+            Tex* qt = find<Tex>(kTexQueryObj);
+            if (!qt || qt->label != "selftest texture") {
+                std::fprintf(stderr,
+                             "[selftest] texture queries: debug label did not "
+                             "stick\n");
+                rc = 16428;
+                goto done;
+            }
+
+            qt->uploaded = true;
+            qt->uploadTried = true;
+            x[0] = kTexQueryObj; x[1] = 0; x[2] = 0;
+            tex_invalidate_texels(ctx, x);
+            if (qt->uploaded || qt->uploadTried) {
+                std::fprintf(stderr,
+                             "[selftest] texture queries: invalidate left the "
+                             "upload flags set\n");
+                rc = 16428;
+                goto done;
+            }
+
+            x[0] = kTexQueryObj;
+            tex_finalize(ctx, x);
+            if (find<Tex>(kTexQueryObj) || texQuery(tex_get_width) != 0 ||
+                texQuery(tex_get_debug_id) != 0) {
+                std::fprintf(stderr,
+                             "[selftest] texture queries: finalize did not "
+                             "remove the texture\n");
+                rc = 16428;
+                goto done;
+            }
+            std::fprintf(stderr,
+                         "[selftest] texture queries: 14 getters round-tripped "
+                         "the builder values, the label stuck, invalidate "
+                         "cleared the upload flags and finalize removed the "
+                         "object\n");
         }
 
         {

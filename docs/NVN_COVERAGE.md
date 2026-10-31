@@ -7,8 +7,8 @@
 `nvn*` 字符串（运行时按名解析，所以名字本身就暴露了完整接口面）。
 
 - 接口总数：**513**
-- Metal 后端已实现：**284**（55.4%）
-- 仍未实现：**229**
+- Metal 后端已实现：**302**（58.9%）
+- 仍未实现：**211**
 
 > 只有出现在 `ios/nvn/implemented_metal.txt` 里、且确实在
 > `ios/nvn/src/nvn_metal.mm` 中定义过的名字才算“已实现”。
@@ -19,7 +19,7 @@
 | 域 | 已实现 | 总数 | 进度 |
 |---|---:|---:|---|
 | CommandBuffer | 110 | 144 | `########  ` |
-| Texture | 4 | 45 | `#         ` |
+| Texture | 22 | 45 | `#####     ` |
 | TextureBuilder | 14 | 43 | `###       ` |
 | Device | 7 | 27 | `###       ` |
 | SamplerBuilder | 24 | 25 | `##########` |
@@ -499,37 +499,37 @@
 - [ ] `nvnSyncSetDebugLabel`
 - [ ] `nvnSyncWait`
 
-### Texture (4/45)
+### Texture (22/45)
 
 - [ ] `nvnTextureCompare`
-- [ ] `nvnTextureFinalize`
+- [x] `nvnTextureFinalize`
 - [x] `nvnTextureFlushTexels`
-- [ ] `nvnTextureGetDebugID`
-- [ ] `nvnTextureGetDepth`
+- [x] `nvnTextureGetDebugID`
+- [x] `nvnTextureGetDepth`
 - [ ] `nvnTextureGetDepthStencilMode`
-- [ ] `nvnTextureGetFlags`
-- [ ] `nvnTextureGetFormat`
-- [ ] `nvnTextureGetHeight`
-- [ ] `nvnTextureGetLevels`
-- [ ] `nvnTextureGetMemoryOffset`
-- [ ] `nvnTextureGetMemoryPool`
+- [x] `nvnTextureGetFlags`
+- [x] `nvnTextureGetFormat`
+- [x] `nvnTextureGetHeight`
+- [x] `nvnTextureGetLevels`
+- [x] `nvnTextureGetMemoryOffset`
+- [x] `nvnTextureGetMemoryPool`
 - [ ] `nvnTextureGetRawStorageClass`
-- [ ] `nvnTextureGetSamples`
+- [x] `nvnTextureGetSamples`
 - [ ] `nvnTextureGetSparseTileLayout`
 - [ ] `nvnTextureGetStorageClass`
-- [ ] `nvnTextureGetStorageSize`
-- [ ] `nvnTextureGetStride`
-- [ ] `nvnTextureGetSwizzle`
-- [ ] `nvnTextureGetTarget`
-- [ ] `nvnTextureGetTextureAddress`
+- [x] `nvnTextureGetStorageSize`
+- [x] `nvnTextureGetStride`
+- [x] `nvnTextureGetSwizzle`
+- [x] `nvnTextureGetTarget`
+- [x] `nvnTextureGetTextureAddress`
 - [ ] `nvnTextureGetViewOffset`
-- [ ] `nvnTextureGetWidth`
+- [x] `nvnTextureGetWidth`
 - [ ] `nvnTextureGetZCullStorageSize`
 - [x] `nvnTextureInitialize`
-- [ ] `nvnTextureInvalidateTexels`
+- [x] `nvnTextureInvalidateTexels`
 - [ ] `nvnTextureReadTexels`
 - [ ] `nvnTextureReadTexelsStrided`
-- [ ] `nvnTextureSetDebugLabel`
+- [x] `nvnTextureSetDebugLabel`
 - [ ] `nvnTextureViewCompare`
 - [ ] `nvnTextureViewGetDepthStencilMode`
 - [ ] `nvnTextureViewGetFormat`

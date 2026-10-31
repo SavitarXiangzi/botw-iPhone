@@ -75,6 +75,7 @@ enum {
     MTLGPUFamilyMetal3 = 5001,
 };
 @protocol MTLResource
+@property (copy) NSString* label;
 @end
 
 typedef NSUInteger MTLCommandBufferStatus;

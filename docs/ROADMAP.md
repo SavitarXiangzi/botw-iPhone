@@ -5238,5 +5238,77 @@ powershell -ExecutionPolicy Bypass -File scripts/build_abi_test.ps1
 git diff --check
 ```
 
-本地已通过（513 procs / 284 implemented / 477 measured + 6 inferred）。
+本地已通过（513 procs / 284 implemented / 477 measured + 6 inferred）；GitHub
+Actions run `41184203852` 的 macOS `ios` job 也已通过，模拟器输出确认：
+
+```text
+[selftest] state: point size, line width, sample mask, conservative raster,
+subpixel bias, tiled cache and scratch memory were recorded, and rasterizer
+discard consumed one draw
+BOTW_SELFTEST rc=0
+```
+
+## M4 续十七：纹理对象查询、finalize 与失效
+
+纹理侧此前只有 initialize / WriteTexels / WriteTexelsStrided / FlushTexels 四个入口，
+其余 41 个全是日志桩。客体创建纹理后会查询宽高、格式、存储大小，也会在销毁时调
+Finalize；查询返回 0 会让上层把纹理当成非法。本轮补齐 18 个：
+
+* Texture：22/45（+18）
+
+Metal 覆盖从 **284/513（55.4%）** 到 **302/513（58.9%）**，未实现 211。
+
+### 1. getter 回答 builder 给过的值
+
+`nvnTextureGetWidth/Height/Depth/Levels/Samples/Format/Target/Flags/MemoryPool/
+MemoryOffset/Stride/DebugID` 都从宿主侧 `Tex` 记录返回，而那份记录正是
+`nvnTextureBuilderSet*` 存下来的值，所以设置什么就取回什么，包括来自默认值的字段。
+`GetTextureAddress` 返回 `pool + offset`（没有 pool 时为 0）。
+
+`GetStorageSize` 用 `nvngfx_tex_layout` 重算整张纹理的字节数，和上传路径用的是同一份
+布局代码；超过 `INT_MAX` 时饱和并上报一次。
+
+`GetSwizzle` 有四个输出指针，逐个检查 guest 内存后写入 builder 的 R/G/B/A 值
+（默认 2/3/4/5）。`GetDebugID` 是宿主分配的单调 id，不是从 guest 结构体里读的。
+
+### 2. SetDebugLabel / Finalize / InvalidateTexels
+
+* `SetDebugLabel` 存进 `Tex`，同时设到 `MTLTexture.label` 上，Xcode 捕获里能看见；
+* `Finalize` 删除宿主 `Tex`。纹理池的槽位仍然保留，但解析时 `find<Tex>` 返回 null，
+  拿着旧句柄的 draw 会被丢弃，而不是读已释放对象；
+* `InvalidateTexels` 表示内容变成未定义。对本后端：只有 guest 池副本的纹理清掉一次性
+  上传标志，下次采样重新上传（未定义数据允许这种选择）；已经渲染过的纹理保留 Metal
+  内容，不会用陈旧的 guest 字节覆盖画面。部分区域不跟踪，按整张纹理处理并上报一次。
+
+仍未接的纹理入口主要是 `ReadTexels*`（需要 GPU 回读并按 block-linear 重新编码）、
+`GetStorageClass` / `GetSparseTileLayout` / `GetZCullStorageSize`（枚举或结构体语义未
+核实）、`View*` 系列与 `Compare`。
+
+### 3. 模拟器自测
+
+新增失败码 `16428`：
+
+1. 用 builder 建一张 4×4 RGBA8 纹理；
+2. 逐个调 14 个 getter，核对 4/4/1、levels 1、samples 1、format 0x25、target 0、
+   flags 0、pool 0、offset 0、stride 0、非零 debug id、address 0、storage size 等于
+   本地重算的 `nvngfx_tex_layout().size`；
+3. `GetSwizzle` 的四个输出等于默认的 2/3/4/5；
+4. `SetDebugLabel` 后 `Tex.label` 与 guest 字符串一致；
+5. `InvalidateTexels` 把 `uploaded` / `uploadTried` 清零；
+6. `Finalize` 之后 `find<Tex>` 为空，且再查宽高 / debug id 都返回 0。
+
+这一组证明宿主侧查询与生命周期，不是标题纹理内容。
+
+### 4. 门禁
+
+```text
+python scripts/syntax_check_metal.py
+python scripts/gen_nvn.py --repo . --check
+python scripts/extract_nvn_signatures.py --check
+python scripts/verify_ios.py
+powershell -ExecutionPolicy Bypass -File scripts/build_abi_test.ps1
+git diff --check
+```
+
+本地已通过（513 procs / 302 implemented / 477 measured + 6 inferred）。
 CI 结果待补。
