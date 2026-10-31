@@ -4118,7 +4118,7 @@ CI（run 41151003231，commit `ecfd58e`）两个 job 都通过：portable
 |---|---|
 | iOS 侧 `cmdbuf_end_recording` 仍在 EndRecording 里直接 commit 并返回 handle 0 | 客体拿不到可提交的句柄，回放层没有命令流可重放 |
 | iOS 侧未实现 `nvnCommandBufferCallCommands` / `nvnQueueSubmitCommands` | harness 记录得出来，回放层展不开 |
-| `ClearColori/ui` / `ClearBuffer` / `ClearTexture*` 只 `log_once`（该轮状态） | 该轮整数清屏、ClearBuffer 与纹理清屏仍是占位；整数清屏已在 M4 续五、ClearBuffer 已在 M4 续六接入，`ClearColor`（float）有真路径；`ClearDepthStencil` 已在下一轮接入 |
+| `ClearColori/ui` / `ClearBuffer` / `ClearTexture*` 只 `log_once`（该轮状态） | 该轮整数清屏、ClearBuffer 与纹理清屏仍是占位；整数清屏已在 M4 续五、ClearBuffer 已在 M4 续六接入，ClearTexture 已在 M4 续九接入；`ClearColor`（float）有真路径；`ClearDepthStencil` 已在下一轮接入 |
 | storage buffer / image / transform feedback 只记录句柄 | 计算与 UAV 路径未接线 |
 | harness 的 `nvnSamplerCompare` 只比较部分已实现字段，`SamplerBuilder` 缺 wrap / compare / border setter | 采样器状态不完整 |
 | 没有真机运行 | 不能声称画面，任何"能玩"的说法都不成立 |
@@ -4304,7 +4304,7 @@ build_abi_test: all tests passed
 
 * `SetDepthBounds` 只有记录与上报，Metal 没有深度边界测试；
 * 部分模板清屏掩码；
-* `ClearTexture*` 仍是日志占位（整数清屏已在 M4 续五、ClearBuffer 已在 M4 续六落地）；
+* `ClearTexture*` 仍是日志占位（整数清屏已在 M4 续五、ClearBuffer 已在 M4 续六落地；该轮当时未支持，M4 续九已实现）；
 * 没有真机像素验证，不能声称画面正确。
 
 ## M4 续三：多颜色附件（MRT）
@@ -4362,7 +4362,7 @@ build_abi_test: all tests passed
 * 没有颜色目标的纯深度 pass 仍打不开 encoder；
 * `SetDepthBounds` 只有记录与上报，Metal 没有深度边界测试；
 * 部分模板清屏掩码；
-* `ClearTexture*` 仍是日志占位（整数清屏已在 M4 续五、ClearBuffer 已在 M4 续六落地）；
+* `ClearTexture*` 仍是日志占位（整数清屏已在 M4 续五、ClearBuffer 已在 M4 续六落地；该轮当时未支持，M4 续九已实现）；
 * 没有真机像素验证，不能声称画面正确。
 
 ## M4 续四：纯深度 pass
@@ -4409,7 +4409,7 @@ build_abi_test: all tests passed
 
 * `SetDepthBounds` 只有记录与上报，Metal 没有深度边界测试；
 * 部分模板清屏掩码；
-* `ClearTexture*` 仍是日志占位（整数清屏已在 M4 续五、ClearBuffer 已在 M4 续六落地）；
+* `ClearTexture*` 仍是日志占位（整数清屏已在 M4 续五、ClearBuffer 已在 M4 续六落地；该轮当时未支持，M4 续九已实现）；
 * 没有真机像素验证，不能声称画面正确。
 
 ## M4 续五：整数颜色清屏
@@ -4456,7 +4456,7 @@ build_abi_test: all tests passed
 
 * `SetDepthBounds` 只有记录与上报，Metal 没有深度边界测试；
 * 模板与颜色清屏的部分通道掩码（颜色部分已在 M4 续八实现；模板仍未支持）；
-* `ClearTexture{i,ui}`（ClearBuffer 已在 M4 续六落地）；
+* `ClearTexture{i,ui}`（ClearBuffer 已在 M4 续六落地；该轮当时未支持，M4 续九已实现）；
 * 没有真机像素验证，不能声称画面正确。
 
 ## M4 续六：任意 32 位 ClearBuffer
@@ -4496,7 +4496,7 @@ build_abi_test: all tests passed
 
 * `SetDepthBounds` 只有记录与上报，Metal 没有深度边界测试；
 * 模板与颜色清屏的部分通道掩码（颜色部分已在 M4 续八实现；模板仍未支持）；
-* `ClearTexture{i,ui}`；
+* `ClearTexture{i,ui}`（该轮当时未支持；后续 M4 续九已实现）；
 * guest `DispatchCompute` / image / storage buffer 路径；
 * 没有真机像素验证，不能声称画面正确。
 
@@ -4539,7 +4539,7 @@ build_abi_test: all tests passed
 仍未支持：
 
 * 模板与颜色清屏的部分通道掩码（颜色部分已在 M4 续八实现；模板仍未支持）；
-* `ClearTexture{i,ui}`；
+* `ClearTexture{i,ui}`（该轮当时未支持；后续 M4 续九已实现）；
 * guest `DispatchCompute` / image / storage buffer 路径；
 * 真实标题 shader 的离线 MSL 接入（`nvn_shader_blobs.gen.c` 仍为空表）；
 * 没有真机像素验证，不能声称画面正确。
@@ -4591,7 +4591,57 @@ build_abi_test: all tests passed
 仍未支持：
 
 * 模板清屏的部分通道掩码；
-* `ClearTexture{i,ui}`；
+* `ClearTexture{i,ui}`（该轮当时未支持；后续 M4 续九已实现）；
+* guest `DispatchCompute` / image / storage buffer 路径；
+* 真实标题 shader 的离线 MSL 接入（`nvn_shader_blobs.gen.c` 仍为空表）；
+* 没有真机像素验证，不能声称画面正确。
+
+## M4 续九：ClearTexture 完整级别、区域与掩码清屏
+
+`nvnCommandBufferClearTexture` / `ClearTexturei` / `ClearTextureui` 此前只打印
+`unsupported`。Metal 没有纹理填充 API，这一轮按“完整级别用 load action、局部或
+掩码用 scissor 全屏三角形”的方式接上，并且逐 mip、逐 array slice / cube face
+挂载颜色附件。
+
+### 1. 两条清屏路径
+
+* 新增 `clear_texture_common()`，三个入口只负责把颜色指针解释为 `float4`、
+  `int4` 或 `uint4`；
+* 无 region 且 `mask == 0xF` 时，每个 level/slice 用 `MTLLoadActionClear`；
+* 有 region、部分掩码或非整级清屏时，使用 `MTLLoadActionLoad`，以附件尺寸设置
+  viewport、以 region 设置 scissor，再走 M4 续八的宿主 clear 管线；
+* 颜色附件通过 `level` / `slice` 选择 mip 与层；`Tex::layers` 而不是
+  `MTLTexture.arrayLength` 决定层数，因为 cube 的 arrayLength 是 1 但有六个面，
+  cube array 的 arrayLength 是 cube 数而不是 slice 数；
+* 支持 2D、2D array、cube、cube array、2D MSAA 颜色纹理；完整多 mip 清屏可用，
+  显式 region 仅接受单 level 视图；
+* 1D、3D、depth/stencil 目标与格式变更的 texture view 明确上报并拒绝，避免清错；
+* 清屏前先落地 pending ClearColor/ClearDepthStencil，再结束当前 render encoder，
+  保证命令顺序。
+
+### 2. 模拟器自测
+
+* RGBA8 目标先整级清蓝，再用 region 把右下四分之一清红：中心必须红、左上仍蓝；
+* 同一区域再以 `mask=0x2` 清绿：中心由红变黄 `(255,255,0,255)`，证明只写 G；
+* RGBA8Uint 完整清屏回读 `(0x11,0x22,0x33,0x44)`；
+* cube 目标完整清屏后逐面回读六个 face 都为蓝，证明 cube 不能只清 face 0；
+* 两级 mip 的 2D 目标完整清屏后回读 mip 1 为绿，证明附件的 `level` 选择生效。
+
+### 3. 覆盖与仍然缺的
+
+没有新增 NVN 入口，覆盖率保持 **202/513（39.4%）**，未实现 311；CommandBuffer 域
+**57/144**。门禁输出：
+
+```text
+syntax_check_metal: ok (clang++.exe)
+verify_ios: ok (metal bindings: 202/513)
+build_abi_test: all tests passed
+```
+
+仍未支持：
+
+* 模板清屏的部分通道掩码；
+* 1D / 3D / depth-stencil 的 `ClearTexture{i,ui}`；
 * guest `DispatchCompute` / image / storage buffer 路径；
 * 真实标题 shader 的离线 MSL 接入（`nvn_shader_blobs.gen.c` 仍为空表）；
 * 没有真机像素验证，不能声称画面正确。

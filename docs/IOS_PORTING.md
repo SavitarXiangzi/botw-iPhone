@@ -509,10 +509,14 @@ guest storage，再调用 `nvnTextureFlushTexels` 改成棕/钢蓝/橙/天蓝并
   blit `fillBuffer` 只能重复单字节，而 NVN 的 value 是 32 位字。kernel 在同一个
   `MTLCommandBuffer` 内写入已注册 memory pool 的 span，支持任意 32 位模式，地址和长度
   要求 4 字节对齐；模拟器用 0xA1B2C3D4 回读 8 个 word。仍缺
-  `SetStencilCullCriteria`、`ClearTexture{i,ui}` 与 guest compute dispatch；颜色清屏的部分通道掩码已改为
+  `SetStencilCullCriteria` 与 guest compute dispatch；颜色清屏的部分通道掩码已改为
   Load + 全屏三角形（管线写掩码选通道），模拟器验证 RGBA8 的 R/G 合并清屏与
-  RGBA8Uint 的 R/G 掩码清屏保留 B/A；模板清屏的部分通道掩码仍无法用 load action
-  表达，会明确上报而不是错误清除。
+  RGBA8Uint 的 R/G 掩码清屏保留 B/A。`ClearTexture` / `ClearTexturei` /
+  `ClearTextureui` 已支持 2D / 2D array / cube / cube array / 2D MSAA 颜色纹理的
+  完整级别、region、mask 与完整多 mip 清屏；模拟器回读完整、区域、mask、整数、
+  cube 六面和 mip 1。显式 region 仅接受单 level 视图，1D / 3D / depth-stencil
+  明确拒绝；模板清屏的部分通道掩码仍无法用 load action 表达，会明确上报而不是
+  错误清除。
 - ✅ Sampler：M3.82 完成 builder、object、getter 和真实的
   `MTLSamplerState`；M3.83 完成 sampler pool、`BindSeparateSampler(s)` 与
   参数缓冲区/直连绑定两条路径。M3.84 已把真实 shader 的 `[[id(k)]]` 顺序

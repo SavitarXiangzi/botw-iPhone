@@ -14,7 +14,8 @@
  *         command buffer -> MTLCommandBuffer, viewport / scissor / drawArrays
  *         render targets + one render pass (1-8 colour attachments) +
  *           ClearColor / ClearColori / ClearColorui / ClearDepthStencil as
- *           load actions, flushed even without a draw
+ *           load actions, and ClearTexture{i,ui} as per-level/slice attachment
+ *           passes, flushed even without a draw
  *         ClearBuffer -> host compute kernel over a pool span
  *         texture objects, built from the values nvnTextureBuilderSet* was
  *           given (no guest struct offsets are read)
@@ -34,8 +35,9 @@
  *         path -- pipeline creation with a real vertex descriptor, buffer
  *         binding, draw encoding, pixel readback -- is executed by
  *         nvngfx_metal_selftest() in CI's iOS Simulator: eighteen draws,
- *         five clear-only regressions (R32Uint / R32Sint full clears and
- *         partial-mask RGBA8 / RGBA8Uint clears), a
+ *         six clear-only regressions (full / partial-mask / integer
+ *         ClearColor, ClearTexture full-region-mask-uint-cube-mip, depth /
+ *         stencil and MRT clears), a
  *         buffer-fill compute probe, a bindless table probe, and a vertex-stage
  *         argument-buffer draw whose shifted pixels are read back.  The ninth
  *         builds a block-linear texture in a guest memory pool and proves that
@@ -5107,22 +5109,307 @@ void cmdbuf_clear_buffer(nvngfx_ctx* ctx, uint64_t* x) {
     [enc endEncoding];
 }
 
-/* nvnCommandBufferClearTexture{,i,ui}: the texture clear path is not wired
- * to a Metal blit yet.  Keep the call visible instead of silently dropping. */
-void cmdbuf_clear_texture(nvngfx_ctx*, uint64_t* x) {
+/* nvnCommandBufferClearTexture{,i,ui}
+ *
+ * NVN clears a region of a colour texture.  Metal has no texture fill call.
+ * A full-level, full-mask clear is the attachment's load action; a sub-region
+ * or masked clear is a scissored full-screen triangle through the host clear
+ * pipeline.  The texture is attached one mip level and one array slice/face
+ * at a time.
+ *
+ * Scope: 2D / 2D-array / cube colour textures, including multisampled 2D.
+ * A full multi-mip clear is supported; an explicit region is accepted only
+ * for a single-level view.  3D / 1D attachments and depth/stencil textures
+ * are reported and refused rather than cleared incorrectly.
+ */
+void clear_texture_common(nvngfx_ctx* ctx, uint64_t* x, int apiKind) {
+    Ctx* c = ctx_of(ctx);
     CmdBuf* b = find_or_add<CmdBuf>(x[0]);
-    if (!b) return;
-    log_once("nvnCommandBufferClearTexture.unsupported", static_cast<unsigned>(x[1] != 0));
+    Tex* t = find<Tex>(x[1]);
+    if (!c || !b) return;
+    if (!t || !t->mtl) {
+        log_once_str("nvnCommandBufferClearTexture",
+                     "texture is not initialized");
+        return;
+    }
+    if (!b->recording || !b->cb) {
+        log_once("nvnCommandBufferClearTexture.notRecording", 1);
+        return;
+    }
+    const void* colorSrc = guest_ptr<const void>(x[4]);
+    if (!colorSrc) {
+        log_once_str("nvnCommandBufferClearTexture", "colour pointer is null");
+        return;
+    }
+    double rgba[4] = {0.0, 0.0, 0.0, 0.0};
+    if (apiKind == 0) {
+        const float* f = static_cast<const float*>(colorSrc);
+        for (unsigned i = 0; i < 4; ++i) rgba[i] = f[i];
+    } else if (apiKind == 1) {
+        const int* v = static_cast<const int*>(colorSrc);
+        for (unsigned i = 0; i < 4; ++i) rgba[i] = static_cast<double>(v[i]);
+    } else {
+        const uint32_t* v = static_cast<const uint32_t*>(colorSrc);
+        for (unsigned i = 0; i < 4; ++i) rgba[i] = static_cast<double>(v[i]);
+    }
+    const unsigned mask = static_cast<unsigned>(x[5]) & 0xFu;
+    if (!mask) return;
+    const int kind =
+        nvngfx_format_component_class(static_cast<int>(t->format));
+    if (kind < 0) {
+        log_once("nvnCommandBufferClearTexture.format",
+                 static_cast<unsigned>(t->format));
+        return;
+    }
+
+    const MTLTextureType type = t->mtl.textureType;
+    const bool isArray = type == MTLTextureType2DArray ||
+                         type == MTLTextureTypeCube ||
+                         type == MTLTextureTypeCubeArray ||
+                         type == MTLTextureType2DMultisampleArray;
+    const bool is2d = type == MTLTextureType2D ||
+                      type == MTLTextureType2DMultisample;
+    if (!isArray && !is2d) {
+        log_once("nvnCommandBufferClearTexture.target",
+                 static_cast<unsigned>(type));
+        return;
+    }
+
+    const unsigned mipCount =
+        static_cast<unsigned>(t->mtl.mipmapLevelCount);
+    /* MTLTexture.arrayLength is not the number of addressable slices for a
+     * cube (one array entry, six faces) or a cube array (one array entry per
+     * cube).  Tex::layers is the layout's total slice count and is the only
+     * value that can drive a face-by-face clear. */
+    const unsigned sliceCount = t->layers ? t->layers : 1u;
+    unsigned baseLevel = 0;
+    unsigned levels = mipCount ? mipCount : 1u;
+    unsigned firstLayer = 0;
+    unsigned layers = sliceCount ? sliceCount : 1u;
+
+    if (x[2]) {
+        if (!guest_range(x[2], sizeof(TexView16))) {
+            log_once_str("nvnCommandBufferClearTexture",
+                         "texture view pointer is not guest memory");
+            return;
+        }
+        TexView16 v = {};
+        std::memcpy(&v, guest_ptr<const void>(x[2]), sizeof v);
+        if ((v.bits & 0x04u) && v.format != t->desc.format) {
+            log_once_str("nvnCommandBufferClearTexture",
+                         "texture view changes the format");
+            return;
+        }
+        if ((v.bits & 0x08u) && v.target != t->desc.target) {
+            log_once_str("nvnCommandBufferClearTexture",
+                         "texture view changes the target");
+            return;
+        }
+        if (v.bits & 0x01u) {
+            baseLevel = v.baseLevel;
+            levels = v.numLevels ? v.numLevels : 1u;
+        }
+        if (v.bits & 0x02u) {
+            firstLayer = v.minLayer;
+            layers = v.numLayers ? v.numLayers : 1u;
+        }
+    }
+    if (!mipCount || baseLevel >= mipCount || levels > mipCount - baseLevel) {
+        log_once("nvnCommandBufferClearTexture.level", baseLevel);
+        return;
+    }
+    if (!sliceCount || firstLayer >= sliceCount ||
+        layers > sliceCount - firstLayer) {
+        log_once("nvnCommandBufferClearTexture.layer", firstLayer);
+        return;
+    }
+
+    bool haveRegion = false;
+    CopyRegion region = {};
+    if (x[3]) {
+        if (!guest_range(x[3], sizeof(CopyRegion))) {
+            log_once_str("nvnCommandBufferClearTexture",
+                         "region pointer is not guest memory");
+            return;
+        }
+        std::memcpy(&region, guest_ptr<const void>(x[3]), sizeof region);
+        if (region.xoffset < 0 || region.yoffset < 0 ||
+            region.zoffset < 0 || region.width < 0 ||
+            region.height < 0 || region.depth < 0) {
+            log_once_str("nvnCommandBufferClearTexture",
+                         "region is negative");
+            return;
+        }
+        if (region.width == 0 || region.height == 0) return;
+        haveRegion = true;
+    }
+    if (haveRegion && levels > 1) {
+        log_once_str("nvnCommandBufferClearTexture",
+                     "explicit region with multiple mip levels is refused");
+        return;
+    }
+
+    const unsigned baseW = static_cast<unsigned>(t->mtl.width);
+    const unsigned baseH = static_cast<unsigned>(t->mtl.height);
+    bool needDraw = mask != 0xFu;
+
+    /* Validate every level/slice before touching the command buffer, so a bad
+     * region cannot leave the texture half-cleared. */
+    for (unsigned lv = 0; lv < levels; ++lv) {
+        const unsigned level = baseLevel + lv;
+        unsigned w = baseW >> level;
+        if (!w) w = 1;
+        unsigned h = baseH >> level;
+        if (!h) h = 1;
+        if (!haveRegion) continue;
+        const unsigned rx = static_cast<unsigned>(region.xoffset);
+        const unsigned ry = static_cast<unsigned>(region.yoffset);
+        const unsigned rw = static_cast<unsigned>(region.width);
+        const unsigned rh = static_cast<unsigned>(region.height);
+        if (rx > w || rw > w - rx || ry > h || rh > h - ry) {
+            log_once("nvnCommandBufferClearTexture.region", level);
+            return;
+        }
+        if (rx != 0 || ry != 0 || rw != w || rh != h) needDraw = true;
+        if (isArray) {
+            const unsigned z = static_cast<unsigned>(region.zoffset);
+            const unsigned d = region.depth
+                                   ? static_cast<unsigned>(region.depth)
+                                   : 1u;
+            if (z > layers || d > layers - z) {
+                log_once("nvnCommandBufferClearTexture.layer", level);
+                return;
+            }
+        } else if (region.zoffset != 0 ||
+                   (region.depth != 0 && region.depth != 1)) {
+            log_once_str("nvnCommandBufferClearTexture",
+                         "2D clear region has a non-zero z/depth");
+            return;
+        }
+    }
+
+    id<MTLRenderPipelineState> pso = nil;
+    id<MTLDepthStencilState> dss = nil;
+    if (needDraw) {
+        const MTLPixelFormat fmt = t->mtl.pixelFormat;
+        pso = clear_pipeline(c, &fmt, &mask, &kind, 1,
+                             static_cast<MTLPixelFormat>(0),
+                             static_cast<MTLPixelFormat>(0),
+                             static_cast<unsigned>(t->mtl.sampleCount));
+        if (!pso) {
+            log_once("nvnCommandBufferClearTexture.pipeline", 1);
+            return;
+        }
+        dss = clear_depth_stencil(c);
+        if (!dss) {
+            log_once("nvnCommandBufferClearTexture.depthState", 1);
+            return;
+        }
+    }
+
+    /* Land pending attachment clears on the current pass before ending it:
+     * the texture passes below need the command buffer to themselves. */
+    if (!flush_pending_clears(c, b)) {
+        log_once("nvnCommandBufferClearTexture.pendingClear", 1);
+        return;
+    }
+    end_encoder(b);
+
+    for (unsigned lv = 0; lv < levels; ++lv) {
+        const unsigned level = baseLevel + lv;
+        unsigned w = baseW >> level;
+        if (!w) w = 1;
+        unsigned h = baseH >> level;
+        if (!h) h = 1;
+        unsigned begin = firstLayer;
+        unsigned count = layers;
+        unsigned rx = 0;
+        unsigned ry = 0;
+        unsigned rw = w;
+        unsigned rh = h;
+        if (haveRegion) {
+            rx = static_cast<unsigned>(region.xoffset);
+            ry = static_cast<unsigned>(region.yoffset);
+            rw = static_cast<unsigned>(region.width);
+            rh = static_cast<unsigned>(region.height);
+            if (isArray) {
+                const unsigned z = static_cast<unsigned>(region.zoffset);
+                const unsigned d = region.depth
+                                       ? static_cast<unsigned>(region.depth)
+                                       : 1u;
+                begin = firstLayer + z;
+                count = d;
+            }
+        }
+        const bool fullSlice = rx == 0 && ry == 0 && rw == w && rh == h;
+        for (unsigned i = 0; i < count; ++i) {
+            const unsigned slice = begin + i;
+            @autoreleasepool {
+                MTLRenderPassDescriptor* rpd =
+                    [MTLRenderPassDescriptor renderPassDescriptor];
+                MTLRenderPassColorAttachmentDescriptor* ca =
+                    rpd.colorAttachments[0];
+                ca.texture = t->mtl;
+                ca.level = static_cast<NSUInteger>(level);
+                ca.slice = isArray ? static_cast<NSUInteger>(slice) : 0;
+                ca.depthPlane = 0;
+                ca.storeAction = MTLStoreActionStore;
+                const bool fast = fullSlice && mask == 0xFu;
+                ca.loadAction =
+                    fast ? MTLLoadActionClear : MTLLoadActionLoad;
+                if (fast) {
+                    ca.clearColor = MTLClearColorMake(
+                        rgba[0], rgba[1], rgba[2], rgba[3]);
+                }
+                id<MTLRenderCommandEncoder> enc =
+                    [b->cb renderCommandEncoderWithDescriptor:rpd];
+                if (!enc) {
+                    log_once("nvnCommandBufferClearTexture.encoder", level);
+                    return;
+                }
+                if (!fast) {
+                    const uint32_t bits[4] = {
+                        clear_component_bits(rgba[0], kind),
+                        clear_component_bits(rgba[1], kind),
+                        clear_component_bits(rgba[2], kind),
+                        clear_component_bits(rgba[3], kind)};
+                    const MTLViewport vp = {
+                        0.0, 0.0, static_cast<double>(w),
+                        static_cast<double>(h), 0.0, 1.0};
+                    const MTLScissorRect sc = {
+                        static_cast<NSUInteger>(rx),
+                        static_cast<NSUInteger>(ry),
+                        static_cast<NSUInteger>(rw),
+                        static_cast<NSUInteger>(rh)};
+                    [enc setViewport:vp];
+                    [enc setScissorRect:sc];
+                    [enc setRenderPipelineState:pso];
+                    [enc setDepthStencilState:dss];
+                    [enc setCullMode:MTLCullModeNone];
+                    [enc setFrontFacingWinding:MTLWindingClockwise];
+                    [enc setTriangleFillMode:MTLTriangleFillModeFill];
+                    [enc setFragmentBytes:bits
+                                   length:sizeof(bits)
+                                  atIndex:0];
+                    [enc drawPrimitives:MTLPrimitiveTypeTriangle
+                            vertexStart:0
+                            vertexCount:3];
+                }
+                [enc endEncoding];
+            }
+        }
+    }
+    t->rendered = true;
 }
-void cmdbuf_clear_texture_i(nvngfx_ctx*, uint64_t* x) {
-    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
-    if (!b) return;
-    log_once("nvnCommandBufferClearTexturei.unsupported", static_cast<unsigned>(x[1] != 0));
+
+void cmdbuf_clear_texture(nvngfx_ctx* ctx, uint64_t* x) {
+    clear_texture_common(ctx, x, 0);
 }
-void cmdbuf_clear_texture_ui(nvngfx_ctx*, uint64_t* x) {
-    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
-    if (!b) return;
-    log_once("nvnCommandBufferClearTextureui.unsupported", static_cast<unsigned>(x[1] != 0));
+void cmdbuf_clear_texture_i(nvngfx_ctx* ctx, uint64_t* x) {
+    clear_texture_common(ctx, x, 1);
+}
+void cmdbuf_clear_texture_ui(nvngfx_ctx* ctx, uint64_t* x) {
+    clear_texture_common(ctx, x, 2);
 }
 
 /* nvnCommandBufferSetAlphaRef(cb, float) */
@@ -5631,9 +5918,10 @@ const nvngfx_backend k_metal = {"metal", nullptr, metal_resolve};
 /* Copies the whole target into a shared buffer and hands back the centre
  * pixel.  Blit + waitUntilCompleted is the same readback the first version
  * did inline; pulling it out lets a second draw be checked the same way. */
-bool read_pixel_at(id<MTLDevice> dev, id<MTLCommandQueue> queue,
-                   id<MTLTexture> tex, NSUInteger side, NSUInteger x, NSUInteger y,
-                   unsigned char px[4]) {
+bool read_pixel_at_layer(id<MTLDevice> dev, id<MTLCommandQueue> queue,
+                         id<MTLTexture> tex, NSUInteger side,
+                         NSUInteger x, NSUInteger y, NSUInteger slice,
+                         NSUInteger level, unsigned char px[4]) {
     if (!dev || !queue || !tex || x >= side || y >= side) return false;
     const NSUInteger bpr = side * 4;
     id<MTLBuffer> buf = [dev newBufferWithLength:bpr * side
@@ -5642,8 +5930,8 @@ bool read_pixel_at(id<MTLDevice> dev, id<MTLCommandQueue> queue,
     id<MTLCommandBuffer> cb = [queue commandBuffer];
     id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
     [blit copyFromTexture:tex
-              sourceSlice:0
-              sourceLevel:0
+              sourceSlice:slice
+              sourceLevel:level
              sourceOrigin:MTLOriginMake(0, 0, 0)
                sourceSize:MTLSizeMake(side, side, 1)
                  toBuffer:buf
@@ -5658,6 +5946,12 @@ bool read_pixel_at(id<MTLDevice> dev, id<MTLCommandQueue> queue,
                              y * bpr + x * 4;
     for (int i = 0; i < 4; ++i) px[i] = p[i];
     return true;
+}
+
+bool read_pixel_at(id<MTLDevice> dev, id<MTLCommandQueue> queue,
+                   id<MTLTexture> tex, NSUInteger side, NSUInteger x, NSUInteger y,
+                   unsigned char px[4]) {
+    return read_pixel_at_layer(dev, queue, tex, side, x, y, 0, 0, px);
 }
 
 bool read_center_pixel(id<MTLDevice> dev, id<MTLCommandQueue> queue,
@@ -9766,6 +10060,322 @@ extern "C" int nvngfx_metal_selftest(void) {
         }
 
         {
+            /* --- ClearTexture: full, region and mask --------------------
+             * A full-level clear is a load action; a sub-region or masked
+             * clear is a scissored full-screen triangle.  The 64x64 target
+             * lets the bottom-right quadrant be cleared while (0,0) proves
+             * the rest of the level survived. */
+            const uint64_t kClearTexBuilder = 0x9100;
+            const uint64_t kClearTex = 0x9200;
+            const uint64_t kCbClearTex = 0x9300;
+            const uint64_t kClearTexUI = 0x9400;
+
+            x[0] = kClearTexBuilder;
+            tex_builder_set_defaults(ctx, x);
+            x[0] = kClearTexBuilder; x[1] = 0;
+            tex_builder_set_target(ctx, x);
+            x[0] = kClearTexBuilder; x[1] = 0x25;   /* RGBA8Unorm */
+            tex_builder_set_format(ctx, x);
+            x[0] = kClearTexBuilder;
+            x[1] = static_cast<uint64_t>(kSide);
+            x[2] = static_cast<uint64_t>(kSide);
+            tex_builder_set_size2d(ctx, x);
+            x[0] = kClearTexBuilder; x[1] = 1;
+            tex_builder_set_levels(ctx, x);
+            x[0] = kClearTexBuilder; x[1] = 1;
+            tex_builder_set_samples(ctx, x);
+            x[0] = kClearTex; x[1] = kClearTexBuilder;
+            tex_initialize(ctx, x);
+            Tex* tc = find<Tex>(kClearTex);
+            if (x[0] != 1 || !tc || !tc->mtl) {
+                std::fprintf(stderr,
+                             "[selftest] ClearTexture: target was not created\n");
+                rc = 16420;
+                goto done;
+            }
+
+            CmdBuf* bct = find_or_add<CmdBuf>(kCbClearTex);
+            const float blue[4] = {0.0f, 0.0f, 1.0f, 1.0f};
+            x[0] = kCbClearTex;
+            cmdbuf_begin_recording(ctx, x);
+            x[0] = kCbClearTex; x[1] = kClearTex; x[2] = 0; x[3] = 0;
+            x[4] = reinterpret_cast<uint64_t>(blue); x[5] = 0xF;
+            cmdbuf_clear_texture(ctx, x);
+            x[0] = kCbClearTex;
+            cmdbuf_end_recording(ctx, x);
+            if (!bct || !bct->last) {
+                std::fprintf(stderr,
+                             "[selftest] ClearTexture: full clear did not commit\n");
+                rc = 16420;
+                goto done;
+            }
+            [bct->last waitUntilCompleted];
+            if (bct->last.status == MTLCommandBufferStatusError) {
+                std::fprintf(stderr,
+                             "[selftest] ClearTexture full error: %s\n",
+                             bct->last.error
+                                 ? [[bct->last.error localizedDescription] UTF8String]
+                                 : "(no description)");
+                rc = 16420;
+                goto done;
+            }
+            unsigned char pxc[4] = {0, 0, 0, 0};
+            const int wantBlue[4] = {0, 0, 255, 255};
+            if (!read_pixel_at(dev, c->queue, tc->mtl, kSide, 0, 0, pxc) ||
+                !pixels_near(pxc, wantBlue, 2)) {
+                std::fprintf(stderr,
+                             "[selftest] ClearTexture full pixel is "
+                             "(%u,%u,%u,%u), want blue\n",
+                             pxc[0], pxc[1], pxc[2], pxc[3]);
+                rc = 16420;
+                goto done;
+            }
+
+            CopyRegion quarter = {};
+            quarter.xoffset = static_cast<int32_t>(kSide / 2);
+            quarter.yoffset = static_cast<int32_t>(kSide / 2);
+            quarter.width = static_cast<int32_t>(kSide / 2);
+            quarter.height = static_cast<int32_t>(kSide / 2);
+            quarter.depth = 1;
+            const float red[4] = {1.0f, 0.0f, 0.0f, 1.0f};
+            x[0] = kCbClearTex;
+            cmdbuf_begin_recording(ctx, x);
+            x[0] = kCbClearTex; x[1] = kClearTex; x[2] = 0;
+            x[3] = reinterpret_cast<uint64_t>(&quarter);
+            x[4] = reinterpret_cast<uint64_t>(red); x[5] = 0xF;
+            cmdbuf_clear_texture(ctx, x);
+            x[0] = kCbClearTex;
+            cmdbuf_end_recording(ctx, x);
+            [bct->last waitUntilCompleted];
+            if (bct->last.status == MTLCommandBufferStatusError) {
+                std::fprintf(stderr,
+                             "[selftest] ClearTexture region error: %s\n",
+                             bct->last.error
+                                 ? [[bct->last.error localizedDescription] UTF8String]
+                                 : "(no description)");
+                rc = 16420;
+                goto done;
+            }
+            const int wantRed[4] = {255, 0, 0, 255};
+            if (!read_pixel_at(dev, c->queue, tc->mtl, kSide,
+                               kSide / 2, kSide / 2, pxc) ||
+                !pixels_near(pxc, wantRed, 2)) {
+                std::fprintf(stderr,
+                             "[selftest] ClearTexture region pixel is "
+                             "(%u,%u,%u,%u), want red\n",
+                             pxc[0], pxc[1], pxc[2], pxc[3]);
+                rc = 16420;
+                goto done;
+            }
+            if (!read_pixel_at(dev, c->queue, tc->mtl, kSide, 0, 0, pxc) ||
+                !pixels_near(pxc, wantBlue, 2)) {
+                std::fprintf(stderr,
+                             "[selftest] ClearTexture region overwrote (0,0)\n");
+                rc = 16420;
+                goto done;
+            }
+
+            const float green[4] = {0.0f, 1.0f, 0.0f, 1.0f};
+            x[0] = kCbClearTex;
+            cmdbuf_begin_recording(ctx, x);
+            x[0] = kCbClearTex; x[1] = kClearTex; x[2] = 0;
+            x[3] = reinterpret_cast<uint64_t>(&quarter);
+            x[4] = reinterpret_cast<uint64_t>(green); x[5] = 0x2;
+            cmdbuf_clear_texture(ctx, x);
+            x[0] = kCbClearTex;
+            cmdbuf_end_recording(ctx, x);
+            [bct->last waitUntilCompleted];
+            if (bct->last.status == MTLCommandBufferStatusError) {
+                std::fprintf(stderr,
+                             "[selftest] ClearTexture mask error: %s\n",
+                             bct->last.error
+                                 ? [[bct->last.error localizedDescription] UTF8String]
+                                 : "(no description)");
+                rc = 16420;
+                goto done;
+            }
+            const int wantYellow[4] = {255, 255, 0, 255};
+            if (!read_pixel_at(dev, c->queue, tc->mtl, kSide,
+                               kSide / 2, kSide / 2, pxc) ||
+                !pixels_near(pxc, wantYellow, 2)) {
+                std::fprintf(stderr,
+                             "[selftest] ClearTexture masked pixel is "
+                             "(%u,%u,%u,%u), want yellow\n",
+                             pxc[0], pxc[1], pxc[2], pxc[3]);
+                rc = 16420;
+                goto done;
+            }
+
+            /* ClearTextureui: integer full clear through the same path. */
+            x[0] = kClearTexBuilder; x[1] = 0x27;   /* RGBA8Uint */
+            tex_builder_set_format(ctx, x);
+            x[0] = kClearTexUI; x[1] = kClearTexBuilder;
+            tex_initialize(ctx, x);
+            Tex* tcu = find<Tex>(kClearTexUI);
+            if (x[0] != 1 || !tcu || !tcu->mtl) {
+                std::fprintf(stderr,
+                             "[selftest] ClearTextureui: target was not created\n");
+                rc = 16420;
+                goto done;
+            }
+            const uint32_t ucolor[4] = {0x11u, 0x22u, 0x33u, 0x44u};
+            x[0] = kCbClearTex;
+            cmdbuf_begin_recording(ctx, x);
+            x[0] = kCbClearTex; x[1] = kClearTexUI; x[2] = 0; x[3] = 0;
+            x[4] = reinterpret_cast<uint64_t>(ucolor); x[5] = 0xF;
+            cmdbuf_clear_texture_ui(ctx, x);
+            x[0] = kCbClearTex;
+            cmdbuf_end_recording(ctx, x);
+            [bct->last waitUntilCompleted];
+            if (bct->last.status == MTLCommandBufferStatusError) {
+                std::fprintf(stderr,
+                             "[selftest] ClearTextureui error: %s\n",
+                             bct->last.error
+                                 ? [[bct->last.error localizedDescription] UTF8String]
+                                 : "(no description)");
+                rc = 16420;
+                goto done;
+            }
+            const int wantU[4] = {0x11, 0x22, 0x33, 0x44};
+            if (!read_pixel_at(dev, c->queue, tcu->mtl, kSide, 0, 0, pxc) ||
+                !pixels_near(pxc, wantU, 0)) {
+                std::fprintf(stderr,
+                             "[selftest] ClearTextureui pixel is "
+                             "(%u,%u,%u,%u), want (11,22,33,44)\n",
+                             pxc[0], pxc[1], pxc[2], pxc[3]);
+                rc = 16420;
+                goto done;
+            }
+            /* Cube: Metal reports one array entry for six addressable faces.
+             * The clear must walk Tex::layers, otherwise only face 0 lands. */
+            const uint64_t kClearTexCubeBuilder = 0x9500;
+            const uint64_t kClearTexCube = 0x9600;
+            x[0] = kClearTexCubeBuilder;
+            tex_builder_set_defaults(ctx, x);
+            x[0] = kClearTexCubeBuilder; x[1] = 8;   /* Cube */
+            tex_builder_set_target(ctx, x);
+            x[0] = kClearTexCubeBuilder; x[1] = 0x25;
+            tex_builder_set_format(ctx, x);
+            x[0] = kClearTexCubeBuilder;
+            x[1] = static_cast<uint64_t>(kSide);
+            x[2] = static_cast<uint64_t>(kSide);
+            tex_builder_set_size2d(ctx, x);
+            x[0] = kClearTexCubeBuilder; x[1] = 1;
+            tex_builder_set_depth(ctx, x);
+            x[0] = kClearTexCubeBuilder; x[1] = 1;
+            tex_builder_set_levels(ctx, x);
+            x[0] = kClearTexCubeBuilder; x[1] = 1;
+            tex_builder_set_samples(ctx, x);
+            x[0] = kClearTexCube; x[1] = kClearTexCubeBuilder;
+            tex_initialize(ctx, x);
+            Tex* tcc = find<Tex>(kClearTexCube);
+            if (x[0] != 1 || !tcc || !tcc->mtl ||
+                tcc->mtl.textureType != MTLTextureTypeCube ||
+                tcc->mtl.arrayLength != 1 || tcc->layers != 6) {
+                std::fprintf(stderr,
+                             "[selftest] ClearTexture: cube target is not "
+                             "six layers (array=%lu layers=%u)\n",
+                             tcc ? static_cast<unsigned long>(
+                                       tcc->mtl.arrayLength)
+                                 : 0ul,
+                             tcc ? tcc->layers : 0u);
+                rc = 16421;
+                goto done;
+            }
+            x[0] = kCbClearTex;
+            cmdbuf_begin_recording(ctx, x);
+            x[0] = kCbClearTex; x[1] = kClearTexCube; x[2] = 0; x[3] = 0;
+            x[4] = reinterpret_cast<uint64_t>(blue); x[5] = 0xF;
+            cmdbuf_clear_texture(ctx, x);
+            x[0] = kCbClearTex;
+            cmdbuf_end_recording(ctx, x);
+            [bct->last waitUntilCompleted];
+            if (bct->last.status == MTLCommandBufferStatusError) {
+                std::fprintf(stderr,
+                             "[selftest] ClearTexture cube error: %s\n",
+                             bct->last.error
+                                 ? [[bct->last.error localizedDescription] UTF8String]
+                                 : "(no description)");
+                rc = 16421;
+                goto done;
+            }
+            for (unsigned face = 0; face < 6; ++face) {
+                if (!read_pixel_at_layer(dev, c->queue, tcc->mtl, kSide,
+                                         0, 0, face, 0, pxc) ||
+                    !pixels_near(pxc, wantBlue, 2)) {
+                    std::fprintf(stderr,
+                                 "[selftest] ClearTexture cube face %u is "
+                                 "(%u,%u,%u,%u), want blue\n",
+                                 face, pxc[0], pxc[1], pxc[2], pxc[3]);
+                    rc = 16421;
+                    goto done;
+                }
+            }
+
+            /* A second level proves the attachment's `level` selection, not
+             * just the base-level render pass. */
+            const uint64_t kClearTexMipBuilder = 0x9700;
+            const uint64_t kClearTexMip = 0x9800;
+            x[0] = kClearTexMipBuilder;
+            tex_builder_set_defaults(ctx, x);
+            x[0] = kClearTexMipBuilder; x[1] = 0;   /* 2D */
+            tex_builder_set_target(ctx, x);
+            x[0] = kClearTexMipBuilder; x[1] = 0x25;
+            tex_builder_set_format(ctx, x);
+            x[0] = kClearTexMipBuilder;
+            x[1] = static_cast<uint64_t>(kSide);
+            x[2] = static_cast<uint64_t>(kSide);
+            tex_builder_set_size2d(ctx, x);
+            x[0] = kClearTexMipBuilder; x[1] = 2;
+            tex_builder_set_levels(ctx, x);
+            x[0] = kClearTexMipBuilder; x[1] = 1;
+            tex_builder_set_samples(ctx, x);
+            x[0] = kClearTexMip; x[1] = kClearTexMipBuilder;
+            tex_initialize(ctx, x);
+            Tex* tcm = find<Tex>(kClearTexMip);
+            if (x[0] != 1 || !tcm || !tcm->mtl ||
+                tcm->mtl.mipmapLevelCount != 2) {
+                std::fprintf(stderr,
+                             "[selftest] ClearTexture: mip target was not "
+                             "created with two levels\n");
+                rc = 16422;
+                goto done;
+            }
+            x[0] = kCbClearTex;
+            cmdbuf_begin_recording(ctx, x);
+            x[0] = kCbClearTex; x[1] = kClearTexMip; x[2] = 0; x[3] = 0;
+            x[4] = reinterpret_cast<uint64_t>(green); x[5] = 0xF;
+            cmdbuf_clear_texture(ctx, x);
+            x[0] = kCbClearTex;
+            cmdbuf_end_recording(ctx, x);
+            [bct->last waitUntilCompleted];
+            if (bct->last.status == MTLCommandBufferStatusError) {
+                std::fprintf(stderr,
+                             "[selftest] ClearTexture mip error: %s\n",
+                             bct->last.error
+                                 ? [[bct->last.error localizedDescription] UTF8String]
+                                 : "(no description)");
+                rc = 16422;
+                goto done;
+            }
+            const int wantGreen[4] = {0, 255, 0, 255};
+            if (!read_pixel_at_layer(dev, c->queue, tcm->mtl, kSide / 2,
+                                     0, 0, 0, 1, pxc) ||
+                !pixels_near(pxc, wantGreen, 2)) {
+                std::fprintf(stderr,
+                             "[selftest] ClearTexture mip level 1 is "
+                             "(%u,%u,%u,%u), want green\n",
+                             pxc[0], pxc[1], pxc[2], pxc[3]);
+                rc = 16422;
+                goto done;
+            }
+
+            std::fprintf(stderr,
+                         "[selftest] ClearTexture cleared full, region, mask, "
+                         "uint, six cube faces and mip level 1\n");
+        }
+
+        {
             /* --- ClearBuffer: arbitrary 32-bit word pattern --------------
              * Metal blit fillBuffer only repeats one byte.  This value has
              * four different bytes, so the compute kernel is the only way the
@@ -9937,6 +10547,14 @@ extern "C" int nvngfx_metal_selftest(void) {
         forget<Tex>(0x8D00);
         forget<Tex>(0x8F00);
         g_tex_specs.erase(0x8C00);
+        forget<CmdBuf>(0x9300);
+        forget<Tex>(0x9200);
+        forget<Tex>(0x9400);
+        forget<Tex>(0x9600);
+        forget<Tex>(0x9800);
+        g_tex_specs.erase(0x9100);
+        g_tex_specs.erase(0x9500);
+        g_tex_specs.erase(0x9700);
         forget<Tex>(kTexClearUI);
         forget<Tex>(kTexClearI);
         g_tex_specs.erase(kTexIntBuilder);

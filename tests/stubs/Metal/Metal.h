@@ -566,6 +566,11 @@ destinationBytesPerImage:(NSUInteger)bpi;
 @property MTLLoadAction loadAction;
 @property MTLStoreAction storeAction;
 @property MTLClearColor clearColor;
+/* Mip level, array slice / cube face and 3D depth plane selected by this
+ * attachment.  Real Metal declares these on the attachment base class. */
+@property NSUInteger level;
+@property NSUInteger slice;
+@property NSUInteger depthPlane;
 @end
 
 @interface MTLRenderPassColorAttachmentDescriptorArray : NSObject
