@@ -5063,5 +5063,11 @@ powershell -ExecutionPolicy Bypass -File scripts/build_abi_test.ps1
 git diff --check
 ```
 
-本地已通过（513 procs / 248 implemented / 477 measured + 6 inferred）。
-CI 结果待补。
+本地已通过（513 procs / 248 implemented / 477 measured + 6 inferred）；GitHub
+Actions run `41181832245` 的 macOS `ios` job 也已通过，模拟器输出确认：
+
+```text
+[selftest] buffer/texture copies: B2T/T2B/T2T round-tripped a 4x4 RGBA8
+image through row/image strides 32/128 -> 24/96 -> tight
+BOTW_SELFTEST rc=0
+```
