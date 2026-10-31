@@ -1,9 +1,9 @@
 {
  "schema": 1,
  "source": "runtime-resolved nvn* name strings in title binary",
- "count": 513,
+ "count": 514,
  "domains": {
-  "CommandBuffer": 144,
+  "CommandBuffer": 145,
   "Texture": 45,
   "TextureBuilder": 43,
   "Device": 27,
@@ -432,6 +432,12 @@
   },
   {
    "name": "nvnCommandBufferBindTextures",
+   "domain": "CommandBuffer",
+   "prototype": false,
+   "metal": false
+  },
+  {
+   "name": "nvnCommandBufferBindTexturesDeferred",
    "domain": "CommandBuffer",
    "prototype": false,
    "metal": false

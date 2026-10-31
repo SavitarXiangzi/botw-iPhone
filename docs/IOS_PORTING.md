@@ -3,7 +3,7 @@
 本文是 `ios/` 目录的操作手册。它描述的是**已经写进仓库的东西**和
 **机器能验证的事实**，不是你付钱就能玩到游戏的承诺。当前状态一句话：
 
-> iOS 侧的壳、C ABI、513 个 NVN 入口点的分发表、476 个 Metal 后端入口，
+> iOS 侧的壳、C ABI、514 个 NVN 入口点的分发表、484 个 Metal 后端入口，
 > 都能在非 Apple 主机上编译并跑通自测；纹理能建、渲染目标能绑、encoder
 > 能开，program -> pipeline -> draw -> 回读这条链已经在 **CI 的 iOS 模拟器**
 > 里跑通了十八条合成 draw（模拟器实际执行十七条）与七阶段 instanced / base-vertex / indirect draw 回归，其中包括从 guest 内存池
@@ -26,22 +26,22 @@ ios/BotW/GameView.swift       CAMetalLayer 视图 + 调试 HUD（nvn 覆盖数�
 ios/BotW/Renderer.swift       CADisplayLink 驱动 botw_core_frame，把视图的层交给核心
 ios/BotW/BotWBridge.h         Swift/ObjC 桥接头，只 #import botw_core.h
 ios/project.yml               XcodeGen 工程描述（不提交 .xcodeproj）
-ios/nvn/registry.json         513 个入口点，从标题自己的 getproc 字符串提取
+ios/nvn/registry.json         514 个入口点，从标题自己的 getproc 字符串提取
 ios/nvn/signatures.json       477 个参数形状（公开 nxnative 原型表，MIT）
-ios/nvn/inferred_signatures.json  25 个按推断的形状，单独标注
+ios/nvn/inferred_signatures.json  29 个按推断的形状，单独标注
 ios/nvn/include/nvn_api.h     生成：名字表 + 函数指针 ABI
 ios/nvn/src/nvn_dispatch.cpp  生成：二分查找 + 缺失上报
 ios/nvn/include/nvn_backend.h 后端接口（null / metal 二选一）
 ios/nvn/src/nvn_null.cpp      空后端，任何主机都能编译
-ios/nvn/src/nvn_metal.mm      Metal 后端（476 个入口，含大量 TODO）
+ios/nvn/src/nvn_metal.mm      Metal 后端（484 个入口，含大量 TODO）
 ios/nvn/src/nvn_texture.c     157 项 NVNformat -> MTLPixelFormat 表（附 lossy 标记）
 ios/nvn/include/nvn_texture.h 纹理描述结构 + 表查询接口
 ios/nvn/src/nvn_shader.c      着色器翻译的唯一接口：现在只会说"没有翻译器"
-ios/nvn/implemented_metal.txt 476 行，和 BIND(...) 列表由门禁强制相等
+ios/nvn/implemented_metal.txt 484 行，和 BIND/BIND_CB 列表由门禁强制相等
 ios/nvn/shaders/              空目录 + 路线说明（见该目录 README）
 docs/NVN_COVERAGE.md          生成的逐域覆盖表
 scripts/                      提取、生成、校验、编译脚本
-tests/nvn_abi_test.cpp        513 个入口点的名字/顺序/查找一致性
+tests/nvn_abi_test.cpp        514 个入口点的名字/顺序/查找一致性
 tests/core_smoke_test.cpp     C ABI 冒烟：创建、查覆盖数、跑帧、销毁
 tests/nvn_texture_test.cpp    157 项格式表的抽查：精确项、替代项、越界、重复
 tests/nvn_shader_test.cpp     翻译接口的行为：拒绝 SASS、passthrough 需显式打开
@@ -73,14 +73,14 @@ C:\Python314\python.exe scripts\syntax_check_metal.py
 最近一次实测结果（Windows / MSVC 19.4x，`/W4 /WX`）：
 
 ```
-nvn_abi_test: ok (513 procs)                 exit=0
-core_smoke_test: ok (nvn 0/513 on null)      exit=0
+nvn_abi_test: ok (514 procs)                 exit=0
+core_smoke_test: ok (nvn 0/514 on null)      exit=0
 nvn_texture_test: ok (157 formats in table)  exit=0
 nvn_shader_test: ok (seam, blob table, packed slots, bindless, c1, SHA-256, shader key, layered/cube fixtures)  exit=0
 nvn_vertex_test: ok (packing, 26 formats, layout id)  exit=0
 nvn_texlayout_test: ok (block shapes, sizes, offsets, round trip, linear, write region, refusals)  exit=0
 syntax_check_metal: ok (clang++.exe)
-verify_ios: ok (metal bindings: 481/513)
+verify_ios: ok (metal bindings: 484/514)
 build_abi_test: all tests passed
 ```
 
@@ -251,7 +251,7 @@ iOS 是统一内存，guest 堆本来就是宿主可读的，所以
 | DepthStencilState / PolygonState | 13/13 + 9/9 | 默认值、深度/模板/剔除/偏移 setter 与全部 getter；双面 stencil func/op 可分别回读 |
 | MultisampleState / ChannelMaskState | 22/23 + 3/3 | 默认值、采样数、coverage 相关 setter、写掩码与 10 个单字节 getter；SampleLocationsGrid 因状态里没有网格尺寸保留 |
 
-上表是主要域；完整 29 个域共 **481/513**，逐项状态见 `docs/NVN_COVERAGE.md`。
+上表是主要域；完整 29 个域共 **484/514**，逐项状态见 `docs/NVN_COVERAGE.md`。
 
 纹理侧最近两批：14 个 `NVNtextureView` 状态入口（16 字节实测布局，7 个 setter / 6 个 getter /
 字段比较）；texture builder 的 device / swizzle / GL 名称 / depth-stencil mode 三组读写、

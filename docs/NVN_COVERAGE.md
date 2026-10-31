@@ -6,8 +6,8 @@
 注册表来源：标题二进制里会被 `nvnDeviceGetProcAddress` 按名解析的
 `nvn*` 字符串（运行时按名解析，所以名字本身就暴露了完整接口面）。
 
-- 接口总数：**513**
-- Metal 后端已实现：**483**（94.2%）
+- 接口总数：**514**
+- Metal 后端已实现：**484**（94.2%）
 - 仍未实现：**30**
 
 > 只有出现在 `ios/nvn/implemented_metal.txt` 里、且确实在
@@ -18,7 +18,7 @@
 
 | 域 | 已实现 | 总数 | 进度 |
 |---|---:|---:|---|
-| CommandBuffer | 122 | 144 | `########  ` |
+| CommandBuffer | 123 | 145 | `########  ` |
 | Texture | 45 | 45 | `##########` |
 | TextureBuilder | 43 | 43 | `##########` |
 | Device | 27 | 27 | `##########` |
@@ -112,7 +112,7 @@
 - [x] `nvnColorStateSetDefaults`
 - [x] `nvnColorStateSetLogicOp`
 
-### CommandBuffer (122/144)
+### CommandBuffer (123/145)
 
 - [x] `nvnCommandBufferAddCommandMemory`
 - [x] `nvnCommandBufferAddControlMemory`
@@ -137,6 +137,7 @@
 - [x] `nvnCommandBufferBindStorageBuffers`
 - [x] `nvnCommandBufferBindTexture`
 - [x] `nvnCommandBufferBindTextures`
+- [x] `nvnCommandBufferBindTexturesDeferred`
 - [x] `nvnCommandBufferBindTransformFeedbackBuffer`
 - [x] `nvnCommandBufferBindTransformFeedbackBuffers`
 - [x] `nvnCommandBufferBindUniformBuffer`

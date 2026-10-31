@@ -6409,8 +6409,10 @@ powershell -ExecutionPolicy Bypass -File scripts/build_abi_test.ps1
 git diff --check
 ```
 
-本机（Windows，无 Metal 运行时）已通过类型检查和全部便携门禁；
-`16441` 的实际 Metal 执行要等 macOS CI 的 iOS Simulator job。
+本机（Windows，无 Metal 运行时）已通过类型检查和全部便携门禁。推送后
+CI run `41205888000`（run 158）的 `portable` job `124550762741` 与 `ios`
+job `124550849211` 均成功；iOS job 的 “Run the replay-layer self-test in
+the simulator” 步骤通过，说明 `16441` 在模拟器里实际返回 0。
 
 ### 5. 仍然没有闭环的部分
 
@@ -6419,9 +6421,62 @@ git diff --check
   仍是 0（命令不写 guest 内存）。
 * 持久对象（纹理、program、pool、event、sync）在回放时解析，而不是在录制时
   冻结；状态对象的标量已快照，但对象生命周期仍必须覆盖提交。
-* `BindTexturesDeferred` 还不在注册表里。BOTW 的组合纹理路径会使用它，
-  语义是“提交/回放时再读 handle 指针”，与普通 `BindTextures` 的录制时
-  复制相反；下一步要把它作为显式 NOPROTO 入口加进注册表，并让捕获路径
-  保留指针而不是快照。
+* `BindTexturesDeferred` 已在“续三十”接入：它保留 guest 句柄地址，回放/
+  提交时才读取；普通 `BindTextures` 仍在录制时复制句柄。
 * 真实标题仍没有离线 MSL blob，`draw` 依然为 0；`16441` 通过只证明宿主
   回放链正确，不证明游戏已经出画面。
+
+## M4 续三十：BindTexturesDeferred 与 BOTW 的延迟纹理句柄
+
+nxnative 的 BOTW 记录指出，3D 场景黑屏、只剩粒子和 HUD 的根因在
+`nvnCommandBufferBindTexturesDeferred`：标题用 texture-sampler 对象里 handle
+字段的地址做绑定（usage 里约 37.98 万次），命令块只录一次，句柄在录制后
+才写入或替换。普通 `BindTextures` 在录制时复制数组，延迟版本必须保留地址，
+在回放/提交时读取最新值。
+
+### 1. 入口与语义
+
+* 注册表 **513 -> 514**，CommandBuffer **144 -> 145**；
+* 推断签名 **28 -> 29**；`nvnCommandBufferBindTexturesDeferred` 没有公开原型，
+  参数形状取自 nxnative HLE：`(NVNcommandBuffer*, NVNshaderStage, int first,
+  int n, const NVNtextureHandle*)`；
+* `BIND_CB` 捕获，绑定表复用 `cmdbuf_bind_textures`；
+* `snapshot_replay_args` 对 deferred 只做地址范围校验，**不复制 handle**；
+  `ReplayOp.x[4]` 保持 guest 地址，`QueueSubmitCommands` 回放时读取；
+* 普通 `BindTextures` 仍把 n 个 8 字节 handle 复制进 arena。
+
+### 2. 自检 16442
+
+新增失败码 `16442`，通过 `metal_resolve()` 走真实分发表：
+
+1. 普通 `BindTextures` 记录 H1，`EndRecording` 后数组改成 H2，提交后
+   owner 的 `texHandle[stage][slot]` 仍是 H1，并确认段内 `snap[4].size == 8`；
+2. `BindTexturesDeferred` 记录 H1，`EndRecording` 后数组改成 H2，提交后
+   `texHandle[stage][slot]` 为 H2，并确认段内 `snap[4].size == 0`；
+3. 两个句柄都经 `DeviceFinalizeCommandHandle` 释放，命令段表回到空。
+
+### 3. 门禁
+
+```text
+python scripts/syntax_check_metal.py --require
+python scripts/gen_nvn.py --repo . --check
+python scripts/extract_nvn_signatures.py --check
+python scripts/shader_chain/test_gen_blobs.py
+python scripts/verify_ios.py
+powershell -ExecutionPolicy Bypass -File scripts/build_abi_test.ps1
+git diff --check
+```
+
+本机（Windows，无 Metal 运行时）已通过类型检查与全部便携门禁：
+**514 procs / 484 implemented / 477 measured + 29 inferred**；
+`16442` 的实际 Metal 执行仍要等 macOS CI 的 iOS Simulator job。
+
+### 4. 仍然没有闭环的部分
+
+* 这仍是**宿主调用捕获**，不是 guest 命令内存解释器；客体原地修补
+  `AddCommandMemory` 的命令字节，后端看不到，`GetCommandMemoryUsed` 仍为 0。
+* nxnative 还列出另外五个 Deferred 变体（images / separate samplers /
+  separate textures / storage buffers / uniform buffers）。本标题的 usage 里
+  没有出现，因此不把它们加进这份“标题按名解析”的注册表。
+* 真实标题仍没有离线 MSL blob，`draw` 依然为 0；`16442` 通过只证明延迟
+  纹理句柄的回放语义，不证明游戏已经出画面。

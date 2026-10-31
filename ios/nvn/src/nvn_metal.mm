@@ -3554,6 +3554,14 @@ void cmdbuf_bind_textures(nvngfx_ctx*, uint64_t* x) {
     }
     b->argbuf[si] = nil;
 }
+/* nvnCommandBufferBindTexturesDeferred(cb, stage, first, n, handles).
+ * Same binding table as BindTextures, but the handle array is read when the
+ * command executes, not when it is recorded.  BOTW records command blocks
+ * once and writes the handle field inside its texture-sampler object before
+ * replay, so the guest address must survive into the command segment. */
+void cmdbuf_bind_textures_deferred(nvngfx_ctx* ctx, uint64_t* x) {
+    cmdbuf_bind_textures(ctx, x);
+}
 void cmdbuf_bind_separate_texture(nvngfx_ctx*, uint64_t* x) {
     CmdBuf* b = find<CmdBuf>(x[0]);
     if (!b) return;
@@ -10423,7 +10431,9 @@ bool snapshot_render_target_views(CmdBuf* b, ReplayOp& op,
 
 /* Snapshot only arguments whose value NVN copies into command memory.  Object
  * addresses (textures, programs, pools, events, syncs) remain guest handles;
- * those objects are lifetime-managed by the title and are not stack values. */
+ * those objects are lifetime-managed by the title and are not stack values.
+ * BindTexturesDeferred is the explicit exception on the other side: NVN reads
+ * its handle array at execution time, so the address, not the bytes, is kept. */
 template <void (*Fn)(nvngfx_ctx*, uint64_t*)>
 bool snapshot_replay_args(CmdBuf* b, ReplayOp& op,
                           const nvngfx_args& in) {
@@ -10468,6 +10478,13 @@ bool snapshot_replay_args(CmdBuf* b, ReplayOp& op,
         int n = static_cast<int>(in.x[1]);
         if (n > NVNGFX_MAX_VERTEX_STREAMS) n = NVNGFX_MAX_VERTEX_STREAMS;
         return n <= 0 || snap(2, in.x[2], static_cast<size_t>(n) * 8);
+    } else if constexpr (Fn == cmdbuf_bind_textures_deferred) {
+        int n = static_cast<int>(in.x[3]);
+        if (n > NVNGFX_MAX_TEXTURE_SLOTS) n = NVNGFX_MAX_TEXTURE_SLOTS;
+        if (n <= 0) return true;
+        /* Validate now so a corrupt address is dropped instead of read on
+         * submission; the pointed-to handles themselves stay live. */
+        return guest_range(in.x[4], static_cast<size_t>(n) * 8);
     } else if constexpr (Fn == cmdbuf_bind_textures ||
                          Fn == cmdbuf_bind_separate_textures ||
                          Fn == cmdbuf_bind_separate_samplers ||
@@ -10839,6 +10856,7 @@ const Binding kBindings[] = {
     BIND_CB("nvnCommandBufferSetSamplerPool", cmdbuf_set_sampler_pool),
     BIND_CB("nvnCommandBufferBindTexture", cmdbuf_bind_texture),
     BIND_CB("nvnCommandBufferBindTextures", cmdbuf_bind_textures),
+    BIND_CB("nvnCommandBufferBindTexturesDeferred", cmdbuf_bind_textures_deferred),
     BIND_CB("nvnCommandBufferBindSeparateTexture", cmdbuf_bind_separate_texture),
     BIND_CB("nvnCommandBufferBindSeparateTextures", cmdbuf_bind_separate_textures),
     BIND_CB("nvnCommandBufferBindSeparateSampler", cmdbuf_bind_separate_sampler),
@@ -11668,6 +11686,142 @@ extern "C" int nvngfx_metal_selftest(void) {
                          "submitted once, record-time snapshots ignored the "
                          "later stack writes, and the pixel is correct\n");
         }
+        }
+
+        {
+            /* --- Deferred texture binds ---------------------------------
+             * BOTW records its texture binds once and writes the handle
+             * field inside the texture-sampler object afterwards.  The
+             * ordinary entry point copies the handles at record time; the
+             * deferred entry point must keep the guest address and read the
+             * current value when the command handle is submitted. */
+            const uint64_t kBindNormalCb = 0xB200;
+            const uint64_t kBindDeferredCb = 0xB240;
+            const uint64_t kBindQueue = 0xB280;
+            const unsigned kBindStage = 1;   /* fragment */
+            const unsigned kBindSlot = 31;
+            const uint64_t kRecordedHandle = 0x00123456u;
+            const uint64_t kReplacementHandle = 0x00654321u;
+            nvngfx_proc const bindNow =
+                metal_resolve(nullptr, "nvnCommandBufferBindTextures");
+            nvngfx_proc const bindDeferred =
+                metal_resolve(nullptr, "nvnCommandBufferBindTexturesDeferred");
+            if (!bindNow || !bindDeferred) {
+                std::fprintf(stderr,
+                             "[selftest] deferred texture bind: a wrapped "
+                             "entry point is missing\n");
+                rc = 16442;
+                goto done;
+            }
+
+            uint64_t handles[1] = {kRecordedHandle};
+            nvngfx_args a{};
+            a.x[0] = kBindNormalCb;
+            cmdbuf_begin_recording(ctx, a.x);
+            a = nvngfx_args{};
+            a.x[0] = kBindNormalCb; a.x[1] = kBindStage;
+            a.x[2] = kBindSlot; a.x[3] = 1;
+            a.x[4] = reinterpret_cast<uint64_t>(handles);
+            bindNow(ctx, &a);
+            a = nvngfx_args{};
+            a.x[0] = kBindNormalCb;
+            cmdbuf_end_recording(ctx, a.x);
+            const uint64_t normalHandle = a.x[0];
+            auto normalSeg = g_command_segments.find(normalHandle);
+            CmdBuf* const normalCb = find<CmdBuf>(kBindNormalCb);
+            if (!normalHandle || normalSeg == g_command_segments.end() ||
+                normalSeg->second.ops.size() != 1 ||
+                normalSeg->second.ops[0].snap[4].size != 8 ||
+                !normalCb ||
+                normalCb->texHandle[kBindStage][kBindSlot] != 0) {
+                std::fprintf(stderr,
+                             "[selftest] deferred texture bind: ordinary "
+                             "BindTextures was not captured with a handle "
+                             "snapshot (handle=%llx)\n",
+                             static_cast<unsigned long long>(normalHandle));
+                rc = 16442;
+                goto done;
+            }
+            handles[0] = kReplacementHandle;
+            (void)find_or_add<NvnQueue>(kBindQueue);
+            uint64_t submitHandle = normalHandle;
+            a = nvngfx_args{};
+            a.x[0] = kBindQueue; a.x[1] = 1;
+            a.x[2] = reinterpret_cast<uint64_t>(&submitHandle);
+            queue_submit_commands(ctx, a.x);
+            if (normalCb->texHandle[kBindStage][kBindSlot] !=
+                kRecordedHandle) {
+                std::fprintf(stderr,
+                             "[selftest] deferred texture bind: ordinary "
+                             "BindTextures read the later handle %llx\n",
+                             static_cast<unsigned long long>(
+                                 normalCb->texHandle[kBindStage][kBindSlot]));
+                rc = 16442;
+                goto done;
+            }
+
+            handles[0] = kRecordedHandle;
+            a = nvngfx_args{};
+            a.x[0] = kBindDeferredCb;
+            cmdbuf_begin_recording(ctx, a.x);
+            a = nvngfx_args{};
+            a.x[0] = kBindDeferredCb; a.x[1] = kBindStage;
+            a.x[2] = kBindSlot; a.x[3] = 1;
+            a.x[4] = reinterpret_cast<uint64_t>(handles);
+            bindDeferred(ctx, &a);
+            a = nvngfx_args{};
+            a.x[0] = kBindDeferredCb;
+            cmdbuf_end_recording(ctx, a.x);
+            const uint64_t deferredHandle = a.x[0];
+            auto deferredSeg = g_command_segments.find(deferredHandle);
+            CmdBuf* const deferredCb = find<CmdBuf>(kBindDeferredCb);
+            if (!deferredHandle || deferredSeg == g_command_segments.end() ||
+                deferredSeg->second.ops.size() != 1 ||
+                deferredSeg->second.ops[0].snap[4].size != 0 ||
+                !deferredCb ||
+                deferredCb->texHandle[kBindStage][kBindSlot] != 0) {
+                std::fprintf(stderr,
+                             "[selftest] deferred texture bind: the deferred "
+                             "pointer was snapshotted or the call was not "
+                             "captured (handle=%llx)\n",
+                             static_cast<unsigned long long>(deferredHandle));
+                rc = 16442;
+                goto done;
+            }
+            handles[0] = kReplacementHandle;
+            submitHandle = deferredHandle;
+            a = nvngfx_args{};
+            a.x[0] = kBindQueue; a.x[1] = 1;
+            a.x[2] = reinterpret_cast<uint64_t>(&submitHandle);
+            queue_submit_commands(ctx, a.x);
+            if (deferredCb->texHandle[kBindStage][kBindSlot] !=
+                kReplacementHandle) {
+                std::fprintf(stderr,
+                             "[selftest] deferred texture bind: replay kept "
+                             "%llx instead of the later handle %llx\n",
+                             static_cast<unsigned long long>(
+                                 deferredCb->texHandle[kBindStage][kBindSlot]),
+                             static_cast<unsigned long long>(
+                                 kReplacementHandle));
+                rc = 16442;
+                goto done;
+            }
+            uint64_t fin[8] = {0, normalHandle, 0, 0, 0, 0, 0, 0};
+            dev_finalize_command_handle(ctx, fin);
+            fin[1] = deferredHandle;
+            dev_finalize_command_handle(ctx, fin);
+            if (!g_command_segments.empty()) {
+                std::fprintf(stderr,
+                             "[selftest] deferred texture bind: %zu handles "
+                             "survived DeviceFinalizeCommandHandle\n",
+                             g_command_segments.size());
+                rc = 16442;
+                goto done;
+            }
+            std::fprintf(stderr,
+                         "[selftest] deferred texture bind: ordinary bind kept "
+                         "the recorded handle, deferred bind read the handle "
+                         "written after recording\n");
         }
 
         {

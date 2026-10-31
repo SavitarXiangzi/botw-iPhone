@@ -74,6 +74,7 @@ static const char* const k_names[NVN_PROC_COUNT] = {
     "nvnCommandBufferBindStorageBuffers",
     "nvnCommandBufferBindTexture",
     "nvnCommandBufferBindTextures",
+    "nvnCommandBufferBindTexturesDeferred",
     "nvnCommandBufferBindTransformFeedbackBuffer",
     "nvnCommandBufferBindTransformFeedbackBuffers",
     "nvnCommandBufferBindUniformBuffer",

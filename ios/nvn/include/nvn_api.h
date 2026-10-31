@@ -53,7 +53,7 @@ static inline void nvngfx_arg_set_f64(nvngfx_args* a, unsigned i, double v) {
  * no marshalling layer. */
 typedef void (*nvngfx_proc)(nvngfx_ctx* ctx, nvngfx_args* args);
 
-/* 513 entry points, sorted by name. */
+/* 514 entry points, sorted by name. */
 #define NVN_PROC_LIST(X) \
     X(nvnBlendStateGetAdvancedMode) \
     X(nvnBlendStateGetAdvancedNormalizedDst) \
@@ -122,6 +122,7 @@ typedef void (*nvngfx_proc)(nvngfx_ctx* ctx, nvngfx_args* args);
     X(nvnCommandBufferBindStorageBuffers) \
     X(nvnCommandBufferBindTexture) \
     X(nvnCommandBufferBindTextures) \
+    X(nvnCommandBufferBindTexturesDeferred) \
     X(nvnCommandBufferBindTransformFeedbackBuffer) \
     X(nvnCommandBufferBindTransformFeedbackBuffers) \
     X(nvnCommandBufferBindUniformBuffer) \
