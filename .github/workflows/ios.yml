@@ -69,6 +69,7 @@ jobs:
           clang -std=c11 -Wall -Wextra -Werror $INC -c ios/nvn/src/nvn_state.c -o /tmp/nvn_state.o
           clang -std=c11 -Wall -Wextra -Werror $INC -c core/guest/guest_image.c -o /tmp/guest_image.o
           clang -std=c11 -Wall -Wextra -Werror $INC -c core/guest/guest_slot.c -o /tmp/guest_slot.o
+          clang -std=c11 -Wall -Wextra -Werror $INC -c core/guest/guest_gate.c -o /tmp/guest_gate.o
           LIB="/tmp/guest_image.o ios/nvn/src/nvn_dispatch.cpp ios/nvn/src/nvn_null.cpp core/src/botw_core.cpp /tmp/nvn_texture.o /tmp/nvn_shader.o /tmp/nvn_shader_key.o /tmp/nvn_shader_bundle.o /tmp/nvn_shader_blobs.o /tmp/nvn_vertex.o /tmp/nvn_sampler.o /tmp/nvn_pool.o /tmp/nvn_texlayout.o /tmp/nvn_bcn.o /tmp/nvn_pipeline.o /tmp/nvn_state.o"
           clang++ $FLAGS $INC tests/nvn_abi_test.cpp      $LIB -o /tmp/nvn_abi_test
           clang++ $FLAGS $INC tests/core_smoke_test.cpp   $LIB -o /tmp/core_smoke_test
@@ -96,12 +97,26 @@ jobs:
           /tmp/nvn_state_test
           clang++ $FLAGS $INC tests/guest_image_test.cpp /tmp/guest_image.o /tmp/guest_slot.o -o /tmp/guest_image_test
           /tmp/guest_image_test
+          # The trampoline is AArch64 assembly: here it only has to compile,
+          # link and skip.  The macOS job runs it against a real core.
+          clang++ $FLAGS $INC tests/guest_gate_test.cpp /tmp/guest_gate.o -o /tmp/guest_gate_test
+          /tmp/guest_gate_test
           # Host-only loader probe: built everywhere, needs a real image to run.
           clang++ $FLAGS $INC scripts/guest/reloc_run.cpp /tmp/guest_image.o /tmp/guest_slot.o -o /tmp/reloc_run
           if /tmp/reloc_run; then
             echo "::error::reloc_run should refuse to run without an image"
             exit 1
           fi
+
+      # Assembly does not need an SDK, so an x86 runner can still catch a
+      # malformed trampoline long before the macOS job starts.
+      - name: AArch64 gate trampoline assembles
+        run: |
+          set -euo pipefail
+          clang --target=aarch64-apple-ios17.0 -Wall -Wextra -Werror \
+            -c core/guest/guest_gate_arm64.S -o /tmp/guest_gate_arm64.o
+          clang --target=aarch64-apple-ios17.0 -Wall -Wextra -Werror \
+            -c tests/guest_gate_probe_arm64.S -o /tmp/guest_gate_probe_arm64.o
 
       # nvn_metal.mm is ObjC++; this parses it against tests/stubs/ so a type
       # error in the Metal backend is caught without a mac runner.
@@ -149,6 +164,24 @@ jobs:
 
       - name: Show Xcode version
         run: xcodebuild -version
+
+      # The only step that executes the trampoline: an x86 host cannot, and the
+      # simulator build would only link it.  This is the same compiler and the
+      # same -Werror the app uses, on a synthetic gate block.
+      - name: Guest gate trampoline (native arm64)
+        run: |
+          set -euo pipefail
+          # guest_gate.c is C: clang++ would treat it as C++ and -Werror on
+          # the deprecation warning.
+          xcrun clang -std=c11 -Wall -Wextra -Werror -O2 -I core/guest \
+            -c core/guest/guest_gate.c -o /tmp/guest_gate_entry.o
+          xcrun clang++ -std=c++20 -Wall -Wextra -Werror -O2 -I core/guest \
+            tests/guest_gate_test.cpp \
+            core/guest/guest_gate_arm64.S \
+            tests/guest_gate_probe_arm64.S \
+            /tmp/guest_gate_entry.o \
+            -o /tmp/guest_gate_test
+          /tmp/guest_gate_test
 
       - name: Verify generated project parses
         working-directory: ios

@@ -7190,4 +7190,111 @@ b    <site+4>
 2. 用 CI 的 arm64 runner 跑一个合成 gate 块（不碰客体代码），验证 trampoline
    的寄存器往返；
 3. 可执行映射（text RX / data RW / patch RX）。
+## M4 续三十八：gate trampoline 与寄存器帧
 
+### 1. 入口时的机器状态
+
+续三十六 的块只是“把 `blr x30` 交给宿主”，宿主拿到的是什么，取决于块
+之前做了什么。按 `patch_nso.py` 的 `site_svc` 逐条对：
+
+```text
+stp  x29, x30, [sp, #-16]!      ; 客体 x29 / 客体 LR 落到 [sp] / [sp+8]
+adrp x30, #key_page
+ldr  x30, [x30, #0x18]          ; slot[KGATE]
+ldr  x30, [x30]
+ldr  x29, [sp]                  ; x29 恢复成客体 x29
+blr  x30                        ; 进 trampoline
+```
+
+所以在 `botw_guest_gate_entry` 的第一条指令上：
+
+* `x30` 是**块的 `ldp` 地址**（返回点），不是客体 LR；
+* `x0..x28` 是客体寄存器，`x29` 已是客体 x29；
+* 客体 LR 只在 `[sp + 8]`；
+* `[sp]` / `[sp + 8]` 是块自己压的 16 字节，客体 sp 是 `sp + 16`。
+
+把“`x30` 是返回点”当成“`x30` 是客体 LR”是这个接口最容易错的地方：
+两者都是 `x30`，但一个是代码地址，一个是客体栈上的旧值。
+
+### 2. 帧
+
+`core/guest/guest_gate.h` 的 `botw_guest_regs` 是 272 字节（`31*8 + 3*8`），
+`guest_gate.c` 里用 typedef 断言把偏移锁死（MSVC 的默认 C 模式没有
+`_Static_assert`，所以没用它）：
+
+| 帧字段 | 偏移 | 值 |
+|---|---:|---|
+| `x[0..28]` | 0..224 | 客体寄存器原值 |
+| `x[29]` | 232 | 客体 x29 |
+| `x[30]` | 240 | 客体 LR（取自 `[sp + 8]`） |
+| `sp` | 248 | 客体 sp（块帧 + 16） |
+| `pc` | 256 | 块的 `ldp` 地址（返回点） |
+| `nzcv` | 264 | `mrs xN, nzcv` |
+
+`guest_gate_arm64.S` 就是这一张表的一段手写汇编，`.size` 量出来 0xC8
+字节（50 条指令）。
+
+### 3. 返回路径：写回，而不是“恢复后直接跳”
+
+块在 `blr` 之后还有 `ldp x29, x30, [sp], #16`，它才是客体 x29/x30 的
+真正恢复者。所以 trampoline 不能把 sp 恢复成客体 sp 再 `ret`——那样块会
+从错位 16 字节的地方弹栈。做法是：
+
+1. 把 dispatcher 留下的 `x[29]` / `x[30]` 写进 `[sp_guest - 16]` 与
+   `[sp_guest - 8]`，也就是块自己的那 16 字节；
+2. 带着 `sp = sp_guest - 16` 返回块的 `ldp`；
+3. 块把这两个值弹回 `x29/x30`，`sp` 顺势回到客体 sp。
+
+好处是 dispatcher 改 `x[29]` / `x[30]` 也生效（测试里专门跑了一遍），
+并且 `pc` 与 `x[30]` 解耦：想换返回点就改 `pc`，客体 LR 照旧。
+
+### 4. 恢复顺序：不要在 sp 之下读
+
+一个容易忽略的细节：帧在 `sp` 之上，但一旦把 `sp` 提到客体 sp，整个帧
+就落到 `sp` 之下，而 Darwin 交付信号时正是在 `sp` 之下写 sigframe。所以
+恢复用的是从低到高的 post-index `ldp ..., [sp], #16`：每一步都只读
+“当前 sp 及以上”，最后一次读完之后才 `mov sp, x29`，之后不再碰内存。
+
+`nzcv` 在第一条就把 `msr nzcv, x9` 落定，后续全是 `ldp` / `mov` / `ret`
+（都不改标志），所以标志位能原样往返。
+
+`x18` 在 Apple 上是平台保留寄存器：这里只把它存进帧再原样放回，等于没动；
+dispatcher 不应写 `x[18]`（写了会破坏宿主）。
+
+### 5. 测试
+
+`tests/guest_gate_test.cpp` + `tests/guest_gate_probe_arm64.S`：后者是一段
+**合成的** gate 块（`stp` / `ldr x29,[sp]` / `bl` / `ldp`），寄存器预置成
+已知值，跑三轮：
+
+| 轮次 | dispatcher | 断言 |
+|---|---|---|
+| 1 | 改 `x0`、`x29`、`x30`、`NZCV` | 帧内容、`x0` 回传、`x1..x8`/`x19`/`x20` 不变、块弹回的正是 dispatcher 写的 `x29/x30`、`NZCV` 往返 |
+| 2 | 只改 `x0` | 块弹回仍是客体原值，`sp` 回到原处 |
+| 3 | 不装 dispatcher | `x0 == 0`，其余照旧 |
+
+测试驱动写成独立 `.S` 而不是内联汇编，原因是 Apple 的 ABI 把 `x29` 定为
+FP，内联汇编的 clobber 列表里**拒绝**它（`reserved registers: FP`），
+而块必须覆盖 `x29`。
+
+验证位置：
+
+* `macos-15`（arm64）job 真跑这段汇编，这是唯一能执行 trampoline 的地方；
+* portable job 交叉汇编两个 `.S`（汇编不需要 SDK），并编译/链接
+  `guest_gate_test`，在 x86 上打印 `skipped`；
+* 本机 MSVC `/W4 /WX` 只编 C 侧（`guest_gate.c` 在非 ARM64 上提供空实现）。
+
+### 6. 仍然没有证明
+
+* 没有执行过一条客体指令：trampoline 跑的是合成块，不是 `main` 的 gate；
+* 镜像仍是 `malloc` 的普通内存，text 需要 RX 映射才能执行；
+* HLE 表（1,137 个名字）还没有；
+* 客体若使用 red zone 会被这个 272 字节的宿主帧破坏——Switch 的 AAPCS64
+  没有 red zone，这一点在真机上要再确认一次。
+
+### 7. 下一步
+
+1. 可执行映射：text RX、rodata R、data RW、patch 区 RX，同页权限冲突时
+   复制而不是改权限；
+2. 把 `guest_slot` 的 key page 发布接到装载完成之后、第一个 gate 之前；
+3. 真机上跑第一条客体指令（`rtld` 的入口最干净，只有 19 个 HLE 站点）。
