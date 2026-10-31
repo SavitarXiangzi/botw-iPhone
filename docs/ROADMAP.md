@@ -6865,10 +6865,10 @@ Python 3 + `capstone` + `lz4`。所有产物写入 `build/`，不进版本库。
 
 按依赖顺序，下一步是运行时 loader 的第一块：
 
-1. 解析 fixups 头，映射 text/ro/data/bss，按 `R_RELATIVE` 应用 221,615
-   条重定位；
-2. 把 `R_JUMP_SLOT` / `R_GLOB_DAT` 的 27,106 条导入按符号名解析到 HLE
-   表；不认识的符号必须报红，不能静默返回 0；
+1. 解析 fixups 头，映射 text/ro/data/bss，应用 221,615 条 `R_RELATIVE`
+   和 27,106 条 `R_ABS64`；
+2. 解析 14,116 条 GOT/PLT 槽（其中 1,015 条指向未定义符号、需要 HLE，其余
+   13,101 条指向模块内符号）；不认识的符号必须报红，不能静默返回 0；
 3. 建立每线程 4 KiB 槽和 key page，`tpidrro_el0` 指向槽；
 4. 把 `_dm_gate` 的寄存器帧和 gate 表接到 C 回调；
 5. 先执行 `rtld` 或一个合成模块，确认第一条客体指令真的在 ARM64 宿主
@@ -6882,3 +6882,132 @@ python scripts/guest/verify_rewrite.py --self-test
 python scripts/verify_ios.py
 powershell -ExecutionPolicy Bypass -File scripts/build_abi_test.ps1
 ```
+
+## M4 续三十五：portable guest image loader
+
+### 1. 这一轮做了什么
+
+`core/guest/guest_image.{c,h}` 是 iOS 侧 loader 里不依赖 Apple 框架的那一半：
+不执行任何客体代码，只做四件事——私有复制 `*.patched.bin`、按 MOD0 动态表走
+重定位、通过调用方给的 HLE 表解析导入、返回 `DT_INIT`。它同时被两个消费者使用：
+
+* `tests/guest_image_test.cpp`：合成镜像，进每一步 portable 构建和 CI；
+* `scripts/guest/reloc_run.cpp`：真实镜像，只在本机跑，命令行传路径。
+
+新增的离线工具：
+
+| 文件 | 作用 | 读取标题数据 |
+|---|---|---|
+| `core/guest/guest_image.{c,h}` | fixups / MOD0 / 重定位 / 导入解析 | 否 |
+| `tests/guest_image_test.cpp` | 合成镜像断言 + 五类拒绝路径 | 否 |
+| `scripts/guest/probe_relocs.py` | 统计真实镜像的重定位画像；带 `--self-test` | 是（只读） |
+| `scripts/guest/reloc_run.cpp` | 哨兵解析器把真实镜像完整装载一遍 | 是（只读） |
+
+### 2. 真实重定位画像（1.6.0，四个模块）
+
+| 模块 | R_RELATIVE | R_ABS64 | GOT/PLT | 合计 |
+|---|---:|---:|---:|---:|
+| main | 210,547 | 959 | 455 | 211,961 |
+| sdk | 9,376 | 13,453 | 8,838 | 31,667 |
+| subsdk0 | 1,677 | 12,694 | 4,804 | 19,175 |
+| rtld | 15 | 0 | 19 | 34 |
+| **合计** | **221,615** | **27,106** | **14,116** | **262,837** |
+
+再按 `Elf64_Sym.st_shndx` 把符号分成“模块内已定义”和“未定义（需要 HLE）”：
+
+| 模块 | ABS64 本地 | ABS64 未定义 | GOT/PLT 本地 | GOT/PLT 未定义 | HLE 站点 | 唯一 HLE 名 |
+|---|---:|---:|---:|---:|---:|---:|
+| main | 0 | 959 | 0 | 455 | 1,414 | 458 |
+| sdk | 13,453 | 0 | 8,822 | 16 | 16 | 13 |
+| subsdk0 | 6,674 | 6,020 | 4,279 | 525 | 6,545 | 647 |
+| rtld | 0 | 0 | 0 | 19 | 19 | 19 |
+| **合计** | **20,127** | **6,979** | **13,101** | **1,015** | **7,994** | **1,137** |
+
+三个结论直接决定了 loader 的写法：
+
+* **0 条重定位落在 `text`**，所以 text 可以先按 RX 映射，不需要“先可写再
+  `mprotect`”的窗口；
+* 动态符号绝大多数是**模块内自己的**：27,106 条 `R_ABS64` 里 20,127 条本地，
+  14,116 条 GOT/PLT 槽里 13,101 条本地。把本地符号当导入送进 HLE，会让
+  sdk 的 8,822 个 vtable 槽写进哨兵地址——而在哨兵解析器下这种错误**看起来是
+  成功的**；
+* HLE 表的真实规模只有约 **1,137 个唯一名字 / 7,994 个站点**，比按“全部动态
+  符号”估的 14,196 小一个数量级。这直接决定了下一步 HLE 表的体积。
+
+### 3. `S + A` 的四种组合
+
+`probe_relocs.py` 把两条重定位路径 × 两种符号来源摊开：
+
+| 重定位 | 符号 | 数量 | 正确取值 |
+|---|---|---:|---|
+| `R_RELATIVE` | — | 221,615 | `base + addend` |
+| `R_ABS64` | 索引 0 | 0（本作没有） | `base + addend` |
+| `R_ABS64` | 模块内已定义 | 20,127 | `base + st_value + addend` |
+| `R_ABS64` | 未定义 | 6,979 | `HLE(name) + addend` |
+| `R_GLOB_DAT` / `R_JUMP_SLOT` | 模块内已定义 | 13,101 | `base + st_value + addend` |
+| `R_GLOB_DAT` / `R_JUMP_SLOT` | 未定义 | 1,015 | `HLE(name) + addend` |
+
+这是本轮修掉的两个 bug：初版 loader 把 `R_ABS64` 一律当 `base + addend`；第二版
+把 GOT/PLT 一律当导入。合成测试现在分别断言 base-relative / module-local /
+HLE 三态，并覆盖“符号指到镜像外”“GOT 槽没有符号”等拒绝路径。
+
+符号名长度也踩了一次：sdk 最长符号名 767 字节，初版用 `char name[192]` 直接把
+整块 sdk 判成“不可读”。现在解析器拿到的是**指向镜像内字符串表的指针**（已验证
+NUL 落在 `DT_STRSZ` 内），没有拷贝上限。
+
+### 4. 真实镜像装载结果
+
+`reloc_run` 给每个需要 HLE 的名字分配一个独立 16 字节块，因此 `ok` 的含义是：
+所有重定位都写进去了、所有符号名都读得出来、没有任何导入静默变成 NULL。
+
+```text
+reloc_run: ok main.patched.bin    size=46.1 MiB relocs=211506 symbols=959   hle=1414 imports=455  distinct=458 entry=0x30  load=17ms
+reloc_run: ok sdk.patched.bin     size=13.3 MiB relocs=22829  symbols=13453 hle=16   imports=8838 distinct=13  entry=0x30  load=5ms
+reloc_run: ok subsdk0.patched.bin size=7.6 MiB  relocs=14371  symbols=12694 hle=6545 imports=4804 distinct=647 entry=0x30  load=4ms
+reloc_run: ok rtld.patched.bin    size=0.1 MiB  relocs=15     symbols=0     hle=19   imports=19   distinct=19  entry=0x100 load=0ms
+```
+
+计数口径：`relocs` 是 `R_RELATIVE + R_ABS64`（数据写入），`symbols` 是带符号
+索引的 `R_ABS64`，`hle` 是真正调用解析器的次数（未定义的 ABS64 + 未定义的
+GOT/PLT），`imports` 是 GOT/PLT 槽总数（本地 + 导入）。所以 `relocs + imports`
+等于上表的合计，`hle` 与 `relocs` 不重叠。
+
+### 5. 证明了什么、还没有证明什么
+
+证明：
+
+* 同一份 C 代码能把四个模块的全部 262,837 条重定位应用完，没有越界、没有静默
+  写 NULL；
+* 合成测试在每一步 portable 构建里覆盖三种符号来源和五类拒绝；
+* 装载最大 46 MiB 镜像耗时 17 ms（x86 主机数值，iOS 上未测）。
+
+没有证明：
+
+* **镜像仍然不可执行**：现在只是 `malloc` + 私有复制，没有 ARM64 可执行映射；
+* 线程槽、key page、`tpidrro_el0`、`_dm_gate` 寄存器帧都还没有；
+* HLE 表还没有实现，`reloc_run` 用的是哨兵指针而不是真实服务；
+* iOS 上仍然没有执行过任何一条客体指令，也没有出过真实画面。
+
+### 6. 门禁
+
+```text
+python -m py_compile scripts/guest/*.py scripts/guest/third_party/nxnative/*.py
+python scripts/guest/verify_rewrite.py --self-test
+python scripts/guest/probe_relocs.py --self-test
+python scripts/verify_ios.py
+powershell -ExecutionPolicy Bypass -File scripts/build_abi_test.ps1
+```
+
+`build_abi_test.ps1` 额外用 `/W4 /WX` 编译 `tests/guest_image_test.cpp` 和
+`scripts/guest/reloc_run.cpp`；CI 的 portable job 跑同样的用例，并把
+`reloc_run` 链接一遍（无参数调用必须返回非 0）。
+
+### 7. 下一步
+
+1. **可执行映射**：iOS 不能用 JIT，所以 text/ro 用文件映射（`MAP_PRIVATE`），
+   data/bss 用匿名页，patch 区单独映射；装载完成后 text 必须是 RX、不能是 WX；
+2. 每线程 4 KiB 槽 + key page + `tpidrro_el0` 指向槽；
+3. `_dm_gate` 的寄存器帧接 C 回调；
+4. 一张约 1,137 个名字的 HLE 表：先喂 `main` 的 458 个和 `rtld` 的 19 个，
+   再处理 `subsdk0` 的 647 个；
+5. 只有在真机/模拟器上跑到第一条客体指令之后，才谈 init / fs / vi / nv。

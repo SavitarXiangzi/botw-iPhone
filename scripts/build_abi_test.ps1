@@ -23,10 +23,10 @@ try {
     if (-not (Test-Path $VcVars)) {
         Write-Error "vcvars64.bat not found at '$VcVars'. Pass -VcVars <path>."
     }
-    New-Item -ItemType Directory -Force -Path build\nvn\abi, build\nvn\core, build\nvn\tex, build\nvn\shd, build\nvn\vtx, build\nvn\smp, build\nvn\pool, build\nvn\txl, build\nvn\bcn, build\nvn\pipe, build\nvn\state, build\nvn\bnd | Out-Null
+    New-Item -ItemType Directory -Force -Path build\nvn\abi, build\nvn\core, build\nvn\tex, build\nvn\shd, build\nvn\vtx, build\nvn\smp, build\nvn\pool, build\nvn\txl, build\nvn\bcn, build\nvn\pipe, build\nvn\state, build\nvn\bnd, build\nvn\gst, build\nvn\rel | Out-Null
 
-    $inc = "/I core\include /I ios\nvn\include"
-    $lib = "ios\nvn\src\nvn_dispatch.cpp ios\nvn\src\nvn_null.cpp ios\nvn\src\nvn_pool.c ios\nvn\src\nvn_sampler.c ios\nvn\src\nvn_texture.c ios\nvn\src\nvn_shader.c ios\nvn\src\nvn_shader_key.c ios\nvn\src\nvn_shader_bundle.c ios\nvn\src\nvn_shader_blobs.gen.c ios\nvn\src\nvn_texlayout.c ios\nvn\src\nvn_bcn.c ios\nvn\src\nvn_vertex.c ios\nvn\src\nvn_pipeline.c ios\nvn\src\nvn_state.c core\src\botw_core.cpp"
+    $inc = "/I core\include /I core\guest /I ios\nvn\include"
+    $lib = "ios\nvn\src\nvn_dispatch.cpp ios\nvn\src\nvn_null.cpp ios\nvn\src\nvn_pool.c ios\nvn\src\nvn_sampler.c ios\nvn\src\nvn_texture.c ios\nvn\src\nvn_shader.c ios\nvn\src\nvn_shader_key.c ios\nvn\src\nvn_shader_bundle.c ios\nvn\src\nvn_shader_blobs.gen.c ios\nvn\src\nvn_texlayout.c ios\nvn\src\nvn_bcn.c ios\nvn\src\nvn_vertex.c ios\nvn\src\nvn_pipeline.c ios\nvn\src\nvn_state.c core\src\botw_core.cpp core\guest\guest_image.c"
     $flags = "/nologo /std:c++20 /EHsc /W4 /WX"
 
     $jobs = @(
@@ -40,8 +40,9 @@ try {
         @{ name = "nvn_texlayout_test"; src = "tests\nvn_texlayout_test.cpp"; obj = "build\nvn\txl\" }
         @{ name = "nvn_bcn_test"; src = "tests\nvn_bcn_test.cpp"; obj = "build\nvn\bcn\" }
         @{ name = "nvn_pipeline_test"; src = "tests\nvn_pipeline_test.cpp"; obj = "build\nvn\pipe\" }
-        @{ name = "nvn_state_test"; src = "tests\nvn_state_test.cpp"; obj = "build\vn\state\" }
+        @{ name = "nvn_state_test"; src = "tests\nvn_state_test.cpp"; obj = "build\nvn\state\" }
         @{ name = "nvn_shader_bundle_test"; src = "tests\nvn_shader_bundle_test.cpp"; obj = "build\nvn\bnd\" }
+        @{ name = "guest_image_test"; src = "tests\guest_image_test.cpp"; obj = "build\nvn\gst\" }
     )
 
     foreach ($j in $jobs) {
@@ -71,6 +72,18 @@ try {
     # every portable build.
     & $py scripts\guest\verify_rewrite.py --self-test
     if ($LASTEXITCODE -ne 0) { Write-Error "guest rewrite verifier: self-test failed"; exit 1 }
+
+    # The relocation probe answers the questions the loader would otherwise
+    # guess at (which relocation types exist, whether R_ABS64 carries symbols,
+    # whether they are module-local or imports).  Self-test only: the real
+    # modules are never part of the tree.
+    & $py scripts\guest\probe_relocs.py --self-test
+    if ($LASTEXITCODE -ne 0) { Write-Error "guest relocation probe: self-test failed"; exit 1 }
+
+    # Host-only tool; compiles everywhere, needs a real image to say anything.
+    $cmd = "call `"$VcVars`" >nul && cl $flags $inc /c scripts\guest\reloc_run.cpp /Fo:build\nvn\rel\"
+    cmd /c $cmd 2>&1 | ForEach-Object { if ("$_".Trim()) { Write-Host "  $_" } }
+    if ($LASTEXITCODE -ne 0) { Write-Error "reloc_run.cpp: build failed"; exit 1 }
 
     # keycheck.cpp is a host-only tool (it needs a game to say anything useful)
     # but it must keep compiling: same flags as the CI hygiene step.

@@ -36,6 +36,8 @@ targets:
       - path: ../core/include
         group: core
         buildPhase: none
+      - path: ../core/guest
+        group: core
       # NVN host-HLE: generated dispatch + portable null backend + Metal backend.
       - path: nvn/src
         group: nvn
@@ -62,6 +64,7 @@ targets:
         SWIFT_OBJC_BRIDGING_HEADER: $(SRCROOT)/BotW/BotWBridge.h
         HEADER_SEARCH_PATHS:
           - $(SRCROOT)/../core/include
+          - $(SRCROOT)/../core/guest
           - $(SRCROOT)/nvn/include
         OTHER_CPLUSPLUSFLAGS: "$(inherited) -Wall -Wextra -Werror"
         OTHER_CFLAGS: "$(inherited) -Wall -Wextra -Werror"
