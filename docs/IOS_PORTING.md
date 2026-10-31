@@ -3,7 +3,7 @@
 本文是 `ios/` 目录的操作手册。它描述的是**已经写进仓库的东西**和
 **机器能验证的事实**，不是你付钱就能玩到游戏的承诺。当前状态一句话：
 
-> iOS 侧的壳、C ABI、513 个 NVN 入口点的分发表、302 个 Metal 后端入口，
+> iOS 侧的壳、C ABI、513 个 NVN 入口点的分发表、316 个 Metal 后端入口，
 > 都能在非 Apple 主机上编译并跑通自测；纹理能建、渲染目标能绑、encoder
 > 能开，program -> pipeline -> draw -> 回读这条链已经在 **CI 的 iOS 模拟器**
 > 里跑通了十八条合成 draw（模拟器实际执行十七条）与七阶段 instanced / base-vertex / indirect draw 回归，其中包括从 guest 内存池
@@ -32,11 +32,11 @@ ios/nvn/include/nvn_api.h     生成：名字表 + 函数指针 ABI
 ios/nvn/src/nvn_dispatch.cpp  生成：二分查找 + 缺失上报
 ios/nvn/include/nvn_backend.h 后端接口（null / metal 二选一）
 ios/nvn/src/nvn_null.cpp      空后端，任何主机都能编译
-ios/nvn/src/nvn_metal.mm      Metal 后端（302 个入口，含大量 TODO）
+ios/nvn/src/nvn_metal.mm      Metal 后端（316 个入口，含大量 TODO）
 ios/nvn/src/nvn_texture.c     157 项 NVNformat -> MTLPixelFormat 表（附 lossy 标记）
 ios/nvn/include/nvn_texture.h 纹理描述结构 + 表查询接口
 ios/nvn/src/nvn_shader.c      着色器翻译的唯一接口：现在只会说"没有翻译器"
-ios/nvn/implemented_metal.txt 302 行，和 BIND(...) 列表由门禁强制相等
+ios/nvn/implemented_metal.txt 316 行，和 BIND(...) 列表由门禁强制相等
 ios/nvn/shaders/              空目录 + 路线说明（见该目录 README）
 docs/NVN_COVERAGE.md          生成的逐域覆盖表
 scripts/                      提取、生成、校验、编译脚本
@@ -79,7 +79,7 @@ nvn_shader_test: ok (seam, blob table, packed slots, bindless, c1, SHA-256, shad
 nvn_vertex_test: ok (packing, 26 formats, layout id)  exit=0
 nvn_texlayout_test: ok (block shapes, sizes, offsets, round trip, linear, write region, refusals)  exit=0
 syntax_check_metal: ok (clang++.exe)
-verify_ios: ok (metal bindings: 302/513)
+verify_ios: ok (metal bindings: 316/513)
 build_abi_test: all tests passed
 ```
 
@@ -223,7 +223,7 @@ iOS 是统一内存，guest 堆本来就是宿主可读的，所以
 
 ---
 
-## 6. 已经实现的 302 个入口点
+## 6. 已经实现的 316 个入口点
 
 按域分布（完整明细见 `docs/NVN_COVERAGE.md`）：
 
@@ -231,7 +231,7 @@ iOS 是统一内存，guest 堆本来就是宿主可读的，所以
 |---|---:|---|
 | CommandBuffer | 110/144 | recording/commit、普通与实例化 draw、base-vertex、两种 indirect draw、buffer/vertex/index、viewport/scissor、clear、render target、program、texture/sampler 绑定；M4 增加六个固定功能状态 bind、state object setter 转发、Barrier、UpdateUniformBuffer、CopyBufferToBuffer、Buffer↔Texture / Texture↔Texture copy 与 copy row/image stride，以及 initialize / finalize / is-recording、command / control memory 记账、memory callback、debug label / marker / group、13 个逐 draw 固定功能状态入口，以及纹理对象查询（14 个 getter + label / finalize / invalidate） |
 | Texture | 22/45 | initialize 建 `MTLTexture`；WriteTexels/WriteTexelsStrided 写回 guest 布局并标脏，FlushTexels 标脏，下次采样重传 |
-| TextureBuilder | 14/43 | defaults + 13 个 setter：target/format/size1D/2D/3D/宽高深/levels/samples/storage/stride/flags |
+| TextureBuilder | 28/43 | defaults + 13 个 setter：target/format/size1D/2D/3D/宽高深/levels/samples/storage/stride/flags |
 | Device | 7/27 | initialize、getProcAddress、纹理/采样器句柄查询等 |
 | SamplerBuilder | 24/25 | 状态 setter/getter 与 Metal 采样器创建 |
 | Sampler | 14/15 | builder -> `MTLSamplerState` |
@@ -247,7 +247,7 @@ iOS 是统一内存，guest 堆本来就是宿主可读的，所以
 | DepthStencilState / PolygonState | 7/13 + 5/9 | 默认值、深度/模板/剔除/偏移 setter |
 | MultisampleState / ChannelMaskState | 12/23 + 2/3 | 默认值、采样数、coverage 相关 setter、写掩码 |
 
-上表是主要域；完整 29 个域共 **302/513**，逐项状态见 `docs/NVN_COVERAGE.md`。
+上表是主要域；完整 29 个域共 **316/513**，逐项状态见 `docs/NVN_COVERAGE.md`。
 
 **必须说清楚的六件事**，否则这张表会误导人：
 
@@ -554,6 +554,10 @@ guest storage，再调用 `nvnTextureFlushTexels` 改成棕/钢蓝/橙/天蓝并
   builder 设置的值回读；storage size 由 `nvngfx_tex_layout` 计算。另接 `SetDebugLabel`、
   `Finalize`（池槽位之后解析为 null）和 `InvalidateTexels`（丢弃一次性上传，下次采样重读
   guest 池；已渲染纹理保留宿主内容）。
+- ✅ 纹理 builder 查询：11 个标量 getter（宽、高、深、级别、采样数、format、target、flags、
+  pool、offset、stride）加 storage size / alignment 与 swizzle 四路输出，全部回答 setter
+  记录的值；storage size / alignment 由 `nvngfx_tex_layout` 计算。未设置过的 builder 返回
+  NVN 默认值（1×1、1 级、R/G/B/A），不是全零。
 - `fence / sync / events` 和 `MapVirtual` 仍未接
 
 ---
@@ -634,7 +638,7 @@ constexpr int kEnumsVerified = 0;
 
 ---
 
-## 10. 剩余 211 个入口点的优先级
+## 10. 剩余 197 个入口点的优先级
 
 不要按字母序做。按“挡住第一个 draw call 的”排序：
 
@@ -700,4 +704,4 @@ Swift 侧同理：`Renderer.swift` / `GameView.swift` 只做了括号与结构�
 | `[nvn] nvnCommandBufferDraw.pipeline: no translator...` | 正常，这条就是当前的墙；自检不经过它 |
 | 屏幕全黑且 `frame` 不动 | `MTKView.delegate` 是 weak，Pump 必须被 Coordinator 强引用（已在 `GameView.swift` 修过一次） |
 | `[nvn] UNVERIFIED xxx = 0x...` | 正常，那是诚实闸门在报未验证的枚举 |
-| `[nvn] not implemented: nvnYyy` | 该入口不在 302 个里，按第 10 节排期 |
+| `[nvn] not implemented: nvnYyy` | 该入口不在 316 个里，按第 10 节排期 |

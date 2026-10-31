@@ -7,8 +7,8 @@
 `nvn*` 字符串（运行时按名解析，所以名字本身就暴露了完整接口面）。
 
 - 接口总数：**513**
-- Metal 后端已实现：**302**（58.9%）
-- 仍未实现：**211**
+- Metal 后端已实现：**316**（61.6%）
+- 仍未实现：**197**
 
 > 只有出现在 `ios/nvn/implemented_metal.txt` 里、且确实在
 > `ios/nvn/src/nvn_metal.mm` 中定义过的名字才算“已实现”。
@@ -20,7 +20,7 @@
 |---|---:|---:|---|
 | CommandBuffer | 110 | 144 | `########  ` |
 | Texture | 22 | 45 | `#####     ` |
-| TextureBuilder | 14 | 43 | `###       ` |
+| TextureBuilder | 28 | 43 | `#######   ` |
 | Device | 7 | 27 | `###       ` |
 | SamplerBuilder | 24 | 25 | `##########` |
 | MultisampleState | 12 | 23 | `#####     ` |
@@ -547,30 +547,30 @@
 - [x] `nvnTextureWriteTexels`
 - [x] `nvnTextureWriteTexelsStrided`
 
-### TextureBuilder (14/43)
+### TextureBuilder (28/43)
 
-- [ ] `nvnTextureBuilderGetDepth`
+- [x] `nvnTextureBuilderGetDepth`
 - [ ] `nvnTextureBuilderGetDepthStencilMode`
 - [ ] `nvnTextureBuilderGetDevice`
-- [ ] `nvnTextureBuilderGetFlags`
-- [ ] `nvnTextureBuilderGetFormat`
+- [x] `nvnTextureBuilderGetFlags`
+- [x] `nvnTextureBuilderGetFormat`
 - [ ] `nvnTextureBuilderGetGLTextureName`
-- [ ] `nvnTextureBuilderGetHeight`
-- [ ] `nvnTextureBuilderGetLevels`
-- [ ] `nvnTextureBuilderGetMemoryOffset`
-- [ ] `nvnTextureBuilderGetMemoryPool`
+- [x] `nvnTextureBuilderGetHeight`
+- [x] `nvnTextureBuilderGetLevels`
+- [x] `nvnTextureBuilderGetMemoryOffset`
+- [x] `nvnTextureBuilderGetMemoryPool`
 - [ ] `nvnTextureBuilderGetPackagedTextureData`
 - [ ] `nvnTextureBuilderGetPackagedTextureLayout`
 - [ ] `nvnTextureBuilderGetRawStorageClass`
-- [ ] `nvnTextureBuilderGetSamples`
+- [x] `nvnTextureBuilderGetSamples`
 - [ ] `nvnTextureBuilderGetSparseTileLayout`
-- [ ] `nvnTextureBuilderGetStorageAlignment`
+- [x] `nvnTextureBuilderGetStorageAlignment`
 - [ ] `nvnTextureBuilderGetStorageClass`
-- [ ] `nvnTextureBuilderGetStorageSize`
-- [ ] `nvnTextureBuilderGetStride`
-- [ ] `nvnTextureBuilderGetSwizzle`
-- [ ] `nvnTextureBuilderGetTarget`
-- [ ] `nvnTextureBuilderGetWidth`
+- [x] `nvnTextureBuilderGetStorageSize`
+- [x] `nvnTextureBuilderGetStride`
+- [x] `nvnTextureBuilderGetSwizzle`
+- [x] `nvnTextureBuilderGetTarget`
+- [x] `nvnTextureBuilderGetWidth`
 - [ ] `nvnTextureBuilderGetZCullStorageSize`
 - [x] `nvnTextureBuilderSetDefaults`
 - [x] `nvnTextureBuilderSetDepth`

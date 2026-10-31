@@ -5289,15 +5289,19 @@ MemoryOffset/Stride/DebugID` 都从宿主侧 `Tex` 记录返回，而那份记�
 新增失败码 `16428`：
 
 1. 用 builder 建一张 4×4 RGBA8 纹理；
-2. 逐个调 14 个 getter，核对 4/4/1、levels 1、samples 1、format 0x25、target 0、
-   flags 0、pool 0、offset 0、stride 0、非零 debug id、address 0、storage size 等于
-   本地重算的 `nvngfx_tex_layout().size`；
+2. 逐个调 14 个 getter，核对 4/4/1、levels 1、samples 0（builder 没调 SetSamples，
+   NVN 用 0 表示单采样）、format 0x25、target 0、flags 0、pool 0、offset 0、stride 0、
+   非零 debug id、address 0、storage size 等于本地重算的 `nvngfx_tex_layout().size`；
 3. `GetSwizzle` 的四个输出等于默认的 2/3/4/5；
 4. `SetDebugLabel` 后 `Tex.label` 与 guest 字符串一致；
 5. `InvalidateTexels` 把 `uploaded` / `uploadTried` 清零；
 6. `Finalize` 之后 `find<Tex>` 为空，且再查宽高 / debug id 都返回 0。
 
 这一组证明宿主侧查询与生命周期，不是标题纹理内容。
+
+第一次跑这条回归（run `41184723718`）时，自测错把单采样期望成 `samples == 1`，
+而 builder 默认值是 0；日志里 `samples 0` 与 `BOTW_SELFTEST rc=16428` 就是这次
+不一致，断言已改为 0。
 
 ### 4. 门禁
 
@@ -5311,4 +5315,66 @@ git diff --check
 ```
 
 本地已通过（513 procs / 302 implemented / 477 measured + 6 inferred）。
+CI 结果待补。
+
+## M4 续十八：纹理 builder 查询
+
+上一轮把纹理对象的 getter 接完了，但客体在 `nvnTextureInitialize` 之前也会查询 builder：
+它用 `GetStorageSize` / `GetStorageAlignment` 决定从内存池里切多少字节，用宽高和
+format 做校验。此前这些 14 个入口都是日志桩，返回 0 会让上层把纹理当成非法。
+本轮补齐：
+
+* TextureBuilder：28/43（+14）
+
+Metal 覆盖从 **302/513（58.9%）** 到 **316/513（61.6%）**，未实现 197。
+
+### 1. 回答 setter 记录的值，缺省回答 NVN 默认值
+
+builder 是 guest 对象，本后端从不读它的内存布局；所有 getter 都查
+`g_tex_specs[builder]`，也就是 `nvnTextureBuilderSet*` 写下的那份 `nvngfx_texdesc`。
+没有条目的 builder（从未 SetDefaults / Set*）返回 `nvngfx_texdesc_defaults`：1×1、
+1 级、swizzle R/G/B/A，而不是全零——全零会让 `GetLevels` 得到 0，比“未知”更糟。
+
+覆盖的 getter：`GetWidth` / `GetHeight` / `GetDepth` / `GetLevels` / `GetSamples` /
+`GetFormat` / `GetTarget` / `GetFlags` / `GetMemoryPool` / `GetMemoryOffset` /
+`GetStride` / `GetSwizzle`。
+
+### 2. storage size / alignment 与上传路径同源
+
+`GetStorageSize` 和 `GetStorageAlignment` 调用 `nvngfx_tex_layout`，和
+`nvnTextureInitialize` 建 Metal 纹理、`tex_upload()` 解块时用的是同一份布局代码。
+客体按这两个数字切池，实际上传就不会越界或重叠。布局失败（未知 format）时返回 0。
+
+未接的 builder 入口是 `GetDevice` / `GetPackagedTextureLayout` /
+`GetRawStorageClass`（这三个在注册表里没有签名形状，不能安全绑定）、
+`GetPackagedTextureData`（需要 packaged 格式语义）、`GetSparseTileLayout`（结构体布局
+未核实）、`GetStorageClass` / `GetDepthStencilMode`（枚举值未核实）、
+`GetGLTextureName` / `GetZCullStorageSize`，以及 7 个 setter。
+
+### 3. 模拟器自测
+
+新增失败码 `16429`：
+
+1. 对一个 builder 设 format 0x25、8×4、3 级、1 采样、pool 0x1000 / offset 128、
+   stride 256、flags 0x40；
+2. 11 个标量 getter 与 storage size / alignment 逐个核对，size/alignment 与本地
+   `nvngfx_tex_layout` 重算结果一致；
+3. `GetSwizzle` 的四个输出为默认 2/3/4/5；
+4. 对一个从未设置过的 builder，宽 / 高 / 级数为 1、format 为 0——证明缺省走的是
+   NVN 默认值。
+
+这一组证明 builder 侧查询，不是标题资源。
+
+### 4. 门禁
+
+```text
+python scripts/syntax_check_metal.py
+python scripts/gen_nvn.py --repo . --check
+python scripts/extract_nvn_signatures.py --check
+python scripts/verify_ios.py
+powershell -ExecutionPolicy Bypass -File scripts/build_abi_test.ps1
+git diff --check
+```
+
+本地已通过（513 procs / 316 implemented / 477 measured + 6 inferred）。
 CI 结果待补。

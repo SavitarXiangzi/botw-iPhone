@@ -1281,6 +1281,85 @@ void tex_builder_set_flags(nvngfx_ctx*, uint64_t* x) {
     g_tex_specs[x[0]].flags = static_cast<int>(x[1]);
 }
 
+/* The builder is a guest object whose layout we never read; every getter
+ * answers from the spec the setters recorded.  A builder that was never
+ * defaulted has no entry, so the fallback is the NVN default descriptor, not
+ * a zero-filled one. */
+const nvngfx_texdesc& tex_spec_or_default(uint64_t builder) {
+    static const nvngfx_texdesc fallback = [] {
+        nvngfx_texdesc d;
+        nvngfx_texdesc_defaults(&d);
+        return d;
+    }();
+    auto it = g_tex_specs.find(builder);
+    return it == g_tex_specs.end() ? fallback : it->second;
+}
+
+void tex_builder_get_width(nvngfx_ctx*, uint64_t* x) {
+    x[0] = static_cast<uint64_t>(tex_spec_or_default(x[0]).width);
+}
+void tex_builder_get_height(nvngfx_ctx*, uint64_t* x) {
+    x[0] = static_cast<uint64_t>(tex_spec_or_default(x[0]).height);
+}
+void tex_builder_get_depth(nvngfx_ctx*, uint64_t* x) {
+    x[0] = static_cast<uint64_t>(tex_spec_or_default(x[0]).depth);
+}
+void tex_builder_get_levels(nvngfx_ctx*, uint64_t* x) {
+    x[0] = static_cast<uint64_t>(tex_spec_or_default(x[0]).levels);
+}
+void tex_builder_get_samples(nvngfx_ctx*, uint64_t* x) {
+    x[0] = static_cast<uint64_t>(
+        static_cast<uint32_t>(tex_spec_or_default(x[0]).samples));
+}
+void tex_builder_get_format(nvngfx_ctx*, uint64_t* x) {
+    x[0] = static_cast<uint64_t>(
+        static_cast<uint32_t>(tex_spec_or_default(x[0]).format));
+}
+void tex_builder_get_target(nvngfx_ctx*, uint64_t* x) {
+    x[0] = static_cast<uint64_t>(
+        static_cast<uint32_t>(tex_spec_or_default(x[0]).target));
+}
+void tex_builder_get_flags(nvngfx_ctx*, uint64_t* x) {
+    x[0] = static_cast<uint64_t>(
+        static_cast<uint32_t>(tex_spec_or_default(x[0]).flags));
+}
+void tex_builder_get_memory_pool(nvngfx_ctx*, uint64_t* x) {
+    x[0] = tex_spec_or_default(x[0]).pool;
+}
+void tex_builder_get_memory_offset(nvngfx_ctx*, uint64_t* x) {
+    x[0] = static_cast<uint64_t>(tex_spec_or_default(x[0]).offset);
+}
+void tex_builder_get_stride(nvngfx_ctx*, uint64_t* x) {
+    x[0] = static_cast<uint64_t>(tex_spec_or_default(x[0]).stride);
+}
+
+/* nvnTextureBuilderGetStorageSize / GetStorageAlignment: the same layout
+ * code the upload path uses, so a guest that sizes its pool from these two
+ * numbers and a texture that later uploads agree. */
+void tex_builder_get_storage_size(nvngfx_ctx*, uint64_t* x) {
+    const nvngfx_texdesc& d = tex_spec_or_default(x[0]);
+    nvngfx_texlayout L = {};
+    x[0] = nvngfx_tex_layout(&d, &L) == 0 ? L.size : 0;
+}
+void tex_builder_get_storage_alignment(nvngfx_ctx*, uint64_t* x) {
+    const nvngfx_texdesc& d = tex_spec_or_default(x[0]);
+    nvngfx_texlayout L = {};
+    x[0] = nvngfx_tex_layout(&d, &L) == 0 ? L.alignment : 0;
+}
+
+/* nvnTextureBuilderGetSwizzle(builder, r, g, b, a) */
+void tex_builder_get_swizzle(nvngfx_ctx*, uint64_t* x) {
+    const nvngfx_texdesc& d = tex_spec_or_default(x[0]);
+    for (unsigned i = 0; i < 4; ++i) {
+        if (!x[1 + i]) continue;
+        if (!guest_range(x[1 + i], sizeof(int))) {
+            log_once("nvnTextureBuilderGetSwizzle.pointer", i);
+            continue;
+        }
+        *guest_ptr<int>(x[1 + i]) = static_cast<int>(d.swz[i]);
+    }
+}
+
 /* NVN's target carries the array / cube shape that `rank` alone cannot
  * express (see nvngfx_tex_layout's shape()).  Build the matching Metal view so
  * layer 1 of a 2D array, or a cube face, is addressable as a slice instead of
@@ -8130,6 +8209,21 @@ const Binding kBindings[] = {
     BIND("nvnTextureBuilderSetStorage", tex_builder_set_storage),
     BIND("nvnTextureBuilderSetStride", tex_builder_set_stride),
     BIND("nvnTextureBuilderSetFlags", tex_builder_set_flags),
+    BIND("nvnTextureBuilderGetWidth", tex_builder_get_width),
+    BIND("nvnTextureBuilderGetHeight", tex_builder_get_height),
+    BIND("nvnTextureBuilderGetDepth", tex_builder_get_depth),
+    BIND("nvnTextureBuilderGetLevels", tex_builder_get_levels),
+    BIND("nvnTextureBuilderGetSamples", tex_builder_get_samples),
+    BIND("nvnTextureBuilderGetFormat", tex_builder_get_format),
+    BIND("nvnTextureBuilderGetTarget", tex_builder_get_target),
+    BIND("nvnTextureBuilderGetFlags", tex_builder_get_flags),
+    BIND("nvnTextureBuilderGetMemoryPool", tex_builder_get_memory_pool),
+    BIND("nvnTextureBuilderGetMemoryOffset", tex_builder_get_memory_offset),
+    BIND("nvnTextureBuilderGetStride", tex_builder_get_stride),
+    BIND("nvnTextureBuilderGetStorageSize", tex_builder_get_storage_size),
+    BIND("nvnTextureBuilderGetStorageAlignment",
+         tex_builder_get_storage_alignment),
+    BIND("nvnTextureBuilderGetSwizzle", tex_builder_get_swizzle),
     BIND("nvnTextureInitialize", tex_initialize),
     BIND("nvnTextureWriteTexels", tex_write_texels),
     BIND("nvnTextureGetWidth", tex_get_width),
@@ -14229,8 +14323,10 @@ extern "C" int nvngfx_metal_selftest(void) {
 
             nvngfx_texlayout wantLayout = {};
             const int wantLayoutOk = nvngfx_tex_layout(&want, &wantLayout);
+            /* NVN represents a single-sampled texture with samples 0; the
+             * builder never called SetSamples, so 0 is the expected value. */
             if (qWidth != 4 || qHeight != 4 || qDepth != 1 ||
-                qLevels != 1 || qSamples != 1 || qFormat != 0x25 ||
+                qLevels != 1 || qSamples != 0 || qFormat != 0x25 ||
                 qTarget != 0 || qFlags != 0 || qPool != 0 || qOffset != 0 ||
                 qStride != 0 || qDebug == 0 || qAddress != 0 ||
                 wantLayoutOk != 0 || qStorage != wantLayout.size ||
@@ -14299,6 +14395,134 @@ extern "C" int nvngfx_metal_selftest(void) {
                          "the builder values, the label stuck, invalidate "
                          "cleared the upload flags and finalize removed the "
                          "object\n");
+        }
+
+        {
+            /* --- Texture builder queries -------------------------------
+             * The builder is a guest object this backend never reads.  The
+             * getters must answer from the values the setters recorded, and a
+             * builder that was never touched must answer the NVN defaults
+             * (1x1, one level, R/G/B/A swizzle) rather than zeros. */
+            alignas(16) unsigned char tb[0x80] = {};
+            const uint64_t kTb = reinterpret_cast<uint64_t>(tb);
+            alignas(16) int tbSwz[4] = {-1, -1, -1, -1};
+
+            x[0] = kTb;
+            tex_builder_set_defaults(ctx, x);
+            x[0] = kTb; x[1] = 0x25;
+            tex_builder_set_format(ctx, x);
+            x[0] = kTb; x[1] = 8; x[2] = 4;
+            tex_builder_set_size2d(ctx, x);
+            x[0] = kTb; x[1] = 3;
+            tex_builder_set_levels(ctx, x);
+            x[0] = kTb; x[1] = 1;
+            tex_builder_set_samples(ctx, x);
+            x[0] = kTb; x[1] = 0x1000; x[2] = 128;
+            tex_builder_set_storage(ctx, x);
+            x[0] = kTb; x[1] = 256;
+            tex_builder_set_stride(ctx, x);
+            x[0] = kTb; x[1] = 0x40;
+            tex_builder_set_flags(ctx, x);
+
+            uint64_t tq[8] = {};
+            auto tbQuery = [&](void (*fn)(nvngfx_ctx*, uint64_t*)) {
+                tq[0] = kTb;
+                fn(ctx, tq);
+                return tq[0];
+            };
+            const uint64_t tWidth = tbQuery(tex_builder_get_width);
+            const uint64_t tHeight = tbQuery(tex_builder_get_height);
+            const uint64_t tDepth = tbQuery(tex_builder_get_depth);
+            const uint64_t tLevels = tbQuery(tex_builder_get_levels);
+            const uint64_t tSamples = tbQuery(tex_builder_get_samples);
+            const uint64_t tFormat = tbQuery(tex_builder_get_format);
+            const uint64_t tTarget = tbQuery(tex_builder_get_target);
+            const uint64_t tFlags = tbQuery(tex_builder_get_flags);
+            const uint64_t tPool = tbQuery(tex_builder_get_memory_pool);
+            const uint64_t tOffset = tbQuery(tex_builder_get_memory_offset);
+            const uint64_t tStride = tbQuery(tex_builder_get_stride);
+            const uint64_t tSize = tbQuery(tex_builder_get_storage_size);
+            const uint64_t tAlign = tbQuery(tex_builder_get_storage_alignment);
+            tq[0] = kTb;
+            tq[1] = reinterpret_cast<uint64_t>(&tbSwz[0]);
+            tq[2] = reinterpret_cast<uint64_t>(&tbSwz[1]);
+            tq[3] = reinterpret_cast<uint64_t>(&tbSwz[2]);
+            tq[4] = reinterpret_cast<uint64_t>(&tbSwz[3]);
+            tex_builder_get_swizzle(ctx, tq);
+
+            nvngfx_texdesc tbWant;
+            nvngfx_texdesc_defaults(&tbWant);
+            tbWant.format = 0x25;
+            tbWant.width = 8;
+            tbWant.height = 4;
+            tbWant.depth = 1;
+            tbWant.levels = 3;
+            tbWant.samples = 1;
+            tbWant.pool = 0x1000;
+            tbWant.offset = 128;
+            tbWant.stride = 256;
+            tbWant.flags = 0x40;
+            nvngfx_texlayout tbLayout = {};
+            const int tbLayoutOk = nvngfx_tex_layout(&tbWant, &tbLayout);
+            if (tWidth != 8 || tHeight != 4 || tDepth != 1 || tLevels != 3 ||
+                tSamples != 1 || tFormat != 0x25 || tTarget != 0 ||
+                tFlags != 0x40 || tPool != 0x1000 || tOffset != 128 ||
+                tStride != 256 || tbLayoutOk != 0 || tSize != tbLayout.size ||
+                tAlign != tbLayout.alignment || tbSwz[0] != 2 ||
+                tbSwz[1] != 3 || tbSwz[2] != 4 || tbSwz[3] != 5) {
+                std::fprintf(stderr,
+                             "[selftest] texture builder: got %llu/%llu/%llu "
+                             "levels %llu samples %llu format 0x%llx target "
+                             "%llu flags %llu pool %llu offset %llu stride "
+                             "%llu size %llu align %llu swizzle %d/%d/%d/%d\n",
+                             static_cast<unsigned long long>(tWidth),
+                             static_cast<unsigned long long>(tHeight),
+                             static_cast<unsigned long long>(tDepth),
+                             static_cast<unsigned long long>(tLevels),
+                             static_cast<unsigned long long>(tSamples),
+                             static_cast<unsigned long long>(tFormat),
+                             static_cast<unsigned long long>(tTarget),
+                             static_cast<unsigned long long>(tFlags),
+                             static_cast<unsigned long long>(tPool),
+                             static_cast<unsigned long long>(tOffset),
+                             static_cast<unsigned long long>(tStride),
+                             static_cast<unsigned long long>(tSize),
+                             static_cast<unsigned long long>(tAlign),
+                             tbSwz[0], tbSwz[1], tbSwz[2], tbSwz[3]);
+                rc = 16429;
+                goto done;
+            }
+
+            /* An untouched builder answers the NVN defaults, not zeros. */
+            const uint64_t kTbUnused = 0x9FD0;
+            tq[0] = kTbUnused;
+            tex_builder_get_width(ctx, tq);
+            const uint64_t uWidth = tq[0];
+            tq[0] = kTbUnused;
+            tex_builder_get_height(ctx, tq);
+            const uint64_t uHeight = tq[0];
+            tq[0] = kTbUnused;
+            tex_builder_get_levels(ctx, tq);
+            const uint64_t uLevels = tq[0];
+            tq[0] = kTbUnused;
+            tex_builder_get_format(ctx, tq);
+            const uint64_t uFormat = tq[0];
+            if (uWidth != 1 || uHeight != 1 || uLevels != 1 || uFormat != 0) {
+                std::fprintf(stderr,
+                             "[selftest] texture builder: an untouched builder "
+                             "answered %llu/%llu levels %llu format %llu\n",
+                             static_cast<unsigned long long>(uWidth),
+                             static_cast<unsigned long long>(uHeight),
+                             static_cast<unsigned long long>(uLevels),
+                             static_cast<unsigned long long>(uFormat));
+                rc = 16429;
+                goto done;
+            }
+            std::fprintf(stderr,
+                         "[selftest] texture builder: 11 scalar getters, storage "
+                         "size/alignment and the four swizzle outputs matched "
+                         "the setters; an untouched builder answered the "
+                         "defaults\n");
         }
 
         {
