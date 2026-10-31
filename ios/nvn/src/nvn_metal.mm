@@ -87,6 +87,7 @@
 #include "nvn_metal.h"
 #include "nvn_pool.h"
 #include "nvn_sampler.h"
+#include "nvn_pipeline.h"
 #include "nvn_state.h"
 #include "nvn_shader.h"
 #include "nvn_texlayout.h"
@@ -262,6 +263,12 @@ struct CmdBuf {
      * actually translate something. */
     uint64_t program = 0;
     id<MTLRenderPipelineState> pso = nil;
+    /* Which attachments that pipeline declared.  Binding a depth or stencil
+     * test to a pass without the matching attachment is a Metal error, so the
+     * encoder state is sanitised against these flags. */
+    bool psoHasDepthStencil = false;
+    bool psoHasDepth = false;
+    bool psoHasStencil = false;
     /* Vertex buffers as guest addresses.  Recorded, not consumed: Metal needs
      * an MTLBuffer, which needs the pool the address belongs to, and no draw
      * path fetches vertices before a pipeline exists. */
@@ -315,24 +322,39 @@ struct CmdBuf {
      * layouts into its own 4/8/10-byte objects; a bind copies the decoded
      * fields here so a later pipeline can be built from the state that was
      * current at the draw, not from whatever the guest reused later. */
-    nvngfx_blend_state blendState = {};
+    /* One blend state per colour target: NVN's blend object names its own
+     * target (nvnBlendStateSetBlendTarget), so a bind lands in slot
+     * state.target instead of always in slot 0. */
+    nvngfx_blend_state blendState[NVNGFX_MAX_COLOR_TARGETS] = {};
     nvngfx_color_state colorState = {};
     nvngfx_channel_mask_state channelState = {};
     nvngfx_multisample_state multisampleState = {};
     nvngfx_polygon_state polygonState = {};
     nvngfx_depth_stencil_state depthState = {};
-    bool hasBlendState = false;
+    bool hasBlendState[NVNGFX_MAX_COLOR_TARGETS] = {};
     bool hasColorState = false;
     bool hasChannelState = false;
     bool hasMultisampleState = false;
     bool hasPolygonState = false;
     bool hasDepthState = false;
+    /* MTLDepthStencilState built from depthState; dropped when the state
+     * object is bound again, because the guest may have rewritten it. */
+    id<MTLDepthStencilState> dss = nil;
+    unsigned long long dssKey = 0;
+    bool dssValid = false;
     float blendColor[4] = {0, 0, 0, 0};
     bool hasBlendColor = false;
     float alphaRef = 0.0f;
     bool hasAlphaRef = false;
     uint32_t renderEnable = 1;
     bool hasRenderEnable = false;
+    /* Constants from nvnCommandBufferSetPolygonOffsetClamp.  The polygon
+     * state decides whether the FILL enable is on; point/line enables have
+     * no Metal equivalent and are reported by nvngfx_pipeline_set_polygon(). */
+    float polyOffsetFactor = 0.0f;
+    float polyOffsetUnits = 0.0f;
+    float polyOffsetClamp = 0.0f;
+    bool hasPolyOffset = false;
     float coverageTable[16] = {};
     bool hasCoverageTable = false;
     double depthNear = 0.0, depthFar = 1.0;
@@ -1890,6 +1912,15 @@ struct Program {
         MTLPixelFormat format = static_cast<MTLPixelFormat>(0);
         unsigned long long layout = 0;   /* nvngfx_vertex_layout_id() */
         bool hasLayout = false;          /* false: no vertex descriptor */
+        /* Fixed-function state that was current at the draw.  A pipeline is
+         * only reusable when the whole state matches, not just the format. */
+        unsigned long long stateKey = 0;
+        /* Attachments are baked into the pipeline too.  A depth-only and a
+         * depth+stencil pipeline can share the colour format, so the cache
+         * must not key on the colour format alone. */
+        MTLPixelFormat depthFormat = static_cast<MTLPixelFormat>(0);
+        MTLPixelFormat stencilFormat = static_cast<MTLPixelFormat>(0);
+        unsigned sampleCount = 1;
     };
     PsoSlot slots[4];
 
@@ -1923,13 +1954,20 @@ struct Program {
     bool directBindings = false;
 };
 
-/* The cached pipeline for (format, layout), or nil.  Also records the hit in
- * slot 0 so the next draw with the same key finds it first. */
+/* The cached pipeline for the complete (colour/depth/stencil format, sample
+ * count, vertex layout, fixed-function state) key, or nil.  Also records the
+ * hit in slot 0 so the next draw with the same key finds it first. */
 id<MTLRenderPipelineState> pso_lookup(Program* p, MTLPixelFormat fmt,
-                                     unsigned long long layout, bool hasLayout) {
+                                     unsigned long long layout, bool hasLayout,
+                                     unsigned long long stateKey,
+                                     MTLPixelFormat depthFormat,
+                                     MTLPixelFormat stencilFormat,
+                                     unsigned sampleCount) {
     for (unsigned i = 0; i < 4; ++i) {
         Program::PsoSlot& s = p->slots[i];
-        if (s.pso && s.format == fmt && s.layout == layout && s.hasLayout == hasLayout) {
+        if (s.pso && s.format == fmt && s.layout == layout && s.hasLayout == hasLayout &&
+            s.stateKey == stateKey && s.depthFormat == depthFormat &&
+            s.stencilFormat == stencilFormat && s.sampleCount == sampleCount) {
             if (i != 0) {
                 const Program::PsoSlot keep = s;
                 s = p->slots[0];
@@ -1942,7 +1980,9 @@ id<MTLRenderPipelineState> pso_lookup(Program* p, MTLPixelFormat fmt,
 }
 
 void pso_store(Program* p, id<MTLRenderPipelineState> pso, MTLPixelFormat fmt,
-               unsigned long long layout, bool hasLayout) {
+               unsigned long long layout, bool hasLayout,
+               unsigned long long stateKey, MTLPixelFormat depthFormat,
+               MTLPixelFormat stencilFormat, unsigned sampleCount) {
     /* Shift down; slot 3 falls out.  Releasing the object it held is fine:
      * the command buffers that used it keep their own reference. */
     for (unsigned i = 3; i > 0; --i) p->slots[i] = p->slots[i - 1];
@@ -1950,6 +1990,10 @@ void pso_store(Program* p, id<MTLRenderPipelineState> pso, MTLPixelFormat fmt,
     p->slots[0].format = fmt;
     p->slots[0].layout = layout;
     p->slots[0].hasLayout = hasLayout;
+    p->slots[0].stateKey = stateKey;
+    p->slots[0].depthFormat = depthFormat;
+    p->slots[0].stencilFormat = stencilFormat;
+    p->slots[0].sampleCount = sampleCount;
 }
 
 void pso_drop(Program* p) {
@@ -1958,6 +2002,10 @@ void pso_drop(Program* p) {
         p->slots[i].format = static_cast<MTLPixelFormat>(0);
         p->slots[i].layout = 0;
         p->slots[i].hasLayout = false;
+        p->slots[i].stateKey = 0;
+        p->slots[i].depthFormat = static_cast<MTLPixelFormat>(0);
+        p->slots[i].stencilFormat = static_cast<MTLPixelFormat>(0);
+        p->slots[i].sampleCount = 1;
     }
     p->hasArgBuffer = false;
     p->vHasArgBuffer = false;
@@ -2073,7 +2121,183 @@ MTLVertexDescriptor* vertex_descriptor(const CmdBuf* b, unsigned long long* layo
     return vd;
 }
 
+/* ---- fixed-function state -> pipeline and encoder --------------------- */
+
+/* Layers the six state objects the command buffer currently holds into one
+ * description.  An absent object contributes NVN's defaults, which is what
+ * the guest would see if it had never touched that object. */
+void pipeline_state_of(const CmdBuf* b, nvngfx_pipeline_state* st) {
+    nvngfx_pipeline_defaults(st);
+    for (unsigned i = 0; i < NVNGFX_MAX_COLOR_TARGETS; ++i)
+        if (b->hasBlendState[i]) nvngfx_pipeline_set_blend(st, &b->blendState[i]);
+    if (b->hasColorState) nvngfx_pipeline_set_color(st, &b->colorState);
+    if (b->hasChannelState) nvngfx_pipeline_set_channel_mask(st, &b->channelState);
+    if (b->hasMultisampleState) nvngfx_pipeline_set_multisample(st, &b->multisampleState);
+    if (b->hasPolygonState) nvngfx_pipeline_set_polygon(st, &b->polygonState);
+    if (b->hasDepthState) nvngfx_pipeline_set_depth_stencil(st, &b->depthState);
+}
+
+/* One line per feature that cannot be honoured.  Silently ignoring these is
+ * how a backend ends up "mostly right" and impossible to debug. */
+void report_unsupported(const nvngfx_pipeline_state& st) {
+    const unsigned f = st.unsupported;
+    if (f & NVNGFX_UNSUP_BLEND_FACTOR) log_once("nvnPipeline.blendFactor", 1);
+    if (f & NVNGFX_UNSUP_BLEND_EQUATION) log_once("nvnPipeline.blendEquation", 1);
+    if (f & NVNGFX_UNSUP_DEPTH_FUNC) log_once("nvnPipeline.depthFunc", 1);
+    if (f & NVNGFX_UNSUP_STENCIL_FUNC) log_once("nvnPipeline.stencilFunc", 1);
+    if (f & NVNGFX_UNSUP_STENCIL_OP) log_once("nvnPipeline.stencilOp", 1);
+    if (f & NVNGFX_UNSUP_CULL) log_once("nvnPipeline.cullFrontAndBack", 1);
+    if (f & NVNGFX_UNSUP_FILL) log_once("nvnPipeline.pointFill", 1);
+    if (f & NVNGFX_UNSUP_LOGIC_OP) log_once("nvnPipeline.logicOp", 1);
+    if (f & NVNGFX_UNSUP_ALPHA_TEST) log_once("nvnPipeline.alphaTest", 1);
+    if (f & NVNGFX_UNSUP_MULTISAMPLE) log_once("nvnPipeline.samples", 1);
+    if (f & NVNGFX_UNSUP_COVERAGE) log_once("nvnPipeline.coverage", 1);
+    if (f & NVNGFX_UNSUP_POLYGON_OFFSET) log_once("nvnPipeline.polygonOffsetModes", 1);
+}
+
+MTLBlendFactor to_mtl_blend(unsigned f) {
+    switch (f) {
+    case NVNGFX_BF_ZERO: return MTLBlendFactorZero;
+    case NVNGFX_BF_ONE: return MTLBlendFactorOne;
+    case NVNGFX_BF_SRC_COLOR: return MTLBlendFactorSourceColor;
+    case NVNGFX_BF_ONE_MINUS_SRC_COLOR: return MTLBlendFactorOneMinusSourceColor;
+    case NVNGFX_BF_SRC_ALPHA: return MTLBlendFactorSourceAlpha;
+    case NVNGFX_BF_ONE_MINUS_SRC_ALPHA: return MTLBlendFactorOneMinusSourceAlpha;
+    case NVNGFX_BF_DST_ALPHA: return MTLBlendFactorDestinationAlpha;
+    case NVNGFX_BF_ONE_MINUS_DST_ALPHA: return MTLBlendFactorOneMinusDestinationAlpha;
+    case NVNGFX_BF_DST_COLOR: return MTLBlendFactorDestinationColor;
+    case NVNGFX_BF_ONE_MINUS_DST_COLOR: return MTLBlendFactorOneMinusDestinationColor;
+    case NVNGFX_BF_SRC_ALPHA_SATURATE: return MTLBlendFactorSourceAlphaSaturated;
+    /* NVN's "constant" is Metal's blend colour, which the encoder carries
+     * from nvnCommandBufferSetBlendColor. */
+    case NVNGFX_BF_CONSTANT_COLOR: return MTLBlendFactorBlendColor;
+    case NVNGFX_BF_ONE_MINUS_CONSTANT_COLOR: return MTLBlendFactorOneMinusBlendColor;
+    case NVNGFX_BF_CONSTANT_ALPHA: return MTLBlendFactorBlendAlpha;
+    case NVNGFX_BF_ONE_MINUS_CONSTANT_ALPHA: return MTLBlendFactorOneMinusBlendAlpha;
+    case NVNGFX_BF_SRC1_COLOR: return MTLBlendFactorSource1Color;
+    case NVNGFX_BF_ONE_MINUS_SRC1_COLOR: return MTLBlendFactorOneMinusSource1Color;
+    case NVNGFX_BF_SRC1_ALPHA: return MTLBlendFactorSource1Alpha;
+    case NVNGFX_BF_ONE_MINUS_SRC1_ALPHA: return MTLBlendFactorOneMinusSource1Alpha;
+    default: return MTLBlendFactorOne;   /* already reported as unsupported */
+    }
+}
+
+MTLBlendOperation to_mtl_blend_op(unsigned e) {
+    switch (e) {
+    case NVNGFX_EQ_ADD: return MTLBlendOperationAdd;
+    case NVNGFX_EQ_SUB: return MTLBlendOperationSubtract;
+    case NVNGFX_EQ_REVERSE_SUB: return MTLBlendOperationReverseSubtract;
+    case NVNGFX_EQ_MIN: return MTLBlendOperationMin;
+    case NVNGFX_EQ_MAX: return MTLBlendOperationMax;
+    default: return MTLBlendOperationAdd;
+    }
+}
+
+MTLCompareFunction to_mtl_compare(unsigned c) {
+    switch (c) {
+    case NVNGFX_CMP_NEVER: return MTLCompareFunctionNever;
+    case NVNGFX_CMP_LESS: return MTLCompareFunctionLess;
+    case NVNGFX_CMP_EQUAL: return MTLCompareFunctionEqual;
+    case NVNGFX_CMP_LEQUAL: return MTLCompareFunctionLessEqual;
+    case NVNGFX_CMP_GREATER: return MTLCompareFunctionGreater;
+    case NVNGFX_CMP_NOTEQUAL: return MTLCompareFunctionNotEqual;
+    case NVNGFX_CMP_GEQUAL: return MTLCompareFunctionGreaterEqual;
+    case NVNGFX_CMP_ALWAYS: return MTLCompareFunctionAlways;
+    default: return MTLCompareFunctionAlways;
+    }
+}
+
+MTLStencilOperation to_mtl_stencil(unsigned op) {
+    switch (op) {
+    case NVNGFX_STENCIL_KEEP: return MTLStencilOperationKeep;
+    case NVNGFX_STENCIL_ZERO: return MTLStencilOperationZero;
+    case NVNGFX_STENCIL_REPLACE: return MTLStencilOperationReplace;
+    case NVNGFX_STENCIL_INCR: return MTLStencilOperationIncrementClamp;
+    case NVNGFX_STENCIL_DECR: return MTLStencilOperationDecrementClamp;
+    case NVNGFX_STENCIL_INVERT: return MTLStencilOperationInvert;
+    case NVNGFX_STENCIL_INCR_WRAP: return MTLStencilOperationIncrementWrap;
+    case NVNGFX_STENCIL_DECR_WRAP: return MTLStencilOperationDecrementWrap;
+    default: return MTLStencilOperationKeep;
+    }
+}
+
+MTLCullMode to_mtl_cull(unsigned c) {
+    switch (c) {
+    case NVNGFX_CULL_FRONT: return MTLCullModeFront;
+    case NVNGFX_CULL_BACK: return MTLCullModeBack;
+    default: return MTLCullModeNone;
+    }
+}
+
+MTLWinding to_mtl_winding(unsigned w) {
+    return w == NVNGFX_WINDING_CW ? MTLWindingClockwise : MTLWindingCounterClockwise;
+}
+
+MTLTriangleFillMode to_mtl_fill(unsigned f) {
+    return f == NVNGFX_FILL_LINE ? MTLTriangleFillModeLines : MTLTriangleFillModeFill;
+}
+
+/* Metal requires the pipeline's stencil format to name a format that actually
+ * has stencil bits; declaring one for Depth32Float fails pipeline creation. */
+/* The depth-stencil object only depends on the depth/stencil fields, so it is
+ * cached on that key alone: a blend change must not rebuild it.  Those fields
+ * are declared consecutively in nvngfx_pipeline_state on purpose. */
+unsigned long long depth_stencil_key(const nvngfx_pipeline_state& st) {
+    const unsigned char* p = &st.depth_test;
+    const unsigned n = 12;   /* test, write, func, stencil test, 2 funcs, 6 ops */
+    unsigned long long h = 14695981039346656037ull;
+    for (unsigned i = 0; i < n; ++i) {
+        h ^= p[i];
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+bool mtl_format_has_depth(MTLPixelFormat f) {
+    return f == MTLPixelFormatDepth16Unorm || f == MTLPixelFormatDepth32Float ||
+           f == MTLPixelFormatDepth32Float_Stencil8;
+}
+
+bool mtl_format_has_stencil(MTLPixelFormat f) {
+    return f == MTLPixelFormatStencil8 || f == MTLPixelFormatDepth32Float_Stencil8;
+}
+
+id<MTLDepthStencilState> build_depth_stencil(Ctx* c, const nvngfx_pipeline_state& st) {
+    if (!c || !c->device) return nil;
+    @autoreleasepool {
+        MTLDepthStencilDescriptor* dd = [[MTLDepthStencilDescriptor alloc] init];
+        /* NVN semantics: with the depth test off there is neither a test nor
+         * a write, whatever depthWriteEnable still says. */
+        dd.depthCompareFunction =
+            st.depth_test ? to_mtl_compare(st.depth_func) : MTLCompareFunctionAlways;
+        dd.depthWriteEnabled = (st.depth_test && st.depth_write) ? YES : NO;
+        if (st.stencil_test) {
+            MTLStencilDescriptor* front = [[MTLStencilDescriptor alloc] init];
+            front.stencilCompareFunction = to_mtl_compare(st.stencil_func[0]);
+            front.stencilFailureOperation = to_mtl_stencil(st.stencil_op[0][0]);
+            front.depthFailureOperation = to_mtl_stencil(st.stencil_op[0][1]);
+            front.depthStencilPassOperation = to_mtl_stencil(st.stencil_op[0][2]);
+            front.readMask = 0xFFu;
+            front.writeMask = 0xFFu;
+            MTLStencilDescriptor* back = [[MTLStencilDescriptor alloc] init];
+            back.stencilCompareFunction = to_mtl_compare(st.stencil_func[1]);
+            back.stencilFailureOperation = to_mtl_stencil(st.stencil_op[1][0]);
+            back.depthFailureOperation = to_mtl_stencil(st.stencil_op[1][1]);
+            back.depthStencilPassOperation = to_mtl_stencil(st.stencil_op[1][2]);
+            back.readMask = 0xFFu;
+            back.writeMask = 0xFFu;
+            dd.frontFaceStencil = front;
+            dd.backFaceStencil = back;
+        }
+        return [c->device newDepthStencilStateWithDescriptor:dd];
+    }
+}
+
 id<MTLRenderPipelineState> program_pipeline(Ctx* c, Program* p, MTLPixelFormat fmt,
+                                            MTLPixelFormat depthFmt,
+                                            MTLPixelFormat stencilFmt,
+                                            unsigned colorSamples,
+                                            const nvngfx_pipeline_state& st,
                                             const CmdBuf* b, const char** why) {
     const bool hasLayout = b && b->numAttrib > 0;
     unsigned long long layout = 0;
@@ -2082,7 +2306,18 @@ id<MTLRenderPipelineState> program_pipeline(Ctx* c, Program* p, MTLPixelFormat f
         vd = vertex_descriptor(b, &layout, why);
         if (!vd) return nil;
     }
-    if (id<MTLRenderPipelineState> hit = pso_lookup(p, fmt, layout, hasLayout)) return hit;
+    /* A pipeline's sample count must match the attachments it renders into.
+     * The guest's request wins only when it can actually be honoured. */
+    unsigned raster = st.samples ? st.samples : 1;
+    if (colorSamples && raster != colorSamples) {
+        log_once("nvnPipeline.sampleCountMismatch", raster);
+        raster = colorSamples;
+    }
+
+    const unsigned long long stateKey = nvngfx_pipeline_key(&st);
+    if (id<MTLRenderPipelineState> hit =
+            pso_lookup(p, fmt, layout, hasLayout, stateKey, depthFmt, stencilFmt, raster))
+        return hit;
 
     const char* whyVs = nullptr;
     const char* whyFs = nullptr;
@@ -2160,7 +2395,37 @@ id<MTLRenderPipelineState> program_pipeline(Ctx* c, Program* p, MTLPixelFormat f
         MTLRenderPipelineDescriptor* pd = [[MTLRenderPipelineDescriptor alloc] init];
         pd.vertexFunction = vfn;
         pd.fragmentFunction = ffn;
-        pd.colorAttachments[0].pixelFormat = fmt;
+        /* Every field the guest actually set lands here.  Anything without a
+         * Metal equivalent was already reported by report_unsupported(), so
+         * this descriptor is an honest description of what can be honoured. */
+        MTLRenderPipelineColorAttachmentDescriptor* ca = pd.colorAttachments[0];
+        ca.pixelFormat = fmt;
+        ca.writeMask = static_cast<MTLColorWriteMask>(st.write_mask[0]);
+        const bool blend = st.blend_enable[0] != 0;
+        ca.blendingEnabled = blend ? YES : NO;
+        if (blend) {
+            ca.sourceRGBBlendFactor = to_mtl_blend(st.src_rgb[0]);
+            ca.destinationRGBBlendFactor = to_mtl_blend(st.dst_rgb[0]);
+            ca.rgbBlendOperation = to_mtl_blend_op(st.eq_rgb[0]);
+            ca.sourceAlphaBlendFactor = to_mtl_blend(st.src_a[0]);
+            ca.destinationAlphaBlendFactor = to_mtl_blend(st.dst_a[0]);
+            ca.alphaBlendOperation = to_mtl_blend_op(st.eq_a[0]);
+        }
+        /* Alpha-to-coverage is only defined for attachment 0, and Metal
+         * rejects it when the pass is not multisampled.  If the guest asked
+         * for it on a single-sample target, disabling it is the only valid
+         * description; report instead of making pipeline creation fail. */
+        bool a2c = st.alpha_to_coverage != 0;
+        if (a2c && raster < 2) {
+            log_once("nvnPipeline.alphaToCoverageWithoutMSAA", 1);
+            a2c = false;
+        }
+        pd.alphaToCoverageEnabled = a2c ? YES : NO;
+        if (depthFmt) pd.depthAttachmentPixelFormat = depthFmt;
+        else if (st.depth_test) log_once("nvnPipeline.depthWithoutAttachment", 1);
+        if (stencilFmt) pd.stencilAttachmentPixelFormat = stencilFmt;
+        else if (st.stencil_test) log_once("nvnPipeline.stencilWithoutFormat", 1);
+        pd.rasterSampleCount = raster;
         if (vd) pd.vertexDescriptor = vd;
 
         err = nil;
@@ -2171,7 +2436,7 @@ id<MTLRenderPipelineState> program_pipeline(Ctx* c, Program* p, MTLPixelFormat f
                          err ? [[err localizedDescription] UTF8String] : "nil pipeline");
             return nil;
         }
-        pso_store(p, pso, fmt, layout, hasLayout);
+        pso_store(p, pso, fmt, layout, hasLayout, stateKey, depthFmt, stencilFmt, raster);
         return pso;
     }
 }
@@ -2236,10 +2501,68 @@ bool ensure_pipeline(Ctx* c, CmdBuf* b) {
     Program* p = find<Program>(b->program);
     Tex* t = find<Tex>(b->color[0]);
     if (!p || !t || !t->mtl) return false;
+    nvngfx_pipeline_state st;
+    pipeline_state_of(b, &st);
+    report_unsupported(st);
+    const Tex* dt = b->depth ? find<Tex>(b->depth) : nullptr;
+    const MTLPixelFormat attachmentFmt =
+        (dt && dt->mtl) ? dt->mtl.pixelFormat : static_cast<MTLPixelFormat>(0);
+    const MTLPixelFormat depthFmt =
+        mtl_format_has_depth(attachmentFmt) ? attachmentFmt : static_cast<MTLPixelFormat>(0);
+    const MTLPixelFormat stencilFmt =
+        mtl_format_has_stencil(attachmentFmt) ? attachmentFmt : static_cast<MTLPixelFormat>(0);
     const char* why = nullptr;
-    b->pso = program_pipeline(c, p, t->mtl.pixelFormat, b, &why);
+    b->pso = program_pipeline(c, p, t->mtl.pixelFormat, depthFmt, stencilFmt,
+                              static_cast<unsigned>(t->mtl.sampleCount), st, b, &why);
+    b->psoHasDepthStencil = b->pso != nil && (depthFmt || stencilFmt);
+    b->psoHasDepth = b->pso != nil && depthFmt != 0;
+    b->psoHasStencil = b->pso != nil && stencilFmt != 0;
     if (!b->pso) log_once_str("nvnCommandBufferDraw.pipeline", why ? why : "unknown");
     return b->pso != nil;
+}
+
+/* Applies the state that lives on the encoder rather than in the pipeline:
+ * cull/winding/fill mode and the depth-stencil object.  Called per draw
+ * because a bind can happen between two draws of the same pass. */
+void apply_fixed_state(Ctx* c, CmdBuf* b) {
+    if (!b || !b->enc) return;
+    nvngfx_pipeline_state st;
+    pipeline_state_of(b, &st);
+    [b->enc setCullMode:to_mtl_cull(st.cull)];
+    [b->enc setFrontFacingWinding:to_mtl_winding(st.winding)];
+    [b->enc setTriangleFillMode:to_mtl_fill(st.fill)];
+    if (b->psoHasDepth) {
+        if (st.polygon_offset && b->hasPolyOffset) {
+            [b->enc setDepthBias:b->polyOffsetUnits
+                        slopeScale:b->polyOffsetFactor
+                             clamp:b->polyOffsetClamp];
+        } else {
+            /* Reset, not merely "leave alone": the previous draw in this pass
+             * may have enabled a bias, and encoder state persists.  If the
+             * guest enabled offset without sending constants, zero is the
+             * only safe value but still deserves a report. */
+            [b->enc setDepthBias:0.0f slopeScale:0.0f clamp:0.0f];
+            if (st.polygon_offset) log_once("nvnPipeline.polygonOffsetWithoutClamp", 1);
+        }
+    }
+    /* NVN's defaults still apply when the guest never bound a state object.
+     * With a depth attachment present Metal requires a depth-stencil state,
+     * so build it from the layered description rather than skipping here. */
+    if (!b->psoHasDepthStencil) return;
+    nvngfx_pipeline_state ds = st;
+    if (!b->psoHasDepth) {
+        ds.depth_test = 0;
+        ds.depth_write = 0;
+    }
+    if (!b->psoHasStencil) ds.stencil_test = 0;
+    const unsigned long long key = depth_stencil_key(ds);
+    if (!b->dssValid || b->dssKey != key) {
+        b->dss = build_depth_stencil(c, ds);
+        b->dssKey = key;
+        b->dssValid = b->dss != nil;
+        if (!b->dss) log_once("nvnPipeline.depthStencilState", 1);
+    }
+    if (b->dss) [b->enc setDepthStencilState:b->dss];
 }
 
 /* nvnProgramInitialize(NVNprogram*, NVNdevice*) -> NVNboolean */
@@ -2909,6 +3232,24 @@ bool ensure_encoder(Ctx* c, CmdBuf* b) {
                 b->clear[0], b->clear[1], b->clear[2], b->clear[3]);
         }
         rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
+        /* The pipeline declares attachment formats only when a depth/stencil
+         * texture is bound, so the pass has to attach the same texture(s) or
+         * the two disagree.  There is no ClearDepthStencil path yet, hence
+         * Load: an uncleared pass keeps whatever was in the texture. */
+        Tex* dt = b->depth ? find<Tex>(b->depth) : nullptr;
+        if (dt && dt->mtl) {
+            const MTLPixelFormat df = dt->mtl.pixelFormat;
+            if (mtl_format_has_depth(df)) {
+                rpd.depthAttachment.texture = dt->mtl;
+                rpd.depthAttachment.loadAction = MTLLoadActionLoad;
+                rpd.depthAttachment.storeAction = MTLStoreActionStore;
+            }
+            if (mtl_format_has_stencil(df)) {
+                rpd.stencilAttachment.texture = dt->mtl;
+                rpd.stencilAttachment.loadAction = MTLLoadActionLoad;
+                rpd.stencilAttachment.storeAction = MTLStoreActionStore;
+            }
+        }
         b->enc = [b->cb renderCommandEncoderWithDescriptor:rpd];
         if (b->enc && b->hasViewport) [b->enc setViewport:b->viewport];
         if (b->enc && b->hasScissor) [b->enc setScissorRect:b->scissor];
@@ -2934,17 +3275,28 @@ void cmdbuf_begin_recording(nvngfx_ctx* ctx, uint64_t* x) {
     b->encoded = 0;
     b->numColor = 0;
     b->depth = 0;
+    /* The cached pipeline belongs to the state and targets of the previous
+     * recording.  Both were just reset, so it must not be reused. */
+    b->pso = nil;
+    b->psoHasDepthStencil = false;
+    b->psoHasDepth = false;
+    b->psoHasStencil = false;
     b->pendingClear = false;
     b->argbuf[0] = b->argbuf[1] = nil;
     b->hasViewport = false;
     b->hasScissor = false;
-    b->hasBlendState = b->hasColorState = b->hasChannelState = false;
+    for (unsigned i = 0; i < NVNGFX_MAX_COLOR_TARGETS; ++i) b->hasBlendState[i] = false;
+    b->hasColorState = b->hasChannelState = false;
+    b->dss = nil;
+    b->dssKey = 0;
+    b->dssValid = false;
     b->hasMultisampleState = b->hasPolygonState = b->hasDepthState = false;
     b->hasBlendColor = false;
     b->hasAlphaRef = false;
     b->hasRenderEnable = false;
     b->hasCoverageTable = false;
     b->hasViewportSwizzle = false;
+    b->hasPolyOffset = false;
     b->depthNear = 0.0;
     b->depthFar = 1.0;
     for (unsigned si = 0; si < 6; ++si) {
@@ -3007,6 +3359,9 @@ void cmdbuf_set_render_targets(nvngfx_ctx*, uint64_t* x) {
     if (Tex* dt = find<Tex>(b->depth)) dt->rendered = true;
     /* A pipeline is compiled for one colour format. */
     b->pso = nil;
+    b->psoHasDepthStencil = false;
+    b->psoHasDepth = false;
+    b->psoHasStencil = false;
     /* Texture views are not supported yet; passing a view is legal but the
      * base texture format is what gets attached. */
     if (x[3] || x[5]) log_once("nvnCommandBufferSetRenderTargets.views", 1);
@@ -3048,8 +3403,12 @@ int record_stage_index(uint64_t stage) {
  * not the final values after recording. */
 void cmdbuf_bind_blend_state(nvngfx_ctx*, uint64_t* x) {
     CmdBuf* b = find_or_add<CmdBuf>(x[0]);
-    if (!b || !read_blend(x[1], &b->blendState)) return;
-    b->hasBlendState = true;
+    nvngfx_blend_state s = {};
+    if (!b || !read_blend(x[1], &s)) return;
+    const unsigned slot = s.target & (NVNGFX_MAX_COLOR_TARGETS - 1);
+    s.target = slot;
+    b->blendState[slot] = s;
+    b->hasBlendState[slot] = true;
     b->pso = nil;
 }
 void cmdbuf_bind_color_state(nvngfx_ctx*, uint64_t* x) {
@@ -3080,6 +3439,7 @@ void cmdbuf_bind_depth_state(nvngfx_ctx*, uint64_t* x) {
     CmdBuf* b = find_or_add<CmdBuf>(x[0]);
     if (!b || !read_depth(x[1], &b->depthState)) return;
     b->hasDepthState = true;
+    b->dssValid = false;
     b->pso = nil;
 }
 
@@ -3891,6 +4251,7 @@ void cmdbuf_draw_arrays(nvngfx_ctx* ctx, uint64_t* x) {
     const unsigned first = static_cast<unsigned>(x[2]);
     const unsigned count = static_cast<unsigned>(x[3]);
     [b->enc setRenderPipelineState:b->pso];
+    apply_fixed_state(c, b);
     if (!bind_arguments(c, b)) return;
     /* No attribute state bound (the self-test's [[vertex_id]] program) means
      * no vertex descriptor and nothing to bind. */
@@ -3934,6 +4295,7 @@ void cmdbuf_draw_elements(nvngfx_ctx* ctx, uint64_t* x) {
         return;
     }
     [b->enc setRenderPipelineState:b->pso];
+    apply_fixed_state(c, b);
     if (!bind_arguments(c, b)) return;
     if (b->numAttrib > 0 && !bind_vertex_streams(b)) return;
     [b->enc drawIndexedPrimitives:to_metal_primitive(primitive)
@@ -4055,6 +4417,19 @@ void cmdbuf_set_blend_color(nvngfx_ctx*, uint64_t* x) {
                              blue:b->blendColor[2]
                             alpha:b->blendColor[3]];
     }
+}
+
+/* nvnCommandBufferSetPolygonOffsetClamp(cb, float factor, float units,
+ *     float clamp).  Metal's setDepthBias takes the same three numbers; the
+ *     units are the constant bias, the factor the slope scale. */
+void cmdbuf_set_polygon_offset(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    if (!b) return;
+    nvngfx_args* a = reinterpret_cast<nvngfx_args*>(x);
+    b->polyOffsetFactor = nvngfx_arg_f32(a, 0);
+    b->polyOffsetUnits = nvngfx_arg_f32(a, 1);
+    b->polyOffsetClamp = nvngfx_arg_f32(a, 2);
+    b->hasPolyOffset = true;
 }
 
 /* nvnCommandBufferSetDepthRange(cb, float near, float far) */
@@ -4405,6 +4780,7 @@ const Binding kBindings[] = {
     BIND("nvnCommandBufferClearTextureui", cmdbuf_clear_texture_ui),
     BIND("nvnCommandBufferSetAlphaRef", cmdbuf_set_alpha_ref),
     BIND("nvnCommandBufferSetBlendColor", cmdbuf_set_blend_color),
+    BIND("nvnCommandBufferSetPolygonOffsetClamp", cmdbuf_set_polygon_offset),
     BIND("nvnCommandBufferSetDepthRange", cmdbuf_set_depth_range),
     BIND("nvnCommandBufferSetRenderEnable", cmdbuf_set_render_enable),
     BIND("nvnCommandBufferSetScissors", cmdbuf_set_scissors),

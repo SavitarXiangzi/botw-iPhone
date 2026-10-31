@@ -95,6 +95,12 @@ typedef enum MTLPixelFormat : NSUInteger {
     MTLPixelFormatRGBA8Unorm = 70,
     MTLPixelFormatRGBA8Unorm_sRGB = 71,
     MTLPixelFormatBGRA8Unorm = 80,
+    /* Depth and stencil formats.  The numeric values are Metal's; the
+     * texture-format table in nvn_texture.c already uses them. */
+    MTLPixelFormatDepth16Unorm = 250,
+    MTLPixelFormatDepth32Float = 252,
+    MTLPixelFormatStencil8 = 253,
+    MTLPixelFormatDepth32Float_Stencil8 = 260,
 } MTLPixelFormat;
 
 typedef NSUInteger MTLResourceOptions;
@@ -166,6 +172,77 @@ typedef enum MTLCompareFunction : NSUInteger {
     MTLCompareFunctionAlways = 7,
 } MTLCompareFunction;
 
+typedef enum MTLBlendFactor : NSUInteger {
+    MTLBlendFactorZero = 0,
+    MTLBlendFactorOne = 1,
+    MTLBlendFactorSourceColor = 2,
+    MTLBlendFactorOneMinusSourceColor = 3,
+    MTLBlendFactorSourceAlpha = 4,
+    MTLBlendFactorOneMinusSourceAlpha = 5,
+    MTLBlendFactorDestinationAlpha = 6,
+    MTLBlendFactorOneMinusDestinationAlpha = 7,
+    MTLBlendFactorDestinationColor = 8,
+    MTLBlendFactorOneMinusDestinationColor = 9,
+    MTLBlendFactorSourceAlphaSaturated = 10,
+    MTLBlendFactorBlendColor = 11,
+    MTLBlendFactorOneMinusBlendColor = 12,
+    MTLBlendFactorBlendAlpha = 13,
+    MTLBlendFactorOneMinusBlendAlpha = 14,
+    MTLBlendFactorSource1Color = 15,
+    MTLBlendFactorOneMinusSource1Color = 16,
+    MTLBlendFactorSource1Alpha = 17,
+    MTLBlendFactorOneMinusSource1Alpha = 18,
+} MTLBlendFactor;
+
+typedef enum MTLBlendOperation : NSUInteger {
+    MTLBlendOperationAdd = 0,
+    MTLBlendOperationSubtract = 1,
+    MTLBlendOperationReverseSubtract = 2,
+    MTLBlendOperationMin = 3,
+    MTLBlendOperationMax = 4,
+} MTLBlendOperation;
+
+typedef NSUInteger MTLColorWriteMask;
+enum {
+    MTLColorWriteMaskNone = 0,
+    MTLColorWriteMaskAlpha = 1 << 0,
+    MTLColorWriteMaskBlue = 1 << 1,
+    MTLColorWriteMaskGreen = 1 << 2,
+    MTLColorWriteMaskRed = 1 << 3,
+    MTLColorWriteMaskAll = 0xF,
+};
+
+typedef NSUInteger MTLStencilOperation;
+enum {
+    MTLStencilOperationKeep = 0,
+    MTLStencilOperationZero = 1,
+    MTLStencilOperationReplace = 2,
+    MTLStencilOperationIncrementClamp = 3,
+    MTLStencilOperationDecrementClamp = 4,
+    MTLStencilOperationInvert = 5,
+    MTLStencilOperationIncrementWrap = 6,
+    MTLStencilOperationDecrementWrap = 7,
+};
+
+typedef NSUInteger MTLCullMode;
+enum {
+    MTLCullModeNone = 0,
+    MTLCullModeFront = 1,
+    MTLCullModeBack = 2,
+};
+
+typedef NSUInteger MTLWinding;
+enum {
+    MTLWindingClockwise = 0,
+    MTLWindingCounterClockwise = 1,
+};
+
+typedef NSUInteger MTLTriangleFillMode;
+enum {
+    MTLTriangleFillModeFill = 0,
+    MTLTriangleFillModeLines = 1,
+};
+
 typedef enum MTLSamplerReductionMode : NSUInteger {
     MTLSamplerReductionModeWeightedAverage = 0,
     MTLSamplerReductionModeMinimum = 1,
@@ -223,6 +300,14 @@ typedef enum MTLSamplerReductionMode : NSUInteger {
 
 @interface MTLRenderPipelineColorAttachmentDescriptor : NSObject
 @property MTLPixelFormat pixelFormat;
+@property (getter=isBlendingEnabled) BOOL blendingEnabled;
+@property MTLBlendFactor sourceRGBBlendFactor;
+@property MTLBlendFactor destinationRGBBlendFactor;
+@property MTLBlendOperation rgbBlendOperation;
+@property MTLBlendFactor sourceAlphaBlendFactor;
+@property MTLBlendFactor destinationAlphaBlendFactor;
+@property MTLBlendOperation alphaBlendOperation;
+@property MTLColorWriteMask writeMask;
 @end
 
 @interface MTLRenderPipelineColorAttachmentDescriptorArray : NSObject
@@ -234,6 +319,30 @@ typedef enum MTLSamplerReductionMode : NSUInteger {
 @property (retain) id<MTLFunction> fragmentFunction;
 @property (readonly) MTLRenderPipelineColorAttachmentDescriptorArray* colorAttachments;
 @property (retain) MTLVertexDescriptor* vertexDescriptor;
+@property MTLPixelFormat depthAttachmentPixelFormat;
+@property MTLPixelFormat stencilAttachmentPixelFormat;
+@property NSUInteger rasterSampleCount;
+@property (getter=isAlphaToCoverageEnabled) BOOL alphaToCoverageEnabled;
+@end
+
+/* Depth/stencil objects.  Only the fields nvn_metal.mm sets are declared. */
+@interface MTLStencilDescriptor : NSObject
+@property MTLCompareFunction stencilCompareFunction;
+@property MTLStencilOperation stencilFailureOperation;
+@property MTLStencilOperation depthFailureOperation;
+@property MTLStencilOperation depthStencilPassOperation;
+@property uint32_t readMask;
+@property uint32_t writeMask;
+@end
+
+@interface MTLDepthStencilDescriptor : NSObject
+@property MTLCompareFunction depthCompareFunction;
+@property (getter=isDepthWriteEnabled) BOOL depthWriteEnabled;
+@property (retain) MTLStencilDescriptor* frontFaceStencil;
+@property (retain) MTLStencilDescriptor* backFaceStencil;
+@end
+
+@protocol MTLDepthStencilState
 @end
 
 /* MTLVertexFormat: every name nvn_metal.mm can select.  The real SDK's
@@ -389,6 +498,13 @@ destinationBytesPerImage:(NSUInteger)bpi;
 - (void)setScissorRect:(MTLScissorRect)rect;
 - (void)setBlendColorRed:(float)red green:(float)green blue:(float)blue alpha:(float)alpha;
 - (void)setRenderPipelineState:(id<MTLRenderPipelineState>)state;
+- (void)setDepthStencilState:(id<MTLDepthStencilState>)state;
+- (void)setCullMode:(MTLCullMode)mode;
+- (void)setFrontFacingWinding:(MTLWinding)winding;
+- (void)setTriangleFillMode:(MTLTriangleFillMode)mode;
+- (void)setDepthBias:(float)depthBias
+          slopeScale:(float)slopeScale
+               clamp:(float)clamp;
 - (void)setVertexBuffer:(id<MTLBuffer>)buffer
                  offset:(NSUInteger)offset
                 atIndex:(NSUInteger)index;
@@ -423,9 +539,25 @@ destinationBytesPerImage:(NSUInteger)bpi;
 - (MTLRenderPassColorAttachmentDescriptor*)objectAtIndexedSubscript:(NSUInteger)index;
 @end
 
+@interface MTLRenderPassDepthAttachmentDescriptor : NSObject
+@property (retain) id<MTLTexture> texture;
+@property MTLLoadAction loadAction;
+@property MTLStoreAction storeAction;
+@property double clearDepth;
+@end
+
+@interface MTLRenderPassStencilAttachmentDescriptor : NSObject
+@property (retain) id<MTLTexture> texture;
+@property MTLLoadAction loadAction;
+@property MTLStoreAction storeAction;
+@property uint32_t clearStencil;
+@end
+
 @interface MTLRenderPassDescriptor : NSObject
 + (MTLRenderPassDescriptor*)renderPassDescriptor;
 @property (readonly) MTLRenderPassColorAttachmentDescriptorArray* colorAttachments;
+@property (retain) MTLRenderPassDepthAttachmentDescriptor* depthAttachment;
+@property (retain) MTLRenderPassStencilAttachmentDescriptor* stencilAttachment;
 @end
 
 @protocol MTLCommandQueue
@@ -470,6 +602,8 @@ destinationBytesPerImage:(NSUInteger)bpi;
 - (id<MTLRenderPipelineState>)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor*)d
                                                              error:(NSError**)error;
 - (id<MTLSamplerState>)newSamplerStateWithDescriptor:(MTLSamplerDescriptor*)descriptor;
+- (id<MTLDepthStencilState>)newDepthStencilStateWithDescriptor:
+    (MTLDepthStencilDescriptor*)descriptor;
 @end
 
 id<MTLDevice> MTLCreateSystemDefaultDevice(void);

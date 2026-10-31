@@ -4117,8 +4117,100 @@ CI（run 41151003231，commit `ecfd58e`）两个 job 都通过：portable
 |---|---|
 | iOS 侧 `cmdbuf_end_recording` 仍在 EndRecording 里直接 commit 并返回 handle 0 | 客体拿不到可提交的句柄，回放层没有命令流可重放 |
 | iOS 侧未实现 `nvnCommandBufferCallCommands` / `nvnQueueSubmitCommands` | harness 记录得出来，回放层展不开 |
-| 固定功能状态只记录 / 快照，没有写进 `MTLRenderPipelineDescriptor` | 混合、深度测试、剔除、写掩码都不生效 |
 | `ClearColori/ui` / `ClearDepthStencil` / `ClearBuffer` / `ClearTexture*` 只 `log_once` | 整数清屏与纹理清屏仍是占位；`ClearColor`（float）有真路径 |
 | storage buffer / image / transform feedback 只记录句柄 | 计算与 UAV 路径未接线 |
 | harness 的 `nvnSamplerCompare` 只比较部分已实现字段，`SamplerBuilder` 缺 wrap / compare / border setter | 采样器状态不完整 |
 | 没有真机运行 | 不能声称画面，任何"能玩"的说法都不成立 |
+
+## M4 续：六类固定功能状态进入 Metal 管线描述符
+
+上一轮把这些状态记录下来了，但回放层并没有用它们：`program_pipeline()` 只填了颜色格式和
+顶点描述符，意味着混合、深度测试、剔除、写掩码全都不生效。这一轮把它们接进管线。
+
+### 1. 映射放在可移植层，Metal 只做最后一跳
+
+新增 `ios/nvn/include/nvn_pipeline.h` + `src/nvn_pipeline.c`：
+
+* 把六类状态合成一个 `nvngfx_pipeline_state`：8 个颜色目标的混合使能 / 因子 / 方程、
+  逐目标写掩码、深度测试 / 写 / 比较、模板前后面各自的函数与三个操作、剔除 / 绕序 /
+  填充、采样数、alpha-to-coverage；
+* 把 NVN 枚举解码成 `NVNGFX_*` 中性值。取值来自 `dm/gfx/nvn/include/nvn.h`，不是猜的：
+  `NVN_BLEND_FUNC_ONE=0x2`、`NVN_BLEND_EQUATION_ADD=0x1`、`NVN_DEPTH_FUNC_LESS=0x2`、
+  `NVN_FACE_BACK=0x2`、`NVN_STENCIL_OP_INCR=0x4` …
+* 表示不了的字段进 `unsupported` 位图，由后端逐项上报，**不静默丢弃**。
+
+`tests/nvn_pipeline_test.cpp` 在 Windows 上就能跑，钉住了两处"看着对、其实错"的转换：
+
+| 转换 | 陷阱 |
+|---|---|
+| 写掩码 | NVN 是 `r=1,g=2,b=4,a=8`，Metal 是 `r=8,g=4,b=2,a=1`；直接照抄会把红和 alpha 对调，在灰色测试图上几乎看不出来 |
+| 混合目标 | NVN 的 blend 对象**自带 `target` 字段**，bind 必须落进 `state.target` 对应的槽，而不是永远写 0 号目标 |
+
+### 2. 修掉一个真实 bug：混合状态不分目标
+
+`CmdBuf` 之前只有一个 `blendState`。游戏用 `nvnBlendStateSetBlendTarget` 指定这份状态属于
+哪个颜色目标，全部塞进 0 号槽等于让后面的目标拿不到自己的混合参数，而 0 号目标又被最后
+一次 bind 覆盖。现在按目标存 8 份、`hasBlendState[8]` 独立记录，bind 时按 `target & 7` 落槽。
+
+### 3. 管线描述符里到底填了什么
+
+`program_pipeline()` 现在按状态快照填写：
+
+* `colorAttachments[0].blendingEnabled`、`sourceRGBBlendFactor`、`destinationRGBBlendFactor`、
+  `rgbBlendOperation`，以及 alpha 侧的三项；
+* `colorAttachments[0].writeMask`（已转成 Metal 位序）；
+* `alphaToCoverageEnabled`（只有 0 号目标有定义）；
+* 深度/模板附件按纹理的真实格式分开填：有深度位才填 `depthAttachmentPixelFormat`，
+  有模板位才填 `stencilAttachmentPixelFormat`。`Depth32Float_Stencil8` 两个都填，
+  `Stencil8` 只填模板，`Depth16Unorm` / `Depth32Float` 只填深度——填错 Metal 会直接
+  拒绝建管线；
+* `rasterSampleCount` 先取多重采样状态，和颜色附件实际采样数不一致时以附件为准并上报。
+
+管线缓存键从 `(格式, 顶点布局)` 扩成 `(颜色格式, 深度格式, 模板格式, 采样数, 顶点布局,
+状态哈希)`。否则改一次混合、换一张深度目标或切换 MSAA 都会命中旧管线，表现是"状态设置无效"。
+
+### 4. 编码器侧：剔除、绕序、填充、深度模板对象、polygon offset
+
+`apply_fixed_state()` 在每次 draw 前执行（同一 pass 内的两个 draw 之间可能改了状态）：
+
+* `setCullMode` / `setFrontFacingWinding` / `setTriangleFillMode`；
+* `MTLDepthStencilState`：深度测试关闭时强制 `always` 且不写深度（NVN 语义如此），
+  模板按前 / 后面各自的比较函数与失败 / z-fail / z-pass 三个操作建对象；缓存键只含
+  深度 / 模板字段，改混合不会重建；即使 guest 没 bind 状态对象，也按 NVN 默认值建一份，
+  因为带深度附件的 Metal pass 不能在没有 depth-stencil state 时 draw；
+* 深度 / 模板纹理现在会挂进同一个 render pass；组合格式用同一张纹理同时挂到两个附件。
+
+顺带实现了 `nvnCommandBufferSetPolygonOffsetClamp`（之前完全没实现）：三个 float 直接喂
+`setDepthBias:slopeScale:clamp:`，polygon state 里的 `offset_en` 不再是空话；关闭偏置时
+显式归零，避免同一 pass 内前一条 draw 的 bias 泄漏到下一条。
+覆盖 **196/513（38.2%）**。
+
+### 5. 表示不了、只能上报的
+
+| 字段 | 为什么 |
+|---|---|
+| logic op（≠ COPY） | Metal 没有逻辑运算，要 shader |
+| alpha test（≠ ALWAYS） | 同上，需要 shader 或 discard |
+| polygon mode POINT | Metal 只有 fill / line |
+| cull FRONT_AND_BACK | Metal 只有一个 cull mode；回落成 none，免得整帧消失 |
+| polygon offset 的 POINT / LINE 使能 | Metal 的 depth bias 只作用于填充三角形；只有 FILL 位（0x4）会被采用 |
+| coverage modulation / to-color / sample locations / raster samples / a2c dither | 没有对应路径 |
+| alpha-to-coverage + 单采样附件 | Metal 会拒绝建管线；日志后关闭 a2c |
+| 启用 polygon offset 但没收到常量 | 会用 0 偏置，等于静默失效，所以明确上报 |
+
+### 6. 验证
+
+```text
+nvn_pipeline_test: ok (defaults, enum tables, write-mask order, blend targets,
+                     unsupported reporting, cache key)
+build_abi_test: all tests passed
+syntax_check_metal: ok (clang++.exe)
+verify_ios: ok (metal bindings: 196/513)
+```
+
+### 还没有的
+
+* 只有 0 号颜色目标进入描述符和 render pass；MRT 要等 pass 支持多附件；
+* 管线缓存只有 4 个槽，状态组合一多就会反复重编译（真机上每次数毫秒）；
+* `ClearDepthStencil` 仍是日志占位，深度附件按 load 打开，未清过的 pass 会继承旧内容；
+* 没有真机运行，不能声称画面正确。
