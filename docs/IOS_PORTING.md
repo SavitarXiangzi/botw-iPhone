@@ -9,7 +9,10 @@
 > 里跑通了十八条合成 draw（模拟器实际执行十七条）与七阶段 instanced / base-vertex / indirect draw 回归，其中包括从 guest 内存池
 > 解块上传的纹理、从离线 MSL bundle 按 guest key 命中的 shader，以及
 > `WriteTexels` / `FlushTexels` 触发重传的连续纹理更新。
-> **但客体的 draw 依然一条都不执行**：首要缺口仍是 Maxwell SASS -> MSL 的
+> **但 iOS 侧还没有客体核心，draw 依然一条都不执行**：Windows Unicorn
+> 捕获已证明 1.6.0 标题会发真实 draw/present（两次 700 s 长跑为
+> 707 / 304 与 667 / 288 draws/presents），但那是宿主调用捕获，不是 iOS 上的客体执行；首要缺口
+> 仍是把 1.6.0 的 ARM64 客体核心接进 app（AOT 改写已跑通，loader/HLE 未接），以及 Maxwell SASS -> MSL 的
 > 翻译器；NVNtextureView 的 16 字节状态对象已可读写，但通用 view 的
 > swizzle/depth-stencil mode 尚未应用到采样/渲染目标，多队列、跨队列同步与
 > present blit 等待仍不完整；任意 mapped write 的精确脏页跟踪、BC6H/BC7 也还没有闭环。
@@ -730,11 +733,12 @@ constexpr int kEnumsVerified = 0;
 
 | 缺口 | 现状 | 影响 |
 |---|---|---|
+| 客体核心 | 1.6.0 四模块的 AOT 改写链路已在 `scripts/guest` 跑通（vendored nxnative，MIT）；iOS 工程仍未链接运行时 loader / HLE | 真实标题的 draw/present 仍只存在于 Windows Unicorn 捕获，iPhone 上不会执行 |
 | 渲染目标绑定 | 1–8 个颜色附件、深度/模板附件、纯深度 pass 与 MRT 已接；通用 texture view 仍只记录 | 通用 view 的绑定仍不完整 |
 | 命令句柄回放 | `CallCommands` / `CopyCommands`、嵌套展开、句柄释放与录制时输入快照已接；实现是宿主调用捕获，不是 guest 命令字节解释器 | 不能观察或原地修补客体的命令记录；持久对象（纹理/程序/池/事件）仍按回放时状态解析；单段 arena 上限 256 MiB |
 | 着色器翻译 | 只留了接口，没有实现 | 客体的 draw 全部停在 `noPipeline` |
 | 纹理创建 | 建 host `MTLTexture`；首次采样时从 guest pool 解块/上传，WriteTexels/FlushTexels 后标脏重传 | 2D/数组/cube/LINEAR 和 BC1–BC5 可采样；BC6H/BC7、通用 texture view 与任意 mapped write 的脏页跟踪仍不完整 |
-| draw 执行 | 有 pipeline 就真的编码 draw；没有就丢弃；实例化、base-vertex 与两种 indirect draw 已接 | 客体仍是 0 条；自检十八条 draw（模拟器执行十七条）加七阶段 instanced / base-vertex / indirect 回归、sampler 状态与 compute dispatch 回归由 CI 执行 |
+| draw 执行 | 有 pipeline 就真的编码 draw；没有就丢弃；实例化、base-vertex 与两种 indirect draw 已接 | iOS 客体仍是 0 条（未链接客体核心）；Windows 捕获侧已有 707 draws / 304 presents；自检十八条 draw（模拟器执行十七条）加七阶段 instanced / base-vertex / indirect 回归、sampler 状态与 compute dispatch 回归由 CI 执行 |
 | 顶点输入 | attrib/stream 已接，缓冲从 pool 零拷贝绑到 `MTLBuffer` | 自检的第二条 draw 就是这条路；客体尚未跑到 |
 | 浮点参数 | `nvngfx_args.f[8]` 已扩展，float 在低 32 位 | 本仓库外 guest 调用端仍需实现 s/d 寄存器桥 |
 | 采样器资源 | builder/object、sampler pool 与 `MTLSamplerState` 已建，句柄可解析 | `[[id(k)]]`、c1、packed slot、bindless 与顶点参数缓冲区已接；真实标题 shader 仍缺离线翻译链 |

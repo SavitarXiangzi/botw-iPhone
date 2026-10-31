@@ -6567,8 +6567,9 @@ run `41209052254`（run 161）的 `portable` job `124560000981` 与 `ios`
 job `124560075362` 均成功。iOS job 的 “Run the replay-layer self-test in
 the simulator” 步骤从 14:13:51 跑到 14:19:05，结论成功，说明 `16443`
 在模拟器里实际返回 0；之后的 unsigned Debug 设备构建、Release 必须被
-拒绝、模拟器 app 上传也全部成功。真实标题的 `draw` 仍为 0，`16443`
-只证明 support buffer 与 c[2] 表能到达 shader。
+拒绝、模拟器 app 上传也全部成功。iOS 侧的 `draw` 仍为 0（客体核心尚未
+链接进 app），`16443` 只证明 support buffer 与 c[2] 表能到达 shader；
+Windows 捕获侧的真实 draw/present 证据见续三十三。
 
 ## M4 续三十二：真实 bundle 的容量与加载索引
 
@@ -6625,7 +6626,8 @@ O(n²) 变成了排序和文件读取。手机仍需 macOS CI / 真机测量。
   索引解决的是查重/查找，不是 I/O 或 Metal 编译。
 * MSL 仍是文本，首次建管线还要 `newLibraryWithSource`；`.metallib`
   打包和 5,102 / 19,595 的编译期验证仍没有做。
-* 真实标题的客体代码还没有接到 iOS 工程，`draw` 仍为 0。容量和加载
+* 真实标题的客体代码还没有接到 iOS 工程，iOS 侧的 `draw` 仍为 0
+  （Windows 捕获侧已有真实 draw/present，见续三十三）。容量和加载
   时间修好只说明“shader 集能被装进来”，不说明“游戏能启动”。
 
 ### 5. 门禁
@@ -6642,3 +6644,241 @@ git diff --check
 
 本机已全部通过；真实 bundle 探针 5,102/5,102 加载成功。新 CI run
 在推送后补记。
+
+
+## M4 续三十三：Windows 真实 draw/present 证据与 iOS 交付缺口
+
+### 1. 700 秒长跑：真实标题已经在提交 draw 与 present
+
+`m3_verify.py` 在 `C:\botw-work\tools` 下用真实 1.6.0 数据跑 700 秒
+（`BOTW_M3_BUDGET=700 BOTW_FAST_DEDUP=1`）：
+
+```text
+[m3] t=92  cb=239 draw=86  present=0 MiB=804
+[m3] t=134 cb=263 draw=92  present=0 MiB=873
+...
+M3: 700.0s  frames=8398 (12 fps)  status=budget
+    draw=707  overflow=0  api_entries=130
+    presents=304 (304)
+    first draw: op=13 vals=['701F1C88', '4', '1', '3', '141C22000', '0', '0', '1']
+                caller=0x41D2BA6C main+0x1D2BA6C cb=0x701F1C88 frame#8
+    command handles: calls=5165 copies=0 submits=304 expanded=210807 miss=0
+    first viewport (x,y,w,h) = (0, 0, 1920, 1080)
+RESULT: PASS
+```
+
+这不是合成自检：调用点落在标题自己的 `main` 模块
+（`main+0x1D2BA6C`），command buffer 是 guest 句柄，304 次 submit
+展开了 210,807 条录制命令，句柄 miss 为 0。与 M3.96 的 660 秒门禁
+（701 draws / 301 presents / overflow=236）相比，本轮 `overflow` 从
+236 降到 **0**，说明命令内存对齐和镜像路径的修正生效，draw 数字不是
+靠"段满后丢记录"换来的。
+
+同一配置在本轮又复跑了一次 700 秒，得到 **667 draws / 288 presents /
+288 submits / 199,575 expanded / overflow=0**。两次的差值来自宿主负载
+和调度时序，不是判据；稳定成立的是：`draw>0`、`present>0`、
+`overflow=0`、句柄 `miss=0`。
+
+### 2. 220 秒短门禁与 140 秒的"假 draw=0"
+
+同一份代码用 `BOTW_M3_BUDGET=220 BOTW_FAST_DEDUP=1` 重跑：
+
+```text
+[m3] t=85  cb=239 draw=86  present=0 MiB=804
+[m3] t=116 cb=263 draw=92  present=0 MiB=873
+M3: 220.0s  frames=263 (1 fps)  status=budget
+    draw=92  overflow=0  api_entries=85
+    first draw: ... caller=0x41D2BA6C main+0x1D2BA6C cb=0x701F1C88 frame#8
+RESULT: PASS
+```
+
+第一次交接时用 140 秒、但**没有**设置 `BOTW_FAST_DEDUP=1` 重跑，
+结果在 `cb=14 draw=0` 停了 131 秒，仍然打印 `PASS`。根因不是客体
+行为变化，而是 Python harness 的去重表（`q=17938 dup=11908`）仍是
+O(n²) 线性扫描；同一份输入加上 `BOTW_FAST_DEDUP=1` 后在 t=85 就到达
+`cb=239 draw=86`。因此：
+
+> M3 长短门禁都必须带 `BOTW_FAST_DEDUP=1`。否则测到的是 Python
+> 去重速度，不是客体推进；`PASS` 仍能证明对象图/记录结构，但不能
+> 用来判断 draw 是否出现。
+
+### 3. 严格区分：Windows 捕获 ≠ iOS 执行
+
+| 项 | 现状 |
+|---|---|
+| Windows Unicorn/HLE | 解释执行 guest ARM64；已产生 707 次 draw/dispatch、304 次 present |
+| iOS app | 没有链接客体核心；`botw_core_frame()` 只有宿主 clear + present |
+| iOS Metal 画面 | 合成自检通过；真实标题的 MSL / pipeline / 纹理没有在 iOS 上验证 |
+
+这组证据能证明：
+
+* 1.6.0 标题的客体命令流确实会走到 draw 提交，并且会 present；
+* NVN 命令录制/句柄展开路径可以承载 21 万条命令而不丢句柄；
+* 后续 Metal 回放面对的不是"游戏没画"，而是"画出来的东西是否正确"。
+
+这组证据**不能**证明：
+
+* iOS 能执行客体 ARM64 代码——iPhone 上目前一条 guest 指令都没跑；
+* Metal 能把真实标题画对——Windows 捕获只记录 NVN 调用，不执行 Metal；
+* 游戏可玩或帧率达标——700 秒 8,398 帧是 Unicorn 解释执行的速度。
+
+### 4. 最大的结构缺口：iOS 没有客体核心
+
+仓库当前的 C++ 部分只有 NVN 后端和 C ABI；1.6.0 的 M1/M2/M3
+执行与 HLE 全在私有工作区的 Python + Unicorn 里。具体后果：
+
+* `botw_core_frame()` 不推进任何 guest 线程，只清屏并 present；
+* `GetCommandMemoryUsed` 仍是 0，命令记录是宿主调用捕获，不是
+  guest 命令字节解释器；
+* 仓库里没有 1.6.0 的模块装载、重定位、线程调度和 HLE 服务实现，
+  也没有静态改写 / AOT 工具链；
+* 因此"Windows 有 707 draws"与"iOS 能出画面"之间还隔着整层执行核心。
+
+### 5. 下一步：把 1.6.0 客体核心接进 iOS
+
+候选路线有两条，必须先选定再写代码：
+
+1. **静态 AOT 改写（主路线，参照 nxnative 的方法）**：把 NSO 的
+   ARM64 指令在构建期改写成"原生 ARM64 + HLE stub"，随 app 一起
+   链接；运行时不需要 JIT，符合 iOS 限制。
+2. **可移植 ARM64 解释器（后备）**：用 C++ 写一个无 JIT 的
+   AArch64 解释器 + HLE 服务层，先在 Windows 上跑通，再进 iOS。
+   速度会明显低于 AOT，但实现和验证都更可控。
+
+无论选哪条，第一块可交付物相同：
+
+* 在 `core/include/botw_core.h` 增加客体核心 ABI（装载模块、映射
+  内存、启动/推进线程、解析导入），后端可替换；
+* 把 `m2_*` 的 HLE 服务按入口逐个移植成 C++，每个入口配一个
+  可在 Windows 上跑的单元测试；
+* 所有 1.6.0 地址、结构体偏移、补丁点必须从当前私有工作区重新
+  定位；nxnative 的 1.9.0 补丁表一条都不能直接复用；
+* `botw_core_frame()` 先接"空转的客体核心"（能启动、能返回），
+  再逐步打开 init/fs/vi/nv/NVN 引导，保留现有宿主 clear+present
+  作为无核心时的回退。
+
+### 6. CI
+
+run `41209847347`（run 162）成功：
+
+* `portable` job `124562339154`：成功；
+* `ios` job `124562421106`：成功；
+* “Run the replay-layer self-test in the simulator” 14:23:59–14:27:13；
+* unsigned Debug 设备构建 14:27:13–14:28:33；
+* Release 必须被拒绝 14:28:33–14:29:23；
+* 模拟器 app 上传 14:29:23–14:29:27。
+
+### 7. 门禁
+
+```text
+python scripts/syntax_check_metal.py --require
+python scripts/gen_nvn.py --repo . --check
+python scripts/extract_nvn_signatures.py --check
+python scripts/shader_chain/test_gen_blobs.py
+python scripts/verify_ios.py
+powershell -ExecutionPolicy Bypass -File scripts/build_abi_test.ps1
+git diff --check
+```
+
+
+## M4 续三十四：1.6.0 客体 AOT 改写链路跑通
+
+### 1. 路线选择
+
+iOS 不允许运行时生成可执行代码，所以客体核心不能照搬 Windows 侧的
+Unicorn 解释器。采用与 nxnative 相同的**构建期静态改写**：
+
+* `x18`（Apple 保留的平台寄存器）→ 线程槽；
+* `mrs/msr tpidr_el0`、`tpidrro_el0` → 线程槽读写；
+* `svc`、`mrs cntpct_el0`、`mrs ctr_el0` → 宿主 gate；
+* 自旋等待回边 → 带宿主让出的副本；
+* 指令窗口 / 独占访问 → 保持 guest 语义的补丁块。
+
+改写器是 nxnative 的 MIT 代码（`scripts/guest/third_party/nxnative/`），
+本仓库只裁了 `sdk_patches.py`（保留 1.6.0 SDK 的三条
+`AddressRegionManager` 定点补丁）并新增 1.6.0 profile。**没有**照抄
+nxnative 的 1.9.0 main 补丁地址。
+
+### 2. 四个模块的改写结果
+
+输入是用户自己的 1.6.0 ExeFS（`NSO0`），build ID 在写文件前逐个核对：
+
+| 模块 | build ID（前 16 字节） | text | svc | x18 站点 | TLS 读写 | patch | cuts |
+|---|---|---:|---:|---:|---:|---:|---:|
+| main | `8e9978d50bdd20b4c8395a106c27ffde` | 0x2129BA4 | 94 | 15,188 | 0 | 0xAB994 | 0 |
+| sdk | `fcf93a41b08c5193a1410d262602dc62` | 0x52D880 | 60 | 11,297 | 55 | 0x7041C | 3 |
+| subsdk0 | `93ff8252d975adf07230cb86c83301c5` | 0x3732B0 | 0 | 11,093 | 0 | 0x6CCF4 | 0 |
+| rtld | `39e10c07096696c9c4e228496c4bc44d` | 0x1A00 | 4 | 24 | 0 | 0x438 | 0 |
+
+`sdk` 的三条 cut 是上游公开的 1.6.0 SDK 补丁，原文逐字节断言后才应用：
+AddressRegionManager 的节点区上限从 0x3FE00000 降到 0x3E00000（两处），
+以及 1 GB 以上 region 的对齐从 1 GB 改为 32 MB。这三条是为 iPhone 的
+小地址空间准备的，和我们的 M4 目标一致；不匹配的 SDK build 会直接失败，
+不会把 1.9.0 的偏移套上去。
+
+### 3. 结构校验
+
+`scripts/guest/verify_rewrite.py` 不执行代码，只检查改写产物：
+
+* fixups 头的顺序必须是 `text <= ro <= data < key page < patch`；
+* 改写后的 text 里不能再有 `svc`；
+* `gates.tsv` 的每个 gate 站点必须 `b` 到 patch 区里的 gate block；
+* `sites.tsv` 的每个 x18 / TLS 站点必须分支进入 patch 区；
+* 负向自检：故意保留一条 `svc` 时必须报错。
+
+本机四个模块全部 `ok`：
+
+```text
+verify_rewrite: main: ok  text=0x2129ba4 patch=0x2d70000+0xab994 gates=1431 sites=16692
+verify_rewrite: sdk: ok  text=0x52d880 patch=0xce0000+0x7041c gates=108 sites=11464
+verify_rewrite: subsdk0: ok  text=0x3732b0 patch=0x730000+0x6ccf4 gates=13 sites=11107
+verify_rewrite: rtld: ok  text=0x1a00 patch=0x10000+0x438 gates=4 sites=24
+```
+
+### 4. 复现命令
+
+```text
+python scripts/guest/scan_nso.py <ExeFS/update>/main <ExeFS/update>/sdk ...
+python scripts/guest/rewrite_botw.py --nso-dir <ExeFS/update> --out build/guest
+python scripts/guest/verify_rewrite.py build/guest main
+```
+
+`rewrite_botw.py` 会调用 vendored 的 `patch_nso.py`；本机需要
+Python 3 + `capstone` + `lz4`。所有产物写入 `build/`，不进版本库。
+
+### 5. 这证明了什么、还没有证明什么
+
+证明：
+
+* 通用改写规则能覆盖 1.6.0 的四个模块，包括 15,188 个 main x18 站点；
+* 1.6.0 SDK 的三条定点补丁能按 build ID 精确命中；
+* 改写产物的控制流结构自洽（无残留 svc，gate/site 都落在 patch 区）。
+
+没有证明：
+
+* 改写后的镜像能在 iOS 上加载和执行——loader、重定位、导入解析、
+  线程槽和 HLE 服务都还没有；
+* 客体 NVN 调用能到达 `ios/nvn` 的 Metal 后端——桥接层还没有；
+* 游戏可玩或出画面。
+
+### 6. 下一步
+
+按依赖顺序，下一步是运行时 loader 的第一块：
+
+1. 解析 fixups 头，映射 text/ro/data/bss，按 `R_RELATIVE` 应用 221,615
+   条重定位；
+2. 把 `R_JUMP_SLOT` / `R_GLOB_DAT` 的 27,106 条导入按符号名解析到 HLE
+   表；不认识的符号必须报红，不能静默返回 0；
+3. 建立每线程 4 KiB 槽和 key page，`tpidrro_el0` 指向槽；
+4. 把 `_dm_gate` 的寄存器帧和 gate 表接到 C 回调；
+5. 先执行 `rtld` 或一个合成模块，确认第一条客体指令真的在 ARM64 宿主
+   上跑起来，再逐层打开 init / fs / vi / nv。
+
+### 7. 门禁
+
+```text
+python -m py_compile scripts/guest/*.py scripts/guest/third_party/nxnative/*.py
+python scripts/guest/verify_rewrite.py --self-test
+python scripts/verify_ios.py
+powershell -ExecutionPolicy Bypass -File scripts/build_abi_test.ps1
+```
