@@ -5380,3 +5380,112 @@ git diff --check
 本地已通过（513 procs / 316 implemented / 477 measured + 6 inferred）。CI run
 `41185328486` 的 `portable` 与 macOS `ios` job 均通过；模拟器执行新增的 16429
 回归后写出 `BOTW_SELFTEST rc=0`，设备 Debug 构建与 Release 拒绝门禁也通过。
+
+## M4 续十九：Queue / Sync / Event 对象
+
+上一轮把纹理 builder 补齐后，客体在第一次 `nvnQueueInitialize` 时会先走 QueueBuilder：
+它要问 command / compute / control 内存大小、flush 阈值和内存指针，再据此切池。此前这些
+入口都是日志桩，返回 0 会让队列初始化直接失败。本轮把 QueueBuilder、Queue、Sync、Event
+一起接上：
+
+* QueueBuilder：19/19（+19）
+* Queue：15/15（+14）
+* Event：6/7（+6）
+* Sync：4/6（+4）
+* CommandBuffer：110/144 → 114/144（+4）
+
+Metal 覆盖从 **316/513（61.6%）** 到 **363/513（70.8%）**，未实现 150。
+
+### 1. QueueBuilder 的缺省值与内存总和
+
+builder 仍是 guest 对象，宿主不读它的内存布局。setter 写进 `g_queue_specs[builder]`，
+getter 原样回答；从未 `SetDefaults` 过的 builder 返回与 nxnative / D2R 一致的设备缺省：
+
+* command 64 KiB（65536）
+* compute 256 KiB（262144）
+* control 16 KiB（16384）
+* flush threshold 4 KiB（4096）
+
+`GetQueueMemorySize` 返回 command + compute + control 之和向上按 4 KiB 对齐，缺省即
+**344064** 字节。它不含 flush threshold，也不含 `SetQueueMemory` 给的那块客体存储——
+前者是队列内部需要的总大小，后者是客体提供的后备内存，两者语义不同。
+
+10 个新签名是推断的：9 个 getter 按 Set/Get 对称性，`SetQueuePriority` 按同族 setter
+推断。`inferred_signatures.json` 从 6 涨到 16，`verify_ios.py` 单独计数；这些不是官方
+头文件实测，绑定错误会在真机第一次调用时暴露，不能当成已验证原型。
+
+### 2. Queue 生命周期、提交记账与 fence
+
+* `Initialize` 记录 device，清零 submits / command / compute / control used；
+* `Finalize` 删除宿主记录；`Flush` 是空操作（单队列，Metal 没有对应的 flush）；
+* `SubmitCommands` 只做记账：submits 加一，按 command / control memory callback 的区间
+  累加 used；不再重复提交 Metal 工作，因为 `EndRecording` 已经 commit；
+* `AcquireTexture` 在 `Win::numTextures` 内轮转索引，并写进 `x[2]` 指向的 `int`；
+* `ResetMemoryUsage` 清零三类 used；
+* `QueueGetError` 返回 `GPU_NO_ERROR`；`NVNqueueErrorInfo` 布局未核实，故意不写
+  out-struct；
+* `FenceSync` 把 sync 绑到 `g_last_mtl_buffer`；
+* `QueueFinish` 等待所有已知 CmdBuf 的最后 command buffer 和全局最后一个 buffer。
+  present blit 的独立 command buffer 还没纳入，按缺口记。
+
+### 3. EndRecording 的句柄语义变了
+
+`nvnCommandBufferEndRecording` 现在返回 **guest command buffer 地址**，不再是 0。
+`NVNcommandHandle` 本来就是客体用来标识这次提交的东西；返回 0 会让 `SubmitCommands`
+拿到一个空句柄。Metal 工作仍在 EndRecording 时立即 commit，SubmitCommands 只记账，
+不重复回放。
+
+### 4. Sync：fence 与超时
+
+`nvnSync` 保存最后一次 fence 的 `MTLCommandBuffer`：
+
+* 已 fence 且 buffer 已完成 → `ALREADY_SIGNALED`（0）；
+* buffer 出错 → `FAILED`（3）；
+* timeout=0 → `TIMEOUT_EXPIRED`（2）；
+* 有限 timeout → 1 ms 轮询到 deadline，完成返回 `SIGNALED`（1），否则超时；
+* 无限 timeout（≥ 1 小时）→ `waitUntilCompleted`；
+* 未 fence 的 sync 永远不会 signal：有限 timeout 睡到超时，无限 timeout 只睡 1 ms
+  后明确返回超时，避免宿主永久挂死。
+
+`nvnCommandBufferWaitEvent` / `WaitSync` 在单 Metal 队列里按录制顺序天然满足，因此记录
+一次日志后直接返回；没有设备端计数器可轮询。
+
+### 5. Event：CPU 可见点放在 GPU 完成之后
+
+`nvnEventInitialize` 把 event 绑到 memory pool 的 `pool + offset`，要求至少 4 字节。
+`EventSignal` 的 `mode == 1` 视为 add，否则 store。`CommandBufferSignalEvent` 不在录制
+时写值，而是把 `{address, add, value}` 挂到 CmdBuf；`EndRecording` 在 commit 前注册
+`addCompletedHandler`，GPU 完成后才写回 guest 内存。自测最终读到 9，证明这条回调真的
+执行了。
+
+### 6. 模拟器自测
+
+新增失败码 `16430`：
+
+1. 19 个 builder 入口：缺省值 65536 / 262144 / 16384 / 4096 / 344064，逐个 setter 后
+   再回读；
+2. Queue initialize 记录 device 与 debug label；submit 后 submits=1、commandUsed=0x1000、
+   controlUsed=0x400；reset 后归零；
+3. Event initialize 到 pool + offset，CPU signal 后 GetValue，CommandBufferSignalEvent
+   后 GPU 完成再读到 9；
+4. Sync initialize / debug label / fenced wait / unfenced wait 的返回码；
+5. EndRecording 返回 guest command buffer 地址；SubmitCommands 记账；
+6. AcquireTexture 两次返回 0、1 的轮转；
+7. Finalize 后四类对象都从表里消失。
+
+这一组证明队列/同步对象的宿主记账与完成回调，不是标题的真实多队列负载。
+
+### 7. 门禁
+
+```text
+python scripts/syntax_check_metal.py
+python scripts/gen_nvn.py --repo . --check
+python scripts/extract_nvn_signatures.py --check
+python scripts/verify_ios.py
+powershell -ExecutionPolicy Bypass -File scripts/build_abi_test.ps1
+git diff --check
+```
+
+本地已通过（513 procs / 363 implemented / 477 measured + 16 inferred）。CI run
+`41187102748` 的 `portable` 与 macOS `ios` job 均通过；模拟器执行新增的 16430 回归后
+写出 `BOTW_SELFTEST rc=0`，设备 Debug 构建与 Release 拒绝门禁也通过。
