@@ -4117,7 +4117,7 @@ CI（run 41151003231，commit `ecfd58e`）两个 job 都通过：portable
 |---|---|
 | iOS 侧 `cmdbuf_end_recording` 仍在 EndRecording 里直接 commit 并返回 handle 0 | 客体拿不到可提交的句柄，回放层没有命令流可重放 |
 | iOS 侧未实现 `nvnCommandBufferCallCommands` / `nvnQueueSubmitCommands` | harness 记录得出来，回放层展不开 |
-| `ClearColori/ui` / `ClearBuffer` / `ClearTexture*` 只 `log_once`（该轮状态） | 该轮整数清屏与纹理清屏仍是占位；整数清屏已在 M4 续五接入，`ClearColor`（float）有真路径；`ClearDepthStencil` 已在下一轮接入 |
+| `ClearColori/ui` / `ClearBuffer` / `ClearTexture*` 只 `log_once`（该轮状态） | 该轮整数清屏、ClearBuffer 与纹理清屏仍是占位；整数清屏已在 M4 续五、ClearBuffer 已在 M4 续六接入，`ClearColor`（float）有真路径；`ClearDepthStencil` 已在下一轮接入 |
 | storage buffer / image / transform feedback 只记录句柄 | 计算与 UAV 路径未接线 |
 | harness 的 `nvnSamplerCompare` 只比较部分已实现字段，`SamplerBuilder` 缺 wrap / compare / border setter | 采样器状态不完整 |
 | 没有真机运行 | 不能声称画面，任何"能玩"的说法都不成立 |
@@ -4303,7 +4303,7 @@ build_abi_test: all tests passed
 
 * `SetDepthBounds` 只有记录与上报，Metal 没有深度边界测试；
 * 部分模板清屏掩码；
-* `ClearBuffer`、`ClearTexture*` 仍是日志占位（整数清屏已在 M4 续五落地）；
+* `ClearTexture*` 仍是日志占位（整数清屏已在 M4 续五、ClearBuffer 已在 M4 续六落地）；
 * 没有真机像素验证，不能声称画面正确。
 
 ## M4 续三：多颜色附件（MRT）
@@ -4361,7 +4361,7 @@ build_abi_test: all tests passed
 * 没有颜色目标的纯深度 pass 仍打不开 encoder；
 * `SetDepthBounds` 只有记录与上报，Metal 没有深度边界测试；
 * 部分模板清屏掩码；
-* `ClearBuffer`、`ClearTexture*` 仍是日志占位（整数清屏已在 M4 续五落地）；
+* `ClearTexture*` 仍是日志占位（整数清屏已在 M4 续五、ClearBuffer 已在 M4 续六落地）；
 * 没有真机像素验证，不能声称画面正确。
 
 ## M4 续四：纯深度 pass
@@ -4408,7 +4408,7 @@ build_abi_test: all tests passed
 
 * `SetDepthBounds` 只有记录与上报，Metal 没有深度边界测试；
 * 部分模板清屏掩码；
-* `ClearBuffer`、`ClearTexture*` 仍是日志占位（整数清屏已在 M4 续五落地）；
+* `ClearTexture*` 仍是日志占位（整数清屏已在 M4 续五、ClearBuffer 已在 M4 续六落地）；
 * 没有真机像素验证，不能声称画面正确。
 
 ## M4 续五：整数颜色清屏
@@ -4454,5 +4454,46 @@ build_abi_test: all tests passed
 
 * `SetDepthBounds` 只有记录与上报，Metal 没有深度边界测试；
 * 模板与颜色清屏的部分通道掩码；
-* `ClearBuffer`、`ClearTexture{i,ui}`；
+* `ClearTexture{i,ui}`（ClearBuffer 已在 M4 续六落地）；
+* 没有真机像素验证，不能声称画面正确。
+
+## M4 续六：任意 32 位 ClearBuffer
+
+`nvnCommandBufferClearBuffer(cb, address, size, value)` 之前只打日志。NVN 的 `value` 是
+重复的 32 位字；Metal blit 的 `fillBuffer` 只能重复一个字节，因此不能拿它冒充这个入口。
+
+### 1. 宿主 compute 清填
+
+* `Ctx` 懒加载一个很小的 MSL kernel `nvngfx_clear_buffer`：`device uint*` 目标、
+  `constant uint value` 与 `constant uint count`，线程先检查 `gid < count`；
+* 清填地址和长度必须 4 字节对齐，且地址必须落在已注册 memory pool 的 span 内；否则明确
+  上报，不修改内存；
+* 同一个 `MTLCommandBuffer` 内先结束 render encoder，再开 compute encoder，后续 draw 会
+  重新打开 render pass 并保持相对顺序；
+* 这是宿主工具 kernel，不冒充已经支持 guest `DispatchCompute`；后者仍在 TODO。
+
+### 2. 模拟器自测
+
+在现有 guest pool 上把 32 字节清零，再调用
+`ClearBuffer(address, 32, 0xA1B2C3D4)`。等 command buffer 完成后逐 word 回读，8 个 word
+必须全部等于 `0xA1B2C3D4`。这个值的四个字节不同，单字节 `fillBuffer` 无法通过，正好证明
+compute kernel 真的执行了。
+
+### 3. 覆盖与仍然缺的
+
+没有新增 NVN 入口，覆盖率保持 **202/513（39.4%）**，未实现 311；CommandBuffer 域
+**57/144**。门禁输出：
+
+```text
+syntax_check_metal: ok (clang++.exe)
+verify_ios: ok (metal bindings: 202/513)
+build_abi_test: all tests passed
+```
+
+仍未支持：
+
+* `SetDepthBounds` 只有记录与上报，Metal 没有深度边界测试；
+* 模板与颜色清屏的部分通道掩码；
+* `ClearTexture{i,ui}`；
+* guest `DispatchCompute` / image / storage buffer 路径；
 * 没有真机像素验证，不能声称画面正确。

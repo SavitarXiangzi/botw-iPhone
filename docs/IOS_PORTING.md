@@ -503,8 +503,12 @@ guest storage，再调用 `nvnTextureFlushTexels` 改成棕/钢蓝/橙/天蓝并
   模拟器用“先以 LESS 写 z=0.5，再以 EQUAL 画进颜色目标”验证深度值真的写入。
   ClearColor / ClearColori / ClearColorui 共用 pending-clear 路径：整数分量先精确提升为
   double 再交给 MTLClearColor，模拟器在 R32Uint / R32Sint 目标上回读 0x12345678 与
-  -123456789 的原始字节。仍缺 `SetStencilCullCriteria`；模板/颜色清屏的部分通道掩码
-  无法用 Metal load action 表达，会明确上报而不是错误清除。
+  -123456789 的原始字节。`ClearBuffer` 使用一个很小的宿主 MSL compute kernel：Metal 的
+  blit `fillBuffer` 只能重复单字节，而 NVN 的 value 是 32 位字。kernel 在同一个
+  `MTLCommandBuffer` 内写入已注册 memory pool 的 span，支持任意 32 位模式，地址和长度
+  要求 4 字节对齐；模拟器用 0xA1B2C3D4 回读 8 个 word。仍缺
+  `SetStencilCullCriteria`、`ClearTexture{i,ui}` 与 guest compute dispatch；模板/颜色清屏
+  的部分通道掩码无法用 Metal load action 表达，会明确上报而不是错误清除。
 - ✅ Sampler：M3.82 完成 builder、object、getter 和真实的
   `MTLSamplerState`；M3.83 完成 sampler pool、`BindSeparateSampler(s)` 与
   参数缓冲区/直连绑定两条路径。M3.84 已把真实 shader 的 `[[id(k)]]` 顺序

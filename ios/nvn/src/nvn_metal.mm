@@ -15,6 +15,7 @@
  *         render targets + one render pass (1-8 colour attachments) +
  *           ClearColor / ClearColori / ClearColorui / ClearDepthStencil as
  *           load actions, flushed even without a draw
+ *         ClearBuffer -> host compute kernel over a pool span
  *         texture objects, built from the values nvnTextureBuilderSet* was
  *           given (no guest struct offsets are read)
  *         program objects; the pipeline cache is keyed by every colour
@@ -34,15 +35,15 @@
  *         binding, draw encoding, pixel readback -- is executed by
  *         nvngfx_metal_selftest() in CI's iOS Simulator: eighteen draws,
  *         four clear-only regressions (including R32Uint / R32Sint clears), a
- *         bindless table probe, and a vertex-stage
- *         argument-buffer draw whose shifted pixels are read back.  The ninth builds a block-linear
- *         texture in a guest memory pool and proves that the sampled pixels
- *         came from that storage, not from a host-side upload.  The tenth
- *         computes a guest shader key, loads its MSL from <app>/shaders and
- *         reads back orange.  The eleventh uploads a two-layer 2D array and
- *         reads red from layer 0 and yellow from layer 1.  A sampler state
- *         object is also created, compared and read back.
- *         texture views / compute / sync-fence
+ *         buffer-fill compute probe, a bindless table probe, and a vertex-stage
+ *         argument-buffer draw whose shifted pixels are read back.  The ninth
+ *         builds a block-linear texture in a guest memory pool and proves that
+ *         the sampled pixels came from that storage, not from a host-side
+ *         upload.  The tenth computes a guest shader key, loads its MSL from
+ *         <app>/shaders and reads back orange.  The eleventh uploads a
+ *         two-layer 2D array and reads red from layer 0 and yellow from layer 1.
+ *         A sampler state object is also created, compared and read back.
+ *         texture views / guest compute dispatch / sync-fence
  *         BC6H/BC7 and signed BCn (unsigned BC1-BC5 decode to RGBA8)
  *
  * Argument ABI: measured, not guessed
@@ -160,6 +161,10 @@ struct Ctx {
     unsigned presents = 0;
     unsigned dropped = 0;
     bool ready = false;
+    /* One tiny MSL compute kernel fills an arbitrary 32-bit word pattern into
+     * a guest pool span.  Built lazily and retained for the context lifetime. */
+    id<MTLComputePipelineState> clearBufferPso = nil;
+    bool clearBufferPsoTried = false;
 };
 
 struct Win {
@@ -4684,11 +4689,107 @@ void cmdbuf_clear_depth_stencil(nvngfx_ctx*, uint64_t* x) {
     if (queued) end_encoder(b);
 }
 
-/* nvnCommandBufferClearBuffer(cb, address, size, uint32_t value) */
-void cmdbuf_clear_buffer(nvngfx_ctx*, uint64_t* x) {
+/* The host clear kernel.  Metal blit fillBuffer only repeats one byte, while
+ * NVN's clear value is a 32-bit word.  A compute kernel writes the word
+ * unchanged and works for any value, not only 0x00000000 / 0xFFFFFFFF. */
+bool ensure_clear_buffer_pipeline(Ctx* c) {
+    if (!c) return false;
+    if (c->clearBufferPso) return true;
+    if (c->clearBufferPsoTried) return false;
+    c->clearBufferPsoTried = true;
+
+    NSString* source =
+        @"#include <metal_stdlib>\n"
+         "using namespace metal;\n"
+         "kernel void nvngfx_clear_buffer(device uint* dst [[buffer(0)]],\n"
+         "                                constant uint& value [[buffer(1)]],\n"
+         "                                constant uint& count [[buffer(2)]],\n"
+         "                                uint gid [[thread_position_in_grid]]) {\n"
+         "    if (gid < count) dst[gid] = value;\n"
+         "}\n";
+    NSError* error = nil;
+    id<MTLLibrary> lib = [c->device newLibraryWithSource:source
+                                                 options:nil
+                                                   error:&error];
+    if (!lib) {
+        std::fprintf(stderr, "[nvn] clearBuffer.library: %s\n",
+                     error ? [[error localizedDescription] UTF8String]
+                           : "(no description)");
+        return false;
+    }
+    id<MTLFunction> fn = [lib newFunctionWithName:@"nvngfx_clear_buffer"];
+    if (!fn) {
+        std::fprintf(stderr, "[nvn] clearBuffer.function: not found\n");
+        return false;
+    }
+    error = nil;
+    c->clearBufferPso = [c->device newComputePipelineStateWithFunction:fn
+                                                                 error:&error];
+    if (!c->clearBufferPso) {
+        std::fprintf(stderr, "[nvn] clearBuffer.pipeline: %s\n",
+                     error ? [[error localizedDescription] UTF8String]
+                           : "(no description)");
+        return false;
+    }
+    return true;
+}
+
+/* nvnCommandBufferClearBuffer(cb, address, size, uint32_t value)
+ *
+ * Clear size bytes of a guest pool span to the repeating 32-bit value.  The
+ * address and size must be 4-byte aligned: the kernel writes uint32 words and
+ * a non-word-aligned tail has no defined NVN clear meaning here.  The compute
+ * encoder is ordered inside the same MTLCommandBuffer, so an earlier draw and
+ * a later draw keep their relative order. */
+void cmdbuf_clear_buffer(nvngfx_ctx* ctx, uint64_t* x) {
+    Ctx* c = ctx_of(ctx);
     CmdBuf* b = find_or_add<CmdBuf>(x[0]);
-    if (!b) return;
-    log_once("nvnCommandBufferClearBuffer.unsupported", static_cast<unsigned>(x[3]));
+    if (!c || !b) return;
+    const uint64_t addr = x[1];
+    const size_t len = static_cast<size_t>(x[2]);
+    const uint32_t value = static_cast<uint32_t>(x[3]);
+    if (len == 0) return;
+    if (!b->recording || !b->cb) {
+        log_once("nvnCommandBufferClearBuffer.notRecording", 1);
+        return;
+    }
+    if ((addr & 3u) != 0 || (len & 3u) != 0) {
+        log_once("nvnCommandBufferClearBuffer.alignment",
+                 static_cast<unsigned>(len));
+        return;
+    }
+    const uint64_t words64 = static_cast<uint64_t>(len / 4);
+    if (words64 > 0xFFFFFFFFull) {
+        log_once("nvnCommandBufferClearBuffer.size",
+                 static_cast<unsigned>(words64));
+        return;
+    }
+    id<MTLBuffer> buf = nil;
+    size_t off = 0;
+    if (!pool_span(addr, len, &buf, &off)) {
+        log_once("nvnCommandBufferClearBuffer.pool", static_cast<unsigned>(len));
+        return;
+    }
+    if (!ensure_clear_buffer_pipeline(c)) return;
+
+    /* A render and a compute encoder cannot be open at the same time.  Closing
+     * the pass here is safe: a later draw reopens it with loadAction=Load. */
+    if (b->enc) end_encoder(b);
+    id<MTLComputeCommandEncoder> enc = [b->cb computeCommandEncoder];
+    if (!enc) {
+        log_once("nvnCommandBufferClearBuffer.encoder", 1);
+        return;
+    }
+    const uint32_t count = static_cast<uint32_t>(words64);
+    [enc setComputePipelineState:c->clearBufferPso];
+    [enc setBuffer:buf offset:off atIndex:0];
+    [enc setBytes:&value length:sizeof(value) atIndex:1];
+    [enc setBytes:&count length:sizeof(count) atIndex:2];
+    const NSUInteger tpg = 64;
+    const NSUInteger groups = (static_cast<NSUInteger>(count) + tpg - 1) / tpg;
+    [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+    [enc endEncoding];
 }
 
 /* nvnCommandBufferClearTexture{,i,ui}: the texture clear path is not wired
@@ -9145,6 +9246,64 @@ extern "C" int nvngfx_metal_selftest(void) {
                          "[selftest] integer clears kept 0x12345678 and -123456789\n");
         }
 
+        {
+            /* --- ClearBuffer: arbitrary 32-bit word pattern --------------
+             * Metal blit fillBuffer only repeats one byte.  This value has
+             * four different bytes, so the compute kernel is the only way the
+             * result can match. */
+            unsigned char* const vpool = reinterpret_cast<unsigned char*>(
+                (reinterpret_cast<uintptr_t>(poolRaw) + 16383u) &
+                ~static_cast<uintptr_t>(16383u));
+            const unsigned kClearOffset = 32;
+            const unsigned kClearBytes = 32;
+            const uint32_t kClearValue = 0xA1B2C3D4u;
+            std::memset(vpool + kClearOffset, 0, kClearBytes);
+            const uint64_t clearAddr =
+                reinterpret_cast<uint64_t>(vpool + kClearOffset);
+            const uint64_t kCbClearBuffer = 0x8A00;
+
+            x[0] = kCbClearBuffer;
+            cmdbuf_begin_recording(ctx, x);
+            x[0] = kCbClearBuffer;
+            x[1] = clearAddr;
+            x[2] = kClearBytes;
+            x[3] = kClearValue;
+            cmdbuf_clear_buffer(ctx, x);
+            x[0] = kCbClearBuffer;
+            cmdbuf_end_recording(ctx, x);
+            CmdBuf* bb = find<CmdBuf>(kCbClearBuffer);
+            if (!bb || !bb->last) {
+                std::fprintf(stderr,
+                             "[selftest] ClearBuffer: nothing committed\n");
+                rc = 16418;
+                goto done;
+            }
+            [bb->last waitUntilCompleted];
+            if (bb->last.status == MTLCommandBufferStatusError) {
+                std::fprintf(stderr,
+                             "[selftest] ClearBuffer command buffer error: %s\n",
+                             bb->last.error
+                                 ? [[bb->last.error localizedDescription] UTF8String]
+                                 : "(no description)");
+                rc = 16418;
+                goto done;
+            }
+            const uint32_t* const words =
+                reinterpret_cast<const uint32_t*>(vpool + kClearOffset);
+            for (unsigned i = 0; i < kClearBytes / sizeof(uint32_t); ++i) {
+                if (words[i] != kClearValue) {
+                    std::fprintf(stderr,
+                                 "[selftest] ClearBuffer word %u is 0x%08x, "
+                                 "want 0x%08x\n",
+                                 i, words[i], kClearValue);
+                    rc = 16418;
+                    goto done;
+                }
+            }
+            std::fprintf(stderr,
+                         "[selftest] ClearBuffer wrote 0xA1B2C3D4 to 32 bytes\n");
+        }
+
     done:
         nvngfx_shader_set_msl_passthrough(0);
         forget<CmdBuf>(kCb);
@@ -9204,6 +9363,7 @@ extern "C" int nvngfx_metal_selftest(void) {
         forget<CmdBuf>(0x8600);
         forget<Program>(0x8500);
         forget<CmdBuf>(0x8900);
+        forget<CmdBuf>(0x8A00);
         forget<Tex>(kTexClearUI);
         forget<Tex>(kTexClearI);
         g_tex_specs.erase(kTexIntBuilder);

@@ -493,6 +493,22 @@ destinationBytesPerImage:(NSUInteger)bpi;
      destinationOrigin:(MTLOrigin)dstOrigin;
 @end
 
+@protocol MTLComputePipelineState
+@end
+
+@protocol MTLComputeCommandEncoder
+- (void)endEncoding;
+- (void)setComputePipelineState:(id<MTLComputePipelineState>)state;
+- (void)setBuffer:(id<MTLBuffer>)buffer
+           offset:(NSUInteger)offset
+          atIndex:(NSUInteger)index;
+- (void)setBytes:(const void*)bytes
+          length:(NSUInteger)length
+         atIndex:(NSUInteger)index;
+- (void)dispatchThreadgroups:(MTLSize)threadgroups
+      threadsPerThreadgroup:(MTLSize)threadsPerThreadgroup;
+@end
+
 @protocol MTLRenderCommandEncoder
 - (void)endEncoding;
 - (void)drawPrimitives:(MTLPrimitiveType)type
@@ -532,6 +548,7 @@ destinationBytesPerImage:(NSUInteger)bpi;
 
 @protocol MTLCommandBuffer
 - (id<MTLBlitCommandEncoder>)blitCommandEncoder;
+- (id<MTLComputeCommandEncoder>)computeCommandEncoder;
 - (id<MTLRenderCommandEncoder>)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor*)descriptor;
 - (void)presentDrawable:(id)drawable;
 - (void)commit;
@@ -612,6 +629,9 @@ destinationBytesPerImage:(NSUInteger)bpi;
                                options:(id)options
                                  error:(NSError**)error;
 - (id<MTLRenderPipelineState>)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor*)d
+                                                             error:(NSError**)error;
+- (id<MTLComputePipelineState>)newComputePipelineStateWithFunction:
+                                  (id<MTLFunction>)function
                                                              error:(NSError**)error;
 - (id<MTLSamplerState>)newSamplerStateWithDescriptor:(MTLSamplerDescriptor*)descriptor;
 - (id<MTLDepthStencilState>)newDepthStencilStateWithDescriptor:
