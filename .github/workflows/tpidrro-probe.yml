@@ -1,0 +1,43 @@
+name: tpidrro probe
+
+on:
+  push:
+    branches: [ probe/tpidrro ]
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: macos-15
+    steps:
+      - name: architecture
+        run: uname -m; sysctl -n machdep.cpu.brand_string || true
+      - name: write TPIDRRO_EL0 from EL0
+        run: |
+          set -euo pipefail
+          cat > /tmp/t.c <<'EOF'
+          #include <stdio.h>
+          #include <signal.h>
+          #include <setjmp.h>
+          #include <stdint.h>
+          static sigjmp_buf jb;
+          static void on_sigill(int sig) { (void)sig; siglongjmp(jb, 1); }
+          int main(void) {
+              uint64_t before = 0, after = 0;
+              const uint64_t want = 0x1122334455667788ull;
+              __asm__ volatile("mrs %0, tpidrro_el0" : "=r"(before));
+              printf("before=%#llx\n", (unsigned long long)before);
+              signal(SIGILL, on_sigill);
+              if (sigsetjmp(jb, 1) == 0) {
+                  __asm__ volatile("msr tpidrro_el0, %0" :: "r"(want));
+                  printf("msr completed without signal\n");
+              } else {
+                  printf("msr raised SIGILL\n");
+              }
+              __asm__ volatile("mrs %0, tpidrro_el0" : "=r"(after));
+              printf("after=%#llx changed=%d\n", (unsigned long long)after,
+                     after == want ? 1 : 0);
+              return 0;
+          }
+          EOF
+          xcrun clang -O0 -o /tmp/t /tmp/t.c
+          /tmp/t
