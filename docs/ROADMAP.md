@@ -6558,6 +6558,87 @@ powershell -ExecutionPolicy Bypass -File scripts/build_abi_test.ps1
 git diff --check
 ```
 
-本机已全部通过；`16443` 的实际 Metal 执行仍要等 macOS CI 的 iOS
-Simulator job。真实标题的 `draw` 仍为 0，本轮只证明参数布局和填充
-路径，不证明游戏已经出画面。
+本机已全部通过；`16443` 的实际 Metal 执行由 macOS CI 的 iOS
+Simulator job 验证。
+
+### 6. CI
+
+run `41209052254`（run 161）的 `portable` job `124560000981` 与 `ios`
+job `124560075362` 均成功。iOS job 的 “Run the replay-layer self-test in
+the simulator” 步骤从 14:13:51 跑到 14:19:05，结论成功，说明 `16443`
+在模拟器里实际返回 0；之后的 unsigned Debug 设备构建、Release 必须被
+拒绝、模拟器 app 上传也全部成功。真实标题的 `draw` 仍为 0，`16443`
+只证明 support buffer 与 c[2] 表能到达 shader。
+
+## M4 续三十二：真实 bundle 的容量与加载索引
+
+### 1. 两个会挡住真实着色器集的问题
+
+离线 `Bootup_Graphics` 已经生成 5,102 个 stage，但文件 bundle 的
+`BUNDLE_MAX_ENTRIES` 仍是 4,096。也就是说上一轮虽然把
+`unsupported` 降到 0，真实 bundle 仍会在加载时被整个拒绝；全游戏
+约 19,595 个 stage 更不可能通过。
+
+修掉容量上限后，本机用 MSVC Debug 探针加载真实的 5,102 条 bundle，
+`rc=0`，但耗时 **60.49 秒**。根因是 `nvngfx_shader_set_blobs()` 用
+O(n²) 相邻比较查重，`nvngfx_shader_lookup_blob()` 又是线性扫全表。
+这不是“稍慢”：它会直接吃掉手机启动时间。
+
+### 2. 修复
+
+* `BUNDLE_MAX_ENTRIES` 4096 -> 65536；新增 4,097 条 manifest 的回归
+  测试，确保 cap 不会再悄悄挡住 5,102 条真实输入。
+* shader key 正好是 16 个十六进制字符，即 64 位精确值，不是需要
+  容忍碰撞的哈希。`nvn_shader.c` 现在额外保留一个按
+  `(key 值, stage, 原表下标)` 排序的紧凑索引：
+  * `set_blobs()` 用 O(n log n) 排序和相邻比较查重；
+  * lookup 先按 64 位 key 二分，再在同 key 的 1..3 个 stage 里精确匹配；
+  * 索引分配失败或表校验失败时，旧表和旧索引保持原样；
+  * `clear_blobs()` 同时释放索引。
+* 索引只保存 8 字节 key、stage 和原表下标，不复制 MSL，也不改变
+  “调用者保有 blob 数组生命周期”的约定。
+
+### 3. 实测
+
+同一份 `build/shader-chain/shaders-boot-all-2`：
+
+```text
+manifest:   0.98 MiB
+files:      8,456
+total:      136.48 MiB
+max file:   ~1,003 KiB
+entries:    5,102
+```
+
+| 版本 | 加载结果 | 耗时 |
+|---|---|---:|
+| 仅扩大 cap，线性查重/查找 | rc=0，5,102 条 | 60.49 s |
+| 64 位 key 索引 | rc=0，5,102 条 | **1.02 s** |
+
+首个 entry 也按 key 查到了：`000a8cde2eedfc41` / `fs` / 16 args。
+这是 Windows MSVC Debug 的数字，不是 iPhone 数字；但它证明瓶颈从
+O(n²) 变成了排序和文件读取。手机仍需 macOS CI / 真机测量。
+
+### 4. 仍然没有闭环的部分
+
+* bundle 仍然在启动时把 8,456 个文件、约 136 MiB MSL **全部读入内存**；
+  索引解决的是查重/查找，不是 I/O 或 Metal 编译。
+* MSL 仍是文本，首次建管线还要 `newLibraryWithSource`；`.metallib`
+  打包和 5,102 / 19,595 的编译期验证仍没有做。
+* 真实标题的客体代码还没有接到 iOS 工程，`draw` 仍为 0。容量和加载
+  时间修好只说明“shader 集能被装进来”，不说明“游戏能启动”。
+
+### 5. 门禁
+
+```text
+python scripts/syntax_check_metal.py --require
+python scripts/gen_nvn.py --repo . --check
+python scripts/extract_nvn_signatures.py --check
+python scripts/shader_chain/test_gen_blobs.py
+python scripts/verify_ios.py
+powershell -ExecutionPolicy Bypass -File scripts/build_abi_test.ps1
+git diff --check
+```
+
+本机已全部通过；真实 bundle 探针 5,102/5,102 加载成功。新 CI run
+在推送后补记。

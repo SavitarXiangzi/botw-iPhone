@@ -164,9 +164,16 @@ control + code 上，和 Python 命名文件用的 key 逐个比。5102 个全�
    manifest 是 tab 分隔的五列：
    `key  stage  msl-file  c1-file  args`，其中 args 是
    `id:slot:packed:kind[:offset]`；`kind` 是 `nvngfx_arg_kind` 的**数值**
-   （1..10），不是 C 枚举名。空 c1 必须写成真实文件名而不是 `-`。
+   （1..12），不是 C 枚举名。空 c1 必须写成真实文件名而不是 `-`。
    这仍是 MSL 文本，运行时由 Metal 编译；`.metallib` 打包与 `xcrun metal`
    的编译期校验还没做。
+
+   文件 bundle 的 manifest 上限是 65,536 条，足以覆盖标题约 19,595 个
+   stage；`nvngfx_shader_set_blobs()` 另外维护一个按 64 位精确 key 排序的
+   索引，查重和查找不再是线性扫全表。真实 `Bootup_Graphics` 的 5,102 条
+   输入在本机从 60.49 秒降到 1.02 秒（Windows MSVC Debug，不是 iPhone
+   数字）。限制是启动时仍会把所有 MSL 文本读入内存，索引不解决 I/O 和
+   Metal 编译。
 
 ### 5.3 还差的接线（下一步）
 

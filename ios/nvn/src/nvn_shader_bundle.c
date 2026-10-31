@@ -47,7 +47,10 @@
 /* A single shader this large is already suspicious; the cap keeps a damaged
  * manifest from asking for an unbounded allocation. */
 #define BUNDLE_MAX_MSL (8u * 1024u * 1024u)
-#define BUNDLE_MAX_ENTRIES 4096u
+/* The whole title is ~19,595 stages (Bootup_Graphics alone is 5,102), so
+ * 4,096 would reject every real bundle.  The cap is only a damaged-manifest
+ * guard; it must stay above the title's stage count with room to spare. */
+#define BUNDLE_MAX_ENTRIES 65536u
 #define BUNDLE_LINE_MAX 4096u
 #define KEY_TEXT_MAX 32u
 

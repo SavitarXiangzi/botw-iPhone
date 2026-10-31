@@ -15,7 +15,7 @@ e01e5955f6f39e29  ps    bundle-fs.msl   -   -
   `<app>/shaders`，`NVNGFX_SHADER_DIR` 可以覆盖。
 - 真实翻译产物（几千个 `.msl` + `.c1`）同样按这个格式放，**不要入库**；
   `gen_blobs.py --bundle-out <dir>` 可以直接生成这一目录。
-- manifest 的 args 列中，`kind` 是 `nvngfx_arg_kind` 的数值（1..10），
+- manifest 的 args 列中，`kind` 是 `nvngfx_arg_kind` 的数值（1..12），
   不是 C 枚举名。
 
 这个目录现在**只有合成 fixture，没有真实标题着色器**。原因是 NVN 和 Metal 在这一点上

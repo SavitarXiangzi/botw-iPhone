@@ -169,6 +169,35 @@ int main() {
                                nullptr) != nullptr,
           "the previous bundle is still installed");
 
+    /* Bootup_Graphics alone is already 5,102 stages and the whole title is
+     * about 19,595, so a 4,096-entry manifest cap would make every real
+     * bundle fail to load.  One MSL can be shared by many keys; this test is
+     * about the manifest cap, not about Metal. */
+    {
+        const fs::path many = root / "many";
+        fs::remove_all(many);
+        fs::create_directories(many);
+        write_text(many / "ps.msl", kPs);
+        constexpr unsigned kMany = 4097;
+        std::string manifest;
+        for (unsigned i = 0; i < kMany; ++i) {
+            char key[32];
+            std::snprintf(key, sizeof key, "%016llx",
+                          0x1000000000000000ull + i);
+            manifest += key;
+            manifest += "\tps\tps.msl\t-\t-\n";
+        }
+        write_text(many / "manifest.tsv", manifest);
+        check(nvngfx_shader_load_bundle(many.string().c_str(), why,
+                                        sizeof why) == 0,
+              "a bundle larger than 4,096 entries loads");
+        check(nvngfx_shader_bundle_count() == kMany,
+              "the large bundle contributes every entry");
+        check(nvngfx_shader_lookup("1000000000001000", NVNGFX_STAGE_FRAGMENT,
+                                   nullptr) != nullptr,
+              "the last entry of a large bundle is reachable");
+    }
+
     nvngfx_shader_unload_bundle();
     check(nvngfx_shader_bundle_count() == 0, "unload drops the bundle");
     check(nvngfx_shader_blob_count() == 1, "unload restores the generated table");

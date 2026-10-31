@@ -157,10 +157,12 @@ typedef struct nvngfx_shader_blob {
     unsigned c1_size;
 } nvngfx_shader_blob;
 
-/* Installs a static table.  Nothing is copied.  Returns 0 on success, or
- * -(index + 1) naming the first bad entry (bad key, bad stage, empty MSL, or a
- * duplicate key+stage).  A layout is also checked: ids must be ascending and
- * unique, packed slots must be a permutation of 0..num_args-1, no id above
+/* Installs a static table.  The blob array itself is not copied; a compact
+ * lookup index is built from it, so callers must keep the array alive until
+ * the table is replaced or cleared.  Returns 0 on success, or -(index + 1)
+ * naming the first bad entry (bad key, bad stage, empty MSL, or a duplicate
+ * key+stage).  A layout is also checked: ids must be ascending and unique,
+ * packed slots must be a permutation of 0..num_args-1, no id above
  * NVNGFX_MAX_ARG_ID, every kind in range with a slot that fits its table,
  * and C1 / UNSUPPORTED entries must carry slot -1.  A C1 entry must also name
  * a blob with c1 data (an empty blob is valid), c1_size

@@ -10,6 +10,7 @@
 #include "nvn_shader.h"
 
 #include <stddef.h>
+#include <stdlib.h>
 #include <string.h>
 
 static const char* const kNoTranslator =
@@ -444,6 +445,32 @@ static const char* const kFsDriverTables =
 static const nvngfx_shader_blob* g_blobs = NULL;
 static size_t g_blob_count = 0;
 
+/* A title bundle is ~20,000 stages.  Linear duplicate detection and lookup
+ * made a real 5,102-stage bundle take a minute to install on the development
+ * host.  A key is exactly 16 hex digits, so its low-cased value is a perfect
+ * 64-bit identity -- not a hash with collisions.  Keep one index sorted by
+ * (key value, stage): set_blobs rejects duplicates in O(n log n), and lookup
+ * is a binary search plus a scan of the same key's two or three stages. */
+typedef struct BlobIndex {
+    unsigned long long key;
+    int stage;
+    size_t slot;
+} BlobIndex;
+
+static BlobIndex* g_index = NULL;
+
+static int index_compare(const void* lhs, const void* rhs) {
+    const BlobIndex* a = (const BlobIndex*)lhs;
+    const BlobIndex* b = (const BlobIndex*)rhs;
+    if (a->key < b->key) return -1;
+    if (a->key > b->key) return 1;
+    if (a->stage < b->stage) return -1;
+    if (a->stage > b->stage) return 1;
+    if (a->slot < b->slot) return -1;
+    if (a->slot > b->slot) return 1;
+    return 0;
+}
+
 /* Lowercased hex digit, or 0 when the character is not one. */
 static char hex_lower(char c) {
     if (c >= '0' && c <= '9') return c;
@@ -465,6 +492,19 @@ static int key_eq(const char* a, const char* b) {
     for (i = 0; i < NVNGFX_KEY_LEN; ++i)
         if (hex_lower(a[i]) != hex_lower(b[i])) return 0;
     return 1;
+}
+
+/* The exact 64-bit identity of a validated 16-hex-digit key. */
+static unsigned long long key_bits(const char* key) {
+    unsigned long long v = 0;
+    int i;
+    for (i = 0; i < NVNGFX_KEY_LEN; ++i) {
+        const char c = hex_lower(key[i]);
+        const unsigned digit = c <= '9' ? (unsigned)(c - '0')
+                                        : (unsigned)(c - 'a' + 10);
+        v = (v << 4) | digit;
+    }
+    return v;
 }
 
 /* A layout must be usable without a second validation pass in the backend:
@@ -534,7 +574,8 @@ static int args_valid(const nvngfx_shader_blob* b) {
 }
 
 int nvngfx_shader_set_blobs(const nvngfx_shader_blob* blobs, size_t count) {
-    size_t i, j;
+    BlobIndex* next_index = NULL;
+    size_t i;
     if (count != 0 && blobs == NULL) return -1;
     for (i = 0; i < count; ++i) {
         const nvngfx_shader_blob* b = &blobs[i];
@@ -545,18 +586,37 @@ int nvngfx_shader_set_blobs(const nvngfx_shader_blob* blobs, size_t count) {
             return -(int)(i + 1);
         if (b->msl == NULL || b->msl[0] == '\0') return -(int)(i + 1);
         if (!args_valid(b)) return -(int)(i + 1);
-        for (j = 0; j < i; ++j)
-            if (blobs[j].stage == b->stage && key_eq(blobs[j].key, b->key))
-                return -(int)(i + 1);
     }
-    /* Only now does anything change: a rejected table leaves the installed one
-     * exactly as it was. */
+    if (count != 0) {
+        if (count > (size_t)-1 / sizeof *next_index) return -1;
+        next_index = (BlobIndex*)malloc(count * sizeof *next_index);
+        if (!next_index) return -1;
+        for (i = 0; i < count; ++i) {
+            next_index[i].key = key_bits(blobs[i].key);
+            next_index[i].stage = blobs[i].stage;
+            next_index[i].slot = i;
+        }
+        qsort(next_index, count, sizeof *next_index, index_compare);
+        for (i = 1; i < count; ++i) {
+            const BlobIndex* a = &next_index[i - 1];
+            const BlobIndex* b = &next_index[i];
+            if (a->key != b->key || a->stage != b->stage) continue;
+            free(next_index);
+            return -(int)(b->slot + 1);
+        }
+    }
+    /* Only now does anything change: a rejected table or a failed allocation
+     * leaves the installed one exactly as it was. */
+    free(g_index);
+    g_index = next_index;
     g_blobs = blobs;
     g_blob_count = count;
     return 0;
 }
 
 void nvngfx_shader_clear_blobs(void) {
+    free(g_index);
+    g_index = NULL;
     g_blobs = NULL;
     g_blob_count = 0;
 }
@@ -575,11 +635,28 @@ const nvngfx_shader_blob* nvngfx_shader_lookup_blob(const char* key,
         if (why) *why = "no offline MSL blob table is installed";
         return NULL;
     }
-    for (i = 0; i < g_blob_count; ++i) {
-        if (g_blobs[i].stage != (int)stage) continue;
-        if (!key_eq(g_blobs[i].key, key)) continue;
-        if (why) *why = "offline MSL blob";
-        return &g_blobs[i];
+    if (g_index) {
+        const unsigned long long k = key_bits(key);
+        size_t lo = 0, hi = g_blob_count;
+        while (lo < hi) {
+            const size_t mid = lo + (hi - lo) / 2;
+            if (g_index[mid].key < k) lo = mid + 1;
+            else hi = mid;
+        }
+        for (i = lo; i < g_blob_count && g_index[i].key == k; ++i) {
+            if (g_index[i].stage != (int)stage) continue;
+            if (why) *why = "offline MSL blob";
+            return &g_blobs[g_index[i].slot];
+        }
+    } else {
+        /* Defensive fallback for a table installed by an older caller through
+         * a path that did not build an index; set_blobs always builds one. */
+        for (i = 0; i < g_blob_count; ++i) {
+            if (g_blobs[i].stage != (int)stage) continue;
+            if (!key_eq(g_blobs[i].key, key)) continue;
+            if (why) *why = "offline MSL blob";
+            return &g_blobs[i];
+        }
     }
     if (why) *why = "no offline MSL blob for this key";
     return NULL;
