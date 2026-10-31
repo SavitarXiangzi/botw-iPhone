@@ -4104,7 +4104,12 @@ present 同量级，但三件事变了：
 覆盖从 **134/513** 提升到 **195/513（38.0%）**，CommandBuffer 域从 23/144 到
 50/144。门禁：`verify_ios: ok (metal bindings: 195/513)`、
 `syntax_check_metal: ok (clang++.exe)`、
-`build_abi_test: all tests passed`。
+`build_abi_test: all tests passed`（本地 11 个可移植测试，含新增的
+`nvn_state_test`）。
+
+CI（run 41151003231，commit `ecfd58e`）两个 job 都通过：portable
+（124387228279）编译并运行 `nvn_state_test`；iOS（124387315048）用 Apple 工具链
+编译 `nvn_metal.mm`，模拟器自检通过。
 
 ### 还没有的（M4 的真实缺口）
 
