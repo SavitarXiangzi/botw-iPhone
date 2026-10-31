@@ -6308,6 +6308,11 @@ git diff --check
 
 本地已通过（513 procs / 481 implemented / 477 measured + 28 inferred）。
 
+推送后 CI run `41197993256` 的 `portable`（job `124527951398`）与 `ios`
+（job `124528020038`）两个 job 均成功；iOS 日志里出现
+`[selftest] readtexels: packed=1 strided=1` 与 `BOTW_SELFTEST rc=0`，
+`16439`（sparse tile 布局）与 `16440`（discard 标志）通过。
+
 ### 6. 仍然没有闭环的部分
 
 * 稀疏布局回答的是**本后端的布局**：tile 形状按我们的 GOB/块高规则推导，没有在
