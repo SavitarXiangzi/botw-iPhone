@@ -5120,6 +5120,11 @@ Metal 覆盖从 **248/513（48.3%）** 到 **271/513（52.8%）**，未实现 24
 空栈 pop 只记一次日志，不会下溢。每次 `BeginRecording` 清空 group 栈，并把 label
 重新设到新的 `MTLCommandBuffer` 上。
 
+第一次 CI（run `41183203391`）在 Xcode 16.4 上编译失败：`insertDebugSignpost:`
+属于 `MTLCommandEncoder`，不是 `MTLCommandBuffer`。本地 stub 之前把它声明在后者
+上，`syntax_check_metal` 因此放过了。现在 stub 按真实协议声明，marker 在 pass 内写
+到当前 render encoder，pass 外用只放一个 signpost 的 blit encoder 承载。
+
 ### 5. 模拟器自测
 
 新增失败码 `16426` 的回归：
@@ -5147,5 +5152,11 @@ powershell -ExecutionPolicy Bypass -File scripts/build_abi_test.ps1
 git diff --check
 ```
 
-本地已通过（513 procs / 271 implemented / 477 measured + 6 inferred）。
-CI 结果待补。
+本地已通过（513 procs / 271 implemented / 477 measured + 6 inferred）；GitHub
+Actions run `41183353243` 的 macOS `ios` job 也已通过，模拟器输出确认：
+
+```text
+[selftest] lifecycle: initialize/is-recording, command and control memory
+accounting, the memory callback and three debug entry points survived a commit
+BOTW_SELFTEST rc=0
+```
