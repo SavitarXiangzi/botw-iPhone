@@ -4706,6 +4706,74 @@ void blend_set_equation(nvngfx_ctx*, uint64_t* x) {
     write_blend(x[0], &s);
 }
 
+/* Advanced blend sits in the same 64-bit object (measured layout, nxnative
+ * nvn_obj.h): adv:6 at bit 37, adv_npm:1 at 43, adv_ovl:2 at 44.  adv_npm
+ * stores the inverse of the API's premultiplied-src flag. */
+void blend_set_advanced_mode(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_blend_state s;
+    if (!read_blend(x[0], &s)) return;
+    const unsigned mode = static_cast<unsigned>(x[1]);
+    s.adv = mode <= 0x32u ? mode : 0u;   /* HSL_LUMINOSITY is the last mode */
+    write_blend(x[0], &s);
+}
+void blend_set_advanced_premultiplied(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_blend_state s;
+    if (!read_blend(x[0], &s)) return;
+    s.adv_npm = (x[1] & 0xFFu) ? 0u : 1u;
+    write_blend(x[0], &s);
+}
+void blend_set_advanced_overlap(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_blend_state s;
+    if (!read_blend(x[0], &s)) return;
+    s.adv_ovl = static_cast<unsigned>(x[1]) & 3u;
+    write_blend(x[0], &s);
+}
+
+/* nvnBlendStateGetBlendTarget(const NVNblendState*) -> int */
+void blend_get_target(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_blend_state s;
+    x[0] = read_blend(x[0], &s) ? s.target : 0u;
+}
+/* nvnBlendStateGetBlendFunc(const NVNblendState*, NVNblendFunc* sr,
+ *                           NVNblendFunc* dr, NVNblendFunc* sa, NVNblendFunc* da) */
+void blend_get_func(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_blend_state s;
+    if (!read_blend(x[0], &s)) return;
+    unsigned* sr = guest_ptr<unsigned>(x[1]);
+    unsigned* dr = guest_ptr<unsigned>(x[2]);
+    unsigned* sa = guest_ptr<unsigned>(x[3]);
+    unsigned* da = guest_ptr<unsigned>(x[4]);
+    if (sr) *sr = s.src_rgb;
+    if (dr) *dr = s.dst_rgb;
+    if (sa) *sa = s.src_a;
+    if (da) *da = s.dst_a;
+}
+/* nvnBlendStateGetBlendEquation(const NVNblendState*, NVNblendEquation* rgb,
+ *                               NVNblendEquation* alpha) */
+void blend_get_equation(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_blend_state s;
+    if (!read_blend(x[0], &s)) return;
+    unsigned* rgb = guest_ptr<unsigned>(x[1]);
+    unsigned* alpha = guest_ptr<unsigned>(x[2]);
+    if (rgb) *rgb = s.eq_rgb;
+    if (alpha) *alpha = s.eq_a;
+}
+void blend_get_advanced_mode(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_blend_state s;
+    x[0] = read_blend(x[0], &s) ? s.adv : 0u;
+}
+void blend_get_advanced_premultiplied(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_blend_state s;
+    x[0] = read_blend(x[0], &s) ? (s.adv_npm ? 0u : 1u) : 0u;
+}
+void blend_get_advanced_overlap(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_blend_state s;
+    x[0] = read_blend(x[0], &s) ? s.adv_ovl : 0u;
+}
+/* nvnBlendStateGetAdvancedNormalizedDst and its setter are deliberately not
+ * bound: neither nxnative's measured layout nor its HLE has that field, so
+ * any answer would be a guess. */
+
 /* nvnColorStateSetDefaults / BlendEnable / LogicOp / AlphaTest */
 void color_set_defaults(nvngfx_ctx*, uint64_t* x) {
     nvngfx_color_state s;
@@ -4734,6 +4802,22 @@ void color_set_alpha_test(nvngfx_ctx*, uint64_t* x) {
     write_color(x[0], &s);
 }
 
+/* nvnColorStateGetBlendEnable(const NVNcolorState*, int) -> NVNboolean */
+void color_get_blend_enable(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_color_state s;
+    if (!read_color(x[0], &s)) { x[0] = 0; return; }
+    const int i = static_cast<int>(x[1]);
+    x[0] = (i >= 0 && i < 8 && ((s.blend_en >> i) & 1u)) ? 1u : 0u;
+}
+void color_get_logic_op(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_color_state s;
+    x[0] = read_color(x[0], &s) ? s.logic_op : 0u;
+}
+void color_get_alpha_test(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_color_state s;
+    x[0] = read_color(x[0], &s) ? s.alpha_func : 0u;
+}
+
 /* nvnChannelMaskStateSetDefaults / SetChannelMask */
 void channel_set_defaults(nvngfx_ctx*, uint64_t* x) {
     nvngfx_channel_mask_state s;
@@ -4752,6 +4836,24 @@ void channel_set_mask(nvngfx_ctx*, uint64_t* x) {
     const unsigned sh = 4u * i;
     s.mask = (s.mask & ~(0xFu << sh)) | (nib << sh);
     write_channel(x[0], &s);
+}
+
+/* nvnChannelMaskStateGetChannelMask(const NVNchannelMaskState*, int,
+ *                                   NVNboolean* r, ... , NVNboolean* a) */
+void channel_get_mask(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_channel_mask_state s;
+    if (!read_channel(x[0], &s)) return;
+    const int i = static_cast<int>(x[1]);
+    const unsigned m = (i >= 0 && i < 8)
+                           ? ((s.mask >> (4 * i)) & 0xFu) : 0u;
+    unsigned* r = guest_ptr<unsigned>(x[2]);
+    unsigned* g = guest_ptr<unsigned>(x[3]);
+    unsigned* b = guest_ptr<unsigned>(x[4]);
+    unsigned* a = guest_ptr<unsigned>(x[5]);
+    if (r) *r = (m & 1u) ? 1u : 0u;
+    if (g) *g = (m & 2u) ? 1u : 0u;
+    if (b) *b = (m & 4u) ? 1u : 0u;
+    if (a) *a = (m & 8u) ? 1u : 0u;
 }
 
 /* nvnMultisampleStateSet*: ten one-byte fields in declaration order. */
@@ -4828,6 +4930,52 @@ void multisample_set_sample_locations(nvngfx_ctx*, uint64_t* x) {
              static_cast<unsigned>(x[2]));
 }
 
+/* The ten getters below only read the 10-byte bindable state.  They do not
+ * pretend to know anything the setters did not record. */
+void multisample_get_enable(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_multisample_state s;
+    x[0] = read_multisample(x[0], &s) && s.enable ? 1u : 0u;
+}
+void multisample_get_samples(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_multisample_state s;
+    x[0] = read_multisample(x[0], &s) ? s.samples : 0u;
+}
+void multisample_get_a2c_enable(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_multisample_state s;
+    x[0] = read_multisample(x[0], &s) && s.a2c ? 1u : 0u;
+}
+void multisample_get_a2c_dither(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_multisample_state s;
+    x[0] = read_multisample(x[0], &s) && s.a2c_dither ? 1u : 0u;
+}
+void multisample_get_raster_samples(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_multisample_state s;
+    x[0] = read_multisample(x[0], &s) ? s.raster_samples : 0u;
+}
+void multisample_get_cov_mod(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_multisample_state s;
+    x[0] = read_multisample(x[0], &s) ? s.cov_mod : 0u;
+}
+void multisample_get_cov2color_en(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_multisample_state s;
+    x[0] = read_multisample(x[0], &s) && s.cov2color_en ? 1u : 0u;
+}
+void multisample_get_cov2color_out(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_multisample_state s;
+    x[0] = read_multisample(x[0], &s) ? s.cov2color_out : 0u;
+}
+void multisample_get_sl_enable(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_multisample_state s;
+    x[0] = read_multisample(x[0], &s) && s.sl_en ? 1u : 0u;
+}
+void multisample_get_sl_grid(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_multisample_state s;
+    x[0] = read_multisample(x[0], &s) && s.sl_grid ? 1u : 0u;
+}
+/* nvnMultisampleStateGetSampleLocationsGrid is deliberately not bound: the
+ * state has a grid-enable byte but no grid dimensions, and no public
+ * implementation says what the two int* should receive. */
+
 /* nvnPolygonStateSetDefaults / CullFace / FrontFace / Mode / OffsetEnables */
 void polygon_set_defaults(nvngfx_ctx*, uint64_t* x) {
     nvngfx_polygon_state s;
@@ -4857,6 +5005,23 @@ void polygon_set_offset(nvngfx_ctx*, uint64_t* x) {
     if (!read_polygon(x[0], &s)) return;
     s.offset_en = static_cast<unsigned>(x[1]);
     write_polygon(x[0], &s);
+}
+
+void polygon_get_cull(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_polygon_state s;
+    x[0] = read_polygon(x[0], &s) ? s.cull : 0u;
+}
+void polygon_get_front(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_polygon_state s;
+    x[0] = read_polygon(x[0], &s) ? s.front : 0u;
+}
+void polygon_get_mode(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_polygon_state s;
+    x[0] = read_polygon(x[0], &s) ? s.mode : 0u;
+}
+void polygon_get_offset(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_polygon_state s;
+    x[0] = read_polygon(x[0], &s) ? s.offset_en : 0u;
 }
 
 /* nvnDepthStencilStateSet* */
@@ -4912,6 +5077,42 @@ void depth_set_stencil_op(nvngfx_ctx*, uint64_t* x) {
         s.zpass_b = static_cast<unsigned>(x[4]);
     }
     write_depth(x[0], &s);
+}
+
+void depth_get_test(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_depth_stencil_state s;
+    x[0] = read_depth(x[0], &s) && s.dt ? 1u : 0u;
+}
+void depth_get_write(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_depth_stencil_state s;
+    x[0] = read_depth(x[0], &s) && s.dw ? 1u : 0u;
+}
+void depth_get_func(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_depth_stencil_state s;
+    x[0] = read_depth(x[0], &s) ? s.df : 0u;
+}
+void depth_get_stencil_test(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_depth_stencil_state s;
+    x[0] = read_depth(x[0], &s) && s.st ? 1u : 0u;
+}
+/* NVNface: 1 = front, 2 = back.  The setter accepts a bit mask (3 updates
+ * both faces); the getter follows nxnative and returns the back face only
+ * for exactly NVN_FACE_BACK. */
+void depth_get_stencil_func(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_depth_stencil_state s;
+    if (!read_depth(x[0], &s)) { x[0] = 0; return; }
+    x[0] = static_cast<unsigned>(x[1]) == 2u ? s.sf_b : s.sf_f;
+}
+void depth_get_stencil_op(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_depth_stencil_state s;
+    if (!read_depth(x[0], &s)) return;
+    const bool back = static_cast<unsigned>(x[1]) == 2u;
+    unsigned* fail = guest_ptr<unsigned>(x[2]);
+    unsigned* zfail = guest_ptr<unsigned>(x[3]);
+    unsigned* zpass = guest_ptr<unsigned>(x[4]);
+    if (fail) *fail = back ? s.fail_b : s.fail_f;
+    if (zfail) *zfail = back ? s.zfail_b : s.zfail_f;
+    if (zpass) *zpass = back ? s.zpass_b : s.zpass_f;
 }
 
 /* nvnCommandBufferBindVertexAttribState(NVNcommandBuffer*, int,
@@ -8786,12 +8987,25 @@ const Binding kBindings[] = {
     BIND("nvnBlendStateSetBlendTarget", blend_set_target),
     BIND("nvnBlendStateSetBlendFunc", blend_set_func),
     BIND("nvnBlendStateSetBlendEquation", blend_set_equation),
+    BIND("nvnBlendStateSetAdvancedMode", blend_set_advanced_mode),
+    BIND("nvnBlendStateSetAdvancedPremultipliedSrc", blend_set_advanced_premultiplied),
+    BIND("nvnBlendStateSetAdvancedOverlap", blend_set_advanced_overlap),
+    BIND("nvnBlendStateGetBlendTarget", blend_get_target),
+    BIND("nvnBlendStateGetBlendFunc", blend_get_func),
+    BIND("nvnBlendStateGetBlendEquation", blend_get_equation),
+    BIND("nvnBlendStateGetAdvancedMode", blend_get_advanced_mode),
+    BIND("nvnBlendStateGetAdvancedPremultipliedSrc", blend_get_advanced_premultiplied),
+    BIND("nvnBlendStateGetAdvancedOverlap", blend_get_advanced_overlap),
     BIND("nvnColorStateSetDefaults", color_set_defaults),
     BIND("nvnColorStateSetBlendEnable", color_set_blend_enable),
     BIND("nvnColorStateSetLogicOp", color_set_logic_op),
     BIND("nvnColorStateSetAlphaTest", color_set_alpha_test),
+    BIND("nvnColorStateGetBlendEnable", color_get_blend_enable),
+    BIND("nvnColorStateGetLogicOp", color_get_logic_op),
+    BIND("nvnColorStateGetAlphaTest", color_get_alpha_test),
     BIND("nvnChannelMaskStateSetDefaults", channel_set_defaults),
     BIND("nvnChannelMaskStateSetChannelMask", channel_set_mask),
+    BIND("nvnChannelMaskStateGetChannelMask", channel_get_mask),
     BIND("nvnMultisampleStateSetDefaults", multisample_set_defaults),
     BIND("nvnMultisampleStateSetMultisampleEnable", multisample_set_enable),
     BIND("nvnMultisampleStateSetSamples", multisample_set_samples),
@@ -8804,11 +9018,25 @@ const Binding kBindings[] = {
     BIND("nvnMultisampleStateSetSampleLocationsEnable", multisample_set_sl_enable),
     BIND("nvnMultisampleStateSetSampleLocationsGridEnable", multisample_set_sl_grid),
     BIND("nvnMultisampleStateSetSampleLocations", multisample_set_sample_locations),
+    BIND("nvnMultisampleStateGetMultisampleEnable", multisample_get_enable),
+    BIND("nvnMultisampleStateGetSamples", multisample_get_samples),
+    BIND("nvnMultisampleStateGetAlphaToCoverageEnable", multisample_get_a2c_enable),
+    BIND("nvnMultisampleStateGetAlphaToCoverageDither", multisample_get_a2c_dither),
+    BIND("nvnMultisampleStateGetRasterSamples", multisample_get_raster_samples),
+    BIND("nvnMultisampleStateGetCoverageModulationMode", multisample_get_cov_mod),
+    BIND("nvnMultisampleStateGetCoverageToColorEnable", multisample_get_cov2color_en),
+    BIND("nvnMultisampleStateGetCoverageToColorOutput", multisample_get_cov2color_out),
+    BIND("nvnMultisampleStateGetSampleLocationsEnable", multisample_get_sl_enable),
+    BIND("nvnMultisampleStateGetSampleLocationsGridEnable", multisample_get_sl_grid),
     BIND("nvnPolygonStateSetDefaults", polygon_set_defaults),
     BIND("nvnPolygonStateSetCullFace", polygon_set_cull),
     BIND("nvnPolygonStateSetFrontFace", polygon_set_front),
     BIND("nvnPolygonStateSetPolygonMode", polygon_set_mode),
     BIND("nvnPolygonStateSetPolygonOffsetEnables", polygon_set_offset),
+    BIND("nvnPolygonStateGetCullFace", polygon_get_cull),
+    BIND("nvnPolygonStateGetFrontFace", polygon_get_front),
+    BIND("nvnPolygonStateGetPolygonMode", polygon_get_mode),
+    BIND("nvnPolygonStateGetPolygonOffsetEnables", polygon_get_offset),
     BIND("nvnDepthStencilStateSetDefaults", depth_set_defaults),
     BIND("nvnDepthStencilStateSetDepthTestEnable", depth_set_test),
     BIND("nvnDepthStencilStateSetDepthWriteEnable", depth_set_write),
@@ -8816,6 +9044,12 @@ const Binding kBindings[] = {
     BIND("nvnDepthStencilStateSetStencilTestEnable", depth_set_stencil_test),
     BIND("nvnDepthStencilStateSetStencilFunc", depth_set_stencil_func),
     BIND("nvnDepthStencilStateSetStencilOp", depth_set_stencil_op),
+    BIND("nvnDepthStencilStateGetDepthTestEnable", depth_get_test),
+    BIND("nvnDepthStencilStateGetDepthWriteEnable", depth_get_write),
+    BIND("nvnDepthStencilStateGetDepthFunc", depth_get_func),
+    BIND("nvnDepthStencilStateGetStencilTestEnable", depth_get_stencil_test),
+    BIND("nvnDepthStencilStateGetStencilFunc", depth_get_stencil_func),
+    BIND("nvnDepthStencilStateGetStencilOp", depth_get_stencil_op),
 
     BIND("nvnCommandBufferBindBlendState", cmdbuf_bind_blend_state),
     BIND("nvnCommandBufferBindColorState", cmdbuf_bind_color_state),
@@ -15606,6 +15840,279 @@ extern "C" int nvngfx_metal_selftest(void) {
                          "[selftest] queue/sync: 19 builder entries, queue "
                          "lifecycle/accounting, sync waits, CPU and "
                          "command-buffer events all round-tripped\n");
+        }
+
+        {
+            /* --- Fixed-function state getters ------------------------- */
+            alignas(8) unsigned long long gsb = 0;
+            alignas(8) unsigned gsc = 0, gsch = 0, gsp = 0, gsd = 0;
+            alignas(8) unsigned char gsm[16] = {};
+            const uint64_t kb = reinterpret_cast<uint64_t>(&gsb);
+            const uint64_t kc = reinterpret_cast<uint64_t>(&gsc);
+            const uint64_t kch = reinterpret_cast<uint64_t>(&gsch);
+            const uint64_t km = reinterpret_cast<uint64_t>(gsm);
+            const uint64_t kp = reinterpret_cast<uint64_t>(&gsp);
+            const uint64_t kd = reinterpret_cast<uint64_t>(&gsd);
+            uint64_t y[8] = {};
+            auto get = [&](void (*fn)(nvngfx_ctx*, uint64_t*), uint64_t a) {
+                y[0] = a; y[1] = y[2] = y[3] = y[4] = 0;
+                fn(ctx, y);
+                return y[0];
+            };
+            auto geti = [&](void (*fn)(nvngfx_ctx*, uint64_t*), uint64_t a,
+                            uint64_t i) {
+                y[0] = a; y[1] = i; y[2] = y[3] = y[4] = 0;
+                fn(ctx, y);
+                return y[0];
+            };
+
+            /* Blend: defaults, then target 3 / funcs 5,6,7,8 / eqs 2,3 /
+             * advanced SCREEN, non-premultiplied, conjoined. */
+            y[0] = kb; blend_set_defaults(ctx, y);
+            unsigned bf[4] = {};
+            unsigned be[2] = {};
+            y[0] = kb;
+            y[1] = reinterpret_cast<uint64_t>(&bf[0]);
+            y[2] = reinterpret_cast<uint64_t>(&bf[1]);
+            y[3] = reinterpret_cast<uint64_t>(&bf[2]);
+            y[4] = reinterpret_cast<uint64_t>(&bf[3]);
+            blend_get_func(ctx, y);
+            y[0] = kb;
+            y[1] = reinterpret_cast<uint64_t>(&be[0]);
+            y[2] = reinterpret_cast<uint64_t>(&be[1]);
+            blend_get_equation(ctx, y);
+            if (get(blend_get_target, kb) != 0 ||
+                get(blend_get_advanced_mode, kb) != 0 ||
+                get(blend_get_advanced_premultiplied, kb) != 1 ||
+                get(blend_get_advanced_overlap, kb) != 0 ||
+                bf[0] != 2 || bf[1] != 1 || bf[2] != 2 || bf[3] != 1 ||
+                be[0] != 1 || be[1] != 1) {
+                std::fprintf(stderr,
+                             "[selftest] state getters: blend defaults are "
+                             "wrong\n");
+                rc = 16431;
+                goto done;
+            }
+            y[0] = kb; y[1] = 3; blend_set_target(ctx, y);
+            y[0] = kb; y[1] = 5; y[2] = 6; y[3] = 7; y[4] = 8;
+            blend_set_func(ctx, y);
+            y[0] = kb; y[1] = 2; y[2] = 3; blend_set_equation(ctx, y);
+            y[0] = kb; y[1] = 0x16; blend_set_advanced_mode(ctx, y);
+            y[0] = kb; y[1] = 0; blend_set_advanced_premultiplied(ctx, y);
+            y[0] = kb; y[1] = 2; blend_set_advanced_overlap(ctx, y);
+            bf[0] = bf[1] = bf[2] = bf[3] = 0;
+            be[0] = be[1] = 0;
+            y[0] = kb;
+            y[1] = reinterpret_cast<uint64_t>(&bf[0]);
+            y[2] = reinterpret_cast<uint64_t>(&bf[1]);
+            y[3] = reinterpret_cast<uint64_t>(&bf[2]);
+            y[4] = reinterpret_cast<uint64_t>(&bf[3]);
+            blend_get_func(ctx, y);
+            y[0] = kb;
+            y[1] = reinterpret_cast<uint64_t>(&be[0]);
+            y[2] = reinterpret_cast<uint64_t>(&be[1]);
+            blend_get_equation(ctx, y);
+            if (get(blend_get_target, kb) != 3 ||
+                get(blend_get_advanced_mode, kb) != 0x16 ||
+                get(blend_get_advanced_premultiplied, kb) != 0 ||
+                get(blend_get_advanced_overlap, kb) != 2 ||
+                bf[0] != 5 || bf[1] != 6 || bf[2] != 7 || bf[3] != 8 ||
+                be[0] != 2 || be[1] != 3) {
+                std::fprintf(stderr,
+                             "[selftest] state getters: blend setters did not "
+                             "round-trip\n");
+                rc = 16431;
+                goto done;
+            }
+
+            /* Color, channel mask. */
+            y[0] = kc; color_set_defaults(ctx, y);
+            if (geti(color_get_blend_enable, kc, 0) != 0 ||
+                get(color_get_logic_op, kc) != 3 ||
+                get(color_get_alpha_test, kc) != 8) {
+                std::fprintf(stderr,
+                             "[selftest] state getters: color defaults are "
+                             "wrong\n");
+                rc = 16431;
+                goto done;
+            }
+            y[0] = kc; y[1] = 3; y[2] = 1; color_set_blend_enable(ctx, y);
+            y[0] = kc; y[1] = 2; y[2] = 0; color_set_blend_enable(ctx, y);
+            y[0] = kc; y[1] = 0xC; color_set_logic_op(ctx, y);
+            y[0] = kc; y[1] = 7; color_set_alpha_test(ctx, y);
+            if (geti(color_get_blend_enable, kc, 3) != 1 ||
+                geti(color_get_blend_enable, kc, 2) != 0 ||
+                geti(color_get_blend_enable, kc, 4) != 0 ||
+                get(color_get_logic_op, kc) != 0xC ||
+                get(color_get_alpha_test, kc) != 7) {
+                std::fprintf(stderr,
+                             "[selftest] state getters: color setters did not "
+                             "round-trip\n");
+                rc = 16431;
+                goto done;
+            }
+            unsigned cm[4] = {};
+            y[0] = kch; channel_set_defaults(ctx, y);
+            y[0] = kch; y[1] = 0;
+            y[2] = reinterpret_cast<uint64_t>(&cm[0]);
+            y[3] = reinterpret_cast<uint64_t>(&cm[1]);
+            y[4] = reinterpret_cast<uint64_t>(&cm[2]);
+            y[5] = reinterpret_cast<uint64_t>(&cm[3]);
+            channel_get_mask(ctx, y);
+            if (cm[0] != 1 || cm[1] != 1 || cm[2] != 1 || cm[3] != 1) {
+                std::fprintf(stderr,
+                             "[selftest] state getters: channel defaults are "
+                             "wrong\n");
+                rc = 16431;
+                goto done;
+            }
+            y[0] = kch; y[1] = 1; y[2] = 1; y[3] = 0; y[4] = 1; y[5] = 0;
+            channel_set_mask(ctx, y);
+            cm[0] = cm[1] = cm[2] = cm[3] = 9;
+            y[0] = kch; y[1] = 1;
+            y[2] = reinterpret_cast<uint64_t>(&cm[0]);
+            y[3] = reinterpret_cast<uint64_t>(&cm[1]);
+            y[4] = reinterpret_cast<uint64_t>(&cm[2]);
+            y[5] = reinterpret_cast<uint64_t>(&cm[3]);
+            channel_get_mask(ctx, y);
+            if (cm[0] != 1 || cm[1] != 0 || cm[2] != 1 || cm[3] != 0) {
+                std::fprintf(stderr,
+                             "[selftest] state getters: channel mask did not "
+                             "round-trip\n");
+                rc = 16431;
+                goto done;
+            }
+
+            /* Multisample: ten one-byte fields. */
+            y[0] = km; multisample_set_defaults(ctx, y);
+            if (get(multisample_get_enable, km) != 1 ||
+                get(multisample_get_samples, km) != 0 ||
+                get(multisample_get_a2c_enable, km) != 0 ||
+                get(multisample_get_a2c_dither, km) != 0 ||
+                get(multisample_get_raster_samples, km) != 0 ||
+                get(multisample_get_cov_mod, km) != 0 ||
+                get(multisample_get_cov2color_en, km) != 0 ||
+                get(multisample_get_cov2color_out, km) != 0 ||
+                get(multisample_get_sl_enable, km) != 0 ||
+                get(multisample_get_sl_grid, km) != 0) {
+                std::fprintf(stderr,
+                             "[selftest] state getters: multisample defaults "
+                             "are wrong\n");
+                rc = 16431;
+                goto done;
+            }
+            y[0] = km; y[1] = 0; multisample_set_enable(ctx, y);
+            y[0] = km; y[1] = 4; multisample_set_samples(ctx, y);
+            y[0] = km; y[1] = 1; multisample_set_a2c(ctx, y);
+            y[0] = km; y[1] = 1; multisample_set_dither(ctx, y);
+            y[0] = km; y[1] = 8; multisample_set_raster_samples(ctx, y);
+            y[0] = km; y[1] = 2; multisample_set_cov_mod(ctx, y);
+            y[0] = km; y[1] = 1; multisample_set_cov2color_en(ctx, y);
+            y[0] = km; y[1] = 3; multisample_set_cov2color_out(ctx, y);
+            y[0] = km; y[1] = 1; multisample_set_sl_enable(ctx, y);
+            y[0] = km; y[1] = 1; multisample_set_sl_grid(ctx, y);
+            if (get(multisample_get_enable, km) != 0 ||
+                get(multisample_get_samples, km) != 4 ||
+                get(multisample_get_a2c_enable, km) != 1 ||
+                get(multisample_get_a2c_dither, km) != 1 ||
+                get(multisample_get_raster_samples, km) != 8 ||
+                get(multisample_get_cov_mod, km) != 2 ||
+                get(multisample_get_cov2color_en, km) != 1 ||
+                get(multisample_get_cov2color_out, km) != 3 ||
+                get(multisample_get_sl_enable, km) != 1 ||
+                get(multisample_get_sl_grid, km) != 1) {
+                std::fprintf(stderr,
+                             "[selftest] state getters: multisample setters "
+                             "did not round-trip\n");
+                rc = 16431;
+                goto done;
+            }
+
+            /* Polygon and depth/stencil, including both faces. */
+            y[0] = kp; polygon_set_defaults(ctx, y);
+            if (get(polygon_get_cull, kp) != 0 ||
+                get(polygon_get_front, kp) != 1 ||
+                get(polygon_get_mode, kp) != 2 ||
+                get(polygon_get_offset, kp) != 0) {
+                std::fprintf(stderr,
+                             "[selftest] state getters: polygon defaults are "
+                             "wrong\n");
+                rc = 16431;
+                goto done;
+            }
+            y[0] = kp; y[1] = 2; polygon_set_cull(ctx, y);
+            y[0] = kp; y[1] = 0; polygon_set_front(ctx, y);
+            y[0] = kp; y[1] = 1; polygon_set_mode(ctx, y);
+            y[0] = kp; y[1] = 5; polygon_set_offset(ctx, y);
+            if (get(polygon_get_cull, kp) != 2 ||
+                get(polygon_get_front, kp) != 0 ||
+                get(polygon_get_mode, kp) != 1 ||
+                get(polygon_get_offset, kp) != 5) {
+                std::fprintf(stderr,
+                             "[selftest] state getters: polygon setters did "
+                             "not round-trip\n");
+                rc = 16431;
+                goto done;
+            }
+            y[0] = kd; depth_set_defaults(ctx, y);
+            if (get(depth_get_test, kd) != 0 ||
+                get(depth_get_write, kd) != 1 ||
+                get(depth_get_func, kd) != 2 ||
+                get(depth_get_stencil_test, kd) != 0 ||
+                geti(depth_get_stencil_func, kd, 1) != 8 ||
+                geti(depth_get_stencil_func, kd, 2) != 8) {
+                std::fprintf(stderr,
+                             "[selftest] state getters: depth defaults are "
+                             "wrong\n");
+                rc = 16431;
+                goto done;
+            }
+            y[0] = kd; y[1] = 1; depth_set_test(ctx, y);
+            y[0] = kd; y[1] = 0; depth_set_write(ctx, y);
+            y[0] = kd; y[1] = 3; depth_set_func(ctx, y);
+            y[0] = kd; y[1] = 1; depth_set_stencil_test(ctx, y);
+            y[0] = kd; y[1] = 1; y[2] = 2; depth_set_stencil_func(ctx, y);
+            y[0] = kd; y[1] = 2; y[2] = 4; depth_set_stencil_func(ctx, y);
+            y[0] = kd; y[1] = 1; y[2] = 2; y[3] = 3; y[4] = 4;
+            depth_set_stencil_op(ctx, y);
+            y[0] = kd; y[1] = 2; y[2] = 5; y[3] = 6; y[4] = 7;
+            depth_set_stencil_op(ctx, y);
+            unsigned so[3] = {};
+            y[0] = kd; y[1] = 1;
+            y[2] = reinterpret_cast<uint64_t>(&so[0]);
+            y[3] = reinterpret_cast<uint64_t>(&so[1]);
+            y[4] = reinterpret_cast<uint64_t>(&so[2]);
+            depth_get_stencil_op(ctx, y);
+            if (get(depth_get_test, kd) != 1 ||
+                get(depth_get_write, kd) != 0 ||
+                get(depth_get_func, kd) != 3 ||
+                get(depth_get_stencil_test, kd) != 1 ||
+                geti(depth_get_stencil_func, kd, 1) != 2 ||
+                geti(depth_get_stencil_func, kd, 2) != 4 ||
+                so[0] != 2 || so[1] != 3 || so[2] != 4) {
+                std::fprintf(stderr,
+                             "[selftest] state getters: depth setters did not "
+                             "round-trip front\n");
+                rc = 16431;
+                goto done;
+            }
+            so[0] = so[1] = so[2] = 0;
+            y[0] = kd; y[1] = 2;
+            y[2] = reinterpret_cast<uint64_t>(&so[0]);
+            y[3] = reinterpret_cast<uint64_t>(&so[1]);
+            y[4] = reinterpret_cast<uint64_t>(&so[2]);
+            depth_get_stencil_op(ctx, y);
+            if (so[0] != 5 || so[1] != 6 || so[2] != 7) {
+                std::fprintf(stderr,
+                             "[selftest] state getters: back stencil ops did "
+                             "not round-trip\n");
+                rc = 16431;
+                goto done;
+            }
+            std::fprintf(stderr,
+                         "[selftest] state getters: blend (incl. advanced), "
+                         "color, channel mask, multisample, polygon and "
+                         "depth/stencil answered what their setters stored\n");
         }
 
     done:

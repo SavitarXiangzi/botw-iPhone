@@ -22,14 +22,17 @@ int main() {
     unsigned long long bb = nvngfx_blend_pack(&b);
     check(f(bb, 0, 3) == 0 && f(bb, 3, 7) == 2 && f(bb, 10, 7) == 1 &&
           f(bb, 17, 7) == 2 && f(bb, 24, 7) == 1 &&
-          f(bb, 31, 3) == 1 && f(bb, 34, 3) == 1, "blend defaults");
+          f(bb, 31, 3) == 1 && f(bb, 34, 3) == 1 &&
+          f(bb, 37, 6) == 0 && f(bb, 43, 1) == 0 && f(bb, 44, 2) == 0,
+          "blend defaults");
 
     b.target = 2; b.src_rgb = 5; b.dst_rgb = 6; b.src_a = 7; b.dst_a = 8;
-    b.eq_rgb = 2; b.eq_a = 3;
+    b.eq_rgb = 2; b.eq_a = 3; b.adv = 0x16; b.adv_npm = 1; b.adv_ovl = 2;
     nvngfx_blend_state br;
     nvngfx_blend_unpack(&br, nvngfx_blend_pack(&b));
     check(br.target == 2 && br.src_rgb == 5 && br.dst_rgb == 6 &&
-          br.src_a == 7 && br.dst_a == 8 && br.eq_rgb == 2 && br.eq_a == 3,
+          br.src_a == 7 && br.dst_a == 8 && br.eq_rgb == 2 && br.eq_a == 3 &&
+          br.adv == 0x16 && br.adv_npm == 1 && br.adv_ovl == 2,
           "blend round trip");
 
     nvngfx_color_state c;

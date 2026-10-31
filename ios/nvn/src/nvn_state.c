@@ -19,6 +19,7 @@ void nvngfx_blend_defaults(nvngfx_blend_state* s) {
     s->src_rgb = 2; s->dst_rgb = 1;
     s->src_a = 2; s->dst_a = 1;
     s->eq_rgb = 1; s->eq_a = 1;
+    s->adv = 0; s->adv_npm = 0; s->adv_ovl = 0;
 }
 
 unsigned long long nvngfx_blend_pack(const nvngfx_blend_state* s) {
@@ -31,6 +32,9 @@ unsigned long long nvngfx_blend_pack(const nvngfx_blend_state* s) {
     v = put(v, 24, 7, s->dst_a);
     v = put(v, 31, 3, s->eq_rgb);
     v = put(v, 34, 3, s->eq_a);
+    v = put(v, 37, 6, s->adv);
+    v = put(v, 43, 1, s->adv_npm);
+    v = put(v, 44, 2, s->adv_ovl);
     return v;
 }
 
@@ -43,6 +47,9 @@ void nvngfx_blend_unpack(nvngfx_blend_state* s, unsigned long long v) {
     s->dst_a = (unsigned)bf(v, 24, 7);
     s->eq_rgb = (unsigned)bf(v, 31, 3);
     s->eq_a = (unsigned)bf(v, 34, 3);
+    s->adv = (unsigned)bf(v, 37, 6);
+    s->adv_npm = (unsigned)bf(v, 43, 1);
+    s->adv_ovl = (unsigned)bf(v, 44, 2);
 }
 
 /* Color: defaults are blend disabled, COPY, ALWAYS. */

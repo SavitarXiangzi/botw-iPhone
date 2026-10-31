@@ -15,9 +15,14 @@ extern "C" {
 #endif
 
 /* NVNblendState: uint64
- * { target:3, src_rgb:7, dst_rgb:7, src_a:7, dst_a:7, eq_rgb:3, eq_a:3 } */
+ * { target:3, src_rgb:7, dst_rgb:7, src_a:7, dst_a:7, eq_rgb:3, eq_a:3,
+ *   adv:6, adv_npm:1, adv_ovl:2 }
+ * The advanced fields are nxnative's measured layout (nvn_obj.h, MIT):
+ * adv is NVNblendAdvancedMode, adv_npm is the inverse of
+ * SetAdvancedPremultipliedSrc, adv_ovl is NVNblendAdvancedOverlap. */
 typedef struct {
     unsigned target, src_rgb, dst_rgb, src_a, dst_a, eq_rgb, eq_a;
+    unsigned adv, adv_npm, adv_ovl;
 } nvngfx_blend_state;
 
 /* NVNcolorState: uint32 { blend_en:8, logic_op:4, alpha_func:4 } */

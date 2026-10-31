@@ -7,8 +7,8 @@
 `nvn*` 字符串（运行时按名解析，所以名字本身就暴露了完整接口面）。
 
 - 接口总数：**513**
-- Metal 后端已实现：**363**（70.8%）
-- 仍未实现：**150**
+- Metal 后端已实现：**396**（77.2%）
+- 仍未实现：**117**
 
 > 只有出现在 `ios/nvn/implemented_metal.txt` 里、且确实在
 > `ios/nvn/src/nvn_metal.mm` 中定义过的名字才算“已实现”。
@@ -23,46 +23,46 @@
 | TextureBuilder | 28 | 43 | `#######   ` |
 | Device | 7 | 27 | `###       ` |
 | SamplerBuilder | 24 | 25 | `##########` |
-| MultisampleState | 12 | 23 | `#####     ` |
+| MultisampleState | 22 | 23 | `##########` |
 | QueueBuilder | 19 | 19 | `##########` |
-| BlendState | 4 | 15 | `###       ` |
+| BlendState | 13 | 15 | `######### ` |
 | Queue | 15 | 15 | `##########` |
 | Sampler | 14 | 15 | `######### ` |
-| DepthStencilState | 7 | 13 | `#####     ` |
+| DepthStencilState | 13 | 13 | `##########` |
 | Window | 6 | 12 | `#####     ` |
 | WindowBuilder | 5 | 12 | `####      ` |
 | Buffer | 11 | 11 | `##########` |
 | MemoryPool | 9 | 10 | `######### ` |
-| PolygonState | 5 | 9 | `######    ` |
+| PolygonState | 9 | 9 | `##########` |
 | MemoryPoolBuilder | 8 | 8 | `##########` |
 | SamplerPool | 7 | 8 | `######### ` |
 | TexturePool | 7 | 8 | `######### ` |
 | BufferBuilder | 7 | 7 | `##########` |
-| ColorState | 4 | 7 | `######    ` |
+| ColorState | 7 | 7 | `##########` |
 | Event | 6 | 7 | `######### ` |
 | Program | 3 | 7 | `####      ` |
 | Sync | 4 | 6 | `#######   ` |
 | VertexAttribState | 5 | 5 | `##########` |
 | VertexStreamState | 5 | 5 | `##########` |
-| ChannelMaskState | 2 | 3 | `#######   ` |
+| ChannelMaskState | 3 | 3 | `##########` |
 | DeviceBuilder | 3 | 3 | `##########` |
 | Bootstrap | 0 | 1 | `          ` |
 
 ## 明细
 
-### BlendState (4/15)
+### BlendState (13/15)
 
-- [ ] `nvnBlendStateGetAdvancedMode`
+- [x] `nvnBlendStateGetAdvancedMode`
 - [ ] `nvnBlendStateGetAdvancedNormalizedDst`
-- [ ] `nvnBlendStateGetAdvancedOverlap`
-- [ ] `nvnBlendStateGetAdvancedPremultipliedSrc`
-- [ ] `nvnBlendStateGetBlendEquation`
-- [ ] `nvnBlendStateGetBlendFunc`
-- [ ] `nvnBlendStateGetBlendTarget`
-- [ ] `nvnBlendStateSetAdvancedMode`
+- [x] `nvnBlendStateGetAdvancedOverlap`
+- [x] `nvnBlendStateGetAdvancedPremultipliedSrc`
+- [x] `nvnBlendStateGetBlendEquation`
+- [x] `nvnBlendStateGetBlendFunc`
+- [x] `nvnBlendStateGetBlendTarget`
+- [x] `nvnBlendStateSetAdvancedMode`
 - [ ] `nvnBlendStateSetAdvancedNormalizedDst`
-- [ ] `nvnBlendStateSetAdvancedOverlap`
-- [ ] `nvnBlendStateSetAdvancedPremultipliedSrc`
+- [x] `nvnBlendStateSetAdvancedOverlap`
+- [x] `nvnBlendStateSetAdvancedPremultipliedSrc`
 - [x] `nvnBlendStateSetBlendEquation`
 - [x] `nvnBlendStateSetBlendFunc`
 - [x] `nvnBlendStateSetBlendTarget`
@@ -96,17 +96,17 @@
 - [x] `nvnBufferBuilderSetDevice`
 - [x] `nvnBufferBuilderSetStorage`
 
-### ChannelMaskState (2/3)
+### ChannelMaskState (3/3)
 
-- [ ] `nvnChannelMaskStateGetChannelMask`
+- [x] `nvnChannelMaskStateGetChannelMask`
 - [x] `nvnChannelMaskStateSetChannelMask`
 - [x] `nvnChannelMaskStateSetDefaults`
 
-### ColorState (4/7)
+### ColorState (7/7)
 
-- [ ] `nvnColorStateGetAlphaTest`
-- [ ] `nvnColorStateGetBlendEnable`
-- [ ] `nvnColorStateGetLogicOp`
+- [x] `nvnColorStateGetAlphaTest`
+- [x] `nvnColorStateGetBlendEnable`
+- [x] `nvnColorStateGetLogicOp`
 - [x] `nvnColorStateSetAlphaTest`
 - [x] `nvnColorStateSetBlendEnable`
 - [x] `nvnColorStateSetDefaults`
@@ -259,14 +259,14 @@
 - [x] `nvnCommandBufferWaitEvent`
 - [x] `nvnCommandBufferWaitSync`
 
-### DepthStencilState (7/13)
+### DepthStencilState (13/13)
 
-- [ ] `nvnDepthStencilStateGetDepthFunc`
-- [ ] `nvnDepthStencilStateGetDepthTestEnable`
-- [ ] `nvnDepthStencilStateGetDepthWriteEnable`
-- [ ] `nvnDepthStencilStateGetStencilFunc`
-- [ ] `nvnDepthStencilStateGetStencilOp`
-- [ ] `nvnDepthStencilStateGetStencilTestEnable`
+- [x] `nvnDepthStencilStateGetDepthFunc`
+- [x] `nvnDepthStencilStateGetDepthTestEnable`
+- [x] `nvnDepthStencilStateGetDepthWriteEnable`
+- [x] `nvnDepthStencilStateGetStencilFunc`
+- [x] `nvnDepthStencilStateGetStencilOp`
+- [x] `nvnDepthStencilStateGetStencilTestEnable`
 - [x] `nvnDepthStencilStateSetDefaults`
 - [x] `nvnDepthStencilStateSetDepthFunc`
 - [x] `nvnDepthStencilStateSetDepthTestEnable`
@@ -345,19 +345,19 @@
 - [x] `nvnMemoryPoolBuilderSetFlags`
 - [x] `nvnMemoryPoolBuilderSetStorage`
 
-### MultisampleState (12/23)
+### MultisampleState (22/23)
 
-- [ ] `nvnMultisampleStateGetAlphaToCoverageDither`
-- [ ] `nvnMultisampleStateGetAlphaToCoverageEnable`
-- [ ] `nvnMultisampleStateGetCoverageModulationMode`
-- [ ] `nvnMultisampleStateGetCoverageToColorEnable`
-- [ ] `nvnMultisampleStateGetCoverageToColorOutput`
-- [ ] `nvnMultisampleStateGetMultisampleEnable`
-- [ ] `nvnMultisampleStateGetRasterSamples`
-- [ ] `nvnMultisampleStateGetSampleLocationsEnable`
+- [x] `nvnMultisampleStateGetAlphaToCoverageDither`
+- [x] `nvnMultisampleStateGetAlphaToCoverageEnable`
+- [x] `nvnMultisampleStateGetCoverageModulationMode`
+- [x] `nvnMultisampleStateGetCoverageToColorEnable`
+- [x] `nvnMultisampleStateGetCoverageToColorOutput`
+- [x] `nvnMultisampleStateGetMultisampleEnable`
+- [x] `nvnMultisampleStateGetRasterSamples`
+- [x] `nvnMultisampleStateGetSampleLocationsEnable`
 - [ ] `nvnMultisampleStateGetSampleLocationsGrid`
-- [ ] `nvnMultisampleStateGetSampleLocationsGridEnable`
-- [ ] `nvnMultisampleStateGetSamples`
+- [x] `nvnMultisampleStateGetSampleLocationsGridEnable`
+- [x] `nvnMultisampleStateGetSamples`
 - [x] `nvnMultisampleStateSetAlphaToCoverageDither`
 - [x] `nvnMultisampleStateSetAlphaToCoverageEnable`
 - [x] `nvnMultisampleStateSetCoverageModulationMode`
@@ -371,12 +371,12 @@
 - [x] `nvnMultisampleStateSetSampleLocationsGridEnable`
 - [x] `nvnMultisampleStateSetSamples`
 
-### PolygonState (5/9)
+### PolygonState (9/9)
 
-- [ ] `nvnPolygonStateGetCullFace`
-- [ ] `nvnPolygonStateGetFrontFace`
-- [ ] `nvnPolygonStateGetPolygonMode`
-- [ ] `nvnPolygonStateGetPolygonOffsetEnables`
+- [x] `nvnPolygonStateGetCullFace`
+- [x] `nvnPolygonStateGetFrontFace`
+- [x] `nvnPolygonStateGetPolygonMode`
+- [x] `nvnPolygonStateGetPolygonOffsetEnables`
 - [x] `nvnPolygonStateSetCullFace`
 - [x] `nvnPolygonStateSetDefaults`
 - [x] `nvnPolygonStateSetFrontFace`
