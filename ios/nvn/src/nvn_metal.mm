@@ -18454,9 +18454,13 @@ extern "C" int nvngfx_metal_selftest(void) {
                  * is a round trip through both: the same 2x2 region written
                  * then read must come back byte for byte. */
                 int rdRegion[6] = {0, 0, 0, 2, 2, 1};
-                unsigned char wsrc[8] = {0x11, 0x22, 0x33, 0x44,
-                                         0x55, 0x66, 0x77, 0x88};
-                unsigned char rdst[8] = {0};
+                /* A 2x2 RGBA8 region is two rows of 8 bytes, so both the
+                 * source and the tight destination must hold 16. */
+                unsigned char wsrc[16] = {0x11, 0x22, 0x33, 0x44,
+                                          0x55, 0x66, 0x77, 0x88,
+                                          0x91, 0xA2, 0xB3, 0xC4,
+                                          0xD5, 0xE6, 0xF7, 0x08};
+                unsigned char rdst[16] = {0};
                 x[0] = kPkgObject; x[1] = 0;
                 x[2] = reinterpret_cast<uint64_t>(rdRegion);
                 x[3] = reinterpret_cast<uint64_t>(wsrc);
