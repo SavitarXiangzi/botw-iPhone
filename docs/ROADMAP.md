@@ -5160,3 +5160,83 @@ Actions run `41183353243` 的 macOS `ios` job 也已通过，模拟器输出确�
 accounting, the memory callback and three debug entry points survived a commit
 BOTW_SELFTEST rc=0
 ```
+
+## M4 续十六：逐 draw 固定功能状态与 rasterizer discard
+
+NVN 的固定功能状态里有一批 Metal 没有对应 API 的东西：点大小、线宽、全局采样
+掩码、保守光栅、亚像素精度偏置、tiled cache、ZCull 提示、shader scratch。此前这些
+入口全是日志桩。本轮补齐 13 个，并把其中真正能执行的 rasterizer discard 接进
+draw 路径：
+
+* CommandBuffer：110/144（+13）
+
+Metal 覆盖从 **271/513（52.8%）** 到 **284/513（55.4%）**，未实现 229。
+
+### 1. 记录并上报的状态
+
+下面这些值在 `CmdBuf` 上记录、`BeginRecording` 时归零/复位，并在第一次遇到非默认
+值时上报一次（`log_once`），不伪装成已经生效：
+
+| 入口 | Metal 的现实 |
+|---|---|
+| `SetPointSize` | 点大小由顶点着色器的 `[[point_size]]` 输出决定 |
+| `SetLineWidth` | Metal 的线宽固定 1 像素 |
+| `SetSampleMask` | 没有全局 sample mask API |
+| `SetConservativeRasterEnable/Dilate` | Metal 没有保守光栅 |
+| `SetSubpixelPrecisionBias` | 没有对应能力 |
+| `SetShaderScratchMemory` | Metal shader 不能寻址 scratch pool，值留给翻译器 |
+
+tiled cache 的 action / tile size 与 ZCull 的 save / restore 是纯驱动提示，不改变
+结果，因此只记录、不刷日志；ZCull 的 span 仍然检查是否为 guest 内存，坏指针会报
+一次而不是让指针穿过。
+
+### 2. primitive restart 只在固定值上成立
+
+Metal 的 restart index 是固定的：16 位索引为 `0xFFFF`，32 位为 `0xFFFFFFFF`。
+请求这两个值时行为与 NVN 一致，直接成立；请求别的索引、或试图关闭 restart，都
+无法表达，记录并上报一次——静默忽略会让三角带被错误地缝合。
+
+### 3. rasterizer discard 真正生效
+
+`SetRasterizerDiscard(cb, 1)` 之后，`prepare_render_draw()` 在**管线检查之前**就把
+draw 丢掉：
+
+* `draws` 照常加一（客体确实要求了这次 draw）；
+* `discardedDraws` 加一；
+* `encoded` 不变，`prepare_render_draw` 返回 false，不会开 encoder、不会绑资源；
+* 不会打出 `noPipeline` 之类的假错误。
+
+关闭后下一次 draw 恢复正常路径。这样“被丢弃”和“缺 shader”在自测里是两个可区分
+的计数。
+
+### 4. 模拟器自测
+
+新增失败码 `16427`：
+
+1. 逐个调用 13 个 setter（浮点参数通过 `nvngfx_arg_set_f32` 放进 `nvngfx_args.f`）；
+2. 直接读取 `CmdBuf` 的记录字段，核对 point size 2.5、line width 1.5、restart index
+   `0xFFFFFFFF`、sample mask `0x00FF00FF`、conservative dilate 0.5、subpixel bias
+   `(1, -2)`、tiled cache `3 / 64×64`、scratch `pool / 0 / 128`——空实现的 setter
+   过不了这一步；
+3. ZCull save / restore 接受一个 64 字节 span；
+4. 开始录制、打开 rasterizer discard、draw 一次：`discardedDraws == 1`、
+   `encoded == 0`、`draws == 1`；
+5. 关闭 discard 再 draw：`discardedDraws` 仍为 1、`draws == 2`（这一次因为自测没有
+   绑定 program 而停在管线检查）；
+6. 提交后检查 `MTLCommandBufferStatusError`，再 Finalize。
+
+这一组证明记录语义和 discard 的门控位置，不是标题画面。
+
+### 5. 门禁
+
+```text
+python scripts/syntax_check_metal.py
+python scripts/gen_nvn.py --repo . --check
+python scripts/extract_nvn_signatures.py --check
+python scripts/verify_ios.py
+powershell -ExecutionPolicy Bypass -File scripts/build_abi_test.ps1
+git diff --check
+```
+
+本地已通过（513 procs / 284 implemented / 477 measured + 6 inferred）。
+CI 结果待补。

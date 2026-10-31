@@ -7,8 +7,8 @@
 `nvn*` 字符串（运行时按名解析，所以名字本身就暴露了完整接口面）。
 
 - 接口总数：**513**
-- Metal 后端已实现：**271**（52.8%）
-- 仍未实现：**242**
+- Metal 后端已实现：**284**（55.4%）
+- 仍未实现：**229**
 
 > 只有出现在 `ios/nvn/implemented_metal.txt` 里、且确实在
 > `ios/nvn/src/nvn_metal.mm` 中定义过的名字才算“已实现”。
@@ -18,7 +18,7 @@
 
 | 域 | 已实现 | 总数 | 进度 |
 |---|---:|---:|---|
-| CommandBuffer | 97 | 144 | `#######   ` |
+| CommandBuffer | 110 | 144 | `########  ` |
 | Texture | 4 | 45 | `#         ` |
 | TextureBuilder | 14 | 43 | `###       ` |
 | Device | 7 | 27 | `###       ` |
@@ -112,7 +112,7 @@
 - [x] `nvnColorStateSetDefaults`
 - [x] `nvnColorStateSetLogicOp`
 
-### CommandBuffer (97/144)
+### CommandBuffer (110/144)
 
 - [x] `nvnCommandBufferAddCommandMemory`
 - [x] `nvnCommandBufferAddControlMemory`
@@ -205,16 +205,16 @@
 - [ ] `nvnCommandBufferReportValue`
 - [ ] `nvnCommandBufferResetCounter`
 - [ ] `nvnCommandBufferResolveDepthBuffer`
-- [ ] `nvnCommandBufferRestoreZCullData`
+- [x] `nvnCommandBufferRestoreZCullData`
 - [ ] `nvnCommandBufferResumeTransformFeedback`
-- [ ] `nvnCommandBufferSaveZCullData`
+- [x] `nvnCommandBufferSaveZCullData`
 - [x] `nvnCommandBufferSetAlphaRef`
 - [x] `nvnCommandBufferSetBlendColor`
 - [ ] `nvnCommandBufferSetColorReductionEnable`
 - [ ] `nvnCommandBufferSetColorReductionThresholds`
 - [ ] `nvnCommandBufferSetCommandMemoryCallbackEnabled`
-- [ ] `nvnCommandBufferSetConservativeRasterDilate`
-- [ ] `nvnCommandBufferSetConservativeRasterEnable`
+- [x] `nvnCommandBufferSetConservativeRasterDilate`
+- [x] `nvnCommandBufferSetConservativeRasterEnable`
 - [x] `nvnCommandBufferSetCopyImageStride`
 - [x] `nvnCommandBufferSetCopyRowStride`
 - [x] `nvnCommandBufferSetDebugLabel`
@@ -223,32 +223,32 @@
 - [x] `nvnCommandBufferSetDepthRange`
 - [x] `nvnCommandBufferSetDepthRanges`
 - [ ] `nvnCommandBufferSetInnerTessellationLevels`
-- [ ] `nvnCommandBufferSetLineWidth`
+- [x] `nvnCommandBufferSetLineWidth`
 - [x] `nvnCommandBufferSetMemoryCallback`
 - [x] `nvnCommandBufferSetMemoryCallbackData`
 - [ ] `nvnCommandBufferSetOuterTessellationLevels`
 - [ ] `nvnCommandBufferSetPatchSize`
-- [ ] `nvnCommandBufferSetPointSize`
+- [x] `nvnCommandBufferSetPointSize`
 - [x] `nvnCommandBufferSetPolygonOffsetClamp`
-- [ ] `nvnCommandBufferSetPrimitiveRestart`
+- [x] `nvnCommandBufferSetPrimitiveRestart`
 - [ ] `nvnCommandBufferSetProgramSubroutines`
-- [ ] `nvnCommandBufferSetRasterizerDiscard`
+- [x] `nvnCommandBufferSetRasterizerDiscard`
 - [x] `nvnCommandBufferSetRenderEnable`
 - [ ] `nvnCommandBufferSetRenderEnableConditional`
 - [x] `nvnCommandBufferSetRenderTargets`
-- [ ] `nvnCommandBufferSetSampleMask`
+- [x] `nvnCommandBufferSetSampleMask`
 - [x] `nvnCommandBufferSetSamplerPool`
 - [x] `nvnCommandBufferSetScissor`
 - [x] `nvnCommandBufferSetScissors`
-- [ ] `nvnCommandBufferSetShaderScratchMemory`
+- [x] `nvnCommandBufferSetShaderScratchMemory`
 - [ ] `nvnCommandBufferSetStencilCullCriteria`
 - [x] `nvnCommandBufferSetStencilMask`
 - [x] `nvnCommandBufferSetStencilRef`
 - [x] `nvnCommandBufferSetStencilValueMask`
-- [ ] `nvnCommandBufferSetSubpixelPrecisionBias`
+- [x] `nvnCommandBufferSetSubpixelPrecisionBias`
 - [x] `nvnCommandBufferSetTexturePool`
-- [ ] `nvnCommandBufferSetTiledCacheAction`
-- [ ] `nvnCommandBufferSetTiledCacheTileSize`
+- [x] `nvnCommandBufferSetTiledCacheAction`
+- [x] `nvnCommandBufferSetTiledCacheTileSize`
 - [x] `nvnCommandBufferSetViewport`
 - [x] `nvnCommandBufferSetViewportSwizzles`
 - [x] `nvnCommandBufferSetViewports`

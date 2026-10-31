@@ -45,6 +45,10 @@
  *         command buffer initialize / finalize / is-recording, command and
  *           control memory accounting, and guest debug labels, markers and
  *           groups forwarded to the MTLCommandBuffer
+ *         per-draw fixed-function state Metal cannot express (point size,
+ *           line width, sample mask, primitive restart index, conservative
+ *           raster, subpixel bias, tiled cache, ZCull hints, shader scratch)
+ *           recorded, with rasterizer discard actually enforced
  *         present (blit fast path, cleared-drawable fallback)
  *
  *   TODO  a guest draw still stops at "noPipeline" whenever the offline blob
@@ -553,6 +557,24 @@ struct CmdBuf {
      * per recording; the label survives begin/end. */
     std::string debugLabel;
     std::vector<DebugGroup> debugGroups;
+    /* Fixed-function state Metal cannot express.  The values are recorded so
+     * the guest stream stays aligned and a future translator can consume
+     * them; only rasterizer discard changes what is encoded. */
+    float pointSize = 1.0f;
+    float lineWidth = 1.0f;
+    uint32_t sampleMask = 0xFFFFFFFFu;
+    uint32_t primitiveRestartIndex = 0;
+    bool primitiveRestart = false;
+    bool rasterizerDiscard = false;
+    unsigned discardedDraws = 0;
+    bool conservativeRaster = false;
+    float conservativeDilate = 0.0f;
+    int32_t subpixelBias[2] = {0, 0};
+    uint32_t tiledCacheAction = 0;
+    int32_t tiledCacheTile[2] = {0, 0};
+    uint64_t shaderScratchPool = 0;
+    ptrdiff_t shaderScratchOffset = 0;
+    size_t shaderScratchSize = 0;
 };
 
 /* Builder specs are gathered in a side table keyed by the guest's builder
@@ -5312,6 +5334,21 @@ void cmdbuf_begin_recording(nvngfx_ctx* ctx, uint64_t* x) {
         NSString* label = [NSString stringWithUTF8String:b->debugLabel.c_str()];
         if (label) [b->cb setLabel:label];
     }
+    b->pointSize = 1.0f;
+    b->lineWidth = 1.0f;
+    b->sampleMask = 0xFFFFFFFFu;
+    b->primitiveRestartIndex = 0;
+    b->primitiveRestart = false;
+    b->rasterizerDiscard = false;
+    b->discardedDraws = 0;
+    b->conservativeRaster = false;
+    b->conservativeDilate = 0.0f;
+    b->subpixelBias[0] = b->subpixelBias[1] = 0;
+    b->tiledCacheAction = 0;
+    b->tiledCacheTile[0] = b->tiledCacheTile[1] = 0;
+    b->shaderScratchPool = 0;
+    b->shaderScratchOffset = 0;
+    b->shaderScratchSize = 0;
 }
 
 /* nvnCommandBufferEndRecording(NVNcommandBuffer*) -> NVNcommandHandle
@@ -5615,6 +5652,164 @@ void cmdbuf_pop_debug_group_id(nvngfx_ctx*, uint64_t* x) {
     }
     if (b->recording && b->cb) [b->cb popDebugGroup];
     b->debugGroups.pop_back();
+}
+
+/* ------------------------------------------------------------------ */
+/* fixed-function state Metal has no API for                          */
+/* ------------------------------------------------------------------ */
+
+/* nvnCommandBufferSetPointSize(cb, float).  Metal takes the point size from
+ * the vertex shader's [[point_size]] output; there is no fixed-function
+ * equivalent, so the value is recorded and reported once. */
+void cmdbuf_set_point_size(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    if (!b) return;
+    nvngfx_args* a = reinterpret_cast<nvngfx_args*>(x);
+    b->pointSize = nvngfx_arg_f32(a, 0);
+    log_once_str("nvnCommandBufferSetPointSize.unconsumed",
+                 "Metal point size comes from the vertex shader");
+}
+
+/* nvnCommandBufferSetLineWidth(cb, float).  Metal lines are one pixel wide. */
+void cmdbuf_set_line_width(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    if (!b) return;
+    nvngfx_args* a = reinterpret_cast<nvngfx_args*>(x);
+    b->lineWidth = nvngfx_arg_f32(a, 0);
+    log_once_str("nvnCommandBufferSetLineWidth.unconsumed",
+                 "Metal rasterises lines one pixel wide");
+}
+
+/* nvnCommandBufferSetPrimitiveRestart(cb, uint32_t index, int enable).
+ * Metal's restart index is fixed: 0xFFFF for 16-bit and 0xFFFFFFFF for 32-bit
+ * indices.  That request is honoured; anything else is recorded and reported,
+ * because ignoring it would silently stitch strips. */
+void cmdbuf_set_primitive_restart(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    if (!b) return;
+    b->primitiveRestartIndex = static_cast<uint32_t>(x[1]);
+    b->primitiveRestart = x[2] != 0;
+    if (!b->primitiveRestart) {
+        log_once_str("nvnCommandBufferSetPrimitiveRestart.disable",
+                     "Metal always restarts strips at 0xFFFF/0xFFFFFFFF");
+    } else if (b->primitiveRestartIndex != 0xFFFFu &&
+               b->primitiveRestartIndex != 0xFFFFFFFFu) {
+        log_once("nvnCommandBufferSetPrimitiveRestart.index",
+                 b->primitiveRestartIndex);
+    }
+}
+
+/* nvnCommandBufferSetRasterizerDiscard(cb, uint32_t enable).  This one is
+ * enforced: prepare_render_draw() drops the draw and counts it. */
+void cmdbuf_set_rasterizer_discard(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    if (!b) return;
+    b->rasterizerDiscard = x[1] != 0;
+    if (b->rasterizerDiscard) {
+        log_once_str("nvnCommandBufferSetRasterizerDiscard.enabled",
+                     "draws are consumed without rasterising");
+    }
+}
+
+/* nvnCommandBufferSetSampleMask(cb, int mask).  Metal has no global sample
+ * mask; the value is recorded and reported when it is not all ones. */
+void cmdbuf_set_sample_mask(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    if (!b) return;
+    b->sampleMask = static_cast<uint32_t>(x[1]);
+    if (b->sampleMask != 0xFFFFFFFFu) {
+        log_once_str("nvnCommandBufferSetSampleMask.unconsumed",
+                     "Metal has no global sample mask");
+    }
+}
+
+/* nvnCommandBufferSetConservativeRasterEnable(cb, uint32_t) */
+void cmdbuf_set_conservative_raster(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    if (!b) return;
+    b->conservativeRaster = x[1] != 0;
+    if (b->conservativeRaster) {
+        log_once_str("nvnCommandBufferSetConservativeRasterEnable.unconsumed",
+                     "Metal has no conservative rasterisation");
+    }
+}
+
+/* nvnCommandBufferSetConservativeRasterDilate(cb, float) */
+void cmdbuf_set_conservative_dilate(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    if (!b) return;
+    nvngfx_args* a = reinterpret_cast<nvngfx_args*>(x);
+    b->conservativeDilate = nvngfx_arg_f32(a, 0);
+    if (b->conservativeDilate != 0.0f) {
+        log_once_str("nvnCommandBufferSetConservativeRasterDilate.unconsumed",
+                     "Metal has no conservative raster dilation");
+    }
+}
+
+/* nvnCommandBufferSetSubpixelPrecisionBias(cb, int x, int y) */
+void cmdbuf_set_subpixel_bias(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    if (!b) return;
+    b->subpixelBias[0] = static_cast<int32_t>(x[1]);
+    b->subpixelBias[1] = static_cast<int32_t>(x[2]);
+    if (b->subpixelBias[0] || b->subpixelBias[1]) {
+        log_once_str("nvnCommandBufferSetSubpixelPrecisionBias.unconsumed",
+                     "Metal has no subpixel precision bias");
+    }
+}
+
+/* nvnCommandBufferSetTiledCacheAction(cb, NVNtiledCacheAction) and
+ * SetTiledCacheTileSize(cb, int, int).  Tiled caching is a driver hint; it
+ * does not change the result, so it is recorded without a report. */
+void cmdbuf_set_tiled_cache_action(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    if (b) b->tiledCacheAction = static_cast<uint32_t>(x[1]);
+}
+void cmdbuf_set_tiled_cache_tile_size(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    if (!b) return;
+    b->tiledCacheTile[0] = static_cast<int32_t>(x[1]);
+    b->tiledCacheTile[1] = static_cast<int32_t>(x[2]);
+}
+
+/* nvnCommandBufferSaveZCullData / RestoreZCullData(cb, NVNbufferAddress,
+ * size_t).  There is no Metal ZCull surface to save; the span is validated so
+ * a corrupt call is reported, then the hint is accepted as a no-op. */
+void cmdbuf_save_zcull(nvngfx_ctx*, uint64_t* x) {
+    if (!guest_range(x[1], static_cast<size_t>(x[2]))) {
+        log_once_str("nvnCommandBufferSaveZCullData.range",
+                     "ZCull span is not guest memory");
+        return;
+    }
+    log_once("nvnCommandBufferSaveZCullData.hint", 0);
+}
+void cmdbuf_restore_zcull(nvngfx_ctx*, uint64_t* x) {
+    if (!guest_range(x[1], static_cast<size_t>(x[2]))) {
+        log_once_str("nvnCommandBufferRestoreZCullData.range",
+                     "ZCull span is not guest memory");
+        return;
+    }
+    log_once("nvnCommandBufferRestoreZCullData.hint", 0);
+}
+
+/* nvnCommandBufferSetShaderScratchMemory(cb, const NVNmemoryPool*,
+ * ptrdiff_t offset, size_t size).  Maxwell shaders can address scratch
+ * memory; Metal shaders cannot, so the request is recorded for the
+ * translator and otherwise accepted. */
+void cmdbuf_set_shader_scratch(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    if (!b) return;
+    const ptrdiff_t offset = static_cast<ptrdiff_t>(x[2]);
+    if (offset < 0) {
+        log_once_str("nvnCommandBufferSetShaderScratchMemory.offset",
+                     "negative scratch offset");
+        return;
+    }
+    b->shaderScratchPool = x[1];
+    b->shaderScratchOffset = offset;
+    b->shaderScratchSize = static_cast<size_t>(x[3]);
+    log_once_str("nvnCommandBufferSetShaderScratchMemory.unconsumed",
+                 "Metal shaders cannot address a scratch pool");
 }
 
 /* nvnCommandBufferSetRenderTargets(NVNcommandBuffer*, int n,
@@ -6609,6 +6804,13 @@ bool bind_arguments(Ctx* c, CmdBuf* b) {
  * state requires: build/lookup the pipeline, upload sampled textures before a
  * pass opens, open the pass, then apply encoder state and bind arguments. */
 bool prepare_render_draw(Ctx* c, CmdBuf* b, const char* noPipelineTag) {
+    /* Rasterizer discard consumes the draw without rasterising anything.  It
+     * is checked before the pipeline so a discarded draw is not reported as a
+     * missing-shader failure. */
+    if (b->rasterizerDiscard) {
+        b->discardedDraws++;
+        return false;
+    }
     if (!ensure_pipeline(c, b)) {
         /* The honest line: there is no translated shader, so there is no
          * pipeline, so this draw is dropped.  Once per process. */
@@ -7964,6 +8166,22 @@ const Binding kBindings[] = {
     BIND("nvnCommandBufferPushDebugGroupDynamic", cmdbuf_push_debug_group_dynamic),
     BIND("nvnCommandBufferPopDebugGroup", cmdbuf_pop_debug_group),
     BIND("nvnCommandBufferPopDebugGroupId", cmdbuf_pop_debug_group_id),
+    BIND("nvnCommandBufferSetPointSize", cmdbuf_set_point_size),
+    BIND("nvnCommandBufferSetLineWidth", cmdbuf_set_line_width),
+    BIND("nvnCommandBufferSetPrimitiveRestart", cmdbuf_set_primitive_restart),
+    BIND("nvnCommandBufferSetRasterizerDiscard", cmdbuf_set_rasterizer_discard),
+    BIND("nvnCommandBufferSetSampleMask", cmdbuf_set_sample_mask),
+    BIND("nvnCommandBufferSetConservativeRasterEnable",
+         cmdbuf_set_conservative_raster),
+    BIND("nvnCommandBufferSetConservativeRasterDilate",
+         cmdbuf_set_conservative_dilate),
+    BIND("nvnCommandBufferSetSubpixelPrecisionBias", cmdbuf_set_subpixel_bias),
+    BIND("nvnCommandBufferSetTiledCacheAction", cmdbuf_set_tiled_cache_action),
+    BIND("nvnCommandBufferSetTiledCacheTileSize",
+         cmdbuf_set_tiled_cache_tile_size),
+    BIND("nvnCommandBufferSaveZCullData", cmdbuf_save_zcull),
+    BIND("nvnCommandBufferRestoreZCullData", cmdbuf_restore_zcull),
+    BIND("nvnCommandBufferSetShaderScratchMemory", cmdbuf_set_shader_scratch),
     BIND("nvnCommandBufferClearColori", cmdbuf_clear_color_i),
     BIND("nvnCommandBufferClearColorui", cmdbuf_clear_color_ui),
     BIND("nvnCommandBufferClearDepthStencil", cmdbuf_clear_depth_stencil),
@@ -13649,6 +13867,125 @@ extern "C" int nvngfx_metal_selftest(void) {
                          "command and control memory accounting, the memory "
                          "callback and three debug entry points survived a "
                          "commit\n");
+        }
+
+        {
+            /* --- Fixed-function state and rasterizer discard -------------
+             * Point size, line width, sample mask, conservative raster,
+             * subpixel bias and tiled cache have no Metal equivalent, so the
+             * recorded fields are read directly: a setter that does nothing
+             * cannot pass.  Rasterizer discard must consume the draw without
+             * reaching the pipeline. */
+            const uint64_t kCbState = 0x9FA0;
+            alignas(16) unsigned char zcullProbe[64] = {};
+            nvngfx_args fx = {};
+            fx.x[0] = kCbState;
+            nvngfx_arg_set_f32(&fx, 0, 2.5f);
+            cmdbuf_set_point_size(ctx, reinterpret_cast<uint64_t*>(&fx));
+            nvngfx_arg_set_f32(&fx, 0, 1.5f);
+            cmdbuf_set_line_width(ctx, reinterpret_cast<uint64_t*>(&fx));
+            nvngfx_arg_set_f32(&fx, 0, 0.5f);
+            cmdbuf_set_conservative_dilate(ctx,
+                                           reinterpret_cast<uint64_t*>(&fx));
+
+            x[0] = kCbState; x[1] = 0xFFFFFFFFu; x[2] = 1;
+            cmdbuf_set_primitive_restart(ctx, x);
+            x[0] = kCbState; x[1] = 0x00FF00FFu;
+            cmdbuf_set_sample_mask(ctx, x);
+            x[0] = kCbState; x[1] = 1;
+            cmdbuf_set_conservative_raster(ctx, x);
+            x[0] = kCbState; x[1] = 1;
+            x[2] = static_cast<uint64_t>(static_cast<int64_t>(-2));
+            cmdbuf_set_subpixel_bias(ctx, x);
+            x[0] = kCbState; x[1] = 3;
+            cmdbuf_set_tiled_cache_action(ctx, x);
+            x[0] = kCbState; x[1] = 64; x[2] = 64;
+            cmdbuf_set_tiled_cache_tile_size(ctx, x);
+            x[0] = kCbState; x[1] = kCubePool; x[2] = 0; x[3] = 128;
+            cmdbuf_set_shader_scratch(ctx, x);
+            x[0] = kCbState;
+            x[1] = reinterpret_cast<uint64_t>(zcullProbe); x[2] = 64;
+            cmdbuf_save_zcull(ctx, x);
+            x[0] = kCbState;
+            x[1] = reinterpret_cast<uint64_t>(zcullProbe); x[2] = 64;
+            cmdbuf_restore_zcull(ctx, x);
+
+            CmdBuf* const bstate = find<CmdBuf>(kCbState);
+            if (!bstate || bstate->pointSize != 2.5f ||
+                bstate->lineWidth != 1.5f || !bstate->primitiveRestart ||
+                bstate->primitiveRestartIndex != 0xFFFFFFFFu ||
+                bstate->sampleMask != 0x00FF00FFu ||
+                !bstate->conservativeRaster ||
+                bstate->conservativeDilate != 0.5f ||
+                bstate->subpixelBias[0] != 1 ||
+                bstate->subpixelBias[1] != -2 ||
+                bstate->tiledCacheAction != 3u ||
+                bstate->tiledCacheTile[0] != 64 ||
+                bstate->tiledCacheTile[1] != 64 ||
+                bstate->shaderScratchPool != kCubePool ||
+                bstate->shaderScratchOffset != 0 ||
+                bstate->shaderScratchSize != 128) {
+                std::fprintf(stderr,
+                             "[selftest] state: recorded fixed-function "
+                             "values do not match the setters\n");
+                rc = 16427;
+                goto done;
+            }
+
+            x[0] = kCbState;
+            cmdbuf_begin_recording(ctx, x);
+            x[0] = kCbState; x[1] = 1;
+            cmdbuf_set_rasterizer_discard(ctx, x);
+            x[0] = kCbState; x[1] = 0; x[2] = 0; x[3] = 3;
+            cmdbuf_draw_arrays(ctx, x);
+            if (!bstate || bstate->discardedDraws != 1 ||
+                bstate->encoded != 0 || bstate->draws != 1) {
+                std::fprintf(stderr,
+                             "[selftest] state: a discarded draw reached the "
+                             "encoder (%u discarded, %u encoded, %u asked)\n",
+                             bstate ? bstate->discardedDraws : 0u,
+                             bstate ? bstate->encoded : 0u,
+                             bstate ? bstate->draws : 0u);
+                rc = 16427;
+                goto done;
+            }
+            x[0] = kCbState; x[1] = 0;
+            cmdbuf_set_rasterizer_discard(ctx, x);
+            x[0] = kCbState; x[1] = 0; x[2] = 0; x[3] = 3;
+            cmdbuf_draw_arrays(ctx, x);
+            if (bstate->discardedDraws != 1 || bstate->draws != 2) {
+                std::fprintf(stderr,
+                             "[selftest] state: discard stayed on after being "
+                             "disabled\n");
+                rc = 16427;
+                goto done;
+            }
+            x[0] = kCbState;
+            cmdbuf_end_recording(ctx, x);
+            if (!bstate->last) {
+                std::fprintf(stderr,
+                             "[selftest] state: nothing committed\n");
+                rc = 16427;
+                goto done;
+            }
+            [bstate->last waitUntilCompleted];
+            if (bstate->last.status == MTLCommandBufferStatusError) {
+                std::fprintf(stderr,
+                             "[selftest] state command buffer error: %s\n",
+                             bstate->last.error
+                                 ? [[bstate->last.error localizedDescription]
+                                       UTF8String]
+                                 : "(no description)");
+                rc = 16427;
+                goto done;
+            }
+            x[0] = kCbState;
+            cmdbuf_finalize(ctx, x);
+            std::fprintf(stderr,
+                         "[selftest] state: point size, line width, sample "
+                         "mask, conservative raster, subpixel bias, tiled "
+                         "cache and scratch memory were recorded, and "
+                         "rasterizer discard consumed one draw\n");
         }
 
         {
