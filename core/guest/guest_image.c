@@ -358,6 +358,7 @@ int botw_guest_image_open(botw_guest_image* img, const void* file, size_t file_l
     }
     memcpy(img->base, file, file_len);
     img->owns_base = 1;
+    img->file_size = file_len;
     img->size = (size_t)key_off;
     img->text_end = (size_t)text_end;
     img->ro_off = (size_t)ro_off;
@@ -370,6 +371,15 @@ int botw_guest_image_open(botw_guest_image* img, const void* file, size_t file_l
         set_error(img, "fixups header has no BUILD_ID");
         botw_guest_image_close(img);
         return -1;
+    }
+    /* The rewrite only puts *indices* into the gate/x18 blocks; the offsets
+     * themselves are published into the key page at runtime. */
+    {
+        int64_t idx;
+        img->k18_idx = parse_int(fixups_text, "KEY_K18_IDX", &idx) && idx >= 0 ? (unsigned)idx : 0;
+        img->ktls_idx = parse_int(fixups_text, "KEY_KTLS_IDX", &idx) && idx >= 0 ? (unsigned)idx : 1;
+        img->ktlr_idx = parse_int(fixups_text, "KEY_KTLR_IDX", &idx) && idx >= 0 ? (unsigned)idx : 2;
+        img->kgate_idx = parse_int(fixups_text, "KEY_KGATE_IDX", &idx) && idx >= 0 ? (unsigned)idx : 3;
     }
     if (!read_dynamic(img, &d)) {
         botw_guest_image_close(img);
@@ -394,6 +404,17 @@ void botw_guest_image_close(botw_guest_image* img) {
     if (img->owns_base) free(img->base);
     img->base = NULL;
     img->owns_base = 0;
+}
+
+uint8_t* botw_guest_image_key_page(botw_guest_image* img) {
+    if (!img || !img->base || img->key_page_size == 0) return NULL;
+    if (img->key_page_off + img->key_page_size > img->file_size) return NULL;
+    return img->base + img->key_page_off;
+}
+
+size_t botw_guest_image_key_page_size(const botw_guest_image* img) {
+    if (!img || !img->base) return 0;
+    return img->key_page_size;
 }
 
 size_t botw_guest_image_entry(const botw_guest_image* img) {

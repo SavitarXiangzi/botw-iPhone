@@ -14,6 +14,7 @@
  * header.
  */
 #include "guest_image.h"
+#include "guest_slot.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -42,6 +43,10 @@ static const char* kHeader =
     "# PATCH_OFF\t0x5000\n"
     "# KEY_PAGE_OFF\t0x1000\n"
     "# KEY_PAGE_SIZE\t0x4000\n"
+    "# KEY_K18_IDX\t0\n"
+    "# KEY_KTLS_IDX\t1\n"
+    "# KEY_KTLR_IDX\t2\n"
+    "# KEY_KGATE_IDX\t3\n"
     "# TEXT_END\t0x800\n"
     "# RO_OFF\t0x800\n"
     "# DATA_OFF\t0x800\n"
@@ -124,6 +129,8 @@ static void* resolver(void*, const char* name) {
 }
 static void* null_resolver(void*, const char*) { return nullptr; }
 
+alignas(16) static uint8_t g_slot_memory[0x100];
+
 int main() {
     std::vector<uint8_t> file = make_image();
     botw_guest_image img;
@@ -152,6 +159,30 @@ int main() {
     CHECK(*(const uint64_t*)(img.base + kSlotJump) == 0x12345678u);
     // A GOT slot may name a symbol this module defines; it must not go to HLE.
     CHECK(*(const uint64_t*)(img.base + kSlotGlobDat) == (uint64_t)(uintptr_t)img.base + 0x700u);
+    // Per-thread slot: x18 / tpidr_el0 / tpidrro_el0 storage + gate handler.
+    {
+        botw_guest_slot slot;
+        void* handler = (void*)(uintptr_t)0xdeadbeefu;
+        CHECK(botw_guest_slot_init(&slot, g_slot_memory, sizeof g_slot_memory, handler) == 0);
+        CHECK(slot.error[0] == '\0');
+        CHECK(slot.x18_off == 0 && slot.tls_off == 8 && slot.tlr_off == 16 && slot.gate_off == 24);
+        CHECK(*(const uint64_t*)(slot.base + 0) == 0);            // x18 starts zero
+        CHECK(*(void* const*)(slot.base + 24) == handler);
+        CHECK(img.k18_idx == 0 && img.ktls_idx == 1 && img.ktlr_idx == 2 && img.kgate_idx == 3);
+        CHECK(botw_guest_image_key_page_size(&img) == 0x4000);
+        CHECK(botw_guest_slot_publish(&img, &slot) == 0);
+        const uint64_t* key = (const uint64_t*)botw_guest_image_key_page(&img);
+        CHECK(key != nullptr);
+        if (key) CHECK(key[0] == 0 && key[1] == 8 && key[2] == 16 && key[3] == 24);
+
+        CHECK(botw_guest_slot_init(&slot, g_slot_memory, 0x10, handler) != 0);
+        CHECK(std::strstr(slot.error, "at least") != nullptr);
+        CHECK(botw_guest_slot_init(&slot, g_slot_memory + 8, sizeof g_slot_memory - 8, handler) != 0);
+        CHECK(std::strstr(slot.error, "aligned") != nullptr);
+        CHECK(botw_guest_slot_init(&slot, g_slot_memory, sizeof g_slot_memory, nullptr) != 0);
+        CHECK(std::strstr(slot.error, "handler") != nullptr);
+    }
+
     botw_guest_image_close(&img);
     CHECK(img.base == nullptr);
 
@@ -191,6 +222,6 @@ int main() {
         std::printf("guest_image_test: %d failure(s)\n", g_fail);
         return 1;
     }
-    std::printf("guest_image_test: ok (relative, abs64 base/local/import, imports, refusals)\n");
+    std::printf("guest_image_test: ok (relative, abs64 base/local/import, imports, slot, refusals)\n");
     return 0;
 }

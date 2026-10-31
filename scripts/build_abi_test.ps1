@@ -26,7 +26,7 @@ try {
     New-Item -ItemType Directory -Force -Path build\nvn\abi, build\nvn\core, build\nvn\tex, build\nvn\shd, build\nvn\vtx, build\nvn\smp, build\nvn\pool, build\nvn\txl, build\nvn\bcn, build\nvn\pipe, build\nvn\state, build\nvn\bnd, build\nvn\gst, build\nvn\rel | Out-Null
 
     $inc = "/I core\include /I core\guest /I ios\nvn\include"
-    $lib = "ios\nvn\src\nvn_dispatch.cpp ios\nvn\src\nvn_null.cpp ios\nvn\src\nvn_pool.c ios\nvn\src\nvn_sampler.c ios\nvn\src\nvn_texture.c ios\nvn\src\nvn_shader.c ios\nvn\src\nvn_shader_key.c ios\nvn\src\nvn_shader_bundle.c ios\nvn\src\nvn_shader_blobs.gen.c ios\nvn\src\nvn_texlayout.c ios\nvn\src\nvn_bcn.c ios\nvn\src\nvn_vertex.c ios\nvn\src\nvn_pipeline.c ios\nvn\src\nvn_state.c core\src\botw_core.cpp core\guest\guest_image.c"
+    $lib = "ios\nvn\src\nvn_dispatch.cpp ios\nvn\src\nvn_null.cpp ios\nvn\src\nvn_pool.c ios\nvn\src\nvn_sampler.c ios\nvn\src\nvn_texture.c ios\nvn\src\nvn_shader.c ios\nvn\src\nvn_shader_key.c ios\nvn\src\nvn_shader_bundle.c ios\nvn\src\nvn_shader_blobs.gen.c ios\nvn\src\nvn_texlayout.c ios\nvn\src\nvn_bcn.c ios\nvn\src\nvn_vertex.c ios\nvn\src\nvn_pipeline.c ios\nvn\src\nvn_state.c core\src\botw_core.cpp core\guest\guest_image.c core\guest\guest_slot.c"
     $flags = "/nologo /std:c++20 /EHsc /W4 /WX"
 
     $jobs = @(

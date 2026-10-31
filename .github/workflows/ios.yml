@@ -68,6 +68,7 @@ jobs:
           clang -std=c11 -Wall -Wextra -Werror $INC -c ios/nvn/src/nvn_pipeline.c -o /tmp/nvn_pipeline.o
           clang -std=c11 -Wall -Wextra -Werror $INC -c ios/nvn/src/nvn_state.c -o /tmp/nvn_state.o
           clang -std=c11 -Wall -Wextra -Werror $INC -c core/guest/guest_image.c -o /tmp/guest_image.o
+          clang -std=c11 -Wall -Wextra -Werror $INC -c core/guest/guest_slot.c -o /tmp/guest_slot.o
           LIB="/tmp/guest_image.o ios/nvn/src/nvn_dispatch.cpp ios/nvn/src/nvn_null.cpp core/src/botw_core.cpp /tmp/nvn_texture.o /tmp/nvn_shader.o /tmp/nvn_shader_key.o /tmp/nvn_shader_bundle.o /tmp/nvn_shader_blobs.o /tmp/nvn_vertex.o /tmp/nvn_sampler.o /tmp/nvn_pool.o /tmp/nvn_texlayout.o /tmp/nvn_bcn.o /tmp/nvn_pipeline.o /tmp/nvn_state.o"
           clang++ $FLAGS $INC tests/nvn_abi_test.cpp      $LIB -o /tmp/nvn_abi_test
           clang++ $FLAGS $INC tests/core_smoke_test.cpp   $LIB -o /tmp/core_smoke_test
@@ -93,10 +94,10 @@ jobs:
           /tmp/nvn_shader_bundle_test
           /tmp/nvn_pipeline_test
           /tmp/nvn_state_test
-          clang++ $FLAGS $INC tests/guest_image_test.cpp /tmp/guest_image.o -o /tmp/guest_image_test
+          clang++ $FLAGS $INC tests/guest_image_test.cpp /tmp/guest_image.o /tmp/guest_slot.o -o /tmp/guest_image_test
           /tmp/guest_image_test
           # Host-only loader probe: built everywhere, needs a real image to run.
-          clang++ $FLAGS $INC scripts/guest/reloc_run.cpp /tmp/guest_image.o -o /tmp/reloc_run
+          clang++ $FLAGS $INC scripts/guest/reloc_run.cpp /tmp/guest_image.o /tmp/guest_slot.o -o /tmp/reloc_run
           if /tmp/reloc_run; then
             echo "::error::reloc_run should refuse to run without an image"
             exit 1

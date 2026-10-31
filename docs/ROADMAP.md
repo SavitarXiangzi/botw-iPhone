@@ -7011,3 +7011,96 @@ powershell -ExecutionPolicy Bypass -File scripts/build_abi_test.ps1
 4. 一张约 1,137 个名字的 HLE 表：先喂 `main` 的 458 个和 `rtld` 的 19 个，
    再处理 `subsdk0` 的 647 个；
 5. 只有在真机/模拟器上跑到第一条客体指令之后，才谈 init / fs / vi / nv。
+
+## M4 续三十六：线程槽与 key page
+
+### 1. 先看改写后的真实机器码
+
+`main.gates.tsv` 有 1,431 条 gate：1,337 条 `spin`（自旋回边）和 94 条 `svc`。
+每个 `svc` gate 的块都是同样 0x20 字节 + 8 字节尾巴：
+
+```text
+stp  x29, x30, [sp, #-16]!      ; 保存帧
+mrs  x30, tpidrro_el0           ; 槽基址
+adrp x29, #key_page
+ldr  x29, [x29, #0x18]          ; key_page[KGATE=3] = 槽内偏移
+add  x30, x30, x29
+ldr  x30, [x30]                 ; 槽里的 handler 指针
+ldr  x29, [sp]                  ; 还原 fp
+blr  x30                        ; 进宿主
+ldp  x29, x30, [sp], #16
+b    <site+4>                   ; 回到被改写的下一条指令
+```
+
+两条重要事实：
+
+* 94 条 `svc` 的立即数**全是 `#0x38`**——它只是“这是 gate”的标记，真正的
+  Horizon 系统调用号仍然留在 `x8`（`ldr x0, [x8, #0x20]` 这类块可以印证）；
+* `blr x30` 之前只动了 `x29/x30`，`x0..x8` 原样保留，所以宿主 handler 看到的
+  就是客体寄存器，返回值也天然落回 `x0`。
+
+x18 站点则是另一套固定块（`main.sites.tsv` 里 15,188 条）：
+
+```text
+stp  x0, x1, [sp, #-16]
+mrs  x1, tpidrro_el0
+adrp x0, #key_page
+ldr  x0, [x0]                   ; key_page[K18=0] = 槽内偏移
+add  x1, x1, x0
+ldr  x0, [x1]                   ; 旧 x18（读路径用）
+mov  x0, x17                    ; 改写器把新值放到 x17
+str  x0, [x1]                   ; 写回槽
+ldp  x0, x1, [sp, #-16]
+b    <site+4>
+```
+
+也就是说：**x18 完全变成了内存位置**，`tpidrro_el0` 指向每线程槽，key page
+里存的是“槽内偏移”，不是地址。镜像里的 key page 落盘时**全 0**，必须由
+loader 在跑第一条客体指令之前写进去。
+
+### 2. 槽布局
+
+| 字段 | key page 索引 | 槽内偏移 | 用途 |
+|---|---|---:|---|
+| `x18` | `KEY_K18_IDX`（0） | 0 | 被改写的平台寄存器 |
+| `tpidr_el0` | `KEY_KTLS_IDX`（1） | 8 | TLS 指针的宿主副本 |
+| `tpidrro_el0` | `KEY_KTLR_IDX`（2） | 16 | 只读 TLS 指针 |
+| gate handler | `KEY_KGATE_IDX`（3） | 24 | 宿主分发函数指针 |
+
+偏移是 loader 自己定的（这里取 0/8/16/24），索引来自 fixups 头；两者解耦，
+所以换布局不需要重新改写镜像。
+
+### 3. 实现与测试
+
+`core/guest/guest_slot.{c,h}`：
+
+* `botw_guest_slot_init()`：校验 16 字节对齐、最小 0x40 字节、handler 非空，
+  清零整块后把 handler 写进 `gate_off`；
+* `botw_guest_slot_publish()`：把四个偏移按 fixups 头的索引写进镜像的 key
+  page，越界或没有 key page 时返回错误而不是写坏内存；
+* `guest_image` 新增 `botw_guest_image_key_page()` / `_size()`，以及解析
+  `KEY_K18_IDX` 等四个索引。
+
+`tests/guest_image_test.cpp` 现在覆盖：槽偏移、x18 初值为 0、handler 落位、
+key page 四个条目、未对齐/过小/空 handler 三条拒绝。
+
+### 4. 还没有做的
+
+* 真正把 `tpidrro_el0` 设成槽地址——需要 AArch64 汇编（MSR TPIDRRO_EL0）和
+  每线程切换，本机没有 ARM64 环境可执行；
+* gate trampoline：`blr x30` 只保证 `x0..x8` 可见，要拿到完整寄存器帧还得
+  一段 naked 汇编把 `x0..x30` 和 `sp` 存进 `botw_guest_regs`；
+* 可执行映射：镜像现在还是 `malloc` 的普通内存，text 不能执行；
+* HLE 表本体。
+
+### 5. 门禁
+
+```text
+python scripts/guest/probe_relocs.py --self-test
+python scripts/verify_ios.py
+powershell -ExecutionPolicy Bypass -File scripts/build_abi_test.ps1
+```
+
+guest_image_test 现在同时链接 `guest_image.c` 和 `guest_slot.c`，CI 的
+portable job 用 clang 再跑一遍。
+

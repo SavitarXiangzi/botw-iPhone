@@ -33,6 +33,7 @@ typedef void* (*botw_guest_resolve_fn)(void* user, const char* name);
 typedef struct {
     uint8_t* base;              /* owned copy of the image, mapped at runtime later */
     size_t   size;              /* text + ro + data + bss (relocations live here) */
+    size_t   file_size;         /* whole patched.bin, including key page + patch */
     size_t   text_end;
     size_t   ro_off;
     size_t   data_off;
@@ -40,6 +41,10 @@ typedef struct {
     size_t   key_page_size;
     size_t   patch_off;
     size_t   patch_len;
+    unsigned k18_idx;           /* key-page indices, from the fixups header */
+    unsigned ktls_idx;
+    unsigned ktlr_idx;
+    unsigned kgate_idx;
     uint8_t  build_id[16];
     unsigned relocs;            /* R_RELATIVE / R_ABS64 applied */
     unsigned symbols;           /* R_ABS64 entries whose symbol index is non-zero */
@@ -60,6 +65,12 @@ void botw_guest_image_close(botw_guest_image* img);
 
 /* The MOD0 init entry (virtual offset), or 0 when the image has no init. */
 size_t botw_guest_image_entry(const botw_guest_image* img);
+
+/* The key page the rewritten code reads with `adrp/ldr`.  It sits between the
+ * image proper and the patch area and is writable: guest_slot_publish() stores
+ * the thread-slot offsets here before the first guest instruction runs. */
+uint8_t* botw_guest_image_key_page(botw_guest_image* img);
+size_t botw_guest_image_key_page_size(const botw_guest_image* img);
 
 #ifdef __cplusplus
 }

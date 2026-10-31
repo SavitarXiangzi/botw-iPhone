@@ -19,7 +19,8 @@ retail NSO  --rewrite_botw.py-->  patched.bin + fixups/gates/sites
 - [x] 输出结构校验：无残留 `svc`、每个 gate/site 都跳进 patch 区
 - [x] 运行时 loader 的可移植部分（fixups 解析、私有复制、重定位、导入解析）
 - [ ] 可执行映射（text 按 RX、data 按 RW、patch 区单独映射）
-- [ ] 每线程 4 KiB 槽 + key page + `tpidrro_el0`
+- [x] 每线程槽布局 + key page 发布（`guest_slot.c`）
+- [ ] `tpidrro_el0` 指向槽（需要 AArch64 汇编 + 线程切换）
 - [ ] HLE 服务层（init / fs / vi / nv / NVN bootstrap）
 - [ ] 把 NVN 调用桥到 `ios/nvn` 的 Metal 后端
 - [ ] 在 iOS 模拟器/真机执行第一条客体指令
