@@ -4215,7 +4215,7 @@ verify_ios: ok (metal bindings: 196/513)
 * 这一轮结束时 `ClearDepthStencil` 仍是日志占位；下一节已把它接入 load action；
 * 没有真机运行，不能声称画面正确。
 
-## M4 续二：深度/模板清屏与模板命令状态
+## M4 续二：深度/模板清屏与模板/深度命令状态
 
 上一轮的 `MTLDepthStencilState` 已经能描述模板测试，但命令缓冲的模板引用值和掩码没有
 入口，深度/模板清屏也仍是日志。这一轮把两者接进回放层。
@@ -4262,14 +4262,27 @@ verify_ios: ok (metal bindings: 196/513)
    全屏三角形，让 `apply_fixed_state()` 真正调用模板引用设置、建立带深度/模板格式的
    管线。检查挂起状态和最终 Metal command buffer 无错误。
 
-### 4. 覆盖与仍然缺的
+### 4. 深度裁剪与深度边界
 
-覆盖从 **196/513** 提升到 **199/513（38.8%）**，未实现 314；CommandBuffer 域
-**54/144**。门禁输出：
+`nvnCommandBufferSetDepthClamp` 是真实映射：NVN 的 enable 对应
+`MTLDepthClipModeClamp`，关闭时恢复 `MTLDepthClipModeClip`；每次 draw 前重新应用，
+避免 encoder 状态泄漏到下一条 draw。
+
+`nvnCommandBufferSetDepthBounds` 没有 Metal 对应能力。状态会记录 enable / min / max，
+`[0,1]` 的默认范围等价于关闭，不额外报错；启用更窄范围时用 `log_once` 明确说明
+Metal 不会执行深度边界测试。反转的范围会被规范化并上报，不冒充已经生效。
+
+模拟器的深度/模板用例现在同时调用这两个入口，检查 clamp / bounds 状态，再 draw 一条
+全屏三角形，让 `setDepthClipMode:` 真正执行。
+
+### 5. 覆盖与仍然缺的
+
+覆盖从 **196/513** 提升到 **201/513（39.2%）**，未实现 312；CommandBuffer 域
+**56/144**。门禁输出：
 
 ```text
 syntax_check_metal: ok (clang++.exe)
-verify_ios: ok (metal bindings: 199/513)
+verify_ios: ok (metal bindings: 201/513)
 build_abi_test: all tests passed
 ```
 
@@ -4277,6 +4290,7 @@ build_abi_test: all tests passed
 
 * 只有 0 号颜色目标，MRT 还没有；
 * 没有颜色目标的纯深度 pass 仍打不开 encoder；
+* `SetDepthBounds` 只有记录与上报，Metal 没有深度边界测试；
 * 部分模板清屏掩码；
 * `ClearColori/ui`、`ClearBuffer`、`ClearTexture*` 仍是日志占位；
 * 没有真机像素验证，不能声称画面正确。

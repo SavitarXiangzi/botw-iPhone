@@ -243,6 +243,12 @@ enum {
     MTLTriangleFillModeLines = 1,
 };
 
+typedef NSUInteger MTLDepthClipMode;
+enum {
+    MTLDepthClipModeClip = 0,
+    MTLDepthClipModeClamp = 1,
+};
+
 typedef enum MTLSamplerReductionMode : NSUInteger {
     MTLSamplerReductionModeWeightedAverage = 0,
     MTLSamplerReductionModeMinimum = 1,
@@ -507,6 +513,7 @@ destinationBytesPerImage:(NSUInteger)bpi;
 - (void)setDepthBias:(float)depthBias
           slopeScale:(float)slopeScale
                clamp:(float)clamp;
+- (void)setDepthClipMode:(MTLDepthClipMode)depthClipMode;
 - (void)setVertexBuffer:(id<MTLBuffer>)buffer
                  offset:(NSUInteger)offset
                 atIndex:(NSUInteger)index;

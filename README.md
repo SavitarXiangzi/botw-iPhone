@@ -13,7 +13,7 @@ SDK/NVN 调用整层接管（HLE）**，而不是跑一个通用模拟器。
 ios/BotW/       SwiftUI + Metal 壳（CAMetalLayer 视图、CADisplayLink 驱动、NVN 覆盖数 HUD）
 ios/nvn/        NVN host-HLE：513 入口点注册表、生成的分发表、Metal 后端
   registry.json   从标题自己的 getproc 字符串提取，29 个域
-  src/nvn_metal.mm 199 个入口点的 Metal 实现（其余是日志桩）
+  src/nvn_metal.mm 201 个入口点的 Metal 实现（其余是日志桩）
   src/nvn_shader.c 着色器翻译接口（现在只会返回 NULL + 理由）
   src/nvn_texture.c 157 项 NVNformat -> MTLPixelFormat 映射表（带 lossy 标记）
   src/nvn_bcn.c   BC1/BC2/BC3/BC4U/BC5U -> RGBA8 解码器（iOS 没有 BCn 像素格式）
@@ -60,8 +60,8 @@ docs/           路线图、HLE 边界、NVN 覆盖表、iOS 移植手册、着�
 | M3.94 | BC1/BC2/BC3/BC4U/BC5U 在首次采样时解成 RGBA8；sRGB 变体保留 transfer function | ✅ 第十五条 draw 左红右蓝，run 41086648054 |
 | M3.95 | `nvnTextureWriteTexels*` 按 guest 布局做整级 RMW，`FlushTexels` 标脏；下次采样重传 | ✅ 第十六条 draw 在两次显式更新后都回读正确，run 41090664172 |
 | M3.96 | 私有 harness：`nvnCommandBufferDraw*` 补齐、Yaz0 双缓冲源、0x414E01BC 去重表 | ✅ 真实 guest draw 701 / present 301（660 s 严格门禁） |
-| iOS 骨架 | 513 入口点注册表 + 生成分发表 + Metal 后端 199 项 + 三重门禁 | 🟡 十六条合成 draw，其中十五条默认在 CI 模拟器执行，另加两项清屏回归（无 draw 的颜色清屏、深度/模板组合清屏）；第十三条 cube array 需 `BOTW_SELFTEST_CUBE_ARRAY=1`，模拟器的 Metal 建 CubeArray 会崩。含 bindless、顶点参数缓冲区、c1 常量段、guest pool 解块/BCn 上传、显式纹理更新和离线 MSL bundle；客体仍无画面 |
-| M4 | NVN → Metal 回放（管线/纹理/命令缓冲） | 🟡 六类固定功能状态已接入：blend / write mask / alpha-to-coverage / 深度模板格式进入 `MTLRenderPipelineDescriptor`，cull / winding / fill、`MTLDepthStencilState`、模板 ref/掩码与 polygon offset 在编码器逐 draw 应用；`ClearDepthStencil` 通过深度/模板附件的 load action 落地，即使整段只有清屏也会提交 pass；Metal 入口 199/513。仍只有单颜色目标，部分模板清屏掩码、整数清屏和纯深度 pass 未支持，无真机画面 |
+| iOS 骨架 | 513 入口点注册表 + 生成分发表 + Metal 后端 201 项 + 三重门禁 | 🟡 十六条合成 draw，其中十五条默认在 CI 模拟器执行，另加两项清屏回归（无 draw 的颜色清屏、深度/模板组合清屏）；第十三条 cube array 需 `BOTW_SELFTEST_CUBE_ARRAY=1`，模拟器的 Metal 建 CubeArray 会崩。含 bindless、顶点参数缓冲区、c1 常量段、guest pool 解块/BCn 上传、显式纹理更新和离线 MSL bundle；客体仍无画面 |
+| M4 | NVN → Metal 回放（管线/纹理/命令缓冲） | 🟡 六类固定功能状态已接入：blend / write mask / alpha-to-coverage / 深度模板格式进入 `MTLRenderPipelineDescriptor`，cull / winding / fill、`MTLDepthStencilState`、模板 ref/掩码、depth clamp 与 polygon offset 在编码器逐 draw 应用；`ClearDepthStencil` 通过深度/模板附件的 load action 落地，即使整段只有清屏也会提交 pass；Metal 入口 201/513。深度边界测试只有记录与明确上报（Metal 无对应能力）；仍只有单颜色目标，部分模板清屏掩码、整数清屏和纯深度 pass 未支持，无真机画面 |
 | M5 | 音频（nn::audio → AVAudioEngine）、输入 | ⬜ |
 | M6 | 真机性能与内存（6 GB 机型起步） | ⬜ |
 
@@ -218,8 +218,8 @@ guest 业务代码
 |---|---:|---|
 | NVN 入口点 | **513** | 扫 `main.reloc.bin` 里会被 `nvnDeviceGetProcAddress` 按名解析的字符串 |
 | 域 | 29 | 按前缀归类（CommandBuffer 144、Texture 45、TextureBuilder 43…） |
-| Metal 后端已实现 | **199**（38.8%） | 真实 `BIND(...)`，不是靠注释声称 |
-| 未实现 | 314 | 按"挡住第一个 draw call"排序，见 `docs/IOS_PORTING.md` |
+| Metal 后端已实现 | **201**（39.2%） | 真实 `BIND(...)`，不是靠注释声称 |
+| 未实现 | 312 | 按"挡住第一个 draw call"排序，见 `docs/IOS_PORTING.md` |
 | 生成的代码 | 2 个文件 | `gen_nvn.py` 生成 `nvn_api.h` / `nvn_dispatch.cpp`，`--check` 防手改 |
 | 参数形状 | 470 个 | `signatures.json`，解析公开 nxnative 原型表（MIT），最大 arity 8 |
 
@@ -272,7 +272,7 @@ nvn_pipeline_test: ok (defaults, enum tables, write-mask order, blend targets, u
 nvn_shader_bundle_test: ok (manifest, merge, c1, refusals)  exit=0
 test_gen_blobs: ok (ids, packed slots, bindless, c1, bundle, holes, refusals)
 syntax_check_metal: ok (clang++.exe)
-verify_ios: ok (metal bindings: 199/513)
+verify_ios: ok (metal bindings: 201/513)
 build_abi_test: all tests passed
 ```
 

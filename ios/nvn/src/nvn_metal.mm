@@ -368,6 +368,14 @@ struct CmdBuf {
     float coverageTable[16] = {};
     bool hasCoverageTable = false;
     double depthNear = 0.0, depthFar = 1.0;
+    /* NVN depth clamp and depth bounds are command-buffer state.  Metal has
+     * a real depth-clip mode; it has no depth-bounds test, so a non-default
+     * enabled range is recorded and reported rather than silently ignored. */
+    uint32_t depthClamp = 0;
+    uint32_t depthBoundsEnable = 0;
+    float depthBoundsMin = 0.0f;
+    float depthBoundsMax = 1.0f;
+    bool hasDepthBounds = false;
     /* Compute / transform-feedback and image bindings are recorded for the
      * compute path; the render path does not consume them yet. */
     uint64_t storage[6][NVNGFX_MAX_UBO_SLOTS] = {};
@@ -2560,6 +2568,8 @@ void apply_fixed_state(Ctx* c, CmdBuf* b) {
     [b->enc setCullMode:to_mtl_cull(st.cull)];
     [b->enc setFrontFacingWinding:to_mtl_winding(st.winding)];
     [b->enc setTriangleFillMode:to_mtl_fill(st.fill)];
+    [b->enc setDepthClipMode:b->depthClamp ? MTLDepthClipModeClamp
+                                           : MTLDepthClipModeClip];
     if (b->psoHasDepth) {
         if (st.polygon_offset && b->hasPolyOffset) {
             [b->enc setDepthBias:b->polyOffsetUnits
@@ -3378,6 +3388,11 @@ void cmdbuf_begin_recording(nvngfx_ctx* ctx, uint64_t* x) {
     b->hasPolyOffset = false;
     b->depthNear = 0.0;
     b->depthFar = 1.0;
+    b->depthClamp = 0;
+    b->depthBoundsEnable = 0;
+    b->depthBoundsMin = 0.0f;
+    b->depthBoundsMax = 1.0f;
+    b->hasDepthBounds = false;
     for (unsigned si = 0; si < 6; ++si) {
         for (unsigned i = 0; i < NVNGFX_MAX_UBO_SLOTS; ++i) {
             b->storage[si][i] = 0;
@@ -4622,6 +4637,45 @@ void cmdbuf_set_depth_range(nvngfx_ctx*, uint64_t* x) {
     }
 }
 
+/* nvnCommandBufferSetDepthClamp(cb, uint32_t enable) */
+void cmdbuf_set_depth_clamp(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    if (!b) return;
+    b->depthClamp = (x[1] & 0xFFu) ? 1u : 0u;
+    if (b->enc) {
+        [b->enc setDepthClipMode:b->depthClamp ? MTLDepthClipModeClamp
+                                               : MTLDepthClipModeClip];
+    }
+}
+
+/* nvnCommandBufferSetDepthBounds(cb, uint32_t enable, float min, float max)
+ *
+ * Metal has no depth-bounds test.  The default [0,1] range is equivalent to
+ * the test being off; any narrower enabled range changes rasterisation and is
+ * therefore reported.  Record it so the missing behaviour is visible in the
+ * command-buffer state instead of disappearing. */
+void cmdbuf_set_depth_bounds(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    if (!b) return;
+    nvngfx_args* a = reinterpret_cast<nvngfx_args*>(x);
+    b->depthBoundsEnable = (x[1] & 0xFFu) ? 1u : 0u;
+    b->depthBoundsMin = nvngfx_arg_f32(a, 0);
+    b->depthBoundsMax = nvngfx_arg_f32(a, 1);
+    if (b->depthBoundsMax < b->depthBoundsMin) {
+        const float t = b->depthBoundsMin;
+        b->depthBoundsMin = b->depthBoundsMax;
+        b->depthBoundsMax = t;
+        log_once("nvnCommandBufferSetDepthBounds.reversed", 1);
+    }
+    b->hasDepthBounds = true;
+    if (b->depthBoundsEnable &&
+        (b->depthBoundsMin > 0.0f || b->depthBoundsMax < 1.0f)) {
+        log_once("nvnCommandBufferSetDepthBounds.unsupported",
+                 static_cast<unsigned>(b->depthBoundsMin * 1000.0f) ^
+                     (static_cast<unsigned>(b->depthBoundsMax * 1000.0f) << 12));
+    }
+}
+
 /* nvnCommandBufferSetRenderEnable(cb, uint32_t) */
 void cmdbuf_set_render_enable(nvngfx_ctx*, uint64_t* x) {
     CmdBuf* b = find_or_add<CmdBuf>(x[0]);
@@ -4957,6 +5011,8 @@ const Binding kBindings[] = {
     BIND("nvnCommandBufferSetAlphaRef", cmdbuf_set_alpha_ref),
     BIND("nvnCommandBufferSetBlendColor", cmdbuf_set_blend_color),
     BIND("nvnCommandBufferSetPolygonOffsetClamp", cmdbuf_set_polygon_offset),
+    BIND("nvnCommandBufferSetDepthBounds", cmdbuf_set_depth_bounds),
+    BIND("nvnCommandBufferSetDepthClamp", cmdbuf_set_depth_clamp),
     BIND("nvnCommandBufferSetDepthRange", cmdbuf_set_depth_range),
     BIND("nvnCommandBufferSetRenderEnable", cmdbuf_set_render_enable),
     BIND("nvnCommandBufferSetScissors", cmdbuf_set_scissors),
@@ -8367,6 +8423,16 @@ extern "C" int nvngfx_metal_selftest(void) {
             cmdbuf_set_stencil_mask(ctx, x);
             x[0] = kCbDepthClear; x[1] = 2; x[2] = 0x0F;
             cmdbuf_set_stencil_value_mask(ctx, x);
+            x[0] = kCbDepthClear; x[1] = 1;
+            cmdbuf_set_depth_clamp(ctx, x);
+            {
+                nvngfx_args bounds{};
+                nvngfx_arg_set_f32(&bounds, 0, 0.1f);
+                nvngfx_arg_set_f32(&bounds, 1, 0.9f);
+                bounds.x[0] = kCbDepthClear;
+                bounds.x[1] = 1;
+                cmdbuf_set_depth_bounds(ctx, bounds.x);
+            }
             x[0] = kCbDepthClear; x[1] = 0;
             x[2] = reinterpret_cast<uint64_t>(black); x[3] = 0xF;
             cmdbuf_clear_color(ctx, x);
@@ -8383,7 +8449,11 @@ extern "C" int nvngfx_metal_selftest(void) {
                 bd->stencilWriteMask[0] != 0xF0 ||
                 bd->stencilWriteMask[1] != 0xFF ||
                 bd->stencilReadMask[0] != 0xFF ||
-                bd->stencilReadMask[1] != 0x0F) {
+                bd->stencilReadMask[1] != 0x0F ||
+                bd->depthClamp != 1 || !bd->hasDepthBounds ||
+                bd->depthBoundsEnable != 1 ||
+                bd->depthBoundsMin != 0.1f ||
+                bd->depthBoundsMax != 0.9f) {
                 std::fprintf(stderr,
                              "[selftest] depth/stencil state mismatch\n");
                 rc = 16414;
