@@ -5912,3 +5912,131 @@ git diff --check
 改变 Metal 的逐样本行为；sampler debug id 是宿主命名，不是官方语义的精确
 复刻。真实标题的 draw 仍为 0 条，Maxwell SASS → MSL 离线翻译、真实 shader
 绑定和通用 texture view 采样仍未闭环。
+
+## M4 续二十五：Device 状态、帧计数器与 packaged texture 布局
+
+Device 域此前只有 7 个入口，是所有域里最薄的一块。标题每次启动会调用
+`nvnDeviceGetInteger` 十多万次（nxnative 的 1.9.0 usage 里是 123,219 次），
+用返回值算自己的池大小、对齐和纹理 tile 高度；`GetTimestampInNanoseconds`
+和 `ReportCounter` 则被帧间隔控制与动态分辨率读取。少了这些，标题即使画
+出第一帧也会立刻用错误的常量继续配置。
+
+本轮补 26 个入口：Device 20 个，CommandBuffer 3 个，Texture 1 个，
+TextureBuilder 2 个。Metal 覆盖从 **440/513（85.8%）** 到
+**466/513（90.8%）**，未实现 47。Device 达到 **27/27**，CommandBuffer
+117/144，Texture 40/45，TextureBuilder 37/43。实测签名仍为 477，推断 25，
+max arity 8——这批入口都在公开原型表里。
+
+### 1. Device 生命周期与调试入口
+
+* `nvnDeviceFinalize` / `ApplyDeferredFinalizes` / `FinalizeCommandHandle`：
+  本后端在 finalize buffer/texture 时就地释放，没有延迟队列，因此前两个只
+  记录次数，第三个是空操作。这三者不假装有异步回收。
+* `nvnDeviceGenerateDebugDomainId`：按域名分配稳定且互不相同的 id，同名
+  重复调用返回同一个值。
+* `nvnDeviceInstallDebugCallback` / `WalkDebugDatabase`：回调是 **guest 函数
+  指针**，宿主直接调用会跳进模拟代码而没有寄存器与栈准备，所以只记录参数，
+  并统计该 type 下已登记标签的对象数量。
+* `nvnDeviceRegisterFastClearColor(ui/i)` / `RegisterFastClearDepth`：Tegra
+  驱动的优化提示。真正的清屏仍然走 `ClearColor` / `ClearDepthStencil`
+  传进来的值，因此只记录调用并返回 true，不消费注册的颜色。
+* 每个对象（window / memory pool / texture pool / sampler pool / program /
+  command buffer / sync / queue / device）的 `SetDebugLabel` 现在同时写进
+  宿主侧的 `g_debug_objects` 表，`WalkDebugDatabase` 才有东西可数。
+
+### 2. GetInteger 的属性表
+
+`nvnDeviceGetInteger(device, what, out*)` 用一张 0x60 项的静态表回答，
+数据取自 nxnative 的 Tegra X1 profile（MIT）。索引 0/1 是 API 版本
+**55.15**，`0x67`（部分新标题会问的 shader code 对齐）单独返回 256，
+表外的 `what` 打一条一次性日志后返回 0。
+
+必须说清两件事：这张表描述的是 **NVN 在 Tegra X1 上的能力**，不是 Metal 的
+能力，也不是本后端的实际限制；55.15 来自 **BOTW 1.9.0 / SDK 20** 的
+profile，本项目的目标是 1.6.0，是否同样报 55.15 还没有实机或私有运行日志
+可以确认。表里数值若有偏差，最可能的症状是标题按错误的 stride/tile 高度
+配置池，而不是直接报错。
+
+### 3. 时间戳与帧计数器
+
+NVN 的 counter 时间戳是 614.4 MHz tick（384 tick = 625 ns），不是纳秒。
+两个方向都保留在同一个单位下互换：
+
+```text
+ticks_from_ns(ns) = (ns / 625) * 384 + (ns % 625) * 384 / 625
+ns_from_ticks(t)  = (t / 384) * 625 + (t % 384) * 625 / 384
+```
+
+这样 `ReportCounter` 写进去的值可以直接喂给
+`nvnDeviceGetTimestampInNanoseconds`，也能和标题自己算出的差值比较。算术
+拆成两段避免 MSVC 上没有 `__int128` 导致的 64 位溢出。
+
+`nvnCommandBufferReportCounter(cb, type, address)` 把 16 字节
+`{counter, timestamp}` 记在 pending 列表里，`EndRecording` 提交 Metal
+command buffer 时挂 completion handler 写回 guest 内存，所以 guest 在 GPU
+完成之前读不到时间戳，与 NVN 的可见性顺序一致。类型 `0x10`
+（TIMESTAMP_TOP）填 BeginRecording 时刻，其余 timestamp 填 EndRecording
+时刻。`nvnCommandBufferReportValue` 复用同一完成路径写 32 位值，
+`nvnCommandBufferResetCounter` 只把类型记进 64 位掩码，供后续诊断。
+
+**这些是宿主 `steady_clock` 的提交时刻，不是 Metal GPU 时间。** 真实 GPU
+时间戳需要 `MTLCounterSampleBuffer` / MTL4 counter heap，本轮没有接。因此
+帧间隔控制器看到的是“CPU 提交到 CPU 提交”的间隔。它足够让启动流程走下去，
+但不能当作性能测量的依据。
+
+samples-passed 之类的计数目前一律写 0：没有 visibility query，写 0 等价于
+“没有样本通过”。这**不是** occlusion query 已实现的说法，日志里对每个
+非时间戳类型只报一次。
+
+### 4. Packaged texture layout 与 ZCull
+
+`nvnTextureBuilderSetPackagedTextureLayout(builder, const void*)` 只读第一个
+字节：`0xFF` 视为“未打包”，其余值 +1 后存进 `nvngfx_texdesc::pkg_block_h`，
+再由 `nvgfx_tex_layout` 拆成低半字节的 tile height、高二进制的 tile depth。
+用 +1 是因为 0 已经被“从未调用”占用，而 0 是合法的 block height 编码。
+
+`nvnTextureBuilderGetZCullStorageSize` 与 `nvnTextureGetZCullStorageSize`
+返回 0。Metal 不为 ZCull 预留存储，0 是真实答案而不是占位符；调用方通常
+只用它算池偏移，返回 0 不会破坏后续分配。
+
+### 5. 模拟器自测
+
+新增失败码 `16436`，覆盖：
+
+1. `Initialize` 建立的默认 origin/depth mode，setter/getter 回环；
+2. `ApplyDeferredFinalizes` / `FinalizeCommandHandle` / `SetIntermediateShaderCache`
+   / `IsExternalDebuggerAttached` 的记录值与返回值；
+3. `GetInteger` 的 55.15、单项属性与未知 `what` 返回 0；
+4. `GetCurrentTimestampInNanoseconds` 单调递增，`384 tick -> 625 ns`；
+5. debug domain id 同名复用、不同名递增；
+6. fast-clear 注册计数与最后格式；
+7. packaged layout 首字节 3 -> `pkg_block_h = 4` -> `tile_h = 3`；
+8. 两个 ZCull 入口返回 0；
+9. `ReportCounter`（类型 0x10 与 0）、`ReportValue`、`ResetCounter` 在
+   `waitUntilCompleted` 之后回读：类型字段为 0、时间戳非 0、底部的
+   时间戳不早于顶部、值等于写入的 `0x12345678`、重置掩码置位第 0 位。
+
+所有 GPU 写回都在 `waitUntilCompleted` 之后检查，不靠睡眠猜时序。
+
+### 6. 门禁
+
+```text
+python scripts/syntax_check_metal.py
+python scripts/gen_nvn.py --repo . --check
+python scripts/extract_nvn_signatures.py --check
+python scripts/verify_ios.py
+powershell -ExecutionPolicy Bypass -File scripts/build_abi_test.ps1
+git diff --check
+```
+
+本地已通过（513 procs / 466 implemented / 477 measured + 25 inferred）。
+本批 CI 结果在推送后补记。
+
+### 7. 仍然没有闭环的部分
+
+`GetInteger` 的属性表是 1.9.0 profile 的移植值，1.6.0 未确认；时间戳是宿主
+提交时刻而非 GPU 时间；samples-passed 等计数恒为 0；`SetWindowOriginMode` /
+`SetDepthMode` 只记录，尚未改变 Metal 渲染路径（标题设的是 upper-left，
+与 Metal 默认一致，但仍需验证）；fast-clear 注册不改变清屏路径；debug
+callback 与 walk callback 不会被宿主调用。真实标题的 draw 依然为 0 条，
+Maxwell SASS -> MSL 翻译器仍未开始。

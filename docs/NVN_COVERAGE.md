@@ -7,8 +7,8 @@
 `nvn*` 字符串（运行时按名解析，所以名字本身就暴露了完整接口面）。
 
 - 接口总数：**513**
-- Metal 后端已实现：**440**（85.8%）
-- 仍未实现：**73**
+- Metal 后端已实现：**466**（90.8%）
+- 仍未实现：**47**
 
 > 只有出现在 `ios/nvn/implemented_metal.txt` 里、且确实在
 > `ios/nvn/src/nvn_metal.mm` 中定义过的名字才算“已实现”。
@@ -18,10 +18,10 @@
 
 | 域 | 已实现 | 总数 | 进度 |
 |---|---:|---:|---|
-| CommandBuffer | 114 | 144 | `########  ` |
-| Texture | 39 | 45 | `######### ` |
-| TextureBuilder | 35 | 43 | `########  ` |
-| Device | 7 | 27 | `###       ` |
+| CommandBuffer | 117 | 144 | `########  ` |
+| Texture | 40 | 45 | `######### ` |
+| TextureBuilder | 37 | 43 | `######### ` |
+| Device | 27 | 27 | `##########` |
 | SamplerBuilder | 25 | 25 | `##########` |
 | MultisampleState | 22 | 23 | `##########` |
 | QueueBuilder | 19 | 19 | `##########` |
@@ -112,7 +112,7 @@
 - [x] `nvnColorStateSetDefaults`
 - [x] `nvnColorStateSetLogicOp`
 
-### CommandBuffer (114/144)
+### CommandBuffer (117/144)
 
 - [x] `nvnCommandBufferAddCommandMemory`
 - [x] `nvnCommandBufferAddControlMemory`
@@ -201,9 +201,9 @@
 - [x] `nvnCommandBufferPushDebugGroup`
 - [x] `nvnCommandBufferPushDebugGroupDynamic`
 - [x] `nvnCommandBufferPushDebugGroupStatic`
-- [ ] `nvnCommandBufferReportCounter`
-- [ ] `nvnCommandBufferReportValue`
-- [ ] `nvnCommandBufferResetCounter`
+- [x] `nvnCommandBufferReportCounter`
+- [x] `nvnCommandBufferReportValue`
+- [x] `nvnCommandBufferResetCounter`
 - [ ] `nvnCommandBufferResolveDepthBuffer`
 - [x] `nvnCommandBufferRestoreZCullData`
 - [ ] `nvnCommandBufferResumeTransformFeedback`
@@ -275,35 +275,35 @@
 - [x] `nvnDepthStencilStateSetStencilOp`
 - [x] `nvnDepthStencilStateSetStencilTestEnable`
 
-### Device (7/27)
+### Device (27/27)
 
-- [ ] `nvnDeviceApplyDeferredFinalizes`
-- [ ] `nvnDeviceFinalize`
-- [ ] `nvnDeviceFinalizeCommandHandle`
-- [ ] `nvnDeviceGenerateDebugDomainId`
-- [ ] `nvnDeviceGetCurrentTimestampInNanoseconds`
-- [ ] `nvnDeviceGetDepthMode`
+- [x] `nvnDeviceApplyDeferredFinalizes`
+- [x] `nvnDeviceFinalize`
+- [x] `nvnDeviceFinalizeCommandHandle`
+- [x] `nvnDeviceGenerateDebugDomainId`
+- [x] `nvnDeviceGetCurrentTimestampInNanoseconds`
+- [x] `nvnDeviceGetDepthMode`
 - [x] `nvnDeviceGetImageHandle`
-- [ ] `nvnDeviceGetInteger`
+- [x] `nvnDeviceGetInteger`
 - [x] `nvnDeviceGetProcAddress`
 - [x] `nvnDeviceGetSeparateSamplerHandle`
 - [x] `nvnDeviceGetSeparateTextureHandle`
 - [x] `nvnDeviceGetTexelFetchHandle`
 - [x] `nvnDeviceGetTextureHandle`
-- [ ] `nvnDeviceGetTimestampInNanoseconds`
-- [ ] `nvnDeviceGetWindowOriginMode`
+- [x] `nvnDeviceGetTimestampInNanoseconds`
+- [x] `nvnDeviceGetWindowOriginMode`
 - [x] `nvnDeviceInitialize`
-- [ ] `nvnDeviceInstallDebugCallback`
-- [ ] `nvnDeviceIsExternalDebuggerAttached`
-- [ ] `nvnDeviceRegisterFastClearColor`
-- [ ] `nvnDeviceRegisterFastClearColori`
-- [ ] `nvnDeviceRegisterFastClearColorui`
-- [ ] `nvnDeviceRegisterFastClearDepth`
-- [ ] `nvnDeviceSetDebugLabel`
-- [ ] `nvnDeviceSetDepthMode`
-- [ ] `nvnDeviceSetIntermediateShaderCache`
-- [ ] `nvnDeviceSetWindowOriginMode`
-- [ ] `nvnDeviceWalkDebugDatabase`
+- [x] `nvnDeviceInstallDebugCallback`
+- [x] `nvnDeviceIsExternalDebuggerAttached`
+- [x] `nvnDeviceRegisterFastClearColor`
+- [x] `nvnDeviceRegisterFastClearColori`
+- [x] `nvnDeviceRegisterFastClearColorui`
+- [x] `nvnDeviceRegisterFastClearDepth`
+- [x] `nvnDeviceSetDebugLabel`
+- [x] `nvnDeviceSetDepthMode`
+- [x] `nvnDeviceSetIntermediateShaderCache`
+- [x] `nvnDeviceSetWindowOriginMode`
+- [x] `nvnDeviceWalkDebugDatabase`
 
 ### DeviceBuilder (3/3)
 
@@ -499,7 +499,7 @@
 - [x] `nvnSyncSetDebugLabel`
 - [x] `nvnSyncWait`
 
-### Texture (39/45)
+### Texture (40/45)
 
 - [x] `nvnTextureCompare`
 - [x] `nvnTextureFinalize`
@@ -524,7 +524,7 @@
 - [x] `nvnTextureGetTextureAddress`
 - [x] `nvnTextureGetViewOffset`
 - [x] `nvnTextureGetWidth`
-- [ ] `nvnTextureGetZCullStorageSize`
+- [x] `nvnTextureGetZCullStorageSize`
 - [x] `nvnTextureInitialize`
 - [x] `nvnTextureInvalidateTexels`
 - [ ] `nvnTextureReadTexels`
@@ -547,7 +547,7 @@
 - [x] `nvnTextureWriteTexels`
 - [x] `nvnTextureWriteTexelsStrided`
 
-### TextureBuilder (35/43)
+### TextureBuilder (37/43)
 
 - [x] `nvnTextureBuilderGetDepth`
 - [x] `nvnTextureBuilderGetDepthStencilMode`
@@ -571,7 +571,7 @@
 - [x] `nvnTextureBuilderGetSwizzle`
 - [x] `nvnTextureBuilderGetTarget`
 - [x] `nvnTextureBuilderGetWidth`
-- [ ] `nvnTextureBuilderGetZCullStorageSize`
+- [x] `nvnTextureBuilderGetZCullStorageSize`
 - [x] `nvnTextureBuilderSetDefaults`
 - [x] `nvnTextureBuilderSetDepth`
 - [x] `nvnTextureBuilderSetDepthStencilMode`
@@ -582,7 +582,7 @@
 - [x] `nvnTextureBuilderSetHeight`
 - [x] `nvnTextureBuilderSetLevels`
 - [ ] `nvnTextureBuilderSetPackagedTextureData`
-- [ ] `nvnTextureBuilderSetPackagedTextureLayout`
+- [x] `nvnTextureBuilderSetPackagedTextureLayout`
 - [x] `nvnTextureBuilderSetSamples`
 - [x] `nvnTextureBuilderSetSize1D`
 - [x] `nvnTextureBuilderSetSize2D`

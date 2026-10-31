@@ -402,6 +402,15 @@ struct PendingEventSignal {
     uint32_t value = 0;
 };
 
+/* A counter report is a 16-byte NVNcounterData record written after the
+ * command buffer completes.  Type 0 and 0x10 are timestamps; other types
+ * (samples passed) are reported as zero because this backend does not run
+ * visibility queries yet. */
+struct PendingCounterReport {
+    uint64_t address = 0;
+    uint32_t type = 0;
+};
+
 /* The queue builder is a guest object whose layout we never read.  These are
  * the values the setters recorded; QueueSpec defaults follow the device
  * defaults used by nxnative/D2R (64 KiB command, 256 KiB compute, 16 KiB
@@ -621,6 +630,11 @@ struct CmdBuf {
     /* Event signals queued during this recording, published by one Metal
      * completion handler each. */
     std::vector<PendingEventSignal> eventSignals;
+    /* nvnCommandBufferReportCounter records: written by the completion
+     * handler, not by the CPU at recording time. */
+    std::vector<PendingCounterReport> counterReports;
+    uint64_t counterResetMask = 0;   /* bit t = ResetCounter(t) in this recording */
+    uint64_t recordingStartTicks = 0;
     /* Guest debug names forwarded to the Metal command buffer.  Groups are
      * per recording; the label survives begin/end. */
     std::string debugLabel;
@@ -739,6 +753,47 @@ uint64_t g_next_buffer_debug_id = 0x10000;
 uint64_t g_next_texture_debug_id = 0x20000;
 uint64_t g_next_sampler_debug_id = 0x30000;
 std::unordered_map<uint64_t, int> g_device_flags;
+
+/* Device state.  nvnDeviceInitialize is the only place that resets it; the
+ * getters answer these recorded values rather than reading the guest's
+ * 0x3000-byte NVNdevice object (its layout is not something this backend
+ * needs).  Depth mode and window origin are recorded but do not change the
+ * Metal render path yet; BOTW sets the origin to upper-left, which is what
+ * Metal already uses. */
+struct DevSpec {
+    int flags = 0;
+    int depthMode = 0;          /* NVN_DEPTH_MODE_NEAR_IS_MINUS_W */
+    int originMode = 0;         /* NVN_WINDOW_ORIGIN_MODE_LOWER_LEFT */
+    int intermediateCache = 0;
+    unsigned fastClearColors = 0;
+    unsigned fastClearDepths = 0;
+    unsigned fastClearLastFormat = 0;
+    unsigned deferredFinalizes = 0;
+    std::string label;
+    uint64_t debugCallback = 0;
+    uint64_t debugCallbackData = 0;
+    uint32_t debugCallbackEnable = 0;
+};
+std::unordered_map<uint64_t, DevSpec> g_dev_specs;
+
+/* nvnDeviceGenerateDebugDomainId assigns a small process-wide id per name. */
+std::unordered_map<std::string, int> g_debug_domains;
+int g_next_debug_domain = 1;
+
+/* The labels this backend itself recorded.  nvnDeviceWalkDebugDatabase can
+ * only walk what we know about; it does not fabricate unlabelled objects. */
+struct DebugObjectNote {
+    int type = -1;
+    uint64_t address = 0;
+    std::string label;
+};
+std::unordered_map<uint64_t, DebugObjectNote> g_debug_objects;
+void debug_note_object(int type, uint64_t address, const std::string& label) {
+    DebugObjectNote& n = g_debug_objects[address];
+    n.type = type;
+    n.address = address;
+    n.label = label;
+}
 /* Builder state, keyed by the guest builder address.  The guest owns the
  * struct and its layout is unverified, but that does not matter: every
  * field we need arrives through a setter we implement ourselves. */
@@ -814,6 +869,42 @@ bool guest_cstr(uint64_t addr, std::string* out) {
         out->push_back(p[i]);
     }
     return true;
+}
+
+/* ------------------------------------------------------------------ */
+/* host clock and NVN counter timestamps                               */
+/* ------------------------------------------------------------------ */
+
+/* NVN counter timestamps are 614.4 MHz ticks (384 ticks per 625 ns), not
+ * nanoseconds.  Keep that unit in both directions so a value written by
+ * ReportCounter can be passed to nvnDeviceGetTimestampInNanoseconds and
+ * compared with the values the guest computes itself.  Split the arithmetic
+ * to avoid a 64-bit overflow on a long host uptime (MSVC has no __int128). */
+uint64_t host_now_ns() {
+    using namespace std::chrono;
+    return static_cast<uint64_t>(
+        duration_cast<nanoseconds>(steady_clock::now().time_since_epoch())
+            .count());
+}
+uint64_t nvn_ticks_from_host_ns(uint64_t ns) {
+    return (ns / 625u) * 384u + ((ns % 625u) * 384u) / 625u;
+}
+uint64_t nvn_ns_from_ticks(uint64_t ticks) {
+    return (ticks / 384u) * 625u + ((ticks % 384u) * 625u) / 384u;
+}
+
+/* Writes the 16-byte NVNcounterData record ({counter, timestamp}) the GPU
+ * would have produced.  The address is guest memory and is still valid when
+ * the Metal completion handler runs; the two values are captured by value. */
+void counter_report_write(uint64_t address, uint64_t counter, uint64_t ticks) {
+    if (!guest_range(address, sizeof(uint64_t) * 2)) {
+        log_once("nvnCounterReport.pointer",
+                 static_cast<unsigned>(address >> 32));
+        return;
+    }
+    volatile uint64_t* p = guest_ptr<volatile uint64_t>(address);
+    p[0] = counter;
+    p[1] = ticks;
 }
 
 /* ------------------------------------------------------------------ */
@@ -911,6 +1002,13 @@ void dev_initialize(nvngfx_ctx* ctx, uint64_t* x) {
     }
     if (!c->queue) c->queue = [c->device newCommandQueue];
     c->ready = (c->queue != nil);
+    /* A device is a fresh state object: defaults are lower-left origin,
+     * near = -w, no fast-clear registrations and no debug label.  The
+     * builder's flags survive into the device, as they would on NVN. */
+    DevSpec& ds = g_dev_specs[x[0]];
+    ds = DevSpec();
+    auto fit = g_device_flags.find(x[1]);
+    if (fit != g_device_flags.end()) ds.flags = fit->second;
     std::fprintf(stderr, "[nvn] metal device: %s\n", [[c->device name] UTF8String]);
     x[0] = c->ready ? 1u : 0u;
 }
@@ -920,6 +1018,191 @@ void dev_get_proc_address(nvngfx_ctx*, uint64_t* x) {
     const char* name = guest_ptr<const char>(x[1]);
     nvngfx_proc p = nvngfx_lookup(name);
     x[0] = p ? static_cast<uint64_t>(reinterpret_cast<uintptr_t>(p)) : 0;
+}
+
+/* nvnDeviceApplyDeferredFinalizes(device, int n).  This backend finalizes
+ * buffers and textures immediately, so there is no deferred queue to drain;
+ * the count is kept only so a later diagnostic can report it. */
+void dev_apply_deferred_finalizes(nvngfx_ctx*, uint64_t* x) {
+    DevSpec& d = g_dev_specs[x[0]];
+    d.deferredFinalizes += static_cast<unsigned>(x[1]);
+    if (x[1] != 0) {
+        log_once("nvnDeviceApplyDeferredFinalizes.count",
+                 static_cast<unsigned>(x[1]));
+    }
+}
+
+/* nvnDeviceFinalize(device) */
+void dev_finalize(nvngfx_ctx*, uint64_t* x) {
+    g_dev_specs.erase(x[0]);
+}
+
+/* nvnDeviceFinalizeCommandHandle(device, handle).  A command handle is the
+ * guest address this backend already accounted for at EndRecording; no
+ * separate host allocation is owned by it. */
+void dev_finalize_command_handle(nvngfx_ctx*, uint64_t* x) {
+    (void)x;
+}
+
+/* nvnDeviceGenerateDebugDomainId(device, const char*) -> int.  The guest
+ * only needs a stable, distinct id for each domain name. */
+void dev_generate_debug_domain_id(nvngfx_ctx*, uint64_t* x) {
+    std::string name;
+    if (!guest_cstr(x[1], &name)) {
+        x[0] = 0;
+        return;
+    }
+    auto it = g_debug_domains.find(name);
+    if (it == g_debug_domains.end()) {
+        const int id = g_next_debug_domain++;
+        g_debug_domains.emplace(name, id);
+        x[0] = static_cast<uint64_t>(static_cast<uint32_t>(id));
+    } else {
+        x[0] = static_cast<uint64_t>(static_cast<uint32_t>(it->second));
+    }
+}
+
+/* nvnDeviceGetCurrentTimestampInNanoseconds(device) -> uint64_t */
+void dev_get_current_timestamp(nvngfx_ctx*, uint64_t* x) {
+    x[0] = host_now_ns();
+}
+
+/* nvnDeviceGetDepthMode(const device*) -> NVNdepthMode */
+void dev_get_depth_mode(nvngfx_ctx*, uint64_t* x) {
+    auto it = g_dev_specs.find(x[0]);
+    x[0] = it == g_dev_specs.end() ? 0u
+                                   : static_cast<uint64_t>(it->second.depthMode);
+}
+
+/* nvnDeviceGetInteger(const device*, NVNdeviceInfo what, int* out).
+ * The table is the Tegra X1 profile measured by nxnative (MIT), not a
+ * guess about Metal: NVN titles size their own pools from these values and
+ * expect the API/driver they were built against.  The API version is 55.15
+ * (the profile SDK 11+ reports); 0x67 is the shader-code alignment some
+ * newer titles ask for and is not in the measured table. */
+void dev_get_integer(nvngfx_ctx*, uint64_t* x) {
+    static const int info[0x60] = {
+        55, 15, 14, 65536, 256, 8, 16, 4, 16, 32,
+        16, 4, 4, 4, 16, 32, 32, 256, 256,
+        4, 8, 512, 256, 2, 256, 4096, 131072,
+        16, 1536, 1024, 64, 1536, 65535, 65535, 65535,
+        8, 1048576, 4096, 16, 4096, 1, 1, 1,
+        262144, 15, 2048, 1, 1, 14, 5, 1, 8,
+        8, 4, 32, 128, 32, 128, 65536, 1, 4,
+        16384, 134217728, 2048, 16384, 16384, 1, 1, 1,
+        1, 5, 1, 1, 1, 1, 1, 1, 16,
+        1024, 32, 4096, 65536, 65536, 256, 16384,
+        262144, 4096, 1, 4, 2, 0, 4096, 16384,
+        4096, 128, 4096,
+    };
+    const unsigned what = static_cast<unsigned>(x[1]);
+    int value = 0;
+    if (what == 0x67u) {
+        value = 256;   /* shader code alignment; the host reads shaders by key */
+    } else if (what < sizeof(info) / sizeof(info[0])) {
+        value = info[what];
+    } else {
+        static std::set<unsigned> unknown;
+        if (unknown.insert(what).second) {
+            std::fprintf(stderr,
+                         "[nvn] nvnDeviceGetInteger: unknown NVNdeviceInfo "
+                         "%#x, returning 0\n", what);
+        }
+    }
+    int* out = guest_ptr<int>(x[2]);
+    if (!out) {
+        log_once("nvnDeviceGetInteger.out", static_cast<unsigned>(x[2] >> 32));
+        return;
+    }
+    *out = value;
+}
+
+/* nvnDeviceGetTimestampInNanoseconds(const device*, const NVNcounterData*).
+ * ReportCounter stores 614.4 MHz ticks in the second 64-bit field, exactly
+ * what NVN's counter record contains.  A report that has not been written
+ * yet reads as zero (the guest owns that memory). */
+void dev_get_timestamp(nvngfx_ctx*, uint64_t* x) {
+    if (!guest_range(x[1], sizeof(uint64_t) * 2)) {
+        x[0] = 0;
+        return;
+    }
+    const volatile uint64_t* p = guest_ptr<const volatile uint64_t>(x[1]);
+    x[0] = nvn_ns_from_ticks(p[1]);
+}
+
+/* nvnDeviceGetWindowOriginMode(const device*) -> NVNwindowOriginMode */
+void dev_get_window_origin_mode(nvngfx_ctx*, uint64_t* x) {
+    auto it = g_dev_specs.find(x[0]);
+    x[0] = it == g_dev_specs.end()
+               ? 0u : static_cast<uint64_t>(it->second.originMode);
+}
+
+/* nvnDeviceInstallDebugCallback(device, callback, data, enable).  A callback
+ * is a guest function pointer; this backend cannot call it from host code,
+ * so it is recorded and never invoked.  The same rule applies to the walk
+ * callback below. */
+void dev_install_debug_callback(nvngfx_ctx*, uint64_t* x) {
+    DevSpec& d = g_dev_specs[x[0]];
+    d.debugCallback = x[1];
+    d.debugCallbackData = x[2];
+    d.debugCallbackEnable = static_cast<uint32_t>(x[3]);
+}
+
+/* nvnDeviceIsExternalDebuggerAttached(const device*) -> NVNboolean */
+void dev_is_external_debugger_attached(nvngfx_ctx*, uint64_t* x) {
+    x[0] = 0;
+}
+
+/* Fast-clear registrations are hints to the Tegra driver.  The backend clears
+ * with the value passed to ClearColor / ClearDepthStencil, so recording the
+ * call and returning true is the honest behaviour; no colour is consumed. */
+void dev_register_fast_clear_color(nvngfx_ctx*, uint64_t* x) {
+    DevSpec& d = g_dev_specs[x[0]];
+    ++d.fastClearColors;
+    d.fastClearLastFormat = static_cast<unsigned>(x[2]);
+    x[0] = 1;
+}
+void dev_register_fast_clear_colori(nvngfx_ctx*, uint64_t* x) {
+    dev_register_fast_clear_color(nullptr, x);
+}
+void dev_register_fast_clear_colorui(nvngfx_ctx*, uint64_t* x) {
+    dev_register_fast_clear_color(nullptr, x);
+}
+void dev_register_fast_clear_depth(nvngfx_ctx*, uint64_t* x) {
+    DevSpec& d = g_dev_specs[x[0]];
+    ++d.fastClearDepths;
+    x[0] = 1;
+}
+
+/* nvnDeviceSetDebugLabel(device, const char*) */
+void dev_set_debug_label(nvngfx_ctx*, uint64_t* x) {
+    std::string label;
+    if (guest_cstr(x[1], &label)) g_dev_specs[x[0]].label = std::move(label);
+}
+
+void dev_set_depth_mode(nvngfx_ctx*, uint64_t* x) {
+    g_dev_specs[x[0]].depthMode = static_cast<int>(x[1]);
+}
+
+void dev_set_intermediate_shader_cache(nvngfx_ctx*, uint64_t* x) {
+    g_dev_specs[x[0]].intermediateCache = static_cast<int>(x[1]);
+}
+
+void dev_set_window_origin_mode(nvngfx_ctx*, uint64_t* x) {
+    g_dev_specs[x[0]].originMode = static_cast<int>(x[1]);
+}
+
+/* nvnDeviceWalkDebugDatabase(device, type, callback, data).  The callback is
+ * a guest function pointer; invoking it directly from host code would jump
+ * into emulated code without the emulator's register/stack setup.  Count what
+ * this backend recorded for the type, and make the limitation visible once. */
+void dev_walk_debug_database(nvngfx_ctx*, uint64_t* x) {
+    const int type = static_cast<int>(x[1]);
+    unsigned n = 0;
+    for (const auto& kv : g_debug_objects) {
+        if (kv.second.type == type && !kv.second.label.empty()) ++n;
+    }
+    log_once("nvnDeviceWalkDebugDatabase.guestCallback", static_cast<unsigned>(n));
 }
 
 /* ------------------------------------------------------------------ */
@@ -1110,6 +1393,7 @@ void win_set_debug_label(nvngfx_ctx*, uint64_t* x) {
     if (!w) return;
     const char* label = guest_ptr<const char>(x[1]);
     w->label = label ? label : "";
+    debug_note_object(0, x[0], w->label);
 }
 
 /* nvnWindowSetCrop(window, x, y, width, height) / GetCrop(window, rect*).
@@ -1283,6 +1567,7 @@ void pool_set_debug_label(nvngfx_ctx*, uint64_t* x) {
     if (!p) return;
     const char* label = guest_ptr<const char>(x[1]);
     p->label = label ? label : "";
+    debug_note_object(3, x[0], p->label);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1515,6 +1800,33 @@ void tex_builder_set_gl_name(nvngfx_ctx*, uint64_t* x) {
 void tex_builder_set_dsmode(nvngfx_ctx*, uint64_t* x) {
     if (!x[0]) return;
     g_tex_specs[x[0]].dsmode = x[1] == 1 ? 1 : 0;
+}
+
+/* nvnTextureBuilderSetPackagedTextureLayout(builder, const
+ * NVNpackagedTextureLayout*).  The 8-byte layout's first byte encodes the
+ * block height (low nibble) and depth (high nibble) as log2 exponent + 1;
+ * nvngfx_tex_layout already consumes pkg_block_h, so storing this makes the
+ * guest's packaged layout change the storage geometry. */
+void tex_builder_set_packaged_layout(nvngfx_ctx*, uint64_t* x) {
+    if (!x[0]) return;
+    nvngfx_texdesc& d = g_tex_specs[x[0]];
+    if (!x[1]) {
+        d.pkg_block_h = 0;
+        return;
+    }
+    const unsigned char* p = guest_ptr<const unsigned char>(x[1]);
+    if (!p) {
+        d.pkg_block_h = 0;
+        return;
+    }
+    const unsigned v = p[0];
+    d.pkg_block_h = static_cast<unsigned char>(v == 0xFFu ? 0u : v + 1u);
+}
+
+/* nvnTextureBuilderGetZCullStorageSize(builder) -> size_t.  Metal allocates
+ * no ZCull storage, so zero is the truthful answer, not a placeholder. */
+void tex_builder_get_zcull_storage_size(nvngfx_ctx*, uint64_t* x) {
+    x[0] = 0;
 }
 
 /* The builder is a guest object whose layout we never read; every getter
@@ -2062,6 +2374,12 @@ void tex_get_storage_size(nvngfx_ctx*, uint64_t* x) {
     x[0] = L.size;
 }
 
+/* nvnTextureGetZCullStorageSize(const NVNtexture*) -> size_t.  There is no
+ * ZCull allocation on Metal, so the storage size is zero. */
+void tex_get_zcull_storage_size(nvngfx_ctx*, uint64_t* x) {
+    x[0] = 0;
+}
+
 /* nvnTextureGetSwizzle(tex, r, g, b, a).  Four out-pointers, each an
  * NVNtextureSwizzle.  The stored values are exactly what the builder gave
  * (the defaults are R/G/B/A). */
@@ -2598,6 +2916,7 @@ void tex_pool_set_debug_label(nvngfx_ctx*, uint64_t* x) {
     if (!p) return;
     const char* label = guest_ptr<const char>(x[1]);
     p->label = label ? label : "";
+    debug_note_object(10, x[0], p->label);
 }
 
 /* Registers a texture (or an image, which shares the pool index space) at
@@ -2655,6 +2974,7 @@ void samp_pool_set_debug_label(nvngfx_ctx*, uint64_t* x) {
     if (!p) return;
     const char* label = guest_ptr<const char>(x[1]);
     p->label = label ? label : "";
+    debug_note_object(11, x[0], p->label);
 }
 
 int samp_pool_slot(const SamplerPool* p, uint64_t id_arg) {
@@ -4571,6 +4891,7 @@ void prog_set_debug_label(nvngfx_ctx*, uint64_t* x) {
     if (!p) return;
     const char* label = guest_ptr<const char>(x[1]);
     p->label = label ? label : "";
+    debug_note_object(9, x[0], p->label);
 }
 
 /* nvnProgramSetSampleShading(NVNprogram*, int) -> NVNboolean.
@@ -6177,6 +6498,9 @@ void cmdbuf_begin_recording(nvngfx_ctx* ctx, uint64_t* x) {
     b->shaderScratchOffset = 0;
     b->shaderScratchSize = 0;
     b->eventSignals.clear();
+    b->counterReports.clear();
+    b->counterResetMask = 0;
+    b->recordingStartTicks = nvn_ticks_from_host_ns(host_now_ns());
 }
 
 /* nvnCommandBufferEndRecording(NVNcommandBuffer*) -> NVNcommandHandle
@@ -6208,11 +6532,28 @@ void cmdbuf_end_recording(nvngfx_ctx* ctx, uint64_t* x) {
                 event_signal_raw(address, add, value);
             }];
         }
+        /* Counter reports bracket the recording: type 0x10 (TIMESTAMP_TOP)
+         * gets the time BeginRecording was reached, every other timestamp
+         * gets EndRecording.  These are host submission times, not Metal
+         * GPU timestamps; MTL4 counter heaps would be needed for the latter.
+         * Both fields are written when the GPU finishes, like NVN. */
+        const uint64_t startTicks = b->recordingStartTicks;
+        const uint64_t endTicks = nvn_ticks_from_host_ns(host_now_ns());
+        for (const PendingCounterReport& rep : b->counterReports) {
+            const uint64_t address = rep.address;
+            const uint32_t type = rep.type;
+            const uint64_t ticks = type == 0x10 ? startTicks : endTicks;
+            [b->cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+                (void)done;
+                counter_report_write(address, 0, ticks);
+            }];
+        }
         [b->cb commit];
         b->last = b->cb;
         b->cb = nil;
     }
     b->eventSignals.clear();
+    b->counterReports.clear();
     b->recording = false;
     g_last_mtl_buffer = b->last;
     x[0] = cbGuest;
@@ -6374,6 +6715,7 @@ void cmdbuf_set_debug_label(nvngfx_ctx*, uint64_t* x) {
     std::string name;
     if (!b || !guest_cstr(x[1], &name)) return;
     b->debugLabel = name;
+    debug_note_object(2, x[0], name);
     if (b->recording && b->cb) {
         NSString* label = [NSString stringWithUTF8String:name.c_str()];
         if (label) [b->cb setLabel:label];
@@ -8728,6 +9070,56 @@ void cmdbuf_signal_event(nvngfx_ctx*, uint64_t* x) {
     b->eventSignals.push_back(sig);
 }
 
+/* nvnCommandBufferReportCounter(cb, NVNcounterType type, NVNbufferAddress a).
+ * The record is written by a completion handler, so the guest cannot observe
+ * a timestamp before the work it brackets has finished. */
+void cmdbuf_report_counter(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find<CmdBuf>(x[0]);
+    if (!b || !b->recording) {
+        log_once("nvnCommandBufferReportCounter.state", b ? 1u : 0u);
+        return;
+    }
+    PendingCounterReport rep;
+    rep.address = x[2];
+    rep.type = static_cast<uint32_t>(x[1]);
+    b->counterReports.push_back(rep);
+    if (rep.type != 0 && rep.type != 0x10) {
+        /* Samples-passed and other counters need visibility queries.  Writing
+         * zero is the same answer as "nothing passed" and is reported once. */
+        log_once("nvnCommandBufferReportCounter.type", rep.type);
+    }
+}
+
+/* nvnCommandBufferReportValue(cb, uint32_t value, NVNbufferAddress a).  NVN
+ * writes the value when the GPU reaches this point; the existing event
+ * completion path gives the same CPU-visible ordering. */
+void cmdbuf_report_value(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find<CmdBuf>(x[0]);
+    if (!b || !b->recording) {
+        log_once("nvnCommandBufferReportValue.state", b ? 1u : 0u);
+        return;
+    }
+    PendingEventSignal sig;
+    sig.address = x[2];
+    sig.add = false;
+    sig.value = static_cast<uint32_t>(x[1]);
+    b->eventSignals.push_back(sig);
+}
+
+/* nvnCommandBufferResetCounter(cb, NVNcounterType type).  No counter is
+ * accumulated yet, but the reset is remembered so a later report can be
+ * diagnosed against what the guest asked for. */
+void cmdbuf_reset_counter(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find<CmdBuf>(x[0]);
+    if (!b || !b->recording) {
+        log_once("nvnCommandBufferResetCounter.state", b ? 1u : 0u);
+        return;
+    }
+    const unsigned type = static_cast<unsigned>(x[1]);
+    if (type < 64) b->counterResetMask |= (1ull << type);
+    log_once("nvnCommandBufferResetCounter.type", type);
+}
+
 /* In a single Metal queue, commands execute in recording order.  A wait for
  * an earlier signal in the same stream is therefore already ordered; there is
  * no device-side counter to poll here. */
@@ -8757,7 +9149,10 @@ void sync_set_debug_label(nvngfx_ctx*, uint64_t* x) {
     NvnSync* s = find<NvnSync>(x[0]);
     if (!s) return;
     std::string label;
-    if (guest_cstr(x[1], &label)) s->label = std::move(label);
+    if (guest_cstr(x[1], &label)) {
+        s->label = std::move(label);
+        debug_note_object(7, x[0], s->label);
+    }
 }
 
 /* nvnCommandBufferFenceSync(cb, sync, condition, flags).  Both NVN fence
@@ -8952,7 +9347,10 @@ void queue_set_debug_label(nvngfx_ctx*, uint64_t* x) {
     NvnQueue* q = find<NvnQueue>(x[0]);
     if (!q) return;
     std::string label;
-    if (guest_cstr(x[1], &label)) q->label = std::move(label);
+    if (guest_cstr(x[1], &label)) {
+        q->label = std::move(label);
+        debug_note_object(1, x[0], q->label);
+    }
 }
 
 /* nvnQueueAcquireTexture(queue, window, int* index).  The guest's active
@@ -9261,6 +9659,26 @@ const Binding kBindings[] = {
     BIND("nvnDeviceGetSeparateTextureHandle", dev_get_separate_texture_handle),
     BIND("nvnDeviceGetSeparateSamplerHandle", dev_get_separate_sampler_handle),
     BIND("nvnDeviceGetImageHandle", dev_get_image_handle),
+    BIND("nvnDeviceApplyDeferredFinalizes", dev_apply_deferred_finalizes),
+    BIND("nvnDeviceFinalize", dev_finalize),
+    BIND("nvnDeviceFinalizeCommandHandle", dev_finalize_command_handle),
+    BIND("nvnDeviceGenerateDebugDomainId", dev_generate_debug_domain_id),
+    BIND("nvnDeviceGetCurrentTimestampInNanoseconds", dev_get_current_timestamp),
+    BIND("nvnDeviceGetDepthMode", dev_get_depth_mode),
+    BIND("nvnDeviceGetInteger", dev_get_integer),
+    BIND("nvnDeviceGetTimestampInNanoseconds", dev_get_timestamp),
+    BIND("nvnDeviceGetWindowOriginMode", dev_get_window_origin_mode),
+    BIND("nvnDeviceInstallDebugCallback", dev_install_debug_callback),
+    BIND("nvnDeviceIsExternalDebuggerAttached", dev_is_external_debugger_attached),
+    BIND("nvnDeviceRegisterFastClearColor", dev_register_fast_clear_color),
+    BIND("nvnDeviceRegisterFastClearColori", dev_register_fast_clear_colori),
+    BIND("nvnDeviceRegisterFastClearColorui", dev_register_fast_clear_colorui),
+    BIND("nvnDeviceRegisterFastClearDepth", dev_register_fast_clear_depth),
+    BIND("nvnDeviceSetDebugLabel", dev_set_debug_label),
+    BIND("nvnDeviceSetDepthMode", dev_set_depth_mode),
+    BIND("nvnDeviceSetIntermediateShaderCache", dev_set_intermediate_shader_cache),
+    BIND("nvnDeviceSetWindowOriginMode", dev_set_window_origin_mode),
+    BIND("nvnDeviceWalkDebugDatabase", dev_walk_debug_database),
 
     BIND("nvnWindowBuilderSetDefaults", win_builder_set_defaults),
     BIND("nvnWindowBuilderSetDevice", win_builder_set_device),
@@ -9359,6 +9777,8 @@ const Binding kBindings[] = {
     BIND("nvnTextureBuilderSetGLTextureName", tex_builder_set_gl_name),
     BIND("nvnTextureBuilderGetGLTextureName", tex_builder_get_gl_name),
     BIND("nvnTextureBuilderSetDepthStencilMode", tex_builder_set_dsmode),
+    BIND("nvnTextureBuilderSetPackagedTextureLayout", tex_builder_set_packaged_layout),
+    BIND("nvnTextureBuilderGetZCullStorageSize", tex_builder_get_zcull_storage_size),
     BIND("nvnTextureBuilderGetDepthStencilMode", tex_builder_get_dsmode),
     BIND("nvnTextureInitialize", tex_initialize),
     BIND("nvnTextureWriteTexels", tex_write_texels),
@@ -9376,6 +9796,7 @@ const Binding kBindings[] = {
     BIND("nvnTextureGetDebugID", tex_get_debug_id),
     BIND("nvnTextureGetTextureAddress", tex_get_texture_address),
     BIND("nvnTextureGetStorageSize", tex_get_storage_size),
+    BIND("nvnTextureGetZCullStorageSize", tex_get_zcull_storage_size),
     BIND("nvnTextureGetSwizzle", tex_get_swizzle),
     BIND("nvnTextureGetDepthStencilMode", tex_get_dsmode),
     BIND("nvnTextureCompare", tex_compare),
@@ -9665,6 +10086,9 @@ const Binding kBindings[] = {
 
     BIND("nvnCommandBufferFenceSync", cmdbuf_fence_sync),
     BIND("nvnCommandBufferSignalEvent", cmdbuf_signal_event),
+    BIND("nvnCommandBufferReportCounter", cmdbuf_report_counter),
+    BIND("nvnCommandBufferReportValue", cmdbuf_report_value),
+    BIND("nvnCommandBufferResetCounter", cmdbuf_reset_counter),
     BIND("nvnCommandBufferWaitEvent", cmdbuf_wait_event),
     BIND("nvnCommandBufferWaitSync", cmdbuf_wait_sync),
 
@@ -17317,6 +17741,270 @@ extern "C" int nvngfx_metal_selftest(void) {
                          "[selftest] program/sampler state: debug label, "
                          "sample-shading mode, extended shader records, "
                          "builder device and sampler debug id round-tripped\n");
+        }
+
+        {
+            /* --- Device state, timestamps and command-buffer counters ----
+             * These are the entry points BOTW calls every frame before a
+             * draw exists: GetInteger sizes its pools, Timestamp drives the
+             * interval controller, and ReportCounter brackets the frame.
+             * The check is end to end for the counter writes: the values are
+             * read only after the committed MTLCommandBuffer completed. */
+            const uint64_t kDev = 0x9F00;
+            const uint64_t kDevBuilder = 0x9F08;
+            const uint64_t kDev2 = 0x9F10;
+            const uint64_t kCounterCb = 0x9F80;
+            const uint64_t kPkgBuilder = 0x9E00;
+            uint64_t a[8] = {0};
+
+            a[0] = kDev; a[1] = kDevBuilder;
+            dev_initialize(ctx, a);
+            if (a[0] != 1) {
+                std::fprintf(stderr, "[selftest] device: initialize failed\n");
+                rc = 16436;
+                goto done;
+            }
+
+            a[0] = kDev; a[1] = 1;
+            dev_set_window_origin_mode(ctx, a);
+            a[0] = kDev;
+            dev_get_window_origin_mode(ctx, a);
+            const uint64_t gotOrigin = a[0];
+            a[0] = kDev; a[1] = 1;
+            dev_set_depth_mode(ctx, a);
+            a[0] = kDev;
+            dev_get_depth_mode(ctx, a);
+            const uint64_t gotDepth = a[0];
+            a[0] = kDev; a[1] = 4;
+            dev_apply_deferred_finalizes(ctx, a);
+            a[0] = kDev; a[1] = 0x1234;
+            dev_finalize_command_handle(ctx, a);
+            a[0] = kDev; a[1] = 2;
+            dev_set_intermediate_shader_cache(ctx, a);
+            a[0] = kDev;
+            dev_is_external_debugger_attached(ctx, a);
+            const uint64_t externalDebugger = a[0];
+            if (gotOrigin != 1 || gotDepth != 1 || externalDebugger != 0 ||
+                g_dev_specs[kDev].deferredFinalizes != 4 ||
+                g_dev_specs[kDev].intermediateCache != 2) {
+                std::fprintf(stderr,
+                             "[selftest] device: state origin=%llu depth=%llu "
+                             "external=%llu deferred=%u cache=%d\n",
+                             static_cast<unsigned long long>(gotOrigin),
+                             static_cast<unsigned long long>(gotDepth),
+                             static_cast<unsigned long long>(externalDebugger),
+                             g_dev_specs[kDev].deferredFinalizes,
+                             g_dev_specs[kDev].intermediateCache);
+                rc = 16436;
+                goto done;
+            }
+
+            int apiMajor = -1, apiMinor = -1, minMax = -1, unknownInfo = -1;
+            a[0] = kDev; a[1] = 0;
+            a[2] = reinterpret_cast<uint64_t>(&apiMajor);
+            dev_get_integer(ctx, a);
+            a[0] = kDev; a[1] = 1;
+            a[2] = reinterpret_cast<uint64_t>(&apiMinor);
+            dev_get_integer(ctx, a);
+            a[0] = kDev; a[1] = 0x28;
+            a[2] = reinterpret_cast<uint64_t>(&minMax);
+            dev_get_integer(ctx, a);
+            a[0] = kDev; a[1] = 0x1234;
+            a[2] = reinterpret_cast<uint64_t>(&unknownInfo);
+            dev_get_integer(ctx, a);
+            if (apiMajor != 55 || apiMinor != 15 || minMax != 1 ||
+                unknownInfo != 0) {
+                std::fprintf(stderr,
+                             "[selftest] device: info %d.%d minmax=%d "
+                             "unknown=%d\n", apiMajor, apiMinor, minMax,
+                             unknownInfo);
+                rc = 16436;
+                goto done;
+            }
+
+            a[0] = kDev;
+            dev_get_current_timestamp(ctx, a);
+            const uint64_t t0 = a[0];
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            a[0] = kDev;
+            dev_get_current_timestamp(ctx, a);
+            const uint64_t t1 = a[0];
+            struct CounterData { uint64_t counter, timestamp; } cd = {0, 384};
+            a[0] = kDev; a[1] = reinterpret_cast<uint64_t>(&cd);
+            dev_get_timestamp(ctx, a);
+            if (t0 == 0 || t1 <= t0 || a[0] != 625) {
+                std::fprintf(stderr,
+                             "[selftest] device: timestamps %llu -> %llu, "
+                             "384 ticks -> %llu ns\n",
+                             static_cast<unsigned long long>(t0),
+                             static_cast<unsigned long long>(t1),
+                             static_cast<unsigned long long>(a[0]));
+                rc = 16436;
+                goto done;
+            }
+
+            a[0] = kDev; a[1] = reinterpret_cast<uint64_t>("selftest-domain");
+            dev_generate_debug_domain_id(ctx, a);
+            const int domain1 = static_cast<int>(a[0]);
+            a[0] = kDev; a[1] = reinterpret_cast<uint64_t>("selftest-domain");
+            dev_generate_debug_domain_id(ctx, a);
+            const int domain2 = static_cast<int>(a[0]);
+            a[0] = kDev; a[1] = reinterpret_cast<uint64_t>("selftest-domain-2");
+            dev_generate_debug_domain_id(ctx, a);
+            const int domain3 = static_cast<int>(a[0]);
+            a[0] = kDev; a[1] = reinterpret_cast<uint64_t>("selftest device");
+            dev_set_debug_label(ctx, a);
+            a[0] = kDev; a[1] = 0; a[2] = 0; a[3] = 1;
+            dev_install_debug_callback(ctx, a);
+            const float clearColor[4] = {0.25f, 0.5f, 0.75f, 1.0f};
+            const int clearColori[4] = {1, 2, 3, 4};
+            const uint32_t clearColorui[4] = {5, 6, 7, 8};
+            a[0] = kDev; a[1] = reinterpret_cast<uint64_t>(clearColor); a[2] = 0x25;
+            dev_register_fast_clear_color(ctx, a);
+            const uint64_t fastColor = a[0];
+            a[0] = kDev; a[1] = reinterpret_cast<uint64_t>(clearColori); a[2] = 0x25;
+            dev_register_fast_clear_colori(ctx, a);
+            a[0] = kDev; a[1] = reinterpret_cast<uint64_t>(clearColorui); a[2] = 0x25;
+            dev_register_fast_clear_colorui(ctx, a);
+            const float clearDepth = 0.5f;
+            a[0] = kDev; a[1] = reinterpret_cast<uint64_t>(&clearDepth);
+            dev_register_fast_clear_depth(ctx, a);
+            if (domain1 <= 0 || domain1 != domain2 || domain3 == domain1 ||
+                fastColor != 1 || g_dev_specs[kDev].fastClearColors != 3 ||
+                g_dev_specs[kDev].fastClearDepths != 1 ||
+                g_dev_specs[kDev].debugCallbackEnable != 1) {
+                std::fprintf(stderr,
+                             "[selftest] device: domains %d/%d/%d fast=%llu "
+                             "colors=%u depths=%u callback=%u\n",
+                             domain1, domain2, domain3,
+                             static_cast<unsigned long long>(fastColor),
+                             g_dev_specs[kDev].fastClearColors,
+                             g_dev_specs[kDev].fastClearDepths,
+                             g_dev_specs[kDev].debugCallbackEnable);
+                rc = 16436;
+                goto done;
+            }
+
+            a[0] = kDev; a[1] = 2; a[2] = 0; a[3] = 0;
+            dev_walk_debug_database(ctx, a);
+            if (g_dev_specs.find(kDev) == g_dev_specs.end() ||
+                g_dev_specs[kDev].label != "selftest device") {
+                std::fprintf(stderr, "[selftest] device: label was not stored\n");
+                rc = 16436;
+                goto done;
+            }
+
+            /* A device finalized through the entry point loses its state. */
+            a[0] = kDev2; a[1] = 1;
+            dev_set_depth_mode(ctx, a);
+            a[0] = kDev2;
+            dev_finalize(ctx, a);
+            a[0] = kDev2;
+            dev_get_depth_mode(ctx, a);
+            if (a[0] != 0 || g_dev_specs.find(kDev2) != g_dev_specs.end()) {
+                std::fprintf(stderr, "[selftest] device: finalize left state\n");
+                rc = 16436;
+                goto done;
+            }
+
+            /* Packaged layout byte 3 -> block height log2 = 3.  The layout
+             * code must see it without any further translation here. */
+            a[0] = kPkgBuilder;
+            tex_builder_set_defaults(ctx, a);
+            a[0] = kPkgBuilder; a[1] = 0;
+            tex_builder_set_target(ctx, a);
+            a[0] = kPkgBuilder; a[1] = 0x25;
+            tex_builder_set_format(ctx, a);
+            a[0] = kPkgBuilder; a[1] = 64; a[2] = 64;
+            tex_builder_set_size2d(ctx, a);
+            a[0] = kPkgBuilder; a[1] = 1;
+            tex_builder_set_levels(ctx, a);
+            unsigned char packaged[8] = {3, 0, 0, 0, 0, 0, 0, 0};
+            a[0] = kPkgBuilder; a[1] = reinterpret_cast<uint64_t>(packaged);
+            tex_builder_set_packaged_layout(ctx, a);
+            const nvngfx_texdesc& pkg = g_tex_specs[kPkgBuilder];
+            nvngfx_texlayout pkgLayout = {};
+            const int pkgOk = nvngfx_tex_layout(&pkg, &pkgLayout);
+            if (pkg.pkg_block_h != 4 || pkgOk != 0 || pkgLayout.tile_h != 3) {
+                std::fprintf(stderr,
+                             "[selftest] device: packaged byte %u tile=%u\n",
+                             static_cast<unsigned>(pkg.pkg_block_h),
+                             pkgLayout.tile_h);
+                rc = 16436;
+                goto done;
+            }
+            a[0] = kPkgBuilder;
+            tex_builder_get_zcull_storage_size(ctx, a);
+            const uint64_t builderZcull = a[0];
+            a[0] = kTex;
+            tex_get_zcull_storage_size(ctx, a);
+            if (builderZcull != 0 || a[0] != 0) {
+                std::fprintf(stderr, "[selftest] device: ZCull sizes %llu/%llu\n",
+                             static_cast<unsigned long long>(builderZcull),
+                             static_cast<unsigned long long>(a[0]));
+                rc = 16436;
+                goto done;
+            }
+
+            /* ReportCounter/ReportValue are written by the completion handler,
+             * so the buffers are checked only after waitUntilCompleted. */
+            a[0] = kCounterCb; a[1] = kDev;
+            cmdbuf_initialize(ctx, a);
+            if (a[0] != 1) {
+                std::fprintf(stderr, "[selftest] counter: initialize failed\n");
+                rc = 16436;
+                goto done;
+            }
+            a[0] = kCounterCb; a[1] = reinterpret_cast<uint64_t>("selftest counter cb");
+            cmdbuf_set_debug_label(ctx, a);
+            a[0] = kCounterCb;
+            cmdbuf_begin_recording(ctx, a);
+            uint64_t reportTop[2] = {0xAAAAAAAAull, 0xBBBBBBBBull};
+            uint64_t reportBottom[2] = {0xCCCCCCCCull, 0xDDDDDDDDull};
+            uint32_t reportedValue = 0;
+            a[0] = kCounterCb; a[1] = 0x10;
+            a[2] = reinterpret_cast<uint64_t>(reportTop);
+            cmdbuf_report_counter(ctx, a);
+            a[0] = kCounterCb; a[1] = 0;
+            a[2] = reinterpret_cast<uint64_t>(reportBottom);
+            cmdbuf_report_counter(ctx, a);
+            a[0] = kCounterCb; a[1] = 0x12345678;
+            a[2] = reinterpret_cast<uint64_t>(&reportedValue);
+            cmdbuf_report_value(ctx, a);
+            a[0] = kCounterCb; a[1] = 0;
+            cmdbuf_reset_counter(ctx, a);
+            a[0] = kCounterCb;
+            cmdbuf_end_recording(ctx, a);
+            CmdBuf* counterCb = find<CmdBuf>(kCounterCb);
+            if (!counterCb || !counterCb->last ||
+                (counterCb->counterResetMask & 1ull) == 0) {
+                std::fprintf(stderr, "[selftest] counter: no commit or reset\n");
+                rc = 16436;
+                goto done;
+            }
+            [counterCb->last waitUntilCompleted];
+            if (reportTop[0] != 0 || reportTop[1] == 0 ||
+                reportBottom[0] != 0 || reportBottom[1] < reportTop[1] ||
+                reportedValue != 0x12345678) {
+                std::fprintf(stderr,
+                             "[selftest] counter: reports %llu/%llu and "
+                             "%llu/%llu, value=%#x\n",
+                             static_cast<unsigned long long>(reportTop[0]),
+                             static_cast<unsigned long long>(reportTop[1]),
+                             static_cast<unsigned long long>(reportBottom[0]),
+                             static_cast<unsigned long long>(reportBottom[1]),
+                             reportedValue);
+                rc = 16436;
+                goto done;
+            }
+            forget<CmdBuf>(kCounterCb);
+            g_dev_specs.erase(kDev);
+            g_dev_specs.erase(kDev2);
+            g_tex_specs.erase(kPkgBuilder);
+            std::fprintf(stderr,
+                         "[selftest] device/counters: state, API version, "
+                         "timestamps, debug ids, packaged layout and the two "
+                         "frame counter reports round-tripped\n");
         }
 
     done:
