@@ -34,7 +34,8 @@
  *         path -- pipeline creation with a real vertex descriptor, buffer
  *         binding, draw encoding, pixel readback -- is executed by
  *         nvngfx_metal_selftest() in CI's iOS Simulator: eighteen draws,
- *         four clear-only regressions (including R32Uint / R32Sint clears), a
+ *         five clear-only regressions (R32Uint / R32Sint full clears and
+ *         partial-mask RGBA8 / RGBA8Uint clears), a
  *         buffer-fill compute probe, a bindless table probe, and a vertex-stage
  *         argument-buffer draw whose shifted pixels are read back.  The ninth
  *         builds a block-linear texture in a guest memory pool and proves that
@@ -153,6 +154,24 @@ void log_once_str(const char* what, const char* msg) {
 /* host state, keyed by the guest object address                       */
 /* ------------------------------------------------------------------ */
 
+/* A partial colour clear cannot be a Metal load action: a load action
+ * replaces all four channels.  The backend opens the pass with
+ * MTLLoadActionLoad and draws one full-screen triangle whose per-attachment
+ * write masks select the requested channels.  The shader is host-owned and
+ * its output type follows each attachment's component class. */
+constexpr unsigned kClearPsoSlots = 8;
+
+struct ClearPsoEntry {
+    bool used = false;
+    unsigned numColors = 0;
+    unsigned colorFormat[NVNGFX_MAX_COLOR_TARGETS] = {};
+    unsigned writeMask[NVNGFX_MAX_COLOR_TARGETS] = {};
+    unsigned depthFormat = 0;
+    unsigned stencilFormat = 0;
+    unsigned sampleCount = 0;
+    id<MTLRenderPipelineState> pso = nil;
+};
+
 struct Ctx {
     id<MTLDevice> device = nil;
     id<MTLCommandQueue> queue = nil;
@@ -165,6 +184,14 @@ struct Ctx {
      * a guest pool span.  Built lazily and retained for the context lifetime. */
     id<MTLComputePipelineState> clearBufferPso = nil;
     bool clearBufferPsoTried = false;
+    /* Partial-clear pipelines keyed by attachment formats, masks, depth and
+     * stencil formats and sample count.  Partial clears are rare, so a small
+     * linear cache with round-robin eviction is enough. */
+    ClearPsoEntry clearPso[kClearPsoSlots];
+    unsigned clearPsoCount = 0;
+    unsigned clearPsoNext = 0;
+    id<MTLDepthStencilState> clearDss = nil;
+    bool clearDssTried = false;
 };
 
 struct Win {
@@ -265,6 +292,9 @@ struct CmdBuf {
      * together, and because a clear must still happen when EndRecording is
      * reached without a following draw. */
     bool pendingClear[NVNGFX_MAX_COLOR_TARGETS] = {};
+    /* NVN nibble: r=1, g=2, b=4, a=8.  0 means no clear; 0xF is a load
+     * action; anything else is a partial clear encoded as a masked draw. */
+    unsigned clearMask[NVNGFX_MAX_COLOR_TARGETS] = {};
     bool pendingDepthClear = false;
     bool pendingStencilClear = false;
     double clear[NVNGFX_MAX_COLOR_TARGETS][4] = {};
@@ -3317,6 +3347,268 @@ void cmdbuf_bind_vertex_stream_state(nvngfx_ctx*, uint64_t* x) {
 /* command buffer                                                      */
 /* ------------------------------------------------------------------ */
 
+/* ------------------------------------------------------------------ */
+/* partial colour clears                                               */
+/* ------------------------------------------------------------------ */
+
+/* One 32-bit component as the fragment shader will see it.  Integer clears
+ * were stored as doubles precisely so this cast is lossless; a float clear
+ * round-trips through its original float value. */
+uint32_t clear_component_bits(double value, int kind) {
+    uint32_t bits = 0;
+    if (kind == 1) {
+        bits = static_cast<uint32_t>(value);
+    } else if (kind == 2) {
+        const int32_t s = static_cast<int32_t>(value);
+        std::memcpy(&bits, &s, sizeof bits);
+    } else {
+        const float f = static_cast<float>(value);
+        std::memcpy(&bits, &f, sizeof bits);
+    }
+    return bits;
+}
+
+id<MTLDepthStencilState> clear_depth_stencil(Ctx* c) {
+    if (!c) return nil;
+    if (c->clearDss) return c->clearDss;
+    if (c->clearDssTried) return nil;
+    c->clearDssTried = true;
+    @autoreleasepool {
+        MTLDepthStencilDescriptor* d = [[MTLDepthStencilDescriptor alloc] init];
+        d.depthCompareFunction = MTLCompareFunctionAlways;
+        d.depthWriteEnabled = NO;
+        c->clearDss = [c->device newDepthStencilStateWithDescriptor:d];
+    }
+    if (!c->clearDss) log_once("nvnClear.partialDepthState", 1);
+    return c->clearDss;
+}
+
+id<MTLRenderPipelineState> clear_pipeline(Ctx* c,
+                                          const MTLPixelFormat* colorFormats,
+                                          const unsigned* masks,
+                                          const int* kinds, unsigned numColors,
+                                          MTLPixelFormat depthFormat,
+                                          MTLPixelFormat stencilFormat,
+                                          unsigned sampleCount) {
+    if (!c || !c->device || !colorFormats || !masks || !kinds || !numColors)
+        return nil;
+
+    for (unsigned e = 0; e < c->clearPsoCount; ++e) {
+        ClearPsoEntry& k = c->clearPso[e];
+        if (!k.used || k.numColors != numColors ||
+            k.depthFormat != static_cast<unsigned>(depthFormat) ||
+            k.stencilFormat != static_cast<unsigned>(stencilFormat) ||
+            k.sampleCount != sampleCount)
+            continue;
+        bool same = true;
+        for (unsigned i = 0; i < numColors; ++i) {
+            if (k.colorFormat[i] != static_cast<unsigned>(colorFormats[i]) ||
+                k.writeMask[i] != masks[i]) {
+                same = false;
+                break;
+            }
+        }
+        if (same) return k.pso;
+    }
+
+    @autoreleasepool {
+        std::string src =
+            "#include <metal_stdlib>\n"
+            "using namespace metal;\n"
+            "struct NvngfxClearVOut { float4 position [[position]]; };\n"
+            "vertex NvngfxClearVOut nvngfx_clear_vs(uint vid [[vertex_id]]) {\n"
+            "    float2 p = float2(vid == 1 ? 3.0 : -1.0,\n"
+            "                      vid == 2 ? 3.0 : -1.0);\n"
+            "    NvngfxClearVOut o; o.position = float4(p, 0.0, 1.0);\n"
+            "    return o;\n"
+            "}\n"
+            "struct NvngfxClearOut {\n";
+        for (unsigned i = 0; i < numColors; ++i) {
+            const char* type = kinds[i] == 1 ? "uint4"
+                               : kinds[i] == 2 ? "int4" : "float4";
+            src += "    ";
+            src += type;
+            src += " c";
+            src += std::to_string(i);
+            src += " [[color(";
+            src += std::to_string(i);
+            src += ")]];\n";
+        }
+        src += "};\n";
+        src +=
+            "fragment NvngfxClearOut nvngfx_clear_fs("
+            "constant uint4* bits [[buffer(0)]]) {\n"
+            "    NvngfxClearOut o;\n";
+        for (unsigned i = 0; i < numColors; ++i) {
+            src += "    o.c";
+            src += std::to_string(i);
+            src += " = ";
+            if (kinds[i] == 1) {
+                src += "bits[";
+                src += std::to_string(i);
+                src += "]";
+            } else if (kinds[i] == 2) {
+                src += "as_type<int4>(bits[";
+                src += std::to_string(i);
+                src += "])";
+            } else {
+                src += "as_type<float4>(bits[";
+                src += std::to_string(i);
+                src += "])";
+            }
+            src += ";\n";
+        }
+        src += "    return o;\n}\n";
+
+        NSError* err = nil;
+        id<MTLLibrary> lib =
+            [c->device newLibraryWithSource:[NSString stringWithUTF8String:src.c_str()]
+                                    options:nil
+                                      error:&err];
+        if (!lib) {
+            log_once_str("nvnClear.partialLibrary",
+                         err ? [[err localizedDescription] UTF8String]
+                             : "nil library");
+            return nil;
+        }
+        id<MTLFunction> vfn = [lib newFunctionWithName:@"nvngfx_clear_vs"];
+        id<MTLFunction> ffn = [lib newFunctionWithName:@"nvngfx_clear_fs"];
+        if (!vfn || !ffn) {
+            log_once_str("nvnClear.partialFunction",
+                         "MSL did not define nvngfx_clear_vs / nvngfx_clear_fs");
+            return nil;
+        }
+
+        MTLRenderPipelineDescriptor* pd =
+            [[MTLRenderPipelineDescriptor alloc] init];
+        pd.vertexFunction = vfn;
+        pd.fragmentFunction = ffn;
+        for (unsigned i = 0; i < numColors; ++i) {
+            MTLRenderPipelineColorAttachmentDescriptor* ca =
+                pd.colorAttachments[i];
+            ca.pixelFormat = colorFormats[i];
+            ca.writeMask =
+                static_cast<MTLColorWriteMask>(nvngfx_write_mask(masks[i]));
+            ca.blendingEnabled = NO;
+        }
+        if (depthFormat) pd.depthAttachmentPixelFormat = depthFormat;
+        if (stencilFormat) pd.stencilAttachmentPixelFormat = stencilFormat;
+        pd.rasterSampleCount = sampleCount ? sampleCount : 1;
+
+        err = nil;
+        id<MTLRenderPipelineState> pso =
+            [c->device newRenderPipelineStateWithDescriptor:pd error:&err];
+        if (!pso) {
+            log_once_str("nvnClear.partialPipeline",
+                         err ? [[err localizedDescription] UTF8String]
+                             : "nil pipeline");
+            return nil;
+        }
+
+        unsigned slot;
+        if (c->clearPsoCount < kClearPsoSlots) {
+            slot = c->clearPsoCount++;
+        } else {
+            slot = c->clearPsoNext;
+            c->clearPsoNext = (c->clearPsoNext + 1) % kClearPsoSlots;
+        }
+        ClearPsoEntry& e = c->clearPso[slot];
+        e.used = true;
+        e.numColors = numColors;
+        for (unsigned i = 0; i < NVNGFX_MAX_COLOR_TARGETS; ++i) {
+            e.colorFormat[i] =
+                i < numColors ? static_cast<unsigned>(colorFormats[i]) : 0u;
+            e.writeMask[i] = i < numColors ? masks[i] : 0u;
+        }
+        e.depthFormat = static_cast<unsigned>(depthFormat);
+        e.stencilFormat = static_cast<unsigned>(stencilFormat);
+        e.sampleCount = sampleCount;
+        e.pso = pso;
+        return pso;
+    }
+}
+
+/* Encodes the masked clear draws for every target whose pending mask is not
+ * 0xF.  The pass was already opened with MTLLoadActionLoad for those targets.
+ * Returns false only when the host could not build or encode the clear; the
+ * caller then drops the draw instead of silently leaving the target wrong. */
+bool encode_partial_clears(Ctx* c, CmdBuf* b) {
+    if (!c || !b || !b->enc) return false;
+    const unsigned n = b->numColor > NVNGFX_MAX_COLOR_TARGETS
+                           ? NVNGFX_MAX_COLOR_TARGETS
+                           : b->numColor;
+    bool any = false;
+    for (unsigned i = 0; i < n; ++i)
+        if (b->pendingClear[i] && b->clearMask[i] != 0xFu) any = true;
+    if (!any) return true;
+
+    MTLPixelFormat formats[NVNGFX_MAX_COLOR_TARGETS] = {};
+    unsigned masks[NVNGFX_MAX_COLOR_TARGETS] = {};
+    int kinds[NVNGFX_MAX_COLOR_TARGETS] = {};
+    for (unsigned i = 0; i < n; ++i) {
+        const Tex* ti = find<Tex>(b->color[i]);
+        if (!ti || !ti->mtl) return false;
+        formats[i] = ti->mtl.pixelFormat;
+        masks[i] = (b->pendingClear[i] && b->clearMask[i] != 0xFu)
+                       ? b->clearMask[i]
+                       : 0u;
+        kinds[i] = nvngfx_format_component_class(static_cast<int>(ti->format));
+        if (kinds[i] < 0) {
+            log_once("nvnCommandBufferClearColor.partialFormat",
+                     static_cast<unsigned>(ti->format));
+            return false;
+        }
+    }
+
+    MTLPixelFormat depthFmt = static_cast<MTLPixelFormat>(0);
+    MTLPixelFormat stencilFmt = static_cast<MTLPixelFormat>(0);
+    if (const Tex* dt = b->depth ? find<Tex>(b->depth) : nullptr) {
+        if (dt->mtl) {
+            const MTLPixelFormat df = dt->mtl.pixelFormat;
+            if (mtl_format_has_depth(df)) depthFmt = df;
+            if (mtl_format_has_stencil(df)) stencilFmt = df;
+        }
+    }
+    const Tex* t0 = find<Tex>(b->color[0]);
+    if (!t0 || !t0->mtl) return false;
+    const unsigned samples = static_cast<unsigned>(t0->mtl.sampleCount);
+    id<MTLRenderPipelineState> pso =
+        clear_pipeline(c, formats, masks, kinds, n, depthFmt, stencilFmt,
+                       samples);
+    if (!pso) return false;
+    id<MTLDepthStencilState> dss = clear_depth_stencil(c);
+    if (!dss) return false;
+
+    uint32_t bits[NVNGFX_MAX_COLOR_TARGETS][4] = {};
+    for (unsigned i = 0; i < n; ++i) {
+        if (!masks[i]) continue;
+        for (unsigned ch = 0; ch < 4; ++ch)
+            bits[i][ch] = clear_component_bits(b->clear[i][ch], kinds[i]);
+    }
+
+    const NSUInteger w = t0->mtl.width;
+    const NSUInteger h = t0->mtl.height;
+    if (b->hasViewport) {
+        MTLViewport full = {0.0, 0.0, static_cast<double>(w),
+                            static_cast<double>(h), 0.0, 1.0};
+        [b->enc setViewport:full];
+    }
+    if (b->hasScissor) {
+        MTLScissorRect full = {0, 0, w, h};
+        [b->enc setScissorRect:full];
+    }
+    [b->enc setRenderPipelineState:pso];
+    [b->enc setDepthStencilState:dss];
+    [b->enc setCullMode:MTLCullModeNone];
+    [b->enc setFrontFacingWinding:MTLWindingClockwise];
+    [b->enc setTriangleFillMode:MTLTriangleFillModeFill];
+    [b->enc setFragmentBytes:bits length:sizeof(bits) atIndex:0];
+    [b->enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    if (b->hasViewport) [b->enc setViewport:b->viewport];
+    if (b->hasScissor) [b->enc setScissorRect:b->scissor];
+    return true;
+}
+
 /* An open encoder is a render pass.  Closing it is how a new load action
  * (ClearColor / ClearDepthStencil) or a new set of render targets takes effect. */
 void end_encoder(CmdBuf* b) {
@@ -3372,9 +3664,13 @@ bool ensure_encoder(Ctx* c, CmdBuf* b) {
         for (unsigned i = 0; i < numColors; ++i) {
             const Tex* ti = find<Tex>(b->color[i]);
             rpd.colorAttachments[i].texture = ti->mtl;
+            /* A full clear is a load action.  A partial one must load the
+             * previous contents and is encoded as a masked draw below. */
+            const bool fullClear =
+                b->pendingClear[i] && b->clearMask[i] == 0xFu;
             rpd.colorAttachments[i].loadAction =
-                b->pendingClear[i] ? MTLLoadActionClear : MTLLoadActionLoad;
-            if (b->pendingClear[i]) {
+                fullClear ? MTLLoadActionClear : MTLLoadActionLoad;
+            if (fullClear) {
                 rpd.colorAttachments[i].clearColor = MTLClearColorMake(
                     b->clear[i][0], b->clear[i][1], b->clear[i][2], b->clear[i][3]);
             }
@@ -3423,11 +3719,19 @@ bool ensure_encoder(Ctx* c, CmdBuf* b) {
                                 alpha:b->blendColor[3]];
         }
     }
-    for (unsigned i = 0; i < NVNGFX_MAX_COLOR_TARGETS; ++i)
+    if (!b->enc) return false;
+    if (!encode_partial_clears(c, b)) {
+        log_once("nvnCommandBufferClearColor.partialPass", 1);
+        end_encoder(b);
+        return false;
+    }
+    for (unsigned i = 0; i < NVNGFX_MAX_COLOR_TARGETS; ++i) {
         b->pendingClear[i] = false;
+        b->clearMask[i] = 0;
+    }
     b->pendingDepthClear = false;
     b->pendingStencilClear = false;
-    return b->enc != nil;
+    return true;
 }
 
 /* Materialises pending clears before the targets change or recording ends.
@@ -3444,8 +3748,10 @@ bool flush_pending_clears(Ctx* c, CmdBuf* b) {
     if (b->enc) end_encoder(b);
     if (!ok) log_once("nvnCommandBufferClear.noRenderPass", 1);
     /* Never carry a clear onto a later render-target set. */
-    for (unsigned i = 0; i < NVNGFX_MAX_COLOR_TARGETS; ++i)
+    for (unsigned i = 0; i < NVNGFX_MAX_COLOR_TARGETS; ++i) {
         b->pendingClear[i] = false;
+        b->clearMask[i] = 0;
+    }
     b->pendingDepthClear = false;
     b->pendingStencilClear = false;
     return ok;
@@ -3468,8 +3774,10 @@ void cmdbuf_begin_recording(nvngfx_ctx* ctx, uint64_t* x) {
     b->psoHasDepthStencil = false;
     b->psoHasDepth = false;
     b->psoHasStencil = false;
-    for (unsigned i = 0; i < NVNGFX_MAX_COLOR_TARGETS; ++i)
+    for (unsigned i = 0; i < NVNGFX_MAX_COLOR_TARGETS; ++i) {
         b->pendingClear[i] = false;
+        b->clearMask[i] = 0;
+    }
     b->pendingDepthClear = false;
     b->pendingStencilClear = false;
     b->clearDepth = 1.0;
@@ -3575,35 +3883,38 @@ void cmdbuf_set_render_targets(nvngfx_ctx* ctx, uint64_t* x) {
     /* Texture views are not supported yet; passing a view is legal but the
      * base texture format is what gets attached. */
     if (x[3] || x[5]) log_once("nvnCommandBufferSetRenderTargets.views", 1);
-    for (unsigned i = 0; i < NVNGFX_MAX_COLOR_TARGETS; ++i)
+    for (unsigned i = 0; i < NVNGFX_MAX_COLOR_TARGETS; ++i) {
         b->pendingClear[i] = false;
+        b->clearMask[i] = 0;
+    }
     b->pendingDepthClear = false;
     b->pendingStencilClear = false;
 }
 
 /* Shared queueing for ClearColor / ClearColori / ClearColorui.
  *
- * Metal's load-action clear replaces all four channels.  A partial mask cannot
- * be expressed without a separate pass + stored readback, so do not pretend:
- * leaving the old contents is safer than clearing bits the guest asked to
- * preserve.  The colour is kept as double because that is MTLClearColor's
- * component type and an integer clear must survive without a float round-trip. */
+ * A mask of 0 is a no-op.  A mask of 0xF becomes an MTLLoadActionClear.  A
+ * partial mask is merged per channel into the pending value and becomes a
+ * full-screen masked draw when the pass opens: the load action preserves the
+ * unselected channels and the draw's write mask touches only the selected
+ * ones.  The colour is kept as double because an integer clear must survive
+ * without a float round-trip and because MTLClearColor uses doubles. */
 bool queue_color_clear(CmdBuf* b, unsigned index, const double rgba[4],
-                       unsigned mask, const char* targetReason,
-                       const char* maskReason) {
+                       unsigned mask, const char* targetReason) {
     if (!b) return false;
     if (index >= b->numColor || index >= NVNGFX_MAX_COLOR_TARGETS) {
         log_once(targetReason, index);
         return false;
     }
-    if (mask != 0xFu) {
-        log_once(maskReason, mask);
-        return false;
-    }
-    for (int i = 0; i < 4; ++i) b->clear[index][i] = rgba[i];
+    mask &= 0xFu;
+    if (!mask) return true;
+    for (unsigned ch = 0; ch < 4; ++ch)
+        if (mask & (1u << ch)) b->clear[index][ch] = rgba[ch];
+    b->clearMask[index] |= mask;
     b->pendingClear[index] = true;
     /* A clear mid-pass cannot be expressed as a load action, so close the pass;
-     * the next draw, SetRenderTargets or EndRecording opens one that clears. */
+     * the next draw, SetRenderTargets or EndRecording opens one that applies
+     * the merged clear before anything else is drawn. */
     end_encoder(b);
     return true;
 }
@@ -3616,8 +3927,7 @@ void cmdbuf_clear_color(nvngfx_ctx*, uint64_t* x) {
     const double d[4] = {rgba[0], rgba[1], rgba[2], rgba[3]};
     queue_color_clear(b, static_cast<unsigned>(x[1]), d,
                       static_cast<unsigned>(x[3]),
-                      "nvnCommandBufferClearColor.unboundTarget",
-                      "nvnCommandBufferClearColor.mask");
+                      "nvnCommandBufferClearColor.unboundTarget");
 }
 
 /* NVNshaderStage from nxnative's nvn.h: VERTEX=0, FRAGMENT=1, GEOMETRY=2,
@@ -4634,8 +4944,7 @@ void cmdbuf_clear_color_i(nvngfx_ctx*, uint64_t* x) {
                          static_cast<double>(rgba[3])};
     queue_color_clear(b, static_cast<unsigned>(x[1]), d,
                       static_cast<unsigned>(x[3]),
-                      "nvnCommandBufferClearColori.unboundTarget",
-                      "nvnCommandBufferClearColori.mask");
+                      "nvnCommandBufferClearColori.unboundTarget");
 }
 void cmdbuf_clear_color_ui(nvngfx_ctx*, uint64_t* x) {
     CmdBuf* b = find_or_add<CmdBuf>(x[0]);
@@ -4647,8 +4956,7 @@ void cmdbuf_clear_color_ui(nvngfx_ctx*, uint64_t* x) {
                          static_cast<double>(rgba[3])};
     queue_color_clear(b, static_cast<unsigned>(x[1]), d,
                       static_cast<unsigned>(x[3]),
-                      "nvnCommandBufferClearColorui.unboundTarget",
-                      "nvnCommandBufferClearColorui.mask");
+                      "nvnCommandBufferClearColorui.unboundTarget");
 }
 
 /* nvnCommandBufferClearDepthStencil(cb, float depth, uint32_t depthMask,
@@ -9254,6 +9562,210 @@ extern "C" int nvngfx_metal_selftest(void) {
         }
 
         {
+            /* --- Partial colour clears ----------------------------------
+             * A load-action clear replaces all four channels, so a masked
+             * clear is a load + a full-screen triangle with per-target write
+             * masks.  The float case issues two partial clears before the
+             * pass opens (R then G) to check that pending masks merge; the
+             * uint case checks the uint4 shader output and that unmasked
+             * B/A bytes survive. */
+            const uint64_t kPartialBuilder = 0x8C00;
+            const uint64_t kPartialTex = 0x8D00;
+            const uint64_t kCbPartial = 0x8E00;
+            const uint64_t kPartialIntTex = 0x8F00;
+
+            x[0] = kPartialBuilder;
+            tex_builder_set_defaults(ctx, x);
+            x[0] = kPartialBuilder; x[1] = 0;
+            tex_builder_set_target(ctx, x);
+            x[0] = kPartialBuilder; x[1] = 0x25;   /* RGBA8Unorm */
+            tex_builder_set_format(ctx, x);
+            x[0] = kPartialBuilder;
+            x[1] = static_cast<uint64_t>(kSide);
+            x[2] = static_cast<uint64_t>(kSide);
+            tex_builder_set_size2d(ctx, x);
+            x[0] = kPartialBuilder; x[1] = 1;
+            tex_builder_set_levels(ctx, x);
+            x[0] = kPartialBuilder; x[1] = 1;
+            tex_builder_set_samples(ctx, x);
+            x[0] = kPartialTex; x[1] = kPartialBuilder;
+            tex_initialize(ctx, x);
+            Tex* tp = find<Tex>(kPartialTex);
+            if (x[0] != 1 || !tp || !tp->mtl ||
+                tp->mtl.pixelFormat != MTLPixelFormatRGBA8Unorm) {
+                std::fprintf(stderr,
+                             "[selftest] partial clear: RGBA8 target was not created\n");
+                rc = 16419;
+                goto done;
+            }
+
+            const float base[4] = {0.25f, 0.5f, 0.75f, 1.0f};
+            x[0] = kCbPartial;
+            cmdbuf_begin_recording(ctx, x);
+            x[0] = kCbPartial; x[1] = 1;
+            x[2] = reinterpret_cast<uint64_t>(&kPartialTex);
+            x[3] = 0; x[4] = 0; x[5] = 0;
+            cmdbuf_set_render_targets(ctx, x);
+            x[0] = kCbPartial; x[1] = 0;
+            x[2] = reinterpret_cast<uint64_t>(base); x[3] = 0xF;
+            cmdbuf_clear_color(ctx, x);
+            x[0] = kCbPartial;
+            cmdbuf_end_recording(ctx, x);
+            CmdBuf* bp = find<CmdBuf>(kCbPartial);
+            if (!bp || !bp->last) {
+                std::fprintf(stderr,
+                             "[selftest] partial clear: base commit missing\n");
+                rc = 16419;
+                goto done;
+            }
+            [bp->last waitUntilCompleted];
+            if (bp->last.status == MTLCommandBufferStatusError) {
+                std::fprintf(stderr,
+                             "[selftest] partial clear base error: %s\n",
+                             bp->last.error
+                                 ? [[bp->last.error localizedDescription] UTF8String]
+                                 : "(no description)");
+                rc = 16419;
+                goto done;
+            }
+
+            const float red[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+            const float green[4] = {0.0f, 1.0f, 0.0f, 0.0f};
+            x[0] = kCbPartial;
+            cmdbuf_begin_recording(ctx, x);
+            x[0] = kCbPartial; x[1] = 1;
+            x[2] = reinterpret_cast<uint64_t>(&kPartialTex);
+            x[3] = 0; x[4] = 0; x[5] = 0;
+            cmdbuf_set_render_targets(ctx, x);
+            x[0] = kCbPartial; x[1] = 0;
+            x[2] = reinterpret_cast<uint64_t>(red); x[3] = 0x1;
+            cmdbuf_clear_color(ctx, x);
+            x[0] = kCbPartial; x[1] = 0;
+            x[2] = reinterpret_cast<uint64_t>(green); x[3] = 0x2;
+            cmdbuf_clear_color(ctx, x);
+            CmdBuf* bp2 = find<CmdBuf>(kCbPartial);
+            if (!bp2 || bp2->clearMask[0] != 0x3u) {
+                std::fprintf(stderr,
+                             "[selftest] partial clear: masks did not merge\n");
+                rc = 16419;
+                goto done;
+            }
+            x[0] = kCbPartial;
+            cmdbuf_end_recording(ctx, x);
+            if (!bp2->last) {
+                std::fprintf(stderr,
+                             "[selftest] partial clear: masked commit missing\n");
+                rc = 16419;
+                goto done;
+            }
+            [bp2->last waitUntilCompleted];
+            if (bp2->last.status == MTLCommandBufferStatusError) {
+                std::fprintf(stderr,
+                             "[selftest] partial clear masked error: %s\n",
+                             bp2->last.error
+                                 ? [[bp2->last.error localizedDescription] UTF8String]
+                                 : "(no description)");
+                rc = 16419;
+                goto done;
+            }
+
+            unsigned char pxp[4] = {0, 0, 0, 0};
+            const int wantPartial[4] = {255, 255, 191, 255};
+            if (!read_center_pixel(dev, c->queue, tp->mtl, kSide, pxp) ||
+                !pixels_near(pxp, wantPartial, 2)) {
+                std::fprintf(stderr,
+                             "[selftest] partial ClearColor pixel is "
+                             "(%u,%u,%u,%u), want (255,255,191,255)\n",
+                             pxp[0], pxp[1], pxp[2], pxp[3]);
+                rc = 16419;
+                goto done;
+            }
+
+            /* RGBA8Uint: mask R/G only, leave B/A at the full-clear values. */
+            x[0] = kPartialBuilder; x[1] = 0x27;   /* RGBA8Uint */
+            tex_builder_set_format(ctx, x);
+            x[0] = kPartialIntTex; x[1] = kPartialBuilder;
+            tex_initialize(ctx, x);
+            Tex* tpu = find<Tex>(kPartialIntTex);
+            if (x[0] != 1 || !tpu || !tpu->mtl ||
+                tpu->mtl.pixelFormat != MTLPixelFormatRGBA8Uint) {
+                std::fprintf(stderr,
+                             "[selftest] partial clear: RGBA8Uint target was not created\n");
+                rc = 16419;
+                goto done;
+            }
+            const uint32_t ubase[4] = {0x11u, 0x22u, 0x33u, 0x44u};
+            x[0] = kCbPartial;
+            cmdbuf_begin_recording(ctx, x);
+            x[0] = kCbPartial; x[1] = 1;
+            x[2] = reinterpret_cast<uint64_t>(&kPartialIntTex);
+            x[3] = 0; x[4] = 0; x[5] = 0;
+            cmdbuf_set_render_targets(ctx, x);
+            x[0] = kCbPartial; x[1] = 0;
+            x[2] = reinterpret_cast<uint64_t>(ubase); x[3] = 0xF;
+            cmdbuf_clear_color_ui(ctx, x);
+            x[0] = kCbPartial;
+            cmdbuf_end_recording(ctx, x);
+            if (!bp2->last) {
+                std::fprintf(stderr,
+                             "[selftest] partial clear: uint base commit missing\n");
+                rc = 16419;
+                goto done;
+            }
+            [bp2->last waitUntilCompleted];
+            if (bp2->last.status == MTLCommandBufferStatusError) {
+                std::fprintf(stderr,
+                             "[selftest] partial clear uint base error: %s\n",
+                             bp2->last.error
+                                 ? [[bp2->last.error localizedDescription] UTF8String]
+                                 : "(no description)");
+                rc = 16419;
+                goto done;
+            }
+            const uint32_t upart[4] = {0xAAu, 0xBBu, 0xCCu, 0xDDu};
+            x[0] = kCbPartial;
+            cmdbuf_begin_recording(ctx, x);
+            x[0] = kCbPartial; x[1] = 1;
+            x[2] = reinterpret_cast<uint64_t>(&kPartialIntTex);
+            x[3] = 0; x[4] = 0; x[5] = 0;
+            cmdbuf_set_render_targets(ctx, x);
+            x[0] = kCbPartial; x[1] = 0;
+            x[2] = reinterpret_cast<uint64_t>(upart); x[3] = 0x3;
+            cmdbuf_clear_color_ui(ctx, x);
+            x[0] = kCbPartial;
+            cmdbuf_end_recording(ctx, x);
+            if (!bp2->last) {
+                std::fprintf(stderr,
+                             "[selftest] partial clear: uint masked commit missing\n");
+                rc = 16419;
+                goto done;
+            }
+            [bp2->last waitUntilCompleted];
+            if (bp2->last.status == MTLCommandBufferStatusError) {
+                std::fprintf(stderr,
+                             "[selftest] partial clear uint masked error: %s\n",
+                             bp2->last.error
+                                 ? [[bp2->last.error localizedDescription] UTF8String]
+                                 : "(no description)");
+                rc = 16419;
+                goto done;
+            }
+            unsigned char pxu[4] = {0, 0, 0, 0};
+            const int wantUint[4] = {0xAA, 0xBB, 0x33, 0x44};
+            if (!read_center_pixel(dev, c->queue, tpu->mtl, kSide, pxu) ||
+                !pixels_near(pxu, wantUint, 0)) {
+                std::fprintf(stderr,
+                             "[selftest] partial ClearColorui pixel is "
+                             "(%u,%u,%u,%u), want (AA,BB,33,44)\n",
+                             pxu[0], pxu[1], pxu[2], pxu[3]);
+                rc = 16419;
+                goto done;
+            }
+            std::fprintf(stderr,
+                         "[selftest] partial clears kept the masked-out channels\n");
+        }
+
+        {
             /* --- ClearBuffer: arbitrary 32-bit word pattern --------------
              * Metal blit fillBuffer only repeats one byte.  This value has
              * four different bytes, so the compute kernel is the only way the
@@ -9421,6 +9933,10 @@ extern "C" int nvngfx_metal_selftest(void) {
         forget<CmdBuf>(0x8900);
         forget<CmdBuf>(0x8A00);
         forget<Program>(0x8B00);
+        forget<CmdBuf>(0x8E00);
+        forget<Tex>(0x8D00);
+        forget<Tex>(0x8F00);
+        g_tex_specs.erase(0x8C00);
         forget<Tex>(kTexClearUI);
         forget<Tex>(kTexClearI);
         g_tex_specs.erase(kTexIntBuilder);

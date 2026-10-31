@@ -62,6 +62,18 @@ int main() {
 
     CHECK(nvngfx_format_table_size() == 0x9D);
 
+    /* Colour component classes: the clear pipeline emits float4 / uint4 /
+     * int4 to match.  RGBA8_UNORM is float; RGBA8_UINT/SINT are the integer
+     * classes; a depth/stencil or absent format is not a colour target. */
+    CHECK(nvngfx_format_component_class(0x25) == 0);   /* RGBA8_UNORM */
+    CHECK(nvngfx_format_component_class(0x2E) == 0);   /* RGBA32_FLOAT */
+    CHECK(nvngfx_format_component_class(0x27) == 1);   /* RGBA8_UINT */
+    CHECK(nvngfx_format_component_class(0x28) == 2);   /* RGBA8_SINT */
+    CHECK(nvngfx_format_component_class(0x0B) == 1);   /* R32_UINT */
+    CHECK(nvngfx_format_component_class(0x0C) == 2);   /* R32_SINT */
+    CHECK(nvngfx_format_component_class(0x35) == -1);  /* DEPTH24_STENCIL8 */
+    CHECK(nvngfx_format_component_class(0x00) == -1);  /* no format */
+
     /* Builder state: the setters are host code, so this is just arithmetic,
      * but it is the state nvnTextureInitialize will build from. */
     nvngfx_texdesc d;

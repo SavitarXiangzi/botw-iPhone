@@ -4426,7 +4426,8 @@ build_abi_test: all tests passed
 * 浮点入口先把四个 float 提升为 double；整数入口分别读取 guest 的 `int32_t[4]` 或
   `uint32_t[4]`，逐项精确转换成 double，避免经过 float 丢失整数位；
 * 三者仍在清屏时关闭当前 encoder，由下一次 `ensure_encoder()` 通过附件的
-  `MTLLoadActionClear` 落地。部分通道掩码继续明确上报，不冒充已执行。
+  `MTLLoadActionClear` 落地。部分通道掩码在该轮仍明确上报，不冒充已执行；
+  颜色部分已在 M4 续八实现。
 
 ### 2. 模拟器自测
 
@@ -4454,7 +4455,7 @@ build_abi_test: all tests passed
 仍未支持：
 
 * `SetDepthBounds` 只有记录与上报，Metal 没有深度边界测试；
-* 模板与颜色清屏的部分通道掩码；
+* 模板与颜色清屏的部分通道掩码（颜色部分已在 M4 续八实现；模板仍未支持）；
 * `ClearTexture{i,ui}`（ClearBuffer 已在 M4 续六落地）；
 * 没有真机像素验证，不能声称画面正确。
 
@@ -4494,7 +4495,7 @@ build_abi_test: all tests passed
 仍未支持：
 
 * `SetDepthBounds` 只有记录与上报，Metal 没有深度边界测试；
-* 模板与颜色清屏的部分通道掩码；
+* 模板与颜色清屏的部分通道掩码（颜色部分已在 M4 续八实现；模板仍未支持）；
 * `ClearTexture{i,ui}`；
 * guest `DispatchCompute` / image / storage buffer 路径；
 * 没有真机像素验证，不能声称画面正确。
@@ -4537,7 +4538,59 @@ build_abi_test: all tests passed
 
 仍未支持：
 
-* 模板与颜色清屏的部分通道掩码；
+* 模板与颜色清屏的部分通道掩码（颜色部分已在 M4 续八实现；模板仍未支持）；
+* `ClearTexture{i,ui}`；
+* guest `DispatchCompute` / image / storage buffer 路径；
+* 真实标题 shader 的离线 MSL 接入（`nvn_shader_blobs.gen.c` 仍为空表）；
+* 没有真机像素验证，不能声称画面正确。
+
+
+## M4 续八：ClearColor 部分通道掩码
+
+Metal 的 `MTLLoadActionClear` 会覆盖四个通道，无法表达 NVN 的 mask。此前非 `0xF`
+的 `ClearColor*` 会明确上报并丢弃；这一轮把它接上，而不是继续假装。
+
+### 1. 合并 pending clear
+
+* `CmdBuf` 为每个颜色目标保存 `clearMask[8]`（NVN 位序 r=1, g=2, b=4, a=8）；
+* `mask == 0` 是 no-op；`mask == 0xF` 继续走 load action；
+* 部分掩码按通道把值合并进 `clear[i][4]`，同一 pass 打开前的多次部分清屏会合并；
+* 打开 pass 时，部分目标使用 `MTLLoadActionLoad`，保留未选通道。
+
+### 2. 宿主 clear 管线
+
+* 首次需要部分清屏时编译一个宿主 MSL：顶点阶段生成覆盖整个 viewport 的全屏三角形，
+  片元阶段从 `constant uint4* bits` 读取每个目标的清屏值；
+* 片元输出类型按目标的 NVN format 选择 `float4` / `uint4` / `int4`，因此
+  unorm / sRGB / float 与整数目标都能走同一条路径；
+* 管线描述符的每个颜色附件写入 `nvngfx_write_mask()` 转换后的 Metal 写掩码，
+  未参与部分清屏的目标写掩码为 0，混合关闭；
+* 管线按颜色/深度/模板格式、写掩码与采样数缓存在 `Ctx`，最多 8 项，满后轮换淘汰；
+* 清屏前若已有 viewport/scissor，临时改成整个附件并在画完后恢复，避免 clear 被裁掉。
+
+### 3. 模拟器自测
+
+* RGBA8Unorm 目标先全量清成 (0.25,0.5,0.75,1)，再在同一 pass 打开前依次
+  `ClearColor(mask=0x1)` 与 `ClearColor(mask=0x2)`；回读必须是 (255,255,191,255)，
+  证明两次部分清屏合并且 B/A 未被覆盖；
+* RGBA8Uint 目标先全量清成 (0x11,0x22,0x33,0x44)，再以 mask=0x3 清成
+  (0xAA,0xBB,0xCC,0xDD)；回读必须是 (AA,BB,33,44)，证明 `uint4` 输出路径与
+  B/A 保留。
+
+### 4. 覆盖与仍然缺的
+
+没有新增 NVN 入口，覆盖率保持 **202/513（39.4%）**，未实现 311；CommandBuffer 域
+**57/144**。门禁输出：
+
+```text
+syntax_check_metal: ok (clang++.exe)
+verify_ios: ok (metal bindings: 202/513)
+build_abi_test: all tests passed
+```
+
+仍未支持：
+
+* 模板清屏的部分通道掩码；
 * `ClearTexture{i,ui}`；
 * guest `DispatchCompute` / image / storage buffer 路径；
 * 真实标题 shader 的离线 MSL 接入（`nvn_shader_blobs.gen.c` 仍为空表）；

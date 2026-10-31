@@ -100,6 +100,26 @@ unsigned nvngfx_format_to_mtl(int f, int* lossy) {
 
 int nvngfx_format_table_size(void) { return (int)(sizeof k_table / sizeof *k_table); }
 
+int nvngfx_format_component_class(int f) {
+    int lossy = 0;
+    const unsigned mtl = nvngfx_format_to_mtl(f, &lossy);
+    switch (mtl) {
+    case R8Uint: case R16Uint: case RG8Uint: case RG16Uint:
+    case R32Uint: case RG32Uint: case RGBA8Uint: case RGB10A2Uint:
+    case RGBA16Uint: case RGBA32Uint:
+        return 1;
+    case R8Sint: case R16Sint: case RG8Sint: case RG16Sint:
+    case R32Sint: case RG32Sint: case RGBA8Sint: case RGBA16Sint:
+    case RGBA32Sint:
+        return 2;
+    default:
+        break;
+    }
+    if (!mtl) return -1;
+    if (mtl >= Depth16Unorm) return -1;   /* depth / stencil, not colour */
+    return 0;
+}
+
 void nvngfx_texdesc_defaults(nvngfx_texdesc* d) {
     if (!d) return;
     memset(d, 0, sizeof *d);

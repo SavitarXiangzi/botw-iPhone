@@ -61,6 +61,12 @@ unsigned nvngfx_format_to_mtl(int nvn_format, int* lossy);
  * "no format" hole, so the highest addressable NVNformat is 0x9C. */
 int nvngfx_format_table_size(void);
 
+/* Component class of a colour format: 0 = floating point (including unorm,
+ * snorm and sRGB), 1 = unsigned integer, 2 = signed integer.  Returns -1 for
+ * a format Metal cannot use as a colour attachment.  A fragment shader must
+ * declare float4 / uint4 / int4 to match, so the clear pipeline needs this. */
+int nvngfx_format_component_class(int nvn_format);
+
 #ifdef __cplusplus
 }
 #endif

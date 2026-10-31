@@ -97,6 +97,7 @@ typedef enum MTLPixelFormat : NSUInteger {
     MTLPixelFormatR32Float = 55,
     MTLPixelFormatRGBA8Unorm = 70,
     MTLPixelFormatRGBA8Unorm_sRGB = 71,
+    MTLPixelFormatRGBA8Uint = 73,
     MTLPixelFormatBGRA8Unorm = 80,
     /* Depth and stencil formats.  The numeric values are Metal's; the
      * texture-format table in nvn_texture.c already uses them. */
@@ -539,6 +540,9 @@ destinationBytesPerImage:(NSUInteger)bpi;
 - (void)setFragmentBuffer:(id<MTLBuffer>)buffer
                    offset:(NSUInteger)offset
                   atIndex:(NSUInteger)index;
+- (void)setFragmentBytes:(const void*)bytes
+                  length:(NSUInteger)length
+                 atIndex:(NSUInteger)index;
 - (void)setFragmentTexture:(id<MTLTexture>)texture atIndex:(NSUInteger)index;
 - (void)setFragmentSamplerState:(id<MTLSamplerState>)sampler atIndex:(NSUInteger)index;
 - (void)useResource:(id<MTLResource>)resource usage:(MTLResourceUsage)usage stages:(MTLRenderStages)stages;
