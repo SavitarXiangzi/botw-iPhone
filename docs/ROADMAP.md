@@ -5315,7 +5315,8 @@ git diff --check
 ```
 
 本地已通过（513 procs / 302 implemented / 477 measured + 6 inferred）。
-CI 结果待补。
+随后 M4 续十八的 CI run `41185328486` 一并跑过这一轮的 16428 回归，macOS `ios`
+job 的模拟器自测以 `BOTW_SELFTEST rc=0` 通过。
 
 ## M4 续十八：纹理 builder 查询
 
@@ -5376,5 +5377,6 @@ powershell -ExecutionPolicy Bypass -File scripts/build_abi_test.ps1
 git diff --check
 ```
 
-本地已通过（513 procs / 316 implemented / 477 measured + 6 inferred）。
-CI 结果待补。
+本地已通过（513 procs / 316 implemented / 477 measured + 6 inferred）。CI run
+`41185328486` 的 `portable` 与 macOS `ios` job 均通过；模拟器执行新增的 16429
+回归后写出 `BOTW_SELFTEST rc=0`，设备 Debug 构建与 Release 拒绝门禁也通过。

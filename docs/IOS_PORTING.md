@@ -231,7 +231,7 @@ iOS 是统一内存，guest 堆本来就是宿主可读的，所以
 |---|---:|---|
 | CommandBuffer | 110/144 | recording/commit、普通与实例化 draw、base-vertex、两种 indirect draw、buffer/vertex/index、viewport/scissor、clear、render target、program、texture/sampler 绑定；M4 增加六个固定功能状态 bind、state object setter 转发、Barrier、UpdateUniformBuffer、CopyBufferToBuffer、Buffer↔Texture / Texture↔Texture copy 与 copy row/image stride，以及 initialize / finalize / is-recording、command / control memory 记账、memory callback、debug label / marker / group、13 个逐 draw 固定功能状态入口，以及纹理对象查询（14 个 getter + label / finalize / invalidate） |
 | Texture | 22/45 | initialize 建 `MTLTexture`；WriteTexels/WriteTexelsStrided 写回 guest 布局并标脏，FlushTexels 标脏，下次采样重传 |
-| TextureBuilder | 28/43 | defaults + 13 个 setter：target/format/size1D/2D/3D/宽高深/levels/samples/storage/stride/flags |
+| TextureBuilder | 28/43 | defaults + 13 个 setter（target/format/尺寸/levels/samples/storage/stride/flags）与 14 个查询入口：11 个标量、storage size/alignment、swizzle 四路 |
 | Device | 7/27 | initialize、getProcAddress、纹理/采样器句柄查询等 |
 | SamplerBuilder | 24/25 | 状态 setter/getter 与 Metal 采样器创建 |
 | Sampler | 14/15 | builder -> `MTLSamplerState` |
@@ -648,7 +648,7 @@ constexpr int kEnumsVerified = 0;
 | P0 | ~~`nvnCommandBufferBindProgram` / `nvnProgramInitialize`~~ | ✅ 本轮已实现（管线建到 `nvngfx_shader_to_msl` 为止） |
 | P0 | ~~`nvnCommandBufferBindVertexAttribState`~~ | ✅ 本轮已实现（含 `nvnVertexAttribState*` / `nvnVertexStreamState*` 与 `BindVertexStreamState`） |
 | P0 | 真实 shader 的第一次 draw | UBO/texture/sampler、`[[id(k)]]` 侧车、c1、packed slot、bindless、顶点参数缓冲区、分层/LINEAR/BC1–BC5 纹理上传都已接上；仍缺把标题 shader 真正翻成 MSL 的离线链路，以及 BC6H/BC7、texture view 和任意 mapped write 的精确脏页跟踪 |
-| P1 | `nvnTextureBuilder*` 剩余 29 个 | 已做 14 个；剩余主要是 getter 与 pool/offset 细节 |
+| P1 | `nvnTextureBuilder*` 剩余 15 个 | 已做 28 个；剩余是 packaged/sparse/storage-class 查询、GL/ZCull 与 7 个 setter |
 | P1 | ~~`nvnSamplerBuilder*` + `nvnSampler*` + sampler pool~~ | ✅ M3.82/M3.83：38 个 sampler 入口、8 个 pool/bind 入口，能建 `MTLSamplerState` 并从 pool 解析句柄；`SamplerBuilderGetDevice` 无已知形状、`SamplerGetDebugID` 的返回值语义未定 |
 | P1 | `NVNindexType` 枚举值核对 | nxnative 的 `nvn.h` 给出 0=u8 / 1=u16 / 2=u32；后端只接 1/2，u8 未知值不画，且该头文件是 reimplementation 而非 Nintendo SDK |
 | P0 | Maxwell SASS -> MSL 翻译器 | 不是入口点，是整条链的墙 |
