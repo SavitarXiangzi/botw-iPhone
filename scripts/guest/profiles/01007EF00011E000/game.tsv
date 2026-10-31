@@ -1,0 +1,6 @@
+# Game profile consumed by dm/tools/patch_nso.py.  Only the build row is used
+# here: it tells the rewriter that 1.6.0 is a known build, so SDK-wide
+# function-match rules (which are not reviewed for this build) are not applied.
+title_id	01007EF00011E000
+name	The Legend of Zelda: Breath of the Wild
+build	v786432	1.6.0	main=8e9978d50bdd20b4c8395a106c27ffde	subsdk0=93ff8252d975adf07230cb86c83301c53f2804df	sdk=fcf93a41b08c5193a1410d262602dc62

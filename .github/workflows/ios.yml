@@ -28,6 +28,12 @@ jobs:
       - name: Repository invariants (registry / bindings / no title data)
         run: python scripts/verify_ios.py
 
+      - name: Guest-core tools parse
+        run: python -m py_compile scripts/guest/*.py scripts/guest/third_party/nxnative/*.py
+
+      - name: Guest-core rewrite verifier self-test
+        run: python scripts/guest/verify_rewrite.py --self-test
+
       - name: Coverage progress (log only)
         run: python scripts/nvn_status.py
 

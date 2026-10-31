@@ -66,6 +66,12 @@ try {
     & $py $syntax
     if ($LASTEXITCODE -ne 0) { Write-Error "nvn_metal.mm: syntax check failed"; exit 1 }
 
+    # Guest-core toolchain: the structural verifier checks a fake image and
+    # must reject an unpatched SVC.  This uses no title data, so it can run in
+    # every portable build.
+    & $py scripts\guest\verify_rewrite.py --self-test
+    if ($LASTEXITCODE -ne 0) { Write-Error "guest rewrite verifier: self-test failed"; exit 1 }
+
     # keycheck.cpp is a host-only tool (it needs a game to say anything useful)
     # but it must keep compiling: same flags as the CI hygiene step.
     $clangpp = "C:\Program Files\LLVM\bin\clang++.exe"

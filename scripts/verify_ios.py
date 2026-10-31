@@ -356,6 +356,10 @@ def check_doc_refs() -> None:
                     continue
                 path = os.path.join(dirpath, f)
                 rel = os.path.relpath(path, REPO).replace("\\", "/")
+                # Vendored third-party code cites its own upstream docs; those
+                # pages are not part of this repository.
+                if rel.startswith("scripts/guest/third_party/"):
+                    continue
                 text = open(path, encoding="utf-8", errors="replace").read()
                 for m in DOC_REF.finditer(text):
                     ref = m.group(0)
