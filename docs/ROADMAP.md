@@ -4934,7 +4934,7 @@ event 实现；`nvnSync*`、`nvnEvent*` 与跨提交等待仍未接。
 
 仍未实现的相关入口：
 
-* `CopyBufferToTexture` / `CopyTextureToBuffer` / `CopyTextureToTexture`；
+* `CopyBufferToTexture` / `CopyTextureToBuffer` / `CopyTextureToTexture`（M4 续十四 已补齐）；
 * `nvnMemoryPoolMapVirtual`；
 * texture / buffer 的完整 CPU 回读与 compute image 写回 guest 存储；
 * 真实标题 shader 与真机画面。
@@ -4973,3 +4973,95 @@ BOTW_SELFTEST rc=0
 ```
 
 顺手修了 `extract_nvn_signatures.py` 的返回类型正则：`void*` / `NVNmemoryPool*` 这类指针返回此前被漏掉。`nvnBufferMap`、`nvnBufferGetMemoryPool`、`nvnMemoryPoolMap` 因此进入实测集合，形状计数从 470 + 4 变为 **477 + 6**。
+
+## M4 续十四：buffer ↔ texture / texture ↔ texture copy
+
+上一轮把 `CopyBufferToBuffer` 接上了 Metal blit，但三个跨资源 copy 仍落在日志桩。
+真实标题既会用线性 staging 区给纹理传 mip / cube 面，也会把渲染结果回读到
+线性 buffer，还会做 texture → texture 的拷贝。本轮补齐：
+
+* CommandBuffer：74/144（+7）
+
+Metal 覆盖从 **241/513（47.0%）** 到 **248/513（48.3%）**，未实现 265。
+
+### 1. region 与 view 的解析
+
+三个入口共用 `NVNcopyRegion` 读取：拒绝空 region 与负偏移，`depth == 0` 按 1
+处理。`NVNtextureView` 是可选参数，`NULL` 表示 base level 0、min layer 0；非空时
+只接受“设置 base level / min layer”这一类视图，如果视图试图改 format 或
+texture target，就明确拒绝，而不是假装没看见。
+
+边界检查分两层：
+
+1. 对着 mip 级别检查 `xoffset + width`、`yoffset + height`；
+2. 3D texture 检查 `zoffset + depth` 不超过该级 depth，其余类型检查
+   `minLayer + zoffset + depth` 不超过层数。
+
+压缩格式（BCn 类）要求 region 的起点和尺寸都按块对齐，否则拒绝；行 / 面大小按
+块数乘块字节计算，不会把 4×4 块当成 4 个纹素。
+
+### 2. copy row / image stride
+
+`nvnCommandBufferSetCopyRowStride` 与 `SetCopyImageStride` 记录在命令缓冲上，
+`BeginRecording` 时归零。约定与 NVN 一致：
+
+* **0 表示 tight packing**，即用 region 自身的行宽 / 面大小；
+* 非零值不得小于 tight 大小，且必须是 4 字节对齐；
+* 一次 copy 的总跨度是 `imageStride × depth`，对 buffer 一侧做这个范围的
+  pool 命中与偏移对齐检查。
+
+getter 返回当前记录值，供自测与后续入口复用。
+
+### 3. 三个入口
+
+`CopyBufferToTexture`：buffer 一侧是**线性**的 region 映像，不是纹理的
+block-linear 存储，所以 stride 来自命令缓冲而不是 guest 纹理布局。3D 纹理用一次
+`copyFromBuffer` 带 `sourceSize.depth = N`；2D / cube / array 则按 slice 逐层编码，
+每层 `sourceOffset` 前进一个 image stride。
+
+`CopyTextureToBuffer` 与 `CopyTextureToTexture` 在读取前会调用 `tex_upload()`：
+被采样的纹理可能只在 guest pool 里有字节，Metal texture 还是空的，不回传就会拷到
+未初始化内容。
+
+三个入口写完目标纹理后统一调用 `mark_texture_copy_dest()`，把目标标成
+`rendered / uploaded / uploadTried = true`、`dirty = false`。否则下一次采样会拿
+guest pool 里的旧 block-linear 数据把刚拷进去的像素覆盖掉。
+
+明确拒绝的情况：
+
+* BCn transcode 纹理（解码后的 RGBA8 与 guest 存储不再一一对应）；
+* 多重采样纹理；
+* 同一个 texture 的 T2T copy；
+* 源 / 目标 pixel format 或 texture type 不同的 T2T；
+* 除 `ENGINE_2D` / `LINEAR_FILTER` 之外的 copy flag（mirror 需要另一套 blit，
+  不能静默忽略）；
+* 修改 format / target 的 texture view。
+
+### 4. 模拟器自测
+
+在第二个 16 KiB guest pool 里建两张 4×4 RGBA8 纹理：
+
+1. 源 buffer 用 row/image stride `32/128`（行尾 16 字节填充为 0xEE），
+   `CopyBufferToTexture` 写入纹理 A；
+2. 改成 `24/96` 用 `CopyTextureToBuffer` 回读，逐字节核对 4×4 像素，并确认每行
+   8 字节 padding 仍是 0——忽略 stride 的实现会在这里失败；
+3. `CopyTextureToTexture` A → B；
+4. 改成 tight `16/64` 回读 B，逐字节核对；
+5. 顺带验证 copy stride getter 的默认值 `0/0` 与设置后的值。
+
+失败码 `16425`。这一组只证明合成纹理与 Metal blit 的 stride 路径；不是标题资源，
+也不是画面正确。
+
+### 5. 门禁
+
+```text
+python scripts/syntax_check_metal.py
+python scripts/gen_nvn.py --repo . --check
+python scripts/extract_nvn_signatures.py --check
+python scripts/verify_ios.py
+powershell -ExecutionPolicy Bypass -File scripts/build_abi_test.ps1
+git diff --check
+```
+
+本地已通过（513 procs / 248 implemented / 477 measured + 6 inferred）。
+CI 结果待补。

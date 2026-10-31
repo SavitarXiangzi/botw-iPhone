@@ -3,7 +3,7 @@
 本文是 `ios/` 目录的操作手册。它描述的是**已经写进仓库的东西**和
 **机器能验证的事实**，不是你付钱就能玩到游戏的承诺。当前状态一句话：
 
-> iOS 侧的壳、C ABI、513 个 NVN 入口点的分发表、241 个 Metal 后端入口，
+> iOS 侧的壳、C ABI、513 个 NVN 入口点的分发表、248 个 Metal 后端入口，
 > 都能在非 Apple 主机上编译并跑通自测；纹理能建、渲染目标能绑、encoder
 > 能开，program -> pipeline -> draw -> 回读这条链已经在 **CI 的 iOS 模拟器**
 > 里跑通了十八条合成 draw（模拟器实际执行十七条）与七阶段 instanced / base-vertex / indirect draw 回归，其中包括从 guest 内存池
@@ -32,11 +32,11 @@ ios/nvn/include/nvn_api.h     生成：名字表 + 函数指针 ABI
 ios/nvn/src/nvn_dispatch.cpp  生成：二分查找 + 缺失上报
 ios/nvn/include/nvn_backend.h 后端接口（null / metal 二选一）
 ios/nvn/src/nvn_null.cpp      空后端，任何主机都能编译
-ios/nvn/src/nvn_metal.mm      Metal 后端（241 个入口，含大量 TODO）
+ios/nvn/src/nvn_metal.mm      Metal 后端（248 个入口，含大量 TODO）
 ios/nvn/src/nvn_texture.c     157 项 NVNformat -> MTLPixelFormat 表（附 lossy 标记）
 ios/nvn/include/nvn_texture.h 纹理描述结构 + 表查询接口
 ios/nvn/src/nvn_shader.c      着色器翻译的唯一接口：现在只会说"没有翻译器"
-ios/nvn/implemented_metal.txt 241 行，和 BIND(...) 列表由门禁强制相等
+ios/nvn/implemented_metal.txt 248 行，和 BIND(...) 列表由门禁强制相等
 ios/nvn/shaders/              空目录 + 路线说明（见该目录 README）
 docs/NVN_COVERAGE.md          生成的逐域覆盖表
 scripts/                      提取、生成、校验、编译脚本
@@ -79,7 +79,7 @@ nvn_shader_test: ok (seam, blob table, packed slots, bindless, c1, SHA-256, shad
 nvn_vertex_test: ok (packing, 26 formats, layout id)  exit=0
 nvn_texlayout_test: ok (block shapes, sizes, offsets, round trip, linear, write region, refusals)  exit=0
 syntax_check_metal: ok (clang++.exe)
-verify_ios: ok (metal bindings: 241/513)
+verify_ios: ok (metal bindings: 248/513)
 build_abi_test: all tests passed
 ```
 
@@ -223,13 +223,13 @@ iOS 是统一内存，guest 堆本来就是宿主可读的，所以
 
 ---
 
-## 6. 已经实现的 241 个入口点
+## 6. 已经实现的 248 个入口点
 
 按域分布（完整明细见 `docs/NVN_COVERAGE.md`）：
 
 | 域 | 已实现/总数 | 说明 |
 |---|---:|---|
-| CommandBuffer | 67/144 | recording/commit、普通与实例化 draw、base-vertex、两种 indirect draw、buffer/vertex/index、viewport/scissor、clear、render target、program、texture/sampler 绑定；M4 增加六个固定功能状态 bind、state object setter 转发、Barrier、UpdateUniformBuffer 与 CopyBufferToBuffer |
+| CommandBuffer | 74/144 | recording/commit、普通与实例化 draw、base-vertex、两种 indirect draw、buffer/vertex/index、viewport/scissor、clear、render target、program、texture/sampler 绑定；M4 增加六个固定功能状态 bind、state object setter 转发、Barrier、UpdateUniformBuffer、CopyBufferToBuffer、Buffer↔Texture / Texture↔Texture copy 与 copy row/image stride |
 | Texture | 4/45 | initialize 建 `MTLTexture`；WriteTexels/WriteTexelsStrided 写回 guest 布局并标脏，FlushTexels 标脏，下次采样重传 |
 | TextureBuilder | 14/43 | defaults + 13 个 setter：target/format/size1D/2D/3D/宽高深/levels/samples/storage/stride/flags |
 | Device | 7/27 | initialize、getProcAddress、纹理/采样器句柄查询等 |
@@ -247,7 +247,7 @@ iOS 是统一内存，guest 堆本来就是宿主可读的，所以
 | DepthStencilState / PolygonState | 7/13 + 5/9 | 默认值、深度/模板/剔除/偏移 setter |
 | MultisampleState / ChannelMaskState | 12/23 + 2/3 | 默认值、采样数、coverage 相关 setter、写掩码 |
 
-上表是主要域；完整 29 个域共 **241/513**，逐项状态见 `docs/NVN_COVERAGE.md`。
+上表是主要域；完整 29 个域共 **248/513**，逐项状态见 `docs/NVN_COVERAGE.md`。
 
 **必须说清楚的六件事**，否则这张表会误导人：
 
@@ -533,7 +533,12 @@ guest storage，再调用 `nvnTextureFlushTexels` 改成棕/钢蓝/橙/天蓝并
 - ✅ Buffer / MemoryPool：builder、对象查询和映射都对齐到 pool 的零拷贝 storage；
   `nvnCommandBufferUpdateUniformBuffer` 在录制时快照 CPU 字节、提交时用 blit 写入，
   `CopyBufferToBuffer` 走 GPU blit，`Barrier` 由单 command buffer 顺序保证。
-- `fence / sync / events`、buffer↔texture 复制和 `MapVirtual` 仍未接
+- ✅ Buffer ↔ texture copy：`CopyBufferToTexture` / `CopyTextureToBuffer` /
+  `CopyTextureToTexture` 都走 `MTLBlitCommandEncoder`；buffer 一侧按命令缓冲的
+  copy row/image stride（0 = tight）解释，region 与 `NVNtextureView` 逐层校验。
+  只做同格式、同类型、非 BCn transcode、非多重采样的 copy，mirror flag 明确拒绝；
+  目标纹理写入后标记为已上传，避免后续采样用旧 guest 字节覆盖。
+- `fence / sync / events` 和 `MapVirtual` 仍未接
 
 ---
 
@@ -613,7 +618,7 @@ constexpr int kEnumsVerified = 0;
 
 ---
 
-## 10. 剩余 272 个入口点的优先级
+## 10. 剩余 265 个入口点的优先级
 
 不要按字母序做。按“挡住第一个 draw call 的”排序：
 
@@ -641,7 +646,7 @@ constexpr int kEnumsVerified = 0;
 
 | 缺口 | 现状 | 影响 |
 |---|---|---|
-| 渲染目标绑定 | 只挂 `color[0]`，深度/view 只记录 | MRT 与深度测试不可用 |
+| 渲染目标绑定 | 1–8 个颜色附件、深度/模板附件、纯深度 pass 与 MRT 已接；通用 texture view 仍只记录 | 通用 view 的绑定仍不完整 |
 | 着色器翻译 | 只留了接口，没有实现 | 客体的 draw 全部停在 `noPipeline` |
 | 纹理创建 | 建 host `MTLTexture`；首次采样时从 guest pool 解块/上传，WriteTexels/FlushTexels 后标脏重传 | 2D/数组/cube/LINEAR 和 BC1–BC5 可采样；BC6H/BC7、通用 texture view 与任意 mapped write 的脏页跟踪仍不完整 |
 | draw 执行 | 有 pipeline 就真的编码 draw；没有就丢弃；实例化、base-vertex 与两种 indirect draw 已接 | 客体仍是 0 条；自检十八条 draw（模拟器执行十七条）加七阶段 instanced / base-vertex / indirect 回归、sampler 状态与 compute dispatch 回归由 CI 执行 |
@@ -679,4 +684,4 @@ Swift 侧同理：`Renderer.swift` / `GameView.swift` 只做了括号与结构�
 | `[nvn] nvnCommandBufferDraw.pipeline: no translator...` | 正常，这条就是当前的墙；自检不经过它 |
 | 屏幕全黑且 `frame` 不动 | `MTKView.delegate` 是 weak，Pump 必须被 Coordinator 强引用（已在 `GameView.swift` 修过一次） |
 | `[nvn] UNVERIFIED xxx = 0x...` | 正常，那是诚实闸门在报未验证的枚举 |
-| `[nvn] not implemented: nvnYyy` | 该入口不在 241 个里，按第 10 节排期 |
+| `[nvn] not implemented: nvnYyy` | 该入口不在 248 个里，按第 10 节排期 |

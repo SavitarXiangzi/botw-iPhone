@@ -38,8 +38,10 @@
  *           from the guest's own bytes -> MTLVertexDescriptor, and the
  *           stream's guest address -> the MTLBuffer of the pool that holds it
  *         NVN buffer objects and memory-pool address/map queries, plus
- *           UpdateUniformBuffer (record-time CPU snapshot -> GPU blit) and
- *           CopyBufferToBuffer in the same Metal command buffer
+ *           UpdateUniformBuffer (record-time CPU snapshot -> GPU blit),
+ *           CopyBufferToBuffer in the same Metal command buffer, and
+ *           buffer <-> texture / texture -> texture blits with the
+ *           command buffer's copy row/image strides
  *         present (blit fast path, cleared-drawable fallback)
  *
  *   TODO  a guest draw still stops at "noPipeline" whenever the offline blob
@@ -55,7 +57,8 @@
  *         dispatch probes (uniform offset, sampled texel and RGBA8 pixels
  *         read back), seven instanced / base-vertex / indirect draw phases
  *         (including a zero-instance no-op), a buffer / UpdateUniformBuffer /
- *         CopyBufferToBuffer probe, a bindless table probe, and a
+ *         CopyBufferToBuffer probe, a buffer/texture copy probe with
+ *         non-tight row/image strides, a bindless table probe, and a
  *         vertex-stage
  *         argument-buffer draw whose shifted pixels are read back.  The ninth
  *         builds a block-linear texture in a guest memory pool and proves that
@@ -65,8 +68,8 @@
  *         two-layer 2D array and reads red from layer 0 and yellow from layer 1.
  *         A sampler state object is also created, compared and read back.
  *         texture views / mixed graphics+compute programs, translated
- *         compute blobs / sync-fence, and compute image writeback to guest
- *         storage
+ *         compute blobs / sync-fence, compute image writeback to guest
+ *         storage, and BCn-transcoded buffer/texture copies
  *         BC6H/BC7 and signed BCn (unsigned BC1-BC5 decode to RGBA8)
  *
  * Argument ABI: measured, not guessed
@@ -525,6 +528,10 @@ struct CmdBuf {
     uint64_t tfSize[16] = {};
     uint32_t viewportSwizzle[4] = {};
     bool hasViewportSwizzle = false;
+    /* NVN copy pitches.  0 means a tightly packed region; a positive
+     * value is the byte stride between block rows / images. */
+    ptrdiff_t copyRowStride = 0;
+    ptrdiff_t copyImageStride = 0;
 };
 
 /* Builder specs are gathered in a side table keyed by the guest's builder
@@ -3359,6 +3366,449 @@ void cmdbuf_barrier(nvngfx_ctx*, uint64_t* x) {
     (void)x[1];
 }
 
+/* ------------------------------------------------------------------ */
+/* buffer <-> texture and texture <-> texture copies                   */
+/* ------------------------------------------------------------------ */
+
+struct TexCopyGeometry {
+    unsigned bw = 1, bh = 1, bpb = 0;
+    unsigned depth = 1;
+    size_t tightRow = 0, tightImage = 0;
+    size_t row = 0, image = 0, extent = 0;
+};
+
+bool copy_region_read(uint64_t addr, const char* tag, CopyRegion* out) {
+    if (!addr || !out || !guest_range(addr, sizeof(CopyRegion))) {
+        log_once_str(tag, "copy region pointer is not guest memory");
+        return false;
+    }
+    std::memcpy(out, guest_ptr<const void>(addr), sizeof *out);
+    if (out->xoffset < 0 || out->yoffset < 0 || out->zoffset < 0 ||
+        out->width <= 0 || out->height <= 0 || out->depth < 0) {
+        log_once_str(tag, "copy region is empty or negative");
+        return false;
+    }
+    return true;
+}
+
+bool copy_region_geometry(const Tex* t, const CopyRegion& r, const char* tag,
+                          TexCopyGeometry* g) {
+    if (!t || !g) return false;
+    unsigned bpb = 0, bw = 1, bh = 1;
+    if (!nvngfx_tex_format_block(t->desc.format, &bpb, &bw, &bh) || !bpb) {
+        log_once_str(tag, "texture format has no block shape");
+        return false;
+    }
+    if ((bw > 1u || bh > 1u) &&
+        (static_cast<unsigned>(r.xoffset) % bw != 0 ||
+         static_cast<unsigned>(r.yoffset) % bh != 0 ||
+         static_cast<unsigned>(r.width) % bw != 0 ||
+         static_cast<unsigned>(r.height) % bh != 0)) {
+        log_once_str(tag, "compressed copy region is not block aligned");
+        return false;
+    }
+    const size_t wblocks =
+        (static_cast<size_t>(r.width) + bw - 1u) / bw;
+    const size_t hblocks =
+        (static_cast<size_t>(r.height) + bh - 1u) / bh;
+    if (wblocks && bpb > SIZE_MAX / wblocks) {
+        log_once_str(tag, "copy row size overflows");
+        return false;
+    }
+    const size_t tightRow = wblocks * bpb;
+    if (hblocks && tightRow > SIZE_MAX / hblocks) {
+        log_once_str(tag, "copy image size overflows");
+        return false;
+    }
+    const size_t tightImage = tightRow * hblocks;
+    const unsigned depth = r.depth ? static_cast<unsigned>(r.depth) : 1u;
+    g->bw = bw;
+    g->bh = bh;
+    g->bpb = bpb;
+    g->depth = depth;
+    g->tightRow = tightRow;
+    g->tightImage = tightImage;
+    return true;
+}
+
+bool copy_region_bounds(const Tex* t, unsigned level, unsigned minLayer,
+                        const CopyRegion& r, const char* tag,
+                        unsigned* slices, bool* is3d) {
+    if (!t || !t->mtl || !slices || !is3d) return false;
+    const unsigned levels = t->levels ? t->levels : 1u;
+    if (level >= levels) {
+        log_once_str(tag, "texture view names a level past the descriptor");
+        return false;
+    }
+    const NSUInteger lw = t->mtl.width >> level;
+    const NSUInteger lh = t->mtl.height >> level;
+    const unsigned depth = r.depth ? static_cast<unsigned>(r.depth) : 1u;
+    if (static_cast<uint64_t>(r.xoffset) + static_cast<unsigned>(r.width) >
+            (lw ? lw : 1u) ||
+        static_cast<uint64_t>(r.yoffset) + static_cast<unsigned>(r.height) >
+            (lh ? lh : 1u)) {
+        log_once_str(tag, "copy region runs past the mip level");
+        return false;
+    }
+    const bool d3 = t->mtl.textureType == MTLTextureType3D;
+    if (d3) {
+        const NSUInteger ld = t->mtl.depth >> level;
+        if (static_cast<uint64_t>(r.zoffset) + depth > (ld ? ld : 1u)) {
+            log_once_str(tag, "copy region runs past the 3D slices");
+            return false;
+        }
+    } else {
+        const unsigned layers = t->layers ? t->layers : 1u;
+        if (static_cast<uint64_t>(minLayer) + r.zoffset + depth > layers) {
+            log_once_str(tag, "copy region runs past the array layers");
+            return false;
+        }
+    }
+    *slices = depth;
+    *is3d = d3;
+    return true;
+}
+
+bool copy_view_read(const Tex* t, uint64_t addr, const char* tag,
+                    unsigned* baseLevel, unsigned* minLayer) {
+    if (!baseLevel || !minLayer) return false;
+    *baseLevel = 0;
+    *minLayer = 0;
+    if (!addr) return true;
+    if (!t || !guest_range(addr, sizeof(TexView16))) {
+        log_once_str(tag, "texture view pointer is not guest memory");
+        return false;
+    }
+    TexView16 v = {};
+    std::memcpy(&v, guest_ptr<const void>(addr), sizeof v);
+    if ((v.bits & 0x04u) && v.format != t->desc.format) {
+        log_once_str(tag, "texture view changes the format; copy refused");
+        return false;
+    }
+    if ((v.bits & 0x08u) && v.target != t->desc.target) {
+        log_once_str(tag, "texture view changes the target; copy refused");
+        return false;
+    }
+    if (v.bits & 0x01u) *baseLevel = v.baseLevel;
+    if (v.bits & 0x02u) *minLayer = v.minLayer;
+    return true;
+}
+
+bool copy_flags_ok(uint64_t flags, const char* tag) {
+    /* ENGINE_2D and LINEAR_FILTER do not change a 1:1 copy.  A mirror flag
+     * would need a different blit, so it is refused rather than ignored. */
+    const uint64_t supported = 0x1u | 0x2u;
+    if (flags & ~supported) {
+        log_once(tag, static_cast<unsigned>(flags));
+        return false;
+    }
+    return true;
+}
+
+bool copy_pitch_resolve(const CmdBuf* b, TexCopyGeometry* g, const char* tag) {
+    if (!b || !g) return false;
+    if (b->copyRowStride < 0 || b->copyImageStride < 0) {
+        log_once_str(tag, "copy stride is negative");
+        return false;
+    }
+    const size_t row = b->copyRowStride
+                           ? static_cast<size_t>(b->copyRowStride)
+                           : g->tightRow;
+    const size_t image = b->copyImageStride
+                             ? static_cast<size_t>(b->copyImageStride)
+                             : g->tightImage;
+    if (row < g->tightRow || image < g->tightImage) {
+        log_once_str(tag,
+                     "copy stride is narrower than a tightly packed region");
+        return false;
+    }
+    if ((row & 3u) != 0 || (image & 3u) != 0) {
+        log_once_str(tag, "copy row or image stride is not four-byte aligned");
+        return false;
+    }
+    if (g->depth && image > SIZE_MAX / g->depth) {
+        log_once_str(tag, "copy extent overflows");
+        return false;
+    }
+    g->row = row;
+    g->image = image;
+    g->extent = image * g->depth;
+    return true;
+}
+
+void mark_texture_copy_dest(Tex* t) {
+    if (!t) return;
+    /* The Metal texture now owns the pixels.  A later sample must not
+     * re-upload the stale guest block-linear storage over this copy. */
+    t->rendered = true;
+    t->uploaded = true;
+    t->uploadTried = true;
+    t->dirty = false;
+}
+
+/* nvnCommandBufferCopyBufferToTexture(cb, src, tex, view, region, flags).
+ * The buffer is a tightly packed (or SetCopyRowStride/ImageStride-spaced)
+ * linear image of the region, not the texture's block-linear storage. */
+void cmdbuf_copy_buffer_to_texture(nvngfx_ctx* ctx, uint64_t* x) {
+    Ctx* c = ctx_of(ctx);
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    const char* tag = "nvnCommandBufferCopyBufferToTexture";
+    Tex* t = find<Tex>(x[2]);
+    if (!b || !b->recording || !t || !t->mtl) {
+        log_once_str(tag, "texture is not initialized or command buffer is not recording");
+        return;
+    }
+    if (!copy_flags_ok(x[5], tag)) return;
+    if (t->transcoded) {
+        log_once_str(tag, "BCn-transcoded texture copies are not implemented");
+        return;
+    }
+    if (t->desc.samples > 1) {
+        log_once_str(tag, "multisampled texture copies are not implemented");
+        return;
+    }
+    unsigned level = 0, minLayer = 0;
+    if (!copy_view_read(t, x[3], tag, &level, &minLayer)) return;
+    CopyRegion r = {};
+    if (!copy_region_read(x[4], tag, &r)) return;
+    TexCopyGeometry g = {};
+    if (!copy_region_geometry(t, r, tag, &g)) return;
+    unsigned slices = 0;
+    bool is3d = false;
+    if (!copy_region_bounds(t, level, minLayer, r, tag, &slices, &is3d)) return;
+    if (!copy_pitch_resolve(b, &g, tag)) return;
+    id<MTLBuffer> src = nil;
+    size_t srcOff = 0;
+    if (!pool_span(x[1], g.extent, &src, &srcOff) || !src ||
+        (srcOff & 3u) != 0) {
+        log_once_str(tag, "source is not an aligned span in a registered pool");
+        return;
+    }
+    id<MTLBlitCommandEncoder> blit = begin_resource_blit(c, b, tag);
+    if (!blit) return;
+    if (is3d) {
+        [blit copyFromBuffer:src
+                sourceOffset:static_cast<NSUInteger>(srcOff)
+           sourceBytesPerRow:static_cast<NSUInteger>(g.row)
+         sourceBytesPerImage:static_cast<NSUInteger>(g.image)
+                  sourceSize:MTLSizeMake(static_cast<NSUInteger>(r.width),
+                                         static_cast<NSUInteger>(r.height),
+                                         static_cast<NSUInteger>(slices))
+                   toTexture:t->mtl
+            destinationSlice:0
+            destinationLevel:level
+           destinationOrigin:MTLOriginMake(static_cast<NSUInteger>(r.xoffset),
+                                           static_cast<NSUInteger>(r.yoffset),
+                                           static_cast<NSUInteger>(r.zoffset))];
+    } else {
+        for (unsigned z = 0; z < slices; ++z) {
+            [blit copyFromBuffer:src
+                    sourceOffset:static_cast<NSUInteger>(
+                        srcOff + static_cast<size_t>(z) * g.image)
+               sourceBytesPerRow:static_cast<NSUInteger>(g.row)
+             sourceBytesPerImage:static_cast<NSUInteger>(g.image)
+                      sourceSize:MTLSizeMake(static_cast<NSUInteger>(r.width),
+                                             static_cast<NSUInteger>(r.height),
+                                             1)
+                       toTexture:t->mtl
+                destinationSlice:static_cast<NSUInteger>(minLayer +
+                                                         r.zoffset + z)
+                destinationLevel:level
+               destinationOrigin:MTLOriginMake(
+                   static_cast<NSUInteger>(r.xoffset),
+                   static_cast<NSUInteger>(r.yoffset), 0)];
+        }
+    }
+    [blit endEncoding];
+    mark_texture_copy_dest(t);
+}
+
+/* nvnCommandBufferCopyTextureToBuffer(cb, tex, view, region, dst, flags). */
+void cmdbuf_copy_texture_to_buffer(nvngfx_ctx* ctx, uint64_t* x) {
+    Ctx* c = ctx_of(ctx);
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    const char* tag = "nvnCommandBufferCopyTextureToBuffer";
+    Tex* t = find<Tex>(x[1]);
+    if (!b || !b->recording || !t || !t->mtl) {
+        log_once_str(tag, "texture is not initialized or command buffer is not recording");
+        return;
+    }
+    if (!copy_flags_ok(x[5], tag)) return;
+    if (t->transcoded) {
+        log_once_str(tag, "BCn-transcoded texture copies are not implemented");
+        return;
+    }
+    if (t->desc.samples > 1) {
+        log_once_str(tag, "multisampled texture copies are not implemented");
+        return;
+    }
+    unsigned level = 0, minLayer = 0;
+    if (!copy_view_read(t, x[2], tag, &level, &minLayer)) return;
+    CopyRegion r = {};
+    if (!copy_region_read(x[3], tag, &r)) return;
+    TexCopyGeometry g = {};
+    if (!copy_region_geometry(t, r, tag, &g)) return;
+    unsigned slices = 0;
+    bool is3d = false;
+    if (!copy_region_bounds(t, level, minLayer, r, tag, &slices, &is3d)) return;
+    if (!copy_pitch_resolve(b, &g, tag)) return;
+    id<MTLBuffer> dst = nil;
+    size_t dstOff = 0;
+    if (!pool_span(x[4], g.extent, &dst, &dstOff) || !dst ||
+        (dstOff & 3u) != 0) {
+        log_once_str(tag, "destination is not an aligned span in a registered pool");
+        return;
+    }
+    /* A sampled texture may still have its guest bytes only in the pool.
+     * Materialise it before the blit reads the Metal texture. */
+    if (!tex_upload(c, b, t)) {
+        log_once_str(tag, "texture upload failed");
+        return;
+    }
+    id<MTLBlitCommandEncoder> blit = begin_resource_blit(c, b, tag);
+    if (!blit) return;
+    if (is3d) {
+        [blit copyFromTexture:t->mtl
+                  sourceSlice:0
+                  sourceLevel:level
+                 sourceOrigin:MTLOriginMake(
+                     static_cast<NSUInteger>(r.xoffset),
+                     static_cast<NSUInteger>(r.yoffset),
+                     static_cast<NSUInteger>(r.zoffset))
+                   sourceSize:MTLSizeMake(static_cast<NSUInteger>(r.width),
+                                          static_cast<NSUInteger>(r.height),
+                                          static_cast<NSUInteger>(slices))
+                     toBuffer:dst
+            destinationOffset:static_cast<NSUInteger>(dstOff)
+       destinationBytesPerRow:static_cast<NSUInteger>(g.row)
+     destinationBytesPerImage:static_cast<NSUInteger>(g.image)];
+    } else {
+        for (unsigned z = 0; z < slices; ++z) {
+            [blit copyFromTexture:t->mtl
+                      sourceSlice:static_cast<NSUInteger>(minLayer +
+                                                          r.zoffset + z)
+                      sourceLevel:level
+                     sourceOrigin:MTLOriginMake(
+                         static_cast<NSUInteger>(r.xoffset),
+                         static_cast<NSUInteger>(r.yoffset), 0)
+                       sourceSize:MTLSizeMake(
+                           static_cast<NSUInteger>(r.width),
+                           static_cast<NSUInteger>(r.height), 1)
+                         toBuffer:dst
+                destinationOffset:static_cast<NSUInteger>(
+                    dstOff + static_cast<size_t>(z) * g.image)
+           destinationBytesPerRow:static_cast<NSUInteger>(g.row)
+         destinationBytesPerImage:static_cast<NSUInteger>(g.image)];
+        }
+    }
+    [blit endEncoding];
+}
+
+/* nvnCommandBufferCopyTextureToTexture(cb, src, sview, sregion,
+ *     dst, dview, dregion, flags).  Same-type, same-format copies only. */
+void cmdbuf_copy_texture_to_texture(nvngfx_ctx* ctx, uint64_t* x) {
+    Ctx* c = ctx_of(ctx);
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    const char* tag = "nvnCommandBufferCopyTextureToTexture";
+    Tex* s = find<Tex>(x[1]);
+    Tex* d = find<Tex>(x[4]);
+    if (!b || !b->recording || !s || !d || !s->mtl || !d->mtl) {
+        log_once_str(tag, "source or destination texture is not initialized");
+        return;
+    }
+    if (!copy_flags_ok(x[7], tag)) return;
+    if (s->transcoded || d->transcoded) {
+        log_once_str(tag, "BCn-transcoded texture copies are not implemented");
+        return;
+    }
+    if (s->desc.samples > 1 || d->desc.samples > 1) {
+        log_once_str(tag, "multisampled texture copies are not implemented");
+        return;
+    }
+    if (s->mtl == d->mtl) {
+        log_once_str(tag, "same-texture copy is not implemented");
+        return;
+    }
+    if (s->mtl.pixelFormat != d->mtl.pixelFormat) {
+        log_once_str(tag, "source and destination pixel formats differ");
+        return;
+    }
+    if (s->mtl.textureType != d->mtl.textureType) {
+        log_once_str(tag, "source and destination texture types differ");
+        return;
+    }
+    unsigned sl = 0, slayer = 0, dl = 0, dlayer = 0;
+    if (!copy_view_read(s, x[2], tag, &sl, &slayer)) return;
+    if (!copy_view_read(d, x[5], tag, &dl, &dlayer)) return;
+    CopyRegion sr = {}, dr = {};
+    if (!copy_region_read(x[3], tag, &sr)) return;
+    if (!copy_region_read(x[6], tag, &dr)) return;
+    if (sr.width != dr.width || sr.height != dr.height ||
+        (sr.depth ? sr.depth : 1) != (dr.depth ? dr.depth : 1)) {
+        log_once_str(tag, "source and destination region sizes differ");
+        return;
+    }
+    TexCopyGeometry sg = {}, dg = {};
+    if (!copy_region_geometry(s, sr, tag, &sg)) return;
+    if (!copy_region_geometry(d, dr, tag, &dg)) return;
+    unsigned sslices = 0, dslices = 0;
+    bool s3d = false, d3d = false;
+    if (!copy_region_bounds(s, sl, slayer, sr, tag, &sslices, &s3d)) return;
+    if (!copy_region_bounds(d, dl, dlayer, dr, tag, &dslices, &d3d)) return;
+    if (sslices != dslices || s3d != d3d) {
+        log_once_str(tag, "source and destination slice layouts differ");
+        return;
+    }
+    if (!tex_upload(c, b, s)) {
+        log_once_str(tag, "source texture upload failed");
+        return;
+    }
+    id<MTLBlitCommandEncoder> blit = begin_resource_blit(c, b, tag);
+    if (!blit) return;
+    for (unsigned z = 0; z < sslices; ++z) {
+        [blit copyFromTexture:s->mtl
+                  sourceSlice:static_cast<NSUInteger>(
+                                  s3d ? 0 : slayer + sr.zoffset + z)
+                  sourceLevel:sl
+                 sourceOrigin:MTLOriginMake(
+                     static_cast<NSUInteger>(sr.xoffset),
+                     static_cast<NSUInteger>(sr.yoffset),
+                     static_cast<NSUInteger>(s3d ? sr.zoffset + z : 0))
+                   sourceSize:MTLSizeMake(static_cast<NSUInteger>(sr.width),
+                                          static_cast<NSUInteger>(sr.height),
+                                          1)
+                    toTexture:d->mtl
+            destinationSlice:static_cast<NSUInteger>(
+                                  d3d ? 0 : dlayer + dr.zoffset + z)
+            destinationLevel:dl
+           destinationOrigin:MTLOriginMake(
+               static_cast<NSUInteger>(dr.xoffset),
+               static_cast<NSUInteger>(dr.yoffset),
+               static_cast<NSUInteger>(d3d ? dr.zoffset + z : 0))];
+    }
+    [blit endEncoding];
+    mark_texture_copy_dest(d);
+}
+
+/* nvnCommandBufferSet/GetCopyRowStride and Set/GetCopyImageStride.  Zero
+ * means the region is tightly packed. */
+void cmdbuf_set_copy_row_stride(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    if (b) b->copyRowStride = static_cast<ptrdiff_t>(x[1]);
+}
+void cmdbuf_get_copy_row_stride(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find<CmdBuf>(x[0]);
+    x[0] = b ? static_cast<uint64_t>(b->copyRowStride) : 0;
+}
+void cmdbuf_set_copy_image_stride(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    if (b) b->copyImageStride = static_cast<ptrdiff_t>(x[1]);
+}
+void cmdbuf_get_copy_image_stride(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find<CmdBuf>(x[0]);
+    x[0] = b ? static_cast<uint64_t>(b->copyImageStride) : 0;
+}
+
 /* Binds one MTLBuffer per stream that a bound attribute reads.
  *
  * A stream whose guest address is not inside any memory pool is not bindable:
@@ -4811,6 +5261,8 @@ void cmdbuf_begin_recording(nvngfx_ctx* ctx, uint64_t* x) {
     b->hasCoverageTable = false;
     b->hasViewportSwizzle = false;
     b->hasPolyOffset = false;
+    b->copyRowStride = 0;
+    b->copyImageStride = 0;
     b->depthNear = 0.0;
     b->depthFar = 1.0;
     b->depthClamp = 0;
@@ -7172,6 +7624,13 @@ const Binding kBindings[] = {
     BIND("nvnCommandBufferBindTransformFeedbackBuffer", cmdbuf_bind_tf_buffer),
     BIND("nvnCommandBufferBindTransformFeedbackBuffers", cmdbuf_bind_tf_buffers),
     BIND("nvnCommandBufferCopyBufferToBuffer", cmdbuf_copy_buffer_to_buffer),
+    BIND("nvnCommandBufferCopyBufferToTexture", cmdbuf_copy_buffer_to_texture),
+    BIND("nvnCommandBufferCopyTextureToBuffer", cmdbuf_copy_texture_to_buffer),
+    BIND("nvnCommandBufferCopyTextureToTexture", cmdbuf_copy_texture_to_texture),
+    BIND("nvnCommandBufferGetCopyRowStride", cmdbuf_get_copy_row_stride),
+    BIND("nvnCommandBufferGetCopyImageStride", cmdbuf_get_copy_image_stride),
+    BIND("nvnCommandBufferSetCopyRowStride", cmdbuf_set_copy_row_stride),
+    BIND("nvnCommandBufferSetCopyImageStride", cmdbuf_set_copy_image_stride),
     BIND("nvnCommandBufferUpdateUniformBuffer", cmdbuf_update_uniform_buffer),
     BIND("nvnCommandBufferBarrier", cmdbuf_barrier),
     BIND("nvnCommandBufferClearColori", cmdbuf_clear_color_i),
@@ -12478,6 +12937,224 @@ extern "C" int nvngfx_metal_selftest(void) {
                          "[selftest] buffers/copies: NVN buffer getters and map "
                          "matched pool storage; UpdateUniformBuffer snapshotted "
                          "777 and CopyBufferToBuffer supplied 888 to GPU dispatches\n");
+        }
+
+        {
+            /* --- Buffer <-> texture copies and copy pitches -------------
+             * A 4x4 RGBA8 texture is filled from a 32-byte-row / 128-byte-
+             * image source buffer, copied back with a 24-byte row stride,
+             * then copied texture-to-texture and read back tightly.  The
+             * padding bytes stay untouched, so a copy that ignores the
+             * command buffer's copy strides cannot pass. */
+            const uint64_t kCbCopyTex = 0x9F00;
+            const uint64_t kTexCopyA = 0x9F10;
+            const uint64_t kTexCopyB = 0x9F20;
+            const unsigned kCopyTexSrc = 15488;
+            const unsigned kCopyTexDst = 15616;
+            const unsigned kCopyTexDst2 = 15712;
+            const unsigned kCopyTexRow = 32;
+            const unsigned kCopyTexImage = 128;
+            const unsigned kCopyTexOutRow = 24;
+            const unsigned kCopyTexOutImage = 96;
+            const unsigned kCopyTexTightRow = 16;
+            const unsigned kCopyTexTightImage = 64;
+            unsigned char* const vpoolCopyTex =
+                poolRaw2 ? reinterpret_cast<unsigned char*>(
+                               (reinterpret_cast<uintptr_t>(poolRaw2) + 16383u) &
+                               ~static_cast<uintptr_t>(16383u))
+                         : nullptr;
+            if (!vpoolCopyTex) {
+                std::fprintf(stderr,
+                             "[selftest] texture copies: the second pool is "
+                             "missing\n");
+                rc = 16425;
+                goto done;
+            }
+            unsigned char* const copyTexSrc = vpoolCopyTex + kCopyTexSrc;
+            unsigned char* const copyTexDst = vpoolCopyTex + kCopyTexDst;
+            unsigned char* const copyTexDst2 = vpoolCopyTex + kCopyTexDst2;
+            std::memset(copyTexSrc, 0xEE, kCopyTexImage);
+            std::memset(copyTexDst, 0, kCopyTexOutImage);
+            std::memset(copyTexDst2, 0, kCopyTexTightImage);
+            for (unsigned y = 0; y < 4; ++y) {
+                for (unsigned x = 0; x < 4; ++x) {
+                    unsigned char* const p =
+                        copyTexSrc + y * kCopyTexRow + x * 4u;
+                    p[0] = static_cast<unsigned char>(10 + x);
+                    p[1] = static_cast<unsigned char>(20 + y);
+                    p[2] = static_cast<unsigned char>(30 + x + y);
+                    p[3] = 255;
+                }
+            }
+
+            alignas(16) unsigned char copyTexBuilderA[0x80] = {};
+            alignas(16) unsigned char copyTexBuilderB[0x80] = {};
+            auto makeCopyTexture = [&](uint64_t builder, uint64_t texture) {
+                x[0] = builder;
+                tex_builder_set_defaults(ctx, x);
+                x[0] = builder; x[1] = 0;
+                tex_builder_set_target(ctx, x);
+                x[0] = builder; x[1] = 0x25;
+                tex_builder_set_format(ctx, x);
+                x[0] = builder; x[1] = 4; x[2] = 4;
+                tex_builder_set_size2d(ctx, x);
+                x[0] = builder; x[1] = 1;
+                tex_builder_set_levels(ctx, x);
+                x[0] = builder; x[1] = 1;
+                tex_builder_set_samples(ctx, x);
+                x[0] = texture; x[1] = builder;
+                tex_initialize(ctx, x);
+                return x[0] == 1;
+            };
+            if (!makeCopyTexture(
+                    reinterpret_cast<uint64_t>(copyTexBuilderA), kTexCopyA) ||
+                !makeCopyTexture(
+                    reinterpret_cast<uint64_t>(copyTexBuilderB), kTexCopyB)) {
+                std::fprintf(stderr,
+                             "[selftest] texture copies: texture "
+                             "initialization failed\n");
+                rc = 16425;
+                goto done;
+            }
+
+            CopyRegion copyRect = {};
+            copyRect.width = 4;
+            copyRect.height = 4;
+            copyRect.depth = 1;
+            const uint64_t copyTexSrcAddr =
+                reinterpret_cast<uint64_t>(copyTexSrc);
+            const uint64_t copyTexDstAddr =
+                reinterpret_cast<uint64_t>(copyTexDst);
+            const uint64_t copyTexDst2Addr =
+                reinterpret_cast<uint64_t>(copyTexDst2);
+
+            x[0] = kCbCopyTex;
+            cmdbuf_begin_recording(ctx, x);
+            x[0] = kCbCopyTex;
+            cmdbuf_get_copy_row_stride(ctx, x);
+            const uint64_t copyRowDefault = x[0];
+            x[0] = kCbCopyTex;
+            cmdbuf_get_copy_image_stride(ctx, x);
+            const uint64_t copyImageDefault = x[0];
+            if (copyRowDefault != 0 || copyImageDefault != 0) {
+                std::fprintf(stderr,
+                             "[selftest] texture copies: default strides are "
+                             "%llu / %llu, want 0 / 0\n",
+                             static_cast<unsigned long long>(copyRowDefault),
+                             static_cast<unsigned long long>(copyImageDefault));
+                rc = 16425;
+                goto done;
+            }
+            x[0] = kCbCopyTex; x[1] = kCopyTexRow;
+            cmdbuf_set_copy_row_stride(ctx, x);
+            x[0] = kCbCopyTex; x[1] = kCopyTexImage;
+            cmdbuf_set_copy_image_stride(ctx, x);
+            x[0] = kCbCopyTex;
+            cmdbuf_get_copy_row_stride(ctx, x);
+            const uint64_t copyRowGet = x[0];
+            x[0] = kCbCopyTex;
+            cmdbuf_get_copy_image_stride(ctx, x);
+            const uint64_t copyImageGet = x[0];
+            if (copyRowGet != kCopyTexRow ||
+                copyImageGet != kCopyTexImage) {
+                std::fprintf(stderr,
+                             "[selftest] texture copies: stride getters are "
+                             "%llu / %llu, want %u / %u\n",
+                             static_cast<unsigned long long>(copyRowGet),
+                             static_cast<unsigned long long>(copyImageGet),
+                             kCopyTexRow, kCopyTexImage);
+                rc = 16425;
+                goto done;
+            }
+
+            x[0] = kCbCopyTex; x[1] = copyTexSrcAddr;
+            x[2] = kTexCopyA; x[3] = 0;
+            x[4] = reinterpret_cast<uint64_t>(&copyRect); x[5] = 0;
+            cmdbuf_copy_buffer_to_texture(ctx, x);
+
+            x[0] = kCbCopyTex; x[1] = kCopyTexOutRow;
+            cmdbuf_set_copy_row_stride(ctx, x);
+            x[0] = kCbCopyTex; x[1] = kCopyTexOutImage;
+            cmdbuf_set_copy_image_stride(ctx, x);
+            x[0] = kCbCopyTex; x[1] = kTexCopyA; x[2] = 0;
+            x[3] = reinterpret_cast<uint64_t>(&copyRect);
+            x[4] = copyTexDstAddr; x[5] = 0;
+            cmdbuf_copy_texture_to_buffer(ctx, x);
+
+            x[0] = kCbCopyTex; x[1] = kTexCopyA; x[2] = 0;
+            x[3] = reinterpret_cast<uint64_t>(&copyRect);
+            x[4] = kTexCopyB; x[5] = 0;
+            x[6] = reinterpret_cast<uint64_t>(&copyRect); x[7] = 0;
+            cmdbuf_copy_texture_to_texture(ctx, x);
+
+            x[0] = kCbCopyTex; x[1] = kCopyTexTightRow;
+            cmdbuf_set_copy_row_stride(ctx, x);
+            x[0] = kCbCopyTex; x[1] = kCopyTexTightImage;
+            cmdbuf_set_copy_image_stride(ctx, x);
+            x[0] = kCbCopyTex; x[1] = kTexCopyB; x[2] = 0;
+            x[3] = reinterpret_cast<uint64_t>(&copyRect);
+            x[4] = copyTexDst2Addr; x[5] = 0;
+            cmdbuf_copy_texture_to_buffer(ctx, x);
+
+            x[0] = kCbCopyTex;
+            cmdbuf_end_recording(ctx, x);
+            CmdBuf* const bcopytex = find<CmdBuf>(kCbCopyTex);
+            if (!bcopytex || !bcopytex->last) {
+                std::fprintf(stderr,
+                             "[selftest] texture copies: nothing committed\n");
+                rc = 16425;
+                goto done;
+            }
+            [bcopytex->last waitUntilCompleted];
+            if (bcopytex->last.status == MTLCommandBufferStatusError) {
+                std::fprintf(stderr,
+                             "[selftest] texture copies command buffer error: "
+                             "%s\n",
+                             bcopytex->last.error
+                                 ? [[bcopytex->last.error localizedDescription]
+                                       UTF8String]
+                                 : "(no description)");
+                rc = 16425;
+                goto done;
+            }
+            for (unsigned y = 0; y < 4; ++y) {
+                for (unsigned x = 0; x < 16; ++x) {
+                    const unsigned char want =
+                        copyTexSrc[y * kCopyTexRow + x];
+                    if (copyTexDst[y * kCopyTexOutRow + x] != want) {
+                        std::fprintf(stderr,
+                                     "[selftest] texture copies: strided "
+                                     "readback byte (%u,%u) is %u, want %u\n",
+                                     x, y, copyTexDst[y * kCopyTexOutRow + x],
+                                     want);
+                        rc = 16425;
+                        goto done;
+                    }
+                    if (copyTexDst2[y * kCopyTexTightRow + x] != want) {
+                        std::fprintf(stderr,
+                                     "[selftest] texture copies: texture-to-"
+                                     "texture byte (%u,%u) is %u, want %u\n",
+                                     x, y,
+                                     copyTexDst2[y * kCopyTexTightRow + x],
+                                     want);
+                        rc = 16425;
+                        goto done;
+                    }
+                }
+                for (unsigned x = 16; x < kCopyTexOutRow; ++x) {
+                    if (copyTexDst[y * kCopyTexOutRow + x] != 0) {
+                        std::fprintf(stderr,
+                                     "[selftest] texture copies: row padding "
+                                     "(%u,%u) was overwritten\n", x, y);
+                        rc = 16425;
+                        goto done;
+                    }
+                }
+            }
+            std::fprintf(stderr,
+                         "[selftest] buffer/texture copies: B2T/T2B/T2T "
+                         "round-tripped a 4x4 RGBA8 image through row/image "
+                         "strides 32/128 -> 24/96 -> tight\n");
         }
 
         {
