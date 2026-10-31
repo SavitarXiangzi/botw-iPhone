@@ -12,8 +12,8 @@
  *   DONE  device / queue / window / swapchain lifecycle
  *         memory pool -> zero-copy MTLBuffer over guest memory
  *         command buffer -> MTLCommandBuffer, viewport / scissor / drawArrays
- *         render targets + one render pass (colour[0]) + ClearColor as a load
- *           action, opened lazily by the first draw
+ *         render targets + one render pass (colour[0]) + ClearColor /
+ *           ClearDepthStencil as load actions, flushed even without a draw
  *         texture objects, built from the values nvnTextureBuilderSet* was
  *           given (no guest struct offsets are read)
  *         program objects; the pipeline cache is keyed by colour format and
@@ -30,17 +30,16 @@
  *         on a computer, never in the repository.  Everything else on that
  *         path -- pipeline creation with a real vertex descriptor, buffer
  *         binding, draw encoding, pixel readback -- is executed by
- *         nvngfx_metal_selftest() in CI's iOS Simulator: thirteen draws, a
- *         bindless table probe, and a vertex-stage argument-buffer draw whose
- *         shifted pixels are read back.  The ninth builds a block-linear
+ *         nvngfx_metal_selftest() in CI's iOS Simulator: sixteen draws, two
+ *         clear-only regressions, a bindless table probe, and a vertex-stage
+ *         argument-buffer draw whose shifted pixels are read back.  The ninth builds a block-linear
  *         texture in a guest memory pool and proves that the sampled pixels
  *         came from that storage, not from a host-side upload.  The tenth
  *         computes a guest shader key, loads its MSL from <app>/shaders and
  *         reads back orange.  The eleventh uploads a two-layer 2D array and
  *         reads red from layer 0 and yellow from layer 1.  A sampler state
  *         object is also created, compared and read back.
- *         MRT / depth attachment / texture views
- *         streaming texture updates, texture views, compute, sync/fence
+ *         MRT / pure-depth passes / texture views / compute / sync-fence
  *         BC6H/BC7 and signed BCn (unsigned BC1-BC5 decode to RGBA8)
  *
  * Argument ABI: measured, not guessed
@@ -253,11 +252,16 @@ struct CmdBuf {
     unsigned numColor = 0;
     uint64_t color[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     uint64_t depth = 0;
-    /* A ClearColor that has not been turned into a load action yet. */
+    /* Clears that have not been turned into load actions yet.  They are kept
+     * separately because one render pass can clear colour, depth and stencil
+     * together, and because a clear must still happen when EndRecording is
+     * reached without a following draw. */
     bool pendingClear = false;
-    int clearIndex = 0;
-    int clearMask = 0;
+    bool pendingDepthClear = false;
+    bool pendingStencilClear = false;
     float clear[4] = {0, 0, 0, 0};
+    double clearDepth = 1.0;
+    uint32_t clearStencil = 0;
     /* Program bound by nvnCommandBufferBindProgram and the pipeline it
      * produced.  The pipeline stays nil until nvngfx_shader_to_msl() can
      * actually translate something. */
@@ -342,6 +346,12 @@ struct CmdBuf {
     id<MTLDepthStencilState> dss = nil;
     unsigned long long dssKey = 0;
     bool dssValid = false;
+    /* NVN command-buffer stencil state.  These are not part of the depth /
+     * stencil state object: SetStencilRef is encoder state, while the two
+     * masks are baked into MTLDepthStencilState.  Index 0 is front, 1 back. */
+    uint32_t stencilRef[2] = {0, 0};
+    uint32_t stencilReadMask[2] = {0xFFu, 0xFFu};
+    uint32_t stencilWriteMask[2] = {0xFFu, 0xFFu};
     float blendColor[4] = {0, 0, 0, 0};
     bool hasBlendColor = false;
     float alphaRef = 0.0f;
@@ -977,8 +987,14 @@ void tex_initialize(nvngfx_ctx* ctx, uint64_t* x) {
                              ? static_cast<NSUInteger>(d.samples > 1 ? d.samples : 1)
                              : 1;
         td.textureType = type;
-        td.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite |
-                   MTLTextureUsageRenderTarget;
+        /* Depth/stencil formats are not shader-write targets on every Apple
+         * GPU.  They only need sampling and render-target use here. */
+        const bool depthStencil = pf == MTLPixelFormatDepth16Unorm ||
+                                  pf == MTLPixelFormatDepth32Float ||
+                                  pf == MTLPixelFormatStencil8 ||
+                                  pf == MTLPixelFormatDepth32Float_Stencil8;
+        td.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+        if (!depthStencil) td.usage |= MTLTextureUsageShaderWrite;
         td.storageMode = MTLStorageModePrivate;
 
         Tex* t = find_or_add<Tex>(x[0]);
@@ -2239,16 +2255,27 @@ MTLTriangleFillMode to_mtl_fill(unsigned f) {
 
 /* Metal requires the pipeline's stencil format to name a format that actually
  * has stencil bits; declaring one for Depth32Float fails pipeline creation. */
-/* The depth-stencil object only depends on the depth/stencil fields, so it is
- * cached on that key alone: a blend change must not rebuild it.  Those fields
- * are declared consecutively in nvngfx_pipeline_state on purpose. */
-unsigned long long depth_stencil_key(const nvngfx_pipeline_state& st) {
+/* The depth-stencil object only depends on the depth/stencil fields and the
+ * per-face masks, so it is cached on those alone: a blend or stencil-reference
+ * change must not rebuild it.  The pipeline-state fields are declared
+ * consecutively on purpose. */
+unsigned long long depth_stencil_key(const nvngfx_pipeline_state& st,
+                                     const uint32_t readMask[2],
+                                     const uint32_t writeMask[2]) {
     const unsigned char* p = &st.depth_test;
     const unsigned n = 12;   /* test, write, func, stencil test, 2 funcs, 6 ops */
     unsigned long long h = 14695981039346656037ull;
     for (unsigned i = 0; i < n; ++i) {
         h ^= p[i];
         h *= 1099511628211ull;
+    }
+    for (unsigned face = 0; face < 2; ++face) {
+        for (unsigned i = 0; i < 4; ++i) {
+            h ^= static_cast<unsigned char>(readMask[face] >> (8 * i));
+            h *= 1099511628211ull;
+            h ^= static_cast<unsigned char>(writeMask[face] >> (8 * i));
+            h *= 1099511628211ull;
+        }
     }
     return h;
 }
@@ -2262,7 +2289,9 @@ bool mtl_format_has_stencil(MTLPixelFormat f) {
     return f == MTLPixelFormatStencil8 || f == MTLPixelFormatDepth32Float_Stencil8;
 }
 
-id<MTLDepthStencilState> build_depth_stencil(Ctx* c, const nvngfx_pipeline_state& st) {
+id<MTLDepthStencilState> build_depth_stencil(Ctx* c, const nvngfx_pipeline_state& st,
+                                             const uint32_t readMask[2],
+                                             const uint32_t writeMask[2]) {
     if (!c || !c->device) return nil;
     @autoreleasepool {
         MTLDepthStencilDescriptor* dd = [[MTLDepthStencilDescriptor alloc] init];
@@ -2277,15 +2306,15 @@ id<MTLDepthStencilState> build_depth_stencil(Ctx* c, const nvngfx_pipeline_state
             front.stencilFailureOperation = to_mtl_stencil(st.stencil_op[0][0]);
             front.depthFailureOperation = to_mtl_stencil(st.stencil_op[0][1]);
             front.depthStencilPassOperation = to_mtl_stencil(st.stencil_op[0][2]);
-            front.readMask = 0xFFu;
-            front.writeMask = 0xFFu;
+            front.readMask = readMask[0];
+            front.writeMask = writeMask[0];
             MTLStencilDescriptor* back = [[MTLStencilDescriptor alloc] init];
             back.stencilCompareFunction = to_mtl_compare(st.stencil_func[1]);
             back.stencilFailureOperation = to_mtl_stencil(st.stencil_op[1][0]);
             back.depthFailureOperation = to_mtl_stencil(st.stencil_op[1][1]);
             back.depthStencilPassOperation = to_mtl_stencil(st.stencil_op[1][2]);
-            back.readMask = 0xFFu;
-            back.writeMask = 0xFFu;
+            back.readMask = readMask[1];
+            back.writeMask = writeMask[1];
             dd.frontFaceStencil = front;
             dd.backFaceStencil = back;
         }
@@ -2555,14 +2584,21 @@ void apply_fixed_state(Ctx* c, CmdBuf* b) {
         ds.depth_write = 0;
     }
     if (!b->psoHasStencil) ds.stencil_test = 0;
-    const unsigned long long key = depth_stencil_key(ds);
+    const unsigned long long key =
+        depth_stencil_key(ds, b->stencilReadMask, b->stencilWriteMask);
     if (!b->dssValid || b->dssKey != key) {
-        b->dss = build_depth_stencil(c, ds);
+        b->dss = build_depth_stencil(c, ds, b->stencilReadMask, b->stencilWriteMask);
         b->dssKey = key;
         b->dssValid = b->dss != nil;
         if (!b->dss) log_once("nvnPipeline.depthStencilState", 1);
     }
     if (b->dss) [b->enc setDepthStencilState:b->dss];
+    /* References are encoder state, not part of MTLDepthStencilState.  NVN
+     * keeps separate front/back values, so use Metal's pair setter rather
+     * than collapsing them to one. */
+    if (b->psoHasStencil)
+        [b->enc setStencilFrontReferenceValue:b->stencilRef[0]
+                            backReferenceValue:b->stencilRef[1]];
 }
 
 /* nvnProgramInitialize(NVNprogram*, NVNdevice*) -> NVNboolean */
@@ -3203,7 +3239,7 @@ void cmdbuf_bind_vertex_stream_state(nvngfx_ctx*, uint64_t* x) {
 /* ------------------------------------------------------------------ */
 
 /* An open encoder is a render pass.  Closing it is how a new load action
- * (ClearColor) or a new set of render targets takes effect. */
+ * (ClearColor / ClearDepthStencil) or a new set of render targets takes effect. */
 void end_encoder(CmdBuf* b) {
     if (b && b->enc) {
         [b->enc endEncoding];
@@ -3234,22 +3270,37 @@ bool ensure_encoder(Ctx* c, CmdBuf* b) {
         rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
         /* The pipeline declares attachment formats only when a depth/stencil
          * texture is bound, so the pass has to attach the same texture(s) or
-         * the two disagree.  There is no ClearDepthStencil path yet, hence
-         * Load: an uncleared pass keeps whatever was in the texture. */
+         * the two disagree.  A pending ClearDepthStencil becomes the matching
+         * load action; this is the only way Metal can clear one plane while
+         * loading the other from a combined depth/stencil texture. */
+        bool hasDepthPlane = false;
+        bool hasStencilPlane = false;
         Tex* dt = b->depth ? find<Tex>(b->depth) : nullptr;
         if (dt && dt->mtl) {
             const MTLPixelFormat df = dt->mtl.pixelFormat;
-            if (mtl_format_has_depth(df)) {
+            hasDepthPlane = mtl_format_has_depth(df);
+            hasStencilPlane = mtl_format_has_stencil(df);
+            if (hasDepthPlane) {
                 rpd.depthAttachment.texture = dt->mtl;
-                rpd.depthAttachment.loadAction = MTLLoadActionLoad;
+                rpd.depthAttachment.loadAction =
+                    b->pendingDepthClear ? MTLLoadActionClear : MTLLoadActionLoad;
+                if (b->pendingDepthClear)
+                    rpd.depthAttachment.clearDepth = b->clearDepth;
                 rpd.depthAttachment.storeAction = MTLStoreActionStore;
             }
-            if (mtl_format_has_stencil(df)) {
+            if (hasStencilPlane) {
                 rpd.stencilAttachment.texture = dt->mtl;
-                rpd.stencilAttachment.loadAction = MTLLoadActionLoad;
+                rpd.stencilAttachment.loadAction =
+                    b->pendingStencilClear ? MTLLoadActionClear : MTLLoadActionLoad;
+                if (b->pendingStencilClear)
+                    rpd.stencilAttachment.clearStencil = b->clearStencil;
                 rpd.stencilAttachment.storeAction = MTLStoreActionStore;
             }
         }
+        if (b->pendingDepthClear && !hasDepthPlane)
+            log_once("nvnCommandBufferClearDepthStencil.noDepth", 1);
+        if (b->pendingStencilClear && !hasStencilPlane)
+            log_once("nvnCommandBufferClearDepthStencil.noStencil", 1);
         b->enc = [b->cb renderCommandEncoderWithDescriptor:rpd];
         if (b->enc && b->hasViewport) [b->enc setViewport:b->viewport];
         if (b->enc && b->hasScissor) [b->enc setScissorRect:b->scissor];
@@ -3261,7 +3312,26 @@ bool ensure_encoder(Ctx* c, CmdBuf* b) {
         }
     }
     b->pendingClear = false;
+    b->pendingDepthClear = false;
+    b->pendingStencilClear = false;
     return b->enc != nil;
+}
+
+/* Materialises pending clears before the targets change or recording ends.
+ * Without this, a command buffer whose last command is a clear would commit
+ * no pass at all: ensure_encoder() is otherwise only called by a draw. */
+bool flush_pending_clears(Ctx* c, CmdBuf* b) {
+    if (!b) return true;
+    if (!b->pendingClear && !b->pendingDepthClear && !b->pendingStencilClear)
+        return true;
+    const bool ok = ensure_encoder(c, b);
+    if (b->enc) end_encoder(b);
+    if (!ok) log_once("nvnCommandBufferClear.noRenderPass", 1);
+    /* Never carry a clear onto a later render-target set. */
+    b->pendingClear = false;
+    b->pendingDepthClear = false;
+    b->pendingStencilClear = false;
+    return ok;
 }
 
 /* nvnCommandBufferBeginRecording(NVNcommandBuffer*) */
@@ -3282,6 +3352,10 @@ void cmdbuf_begin_recording(nvngfx_ctx* ctx, uint64_t* x) {
     b->psoHasDepth = false;
     b->psoHasStencil = false;
     b->pendingClear = false;
+    b->pendingDepthClear = false;
+    b->pendingStencilClear = false;
+    b->clearDepth = 1.0;
+    b->clearStencil = 0;
     b->argbuf[0] = b->argbuf[1] = nil;
     b->hasViewport = false;
     b->hasScissor = false;
@@ -3290,6 +3364,11 @@ void cmdbuf_begin_recording(nvngfx_ctx* ctx, uint64_t* x) {
     b->dss = nil;
     b->dssKey = 0;
     b->dssValid = false;
+    for (unsigned face = 0; face < 2; ++face) {
+        b->stencilRef[face] = 0;
+        b->stencilReadMask[face] = 0xFFu;
+        b->stencilWriteMask[face] = 0xFFu;
+    }
     b->hasMultisampleState = b->hasPolygonState = b->hasDepthState = false;
     b->hasBlendColor = false;
     b->hasAlphaRef = false;
@@ -3318,12 +3397,16 @@ void cmdbuf_begin_recording(nvngfx_ctx* ctx, uint64_t* x) {
  * The handle is what the guest submits through nvnQueueSubmitCommands.  We do
  * not record a command stream, so 0 ("nothing to submit") is the honest value;
  * the Metal work is already committed here, in queue order. */
-void cmdbuf_end_recording(nvngfx_ctx*, uint64_t* x) {
+void cmdbuf_end_recording(nvngfx_ctx* ctx, uint64_t* x) {
+    Ctx* c = ctx_of(ctx);
     CmdBuf* b = find<CmdBuf>(x[0]);
     if (!b || !b->recording) {
         x[0] = 0;
         return;
     }
+    /* A clear may be the final command in a replay segment.  It still has to
+     * produce a Metal pass before the command buffer is committed. */
+    flush_pending_clears(c, b);
     end_encoder(b);
     if (b->cb) {
         [b->cb commit];
@@ -3337,9 +3420,13 @@ void cmdbuf_end_recording(nvngfx_ctx*, uint64_t* x) {
 /* nvnCommandBufferSetRenderTargets(NVNcommandBuffer*, int n,
  *     const NVNtexture* const* colors, const NVNtextureView* const* views,
  *     const NVNtexture* depth, const NVNtextureView* depthView) */
-void cmdbuf_set_render_targets(nvngfx_ctx*, uint64_t* x) {
+void cmdbuf_set_render_targets(nvngfx_ctx* ctx, uint64_t* x) {
+    Ctx* c = ctx_of(ctx);
     CmdBuf* b = find_or_add<CmdBuf>(x[0]);
     if (!b) return;
+    /* Pending clears belong to the old targets.  Land them before the new
+     * set is installed instead of applying their values to the wrong texture. */
+    flush_pending_clears(c, b);
     const int n = static_cast<int>(x[1]);
     if (n < 0 || n > 8) {
         log_once("nvnCommandBufferSetRenderTargets.count", static_cast<unsigned>(n));
@@ -3366,25 +3453,34 @@ void cmdbuf_set_render_targets(nvngfx_ctx*, uint64_t* x) {
      * base texture format is what gets attached. */
     if (x[3] || x[5]) log_once("nvnCommandBufferSetRenderTargets.views", 1);
     b->pendingClear = false;
+    b->pendingDepthClear = false;
+    b->pendingStencilClear = false;
 }
 
 /* nvnCommandBufferClearColor(NVNcommandBuffer*, int index, const float* rgba, int mask) */
-void cmdbuf_clear_color(nvngfx_ctx* ctx, uint64_t* x) {
-    Ctx* c = ctx_of(ctx);
+void cmdbuf_clear_color(nvngfx_ctx*, uint64_t* x) {
     CmdBuf* b = find_or_add<CmdBuf>(x[0]);
     const float* rgba = guest_ptr<const float>(x[2]);
     if (!b || !rgba) return;
-    b->clearIndex = static_cast<int>(x[1]);
-    b->clearMask = static_cast<int>(x[3]);
+    const unsigned index = static_cast<unsigned>(x[1]);
+    const unsigned mask = static_cast<unsigned>(x[3]);
+    /* Metal's clear load action replaces all four channels.  A partial clear
+     * cannot be expressed without a separate pass + stored readback, so do
+     * not pretend: leaving the old contents is safer than clearing bits the
+     * guest asked to preserve. */
+    if (index != 0) {
+        log_once("nvnCommandBufferClearColor.target", index);
+        return;
+    }
+    if (mask != 0xFu) {
+        log_once("nvnCommandBufferClearColor.mask", mask);
+        return;
+    }
     for (int i = 0; i < 4; ++i) b->clear[i] = rgba[i];
     b->pendingClear = true;
     /* A clear mid-pass cannot be expressed as a load action, so close the pass;
-     * the next draw (or EndRecording) opens one that clears. */
+     * the next draw, SetRenderTargets or EndRecording opens one that clears. */
     end_encoder(b);
-    (void)c;
-    /* ClearColori / ClearColorui use integer masks; this path only has floats.
-     * The mask semantics are an unverified enum, so it is recorded, not acted on. */
-    log_once("nvnCommandBufferClearColor.mask", static_cast<unsigned>(b->clearMask));
 }
 
 /* NVNshaderStage from nxnative's nvn.h: VERTEX=0, FRAGMENT=1, GEOMETRY=2,
@@ -3441,6 +3537,53 @@ void cmdbuf_bind_depth_state(nvngfx_ctx*, uint64_t* x) {
     b->hasDepthState = true;
     b->dssValid = false;
     b->pso = nil;
+}
+
+/* Stencil command-buffer state.  NVNface is a bit set: 1 = front, 2 = back,
+ * 3 = both.  Values are eight-bit even though the SDK passes int. */
+bool update_stencil_faces(uint32_t face, uint32_t value, uint32_t out[2]) {
+    bool any = false;
+    if (face & 1u) { out[0] = value; any = true; }
+    if (face & 2u) { out[1] = value; any = true; }
+    return any;
+}
+
+void cmdbuf_set_stencil_ref(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    if (!b) return;
+    const uint32_t face = static_cast<uint32_t>(x[1]);
+    uint32_t ref = static_cast<uint32_t>(x[2]);
+    if (!update_stencil_faces(face, ref & 0xFFu, b->stencilRef)) {
+        log_once("nvnCommandBufferSetStencilRef.face", face);
+        return;
+    }
+    if (ref & ~0xFFu) log_once("nvnCommandBufferSetStencilRef.range", ref);
+}
+
+void cmdbuf_set_stencil_mask(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    if (!b) return;
+    const uint32_t face = static_cast<uint32_t>(x[1]);
+    uint32_t mask = static_cast<uint32_t>(x[2]);
+    if (!update_stencil_faces(face, mask & 0xFFu, b->stencilWriteMask)) {
+        log_once("nvnCommandBufferSetStencilMask.face", face);
+        return;
+    }
+    if (mask & ~0xFFu) log_once("nvnCommandBufferSetStencilMask.range", mask);
+    b->dssValid = false;
+}
+
+void cmdbuf_set_stencil_value_mask(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    if (!b) return;
+    const uint32_t face = static_cast<uint32_t>(x[1]);
+    uint32_t mask = static_cast<uint32_t>(x[2]);
+    if (!update_stencil_faces(face, mask & 0xFFu, b->stencilReadMask)) {
+        log_once("nvnCommandBufferSetStencilValueMask.face", face);
+        return;
+    }
+    if (mask & ~0xFFu) log_once("nvnCommandBufferSetStencilValueMask.range", mask);
+    b->dssValid = false;
 }
 
 /* nvnCommandBufferBindCoverageModulationTable(NVNcommandBuffer*, const float*) */
@@ -4358,14 +4501,47 @@ void cmdbuf_clear_color_ui(nvngfx_ctx*, uint64_t* x) {
 
 /* nvnCommandBufferClearDepthStencil(cb, float depth, uint32_t depthMask,
  *                                  int stencil, int stencilMask)
- * The current pass has no depth attachment, so a clear cannot be encoded. */
+ *
+ * NVN has one depth/stencil texture, whose format decides which planes exist.
+ * Metal clears a plane through its attachment load action, so the clear is
+ * recorded here and folded into the next pass.  Stencil clear is all-or-nothing
+ * in Metal; a partial mask is reported instead of clearing bits that were
+ * meant to survive. */
 void cmdbuf_clear_depth_stencil(nvngfx_ctx*, uint64_t* x) {
     CmdBuf* b = find_or_add<CmdBuf>(x[0]);
     if (!b) return;
     nvngfx_args* a = reinterpret_cast<nvngfx_args*>(x);
-    log_once("nvnCommandBufferClearDepthStencil.unsupported",
-             static_cast<unsigned>(nvngfx_arg_f32(a, 0) * 1000.0f));
-    (void)x[1]; (void)x[2]; (void)x[3];
+    Tex* dt = b->depth ? find<Tex>(b->depth) : nullptr;
+    const MTLPixelFormat df = (dt && dt->mtl)
+                                  ? dt->mtl.pixelFormat
+                                  : static_cast<MTLPixelFormat>(0);
+    const bool hasDepth = mtl_format_has_depth(df);
+    const bool hasStencil = mtl_format_has_stencil(df);
+    const bool clearDepth = (x[2] & 0xFFFFFFFFu) != 0;
+    const unsigned stencilMask = static_cast<unsigned>(x[4]);
+    bool queued = false;
+
+    if (clearDepth) {
+        if (!hasDepth) {
+            log_once("nvnCommandBufferClearDepthStencil.noDepth", 1);
+        } else {
+            b->clearDepth = static_cast<double>(nvngfx_arg_f32(a, 0));
+            b->pendingDepthClear = true;
+            queued = true;
+        }
+    }
+    if (stencilMask) {
+        /* 0xFF is the normal full-stencil mask.  Treat -1 as full as well,
+         * because the SDK type is int and both spell "all eight bits". */
+        if (!hasStencil || (stencilMask != 0xFFu && stencilMask != 0xFFFFFFFFu)) {
+            log_once("nvnCommandBufferClearDepthStencil.stencilMask", stencilMask);
+        } else {
+            b->clearStencil = static_cast<uint32_t>(x[3]) & 0xFFu;
+            b->pendingStencilClear = true;
+            queued = true;
+        }
+    }
+    if (queued) end_encoder(b);
 }
 
 /* nvnCommandBufferClearBuffer(cb, address, size, uint32_t value) */
@@ -4784,6 +4960,9 @@ const Binding kBindings[] = {
     BIND("nvnCommandBufferSetDepthRange", cmdbuf_set_depth_range),
     BIND("nvnCommandBufferSetRenderEnable", cmdbuf_set_render_enable),
     BIND("nvnCommandBufferSetScissors", cmdbuf_set_scissors),
+    BIND("nvnCommandBufferSetStencilMask", cmdbuf_set_stencil_mask),
+    BIND("nvnCommandBufferSetStencilRef", cmdbuf_set_stencil_ref),
+    BIND("nvnCommandBufferSetStencilValueMask", cmdbuf_set_stencil_value_mask),
     BIND("nvnCommandBufferSetViewports", cmdbuf_set_viewports),
     BIND("nvnCommandBufferSetViewportSwizzles", cmdbuf_set_viewport_swizzles),
 
@@ -4917,6 +5096,11 @@ extern "C" int nvngfx_metal_selftest(void) {
     alignas(16) unsigned char sampPoolObject[0x20] = {};
     alignas(16) unsigned char samplerBuilder5[0x60] = {};
     alignas(16) unsigned char samplerObject5[0x30] = {};
+    /* Depth/stencil clear test: one colour target plus a combined
+     * DEPTH24_STENCIL8 texture. */
+    alignas(16) unsigned char texDepthObject[0x80] = {};
+    alignas(16) unsigned char texDepthBuilder[0x80] = {};
+    alignas(8) unsigned char depthStateObject[8] = {};
     const uint64_t kTex = reinterpret_cast<uint64_t>(texObject);
     const uint64_t kTexBuilder = reinterpret_cast<uint64_t>(texBuilder);
     const uint64_t kSamplerBuilder = reinterpret_cast<uint64_t>(samplerBuilder);
@@ -4930,6 +5114,9 @@ extern "C" int nvngfx_metal_selftest(void) {
     const uint64_t kSampPool = reinterpret_cast<uint64_t>(sampPoolObject);
     const uint64_t kSamplerBuilder5 = reinterpret_cast<uint64_t>(samplerBuilder5);
     const uint64_t kSampler5 = reinterpret_cast<uint64_t>(samplerObject5);
+    const uint64_t kTexDepth = reinterpret_cast<uint64_t>(texDepthObject);
+    const uint64_t kTexDepthBuilder = reinterpret_cast<uint64_t>(texDepthBuilder);
+    const uint64_t kDepthState = reinterpret_cast<uint64_t>(depthStateObject);
     const uint64_t kCb = 0x5200;
     const uint64_t kProg = 0x5300;
     const NSUInteger kSide = 64;
@@ -8071,6 +8258,171 @@ extern "C" int nvngfx_metal_selftest(void) {
         }
 
 
+        {
+            /* --- Clear-only pass: no draw ------------------------------
+             * flush_pending_clears() is the only thing that can turn this
+             * into a Metal pass.  Without it the command buffer commits no
+             * encoder and the target keeps its previous pixels. */
+            const uint64_t kCbClear = 0x8000;
+            const uint64_t target = kTex;
+            const float blue[4] = {0.0f, 0.0f, 1.0f, 1.0f};
+            x[0] = kCbClear;
+            cmdbuf_begin_recording(ctx, x);
+            x[0] = kCbClear; x[1] = 1;
+            x[2] = reinterpret_cast<uint64_t>(&target);
+            x[3] = 0; x[4] = 0; x[5] = 0;
+            cmdbuf_set_render_targets(ctx, x);
+            x[0] = kCbClear; x[1] = 0;
+            x[2] = reinterpret_cast<uint64_t>(blue); x[3] = 0xF;
+            cmdbuf_clear_color(ctx, x);
+            CmdBuf* bc = find<CmdBuf>(kCbClear);
+            if (!bc || !bc->pendingClear) {
+                std::fprintf(stderr,
+                             "[selftest] clear-only: ClearColor was not queued\n");
+                rc = 16412;
+                goto done;
+            }
+            x[0] = kCbClear;
+            cmdbuf_end_recording(ctx, x);
+            if (!bc->last) {
+                std::fprintf(stderr,
+                             "[selftest] clear-only: nothing was committed\n");
+                rc = 16412;
+                goto done;
+            }
+            [bc->last waitUntilCompleted];
+            if (bc->last.status == MTLCommandBufferStatusError) {
+                std::fprintf(stderr,
+                             "[selftest] clear-only command buffer error: %s\n",
+                             bc->last.error
+                                 ? [[bc->last.error localizedDescription] UTF8String]
+                                 : "(no description)");
+                rc = 16412;
+                goto done;
+            }
+            unsigned char px[4] = {0, 0, 0, 0};
+            const int wantBlue[4] = {0, 0, 255, 255};
+            if (!read_center_pixel(dev, c->queue, t->mtl, kSide, px) ||
+                !pixels_near(px, wantBlue, 2)) {
+                std::fprintf(stderr,
+                             "[selftest] clear-only pixel is (%u,%u,%u,%u), "
+                             "want (%d,%d,%d,%d)\n",
+                             px[0], px[1], px[2], px[3],
+                             wantBlue[0], wantBlue[1], wantBlue[2], wantBlue[3]);
+                rc = 16412;
+                goto done;
+            }
+            std::fprintf(stderr,
+                         "[selftest] clear-only pass produced the blue pixel\n");
+        }
+
+        {
+            /* --- Depth/stencil clear and command state ------------------
+             * DEPTH24_STENCIL8 (0x35) becomes Depth32Float_Stencil8.  The
+             * clear is folded into the render pass load actions, so this
+             * checks both the queued state and that Metal accepts the pass. */
+            const uint64_t kCbDepthClear = 0x8100;
+            x[0] = kTexDepthBuilder;
+            tex_builder_set_defaults(ctx, x);
+            x[0] = kTexDepthBuilder; x[1] = 0;
+            tex_builder_set_target(ctx, x);            /* 2D */
+            x[0] = kTexDepthBuilder; x[1] = 0x35;
+            tex_builder_set_format(ctx, x);            /* DEPTH24_STENCIL8 */
+            x[0] = kTexDepthBuilder;
+            x[1] = static_cast<uint64_t>(kSide);
+            x[2] = static_cast<uint64_t>(kSide);
+            tex_builder_set_size2d(ctx, x);
+            x[0] = kTexDepthBuilder; x[1] = 1;
+            tex_builder_set_levels(ctx, x);
+            x[0] = kTexDepthBuilder; x[1] = 1;
+            tex_builder_set_samples(ctx, x);
+            x[0] = kTexDepth; x[1] = kTexDepthBuilder;
+            tex_initialize(ctx, x);
+            Tex* depth = find<Tex>(kTexDepth);
+            if (x[0] != 1 || !depth || !depth->mtl ||
+                depth->mtl.pixelFormat != MTLPixelFormatDepth32Float_Stencil8) {
+                std::fprintf(stderr,
+                             "[selftest] depth/stencil texture was not created\n");
+                rc = 16413;
+                goto done;
+            }
+
+            const uint64_t target = kTex;
+            const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+            x[0] = kCbDepthClear;
+            cmdbuf_begin_recording(ctx, x);
+            x[0] = kCbDepthClear; x[1] = 1;
+            x[2] = reinterpret_cast<uint64_t>(&target);
+            x[3] = 0; x[4] = kTexDepth; x[5] = 0;
+            cmdbuf_set_render_targets(ctx, x);
+            x[0] = kDepthState;
+            depth_set_defaults(ctx, x);
+            x[0] = kDepthState; x[1] = 1;
+            depth_set_stencil_test(ctx, x);
+            x[0] = kCbDepthClear; x[1] = kDepthState;
+            cmdbuf_bind_depth_state(ctx, x);
+            x[0] = kCbDepthClear; x[1] = 3; x[2] = 0x7F;
+            cmdbuf_set_stencil_ref(ctx, x);
+            x[0] = kCbDepthClear; x[1] = 1; x[2] = 0xF0;
+            cmdbuf_set_stencil_mask(ctx, x);
+            x[0] = kCbDepthClear; x[1] = 2; x[2] = 0x0F;
+            cmdbuf_set_stencil_value_mask(ctx, x);
+            x[0] = kCbDepthClear; x[1] = 0;
+            x[2] = reinterpret_cast<uint64_t>(black); x[3] = 0xF;
+            cmdbuf_clear_color(ctx, x);
+            nvngfx_args a{};
+            nvngfx_arg_set_f32(&a, 0, 0.25f);
+            a.x[0] = kCbDepthClear;
+            a.x[1] = 0; a.x[2] = 1; a.x[3] = 0x5A; a.x[4] = 0xFF;
+            cmdbuf_clear_depth_stencil(ctx, a.x);
+
+            CmdBuf* bd = find<CmdBuf>(kCbDepthClear);
+            if (!bd || !bd->pendingDepthClear || !bd->pendingStencilClear ||
+                bd->clearDepth != 0.25 || bd->clearStencil != 0x5A ||
+                bd->stencilRef[0] != 0x7F || bd->stencilRef[1] != 0x7F ||
+                bd->stencilWriteMask[0] != 0xF0 ||
+                bd->stencilWriteMask[1] != 0xFF ||
+                bd->stencilReadMask[0] != 0xFF ||
+                bd->stencilReadMask[1] != 0x0F) {
+                std::fprintf(stderr,
+                             "[selftest] depth/stencil state mismatch\n");
+                rc = 16414;
+                goto done;
+            }
+            /* A draw is what applies the stencil references and builds the
+             * depth-stencil object against both attachment formats. */
+            x[0] = kCbDepthClear; x[1] = kProg; x[2] = 0;
+            cmdbuf_bind_program(ctx, x);
+            x[0] = kCbDepthClear; x[1] = 0; x[2] = 0; x[3] = 3;
+            cmdbuf_draw_arrays(ctx, x);
+            if (bd->encoded != 1) {
+                std::fprintf(stderr,
+                             "[selftest] depth/stencil draw was not encoded\n");
+                rc = 16414;
+                goto done;
+            }
+            x[0] = kCbDepthClear;
+            cmdbuf_end_recording(ctx, x);
+            if (!bd->last) {
+                std::fprintf(stderr,
+                             "[selftest] depth/stencil clear did not commit\n");
+                rc = 16414;
+                goto done;
+            }
+            [bd->last waitUntilCompleted];
+            if (bd->last.status == MTLCommandBufferStatusError) {
+                std::fprintf(stderr,
+                             "[selftest] depth/stencil command buffer error: %s\n",
+                             bd->last.error
+                                 ? [[bd->last.error localizedDescription] UTF8String]
+                                 : "(no description)");
+                rc = 16414;
+                goto done;
+            }
+            std::fprintf(stderr,
+                         "[selftest] depth/stencil clear entered a combined pass\n");
+        }
+
     done:
         nvngfx_shader_set_msl_passthrough(0);
         forget<CmdBuf>(kCb);
@@ -8120,6 +8472,10 @@ extern "C" int nvngfx_metal_selftest(void) {
         forget<CmdBuf>(0x7D00);
         forget<CmdBuf>(0x7E00);
         forget<CmdBuf>(0x7F00);
+        forget<Tex>(kTexDepth);
+        forget<CmdBuf>(0x8000);
+        forget<CmdBuf>(0x8100);
+        g_tex_specs.erase(kTexDepthBuilder);
         forget<Pool>(0x7300);
         g_pool_specs.erase(0x7400);
         std::free(poolRaw2);

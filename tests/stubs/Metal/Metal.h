@@ -499,6 +499,8 @@ destinationBytesPerImage:(NSUInteger)bpi;
 - (void)setBlendColorRed:(float)red green:(float)green blue:(float)blue alpha:(float)alpha;
 - (void)setRenderPipelineState:(id<MTLRenderPipelineState>)state;
 - (void)setDepthStencilState:(id<MTLDepthStencilState>)state;
+- (void)setStencilFrontReferenceValue:(uint32_t)frontReferenceValue
+                   backReferenceValue:(uint32_t)backReferenceValue;
 - (void)setCullMode:(MTLCullMode)mode;
 - (void)setFrontFacingWinding:(MTLWinding)winding;
 - (void)setTriangleFillMode:(MTLTriangleFillMode)mode;

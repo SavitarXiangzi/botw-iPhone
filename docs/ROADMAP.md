@@ -4117,7 +4117,7 @@ CI（run 41151003231，commit `ecfd58e`）两个 job 都通过：portable
 |---|---|
 | iOS 侧 `cmdbuf_end_recording` 仍在 EndRecording 里直接 commit 并返回 handle 0 | 客体拿不到可提交的句柄，回放层没有命令流可重放 |
 | iOS 侧未实现 `nvnCommandBufferCallCommands` / `nvnQueueSubmitCommands` | harness 记录得出来，回放层展不开 |
-| `ClearColori/ui` / `ClearDepthStencil` / `ClearBuffer` / `ClearTexture*` 只 `log_once` | 整数清屏与纹理清屏仍是占位；`ClearColor`（float）有真路径 |
+| `ClearColori/ui` / `ClearBuffer` / `ClearTexture*` 只 `log_once`（该轮状态） | 整数清屏与纹理清屏仍是占位；`ClearColor`（float）有真路径；`ClearDepthStencil` 已在下一轮接入 |
 | storage buffer / image / transform feedback 只记录句柄 | 计算与 UAV 路径未接线 |
 | harness 的 `nvnSamplerCompare` 只比较部分已实现字段，`SamplerBuilder` 缺 wrap / compare / border setter | 采样器状态不完整 |
 | 没有真机运行 | 不能声称画面，任何"能玩"的说法都不成立 |
@@ -4212,5 +4212,71 @@ verify_ios: ok (metal bindings: 196/513)
 
 * 只有 0 号颜色目标进入描述符和 render pass；MRT 要等 pass 支持多附件；
 * 管线缓存只有 4 个槽，状态组合一多就会反复重编译（真机上每次数毫秒）；
-* `ClearDepthStencil` 仍是日志占位，深度附件按 load 打开，未清过的 pass 会继承旧内容；
+* 这一轮结束时 `ClearDepthStencil` 仍是日志占位；下一节已把它接入 load action；
 * 没有真机运行，不能声称画面正确。
+
+## M4 续二：深度/模板清屏与模板命令状态
+
+上一轮的 `MTLDepthStencilState` 已经能描述模板测试，但命令缓冲的模板引用值和掩码没有
+入口，深度/模板清屏也仍是日志。这一轮把两者接进回放层。
+
+### 1. 清屏变成 load action，并且没有 draw 也会落地
+
+`ClearColor`、`ClearDepthStencil` 不再要求后面紧跟一条 draw。清屏先挂在 `CmdBuf` 上，
+`ensure_encoder()` 按目标纹理的真实格式填 `MTLLoadActionClear` / `MTLLoadActionLoad`：
+
+* 组合格式 `Depth32Float_Stencil8` 同时挂 depth/stencil 附件；
+* 纯 `Depth32Float` / `Depth16Unorm` 只清深度；
+* 纯 `Stencil8` 只清模板；
+* `clearDepth` / `clearStencil` 分别是两个平面的清屏值。
+
+`flush_pending_clears()` 在 `EndRecording` 和 `SetRenderTargets` 换目标前调用。它解决了
+“整段只有清屏、没有 draw，结果没有 render pass，提交了个空 command buffer”的回归；
+换目标前先落地也避免把旧目标的清屏值套到新纹理上。
+
+`ClearColor` 目前仍只支持 0 号目标和完整 `0xF` 掩码；其他组合明确 `log_once`。
+`ClearDepthStencil` 的模板清屏目前只接受 `0xFF` / `0xFFFFFFFF` 完整掩码，部分掩码无法
+用 Metal load action 表达。
+
+### 2. 三个模板命令入口
+
+新增并登记：
+
+* `nvnCommandBufferSetStencilRef` -> `setStencilFrontReferenceValue:backReferenceValue:`；
+* `nvnCommandBufferSetStencilMask` -> `MTLStencilDescriptor.writeMask`；
+* `nvnCommandBufferSetStencilValueMask` -> `MTLStencilDescriptor.readMask`。
+
+`NVNface` 按位解释：front=1、back=2、both=3。引用值是 encoder 状态，不进入
+`MTLDepthStencilState` 缓存键；前后脸读/写掩码进入缓存键，改掩码会重建状态对象。
+超过 8 位的值截取并上报。
+
+### 3. 新增模拟器自测
+
+`nvngfx_metal_selftest()` 末尾增加两项：
+
+1. BeginRecording -> SetRenderTargets -> ClearColor 蓝色 -> EndRecording，
+   不绑定程序、不 draw，回读中心像素必须为蓝色。这直接覆盖
+   `flush_pending_clears()` 修复的回归点。
+2. 建一张 `DEPTH24_STENCIL8`（0x35）的 64x64 纹理，与颜色目标一起挂载，
+   设置前后脸模板 ref / 读掩码 / 写掩码，再清深度 0.25、模板 0x5A，并 draw 一条
+   全屏三角形，让 `apply_fixed_state()` 真正调用模板引用设置、建立带深度/模板格式的
+   管线。检查挂起状态和最终 Metal command buffer 无错误。
+
+### 4. 覆盖与仍然缺的
+
+覆盖从 **196/513** 提升到 **199/513（38.8%）**，未实现 314；CommandBuffer 域
+**54/144**。门禁输出：
+
+```text
+syntax_check_metal: ok (clang++.exe)
+verify_ios: ok (metal bindings: 199/513)
+build_abi_test: all tests passed
+```
+
+仍未支持：
+
+* 只有 0 号颜色目标，MRT 还没有；
+* 没有颜色目标的纯深度 pass 仍打不开 encoder；
+* 部分模板清屏掩码；
+* `ClearColori/ui`、`ClearBuffer`、`ClearTexture*` 仍是日志占位；
+* 没有真机像素验证，不能声称画面正确。
