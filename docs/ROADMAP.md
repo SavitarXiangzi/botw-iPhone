@@ -4686,3 +4686,74 @@ build_abi_test: all tests passed
 * guest `DispatchCompute` / image / storage buffer 路径；
 * 真实标题 shader 的离线 MSL 接入（`nvn_shader_blobs.gen.c` 仍为空表）；
 * 没有真机像素验证，不能声称画面正确。
+
+## M4 续十一：guest compute dispatch（direct binding）
+
+`nvnCommandBufferDispatchCompute` / `DispatchComputeIndirect` 以前只写命令流、
+返回日志桩。本轮把 compute-only 程序的 direct-binding 路径接进回放，覆盖率从
+**202/513（39.4%）** 提到 **204/513（39.8%）**，未实现 309；CommandBuffer 域
+**59/144**。
+
+### 1. compute program 与 graphics program 分开
+
+* `CmdBuf` 新增 `computeProgram`；`nvnCommandBufferBindProgram` 解释第三个参数的
+  stage 掩码：bits 0..4 是图形阶段，bit 5 是 compute。带 bit 5 的绑定只更新
+  compute 槽，不会覆盖下一条 draw 使用的图形 program；`stages == 0` 仍按图形
+  program 处理，兼容已有调用；
+* compute 目前只接受 `nvnProgramSetShaders(..., n=1, ...)` 的 compute-only 程序，
+  使用 `key[0]` / `code[0]`；混合 graphics + compute stage 明确拒绝。
+
+### 2. 管线与线程组侧车
+
+* `Program` 增加 `MTLComputePipelineState` 与三维线程组大小；MSL 从 shader key
+  查离线 blob，查不到时仍可走 `nvngfx_shader_to_msl()` 的宿主直供路径；
+* Metal 不在 kernel 函数里保存 launch size，因此 compute MSL 必须带
+  `// nvngfx-threadgroup X Y Z`。`nvngfx_shader_threadgroup_size()` 解析并校验
+  三个维度均为正、乘积不超过 1024；缺失或非法时拒绝建立管线；
+* 入口点固定为 `nvngfx_main_cs`。
+
+### 3. direct binding 契约
+
+```text
+NVN storage buffer slot r -> MSL [[buffer(16 + r)]]
+NVN image slot r          -> MSL [[texture(r)]]
+```
+
+* `begin_compute_dispatch()` 先落地 pending clears，再结束 render pass，然后建
+  `MTLComputeCommandEncoder`，按 compute stage（5）绑定 storage buffer / image；
+* direct dispatch 的三个参数是 threadgroup 数，乘以侧车里的线程组大小；
+* indirect dispatch 把 guest 地址映射到 pool 的 `MTLBuffer`，交给
+  `dispatchThreadgroupsWithIndirectBuffer:...` 由 GPU 读取 `{x, y, z}`，CPU
+  不提前读参数，因此同一 command buffer 里前一个 kernel 写出的组数可见；
+* dispatch 后把绑定的 image 标记为已写入，避免后续采样从 guest 原始纹理存储
+  重传并覆盖 compute 结果。
+
+### 4. 模拟器自测
+
+* compute-only 程序 + `// nvngfx-threadgroup 16 1 1`；
+* storage buffer 0 为源（`src[0] = 1000`），buffer 1 为 direct 输出，buffer 1
+  重新绑定为 indirect 输出；indirect 参数 `{1, 16, 1}`；
+* 16×16 RGBA8 image 同时由 kernel 写入；
+* direct 与 indirect 各 dispatch 一次，回读 256 个 storage word
+  （`1000 + x + y`）与 image 的 `(0,0)` / `(15,15)` 像素；
+* 期望像素约为 `(0, 0, 191, 255)` 与 `(255, 255, 191, 255)`。
+
+### 5. 覆盖与仍然缺的
+
+本地门禁：
+
+```text
+syntax_check_metal: ok (clang++.exe)
+verify_ios: ok (metal bindings: 204/513)
+build_abi_test: all tests passed
+```
+
+仍未支持：
+
+* compute 的 sampled texture / sampler / uniform buffer 绑定（`cmdbuf_bind_texture()` /
+  `bind_sampler()` / `bind_uniform_buffer()` 仍拒绝 stage 5）；
+* mixed graphics + compute 的 `nvnProgramSetShaders`；
+* 离线 manifest 的 compute 条目与真实标题 compute shader 翻译（`gen_blobs.py`
+  仍只有 `vs` / `ps`）；
+* compute image 写回 guest 存储 / CPU 回读的完整一致性；
+* 没有真机像素验证，不能声称画面正确。

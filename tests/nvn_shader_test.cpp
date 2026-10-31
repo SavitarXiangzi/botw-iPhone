@@ -61,7 +61,33 @@ int main() {
     CHECK(vs != nullptr && std::strstr(vs, "nvngfx_main_vs") != nullptr);
     CHECK(vs != nullptr && std::strstr(vs, "[[vertex_id]]") != nullptr);
     CHECK(fs != nullptr && std::strstr(fs, "nvngfx_main_fs") != nullptr);
-    CHECK(nvngfx_shader_selftest_msl(NVNGFX_STAGE_COMPUTE) == nullptr);
+    const char* cs = nvngfx_shader_selftest_msl(NVNGFX_STAGE_COMPUTE);
+    CHECK(cs != nullptr && std::strstr(cs, "nvngfx_main_cs") != nullptr);
+    CHECK(cs != nullptr &&
+          std::strstr(cs, "nvngfx-threadgroup 16 1 1") != nullptr);
+    CHECK(cs != nullptr && std::strstr(cs, "[[texture(0)]]") != nullptr);
+
+    /* The comment is the only place NVN's compute threadgroup size can live:
+     * Metal chooses the launch size at dispatch time.  Pin both the valid
+     * spelling and the refusals that keep a malformed sidecar from launching
+     * a dispatch with the wrong grid. */
+    {
+        unsigned tg[3] = {0, 0, 0};
+        CHECK(nvngfx_shader_threadgroup_size(cs, tg) == 0);
+        CHECK(tg[0] == 16 && tg[1] == 1 && tg[2] == 1);
+        CHECK(nvngfx_shader_threadgroup_size(
+                  "// nvngfx-threadgroup\t8  4 2\nkernel void k() {}", tg) == 0);
+        CHECK(tg[0] == 8 && tg[1] == 4 && tg[2] == 2);
+        CHECK(nvngfx_shader_threadgroup_size("kernel void k() {}", tg) == -1);
+        CHECK(nvngfx_shader_threadgroup_size(
+                  "// nvngfx-threadgroup 0 8 1", tg) == -1);
+        CHECK(nvngfx_shader_threadgroup_size(
+                  "// nvngfx-threadgroup 32 32 2", tg) == -1);
+        CHECK(nvngfx_shader_threadgroup_size(
+                  "// nvngfx-threadgroup 8 8", tg) == -1);
+        CHECK(nvngfx_shader_threadgroup_size(nullptr, tg) == -1);
+        CHECK(nvngfx_shader_threadgroup_size(cs, nullptr) == -1);
+    }
 
     /* The layered-texture self-test must declare a 2D array, not a plain
      * texture2d: a plain declaration would still compile and bind, but it
@@ -147,11 +173,21 @@ int main() {
     why = nullptr;
     CHECK(nvngfx_shader_lookup("fedcba9876543210", NVNGFX_STAGE_FRAGMENT, &why) == blobs[1].msl);
 
-    /* Compute blobs are refused rather than silently never matched. */
-    static const nvngfx_shader_blob cs[] = {
-        {"0123456789abcdef", NVNGFX_STAGE_COMPUTE, "z", nullptr, 0, nullptr, 0},
+    /* Compute is a first-class blob stage: a dispatch looks it up by the same
+     * key, and the stage remains part of the identity. */
+    static const nvngfx_shader_blob compute_blobs[] = {
+        {"0123456789abcdef", NVNGFX_STAGE_COMPUTE,
+         "kernel void nvngfx_main_cs() {}", nullptr, 0, nullptr, 0},
     };
-    CHECK(nvngfx_shader_set_blobs(cs, 1) == -1);
+    CHECK(nvngfx_shader_set_blobs(compute_blobs, 1) == 0);
+    CHECK(nvngfx_shader_blob_count() == 1);
+    why = nullptr;
+    CHECK(nvngfx_shader_lookup("0123456789abcdef", NVNGFX_STAGE_COMPUTE,
+                               &why) == compute_blobs[0].msl);
+    CHECK(why != nullptr && std::strcmp(why, "offline MSL blob") == 0);
+    why = nullptr;
+    CHECK(nvngfx_shader_lookup("0123456789abcdef", NVNGFX_STAGE_VERTEX,
+                               &why) == nullptr);
     CHECK(nvngfx_shader_set_blobs(nullptr, 1) == -1);
 
     /* The argument layout sidecar.  A real fragment shader names 42 entries,

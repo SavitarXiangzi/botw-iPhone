@@ -18,6 +18,10 @@
  *           depth/stencil-only REPLACE pass, and ClearTexture{i,ui} as
  *           per-level/slice attachment passes, flushed even without a draw
  *         ClearBuffer -> host compute kernel over a pool span
+ *         guest DispatchCompute / DispatchComputeIndirect -> compute-only
+ *           program, direct [[buffer(16 + r)]] storage buffers and
+ *           [[texture(r)]] images, threadgroup size from an MSL sidecar;
+ *           indirect group counts are read by the GPU from a pool span
  *         texture objects, built from the values nvnTextureBuilderSet* was
  *           given (no guest struct offsets are read)
  *         program objects; the pipeline cache is keyed by every colour
@@ -39,7 +43,9 @@
  *         seven clear-only regressions (full / partial-mask / integer
  *         ClearColor, ClearTexture full-region-mask-uint-cube-mip, depth /
  *         stencil / partial-stencil and MRT clears), a
- *         buffer-fill compute probe, a bindless table probe, and a vertex-stage
+ *         buffer-fill compute probe, direct and indirect guest compute
+ *         dispatch probes (storage words and RGBA8 pixels read back), a
+ *         bindless table probe, and a vertex-stage
  *         argument-buffer draw whose shifted pixels are read back.  The ninth
  *         builds a block-linear texture in a guest memory pool and proves that
  *         the sampled pixels came from that storage, not from a host-side
@@ -47,7 +53,9 @@
  *         <app>/shaders and reads back orange.  The eleventh uploads a
  *         two-layer 2D array and reads red from layer 0 and yellow from layer 1.
  *         A sampler state object is also created, compared and read back.
- *         texture views / guest compute dispatch / sync-fence
+ *         texture views / compute sampled textures, samplers, uniform
+ *         buffers, mixed graphics+compute programs, translated compute
+ *         blobs / sync-fence
  *         BC6H/BC7 and signed BCn (unsigned BC1-BC5 decode to RGBA8)
  *
  * Argument ABI: measured, not guessed
@@ -332,6 +340,9 @@ struct CmdBuf {
      * produced.  The pipeline stays nil until nvngfx_shader_to_msl() can
      * actually translate something. */
     uint64_t program = 0;
+    /* NVN binds compute programs separately from the graphics stages.  A
+     * compute bind must not replace the program a later draw uses. */
+    uint64_t computeProgram = 0;
     id<MTLRenderPipelineState> pso = nil;
     /* Which attachments that pipeline declared.  Binding a depth or stencil
      * test to a pass without the matching attachment is a Metal error, so the
@@ -2052,6 +2063,11 @@ struct Program {
      * Metal 3 resource ID, so it is the fallback for devices whose
      * gpuResourceID is zero (notably the x86_64 iOS Simulator). */
     bool directBindings = false;
+    /* Compute is a compute-only program in this backend: one NVNshaderData
+     * at index 0, launched with its nvngfx-threadgroup sidecar.  The pipeline
+     * and launch size are created together from the same MSL. */
+    id<MTLComputePipelineState> computePso = nil;
+    unsigned computeThreadgroup[3] = {0, 0, 0};
 };
 
 /* The cached pipeline for the complete (colour/depth/stencil format, sample
@@ -2125,6 +2141,10 @@ void pso_drop(Program* p) {
     p->hasArgBuffer = false;
     p->vHasArgBuffer = false;
     p->directBindings = false;
+    p->computePso = nil;
+    p->computeThreadgroup[0] = 0;
+    p->computeThreadgroup[1] = 0;
+    p->computeThreadgroup[2] = 0;
 }
 
 /* Compiles the program's MSL into a render pipeline for `fmt`.
@@ -2596,6 +2616,227 @@ bool pool_span(uint64_t addr, size_t len, id<MTLBuffer>* buf, size_t* off) {
     return false;
 }
 
+/* Defined with render-pass ownership below; dispatch has to land pending
+ * clears and close the current pass before opening a compute encoder. */
+bool flush_pending_clears(Ctx* c, CmdBuf* b);
+void end_encoder(CmdBuf* b);
+
+/* Compiles a compute-only Program.  The direct-binding contract is the same
+ * one the self-test uses: storage buffer slot r is [[buffer(16 + r)]] and
+ * image slot r is [[texture(r)]].  The threadgroup size is read from the
+ * nvngfx-threadgroup comment because Metal does not expose it through the
+ * pipeline. */
+id<MTLComputePipelineState> compute_pipeline(Ctx* c, Program* p,
+                                             const char** why) {
+    if (!p) {
+        if (why) *why = "no compute program";
+        return nil;
+    }
+    if (p->computePso) return p->computePso;
+    if (!c || !c->ready) {
+        if (why) *why = "backend not ready";
+        return nil;
+    }
+    if (p->numStages != 1) {
+        if (why) *why = "compute program must contain exactly one shader";
+        return nil;
+    }
+    const char* msl = nullptr;
+    if (p->key[0][0])
+        msl = nvngfx_shader_lookup(p->key[0], NVNGFX_STAGE_COMPUTE, why);
+    if (!msl)
+        msl = nvngfx_shader_to_msl(reinterpret_cast<const void*>(p->code[0]), 0,
+                                   NVNGFX_STAGE_COMPUTE, why);
+    if (!msl) {
+        if (why && !*why) *why = "no compute MSL";
+        return nil;
+    }
+    unsigned tg[3] = {0, 0, 0};
+    if (nvngfx_shader_threadgroup_size(msl, tg) != 0) {
+        if (why) *why = "compute MSL lacks a valid nvngfx-threadgroup sidecar";
+        return nil;
+    }
+
+    @autoreleasepool {
+        NSError* err = nil;
+        id<MTLLibrary> lib =
+            [c->device newLibraryWithSource:[NSString stringWithUTF8String:msl]
+                                    options:nil
+                                      error:&err];
+        if (!lib) {
+            log_once_str("nvnCommandBufferDispatchCompute.library",
+                         err ? [[err localizedDescription] UTF8String]
+                             : "nil library");
+            if (why) *why = "compute MSL did not compile";
+            return nil;
+        }
+        id<MTLFunction> fn = [lib
+            newFunctionWithName:[NSString
+                stringWithUTF8String:NVNGFX_ENTRY_COMPUTE]];
+        if (!fn) {
+            if (why) *why = "compute MSL did not define nvngfx_main_cs";
+            return nil;
+        }
+        err = nil;
+        id<MTLComputePipelineState> pso =
+            [c->device newComputePipelineStateWithFunction:fn error:&err];
+        if (!pso) {
+            log_once_str("nvnCommandBufferDispatchCompute.pipeline",
+                         err ? [[err localizedDescription] UTF8String]
+                             : "nil pipeline");
+            if (why) *why = "compute pipeline creation failed";
+            return nil;
+        }
+        p->computeThreadgroup[0] = tg[0];
+        p->computeThreadgroup[1] = tg[1];
+        p->computeThreadgroup[2] = tg[2];
+        p->computePso = pso;
+        return pso;
+    }
+}
+
+/* Direct compute bindings always live in NVN stage 5's tables.  Extra buffer
+ * or texture indices are harmless: Metal ignores an argument the kernel does
+ * not declare. */
+bool bind_compute_resources(CmdBuf* b, id<MTLComputeCommandEncoder> enc) {
+    if (!b || !enc) return false;
+    for (unsigned slot = 0; slot < NVNGFX_MAX_UBO_SLOTS; ++slot) {
+        const uint64_t addr = b->storage[5][slot];
+        if (!addr) continue;
+        const size_t len = static_cast<size_t>(
+            b->storageSize[5][slot] ? b->storageSize[5][slot] : 1u);
+        id<MTLBuffer> buf = nil;
+        size_t off = 0;
+        if (!pool_span(addr, len, &buf, &off)) {
+            log_once("nvnCommandBufferDispatchCompute.storageBuffer", slot);
+            return false;
+        }
+        [enc setBuffer:buf offset:static_cast<NSUInteger>(off)
+               atIndex:static_cast<NSUInteger>(16u + slot)];
+    }
+    for (unsigned slot = 0; slot < NVNGFX_MAX_TEXTURE_SLOTS; ++slot) {
+        const uint64_t handle = b->image[5][slot];
+        if (!handle) continue;
+        const Tex* t = bound_texture(b, handle);
+        if (!t || !t->mtl) {
+            log_once("nvnCommandBufferDispatchCompute.image", slot);
+            return false;
+        }
+        [enc setTexture:t->mtl atIndex:static_cast<NSUInteger>(slot)];
+    }
+    return true;
+}
+
+/* A dispatch writes images through Metal, so a later draw must not overwrite
+ * those pixels from the guest's original texture storage. */
+void mark_compute_image_writes(CmdBuf* b) {
+    if (!b) return;
+    for (unsigned slot = 0; slot < NVNGFX_MAX_TEXTURE_SLOTS; ++slot) {
+        const uint64_t handle = b->image[5][slot];
+        if (!handle) continue;
+        Tex* t = const_cast<Tex*>(bound_texture(b, handle));
+        if (!t) continue;
+        t->uploadTried = true;
+        t->uploaded = true;
+        t->rendered = true;
+        t->dirty = false;
+    }
+}
+
+/* Shared prologue: clear ordering, end the render pass, get the compute
+ * pipeline and bind direct resources.  On failure the caller does not encode
+ * a dispatch. */
+bool begin_compute_dispatch(Ctx* c, CmdBuf* b,
+                            id<MTLComputeCommandEncoder>* out_enc) {
+    if (!c || !b || !out_enc) return false;
+    if (!b->recording || !b->cb) {
+        log_once("nvnCommandBufferDispatchCompute.notRecording", 1);
+        return false;
+    }
+    /* Pending clears were recorded before this dispatch and have to land
+     * first.  The helper also closes the render pass. */
+    flush_pending_clears(c, b);
+    end_encoder(b);
+    Program* p = find<Program>(b->computeProgram);
+    if (!p) {
+        log_once("nvnCommandBufferDispatchCompute.noProgram", 1);
+        return false;
+    }
+    const char* why = nullptr;
+    id<MTLComputePipelineState> pso = compute_pipeline(c, p, &why);
+    if (!pso) {
+        log_once_str("nvnCommandBufferDispatchCompute.noPipeline",
+                     why ? why : "unknown");
+        return false;
+    }
+    id<MTLComputeCommandEncoder> enc = [b->cb computeCommandEncoder];
+    if (!enc) {
+        log_once("nvnCommandBufferDispatchCompute.encoder", 1);
+        return false;
+    }
+    [enc setComputePipelineState:pso];
+    if (!bind_compute_resources(b, enc)) {
+        [enc endEncoding];
+        return false;
+    }
+    *out_enc = enc;
+    return true;
+}
+
+/* nvnCommandBufferDispatchCompute(NVNcommandBuffer*, int x, int y, int z)
+ * The three arguments are threadgroup counts, not thread counts; NVN's
+ * threadgroup dimensions come from the compute shader sidecar. */
+void cmdbuf_dispatch_compute(nvngfx_ctx* ctx, uint64_t* x) {
+    Ctx* c = ctx_of(ctx);
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    id<MTLComputeCommandEncoder> enc = nil;
+    if (!begin_compute_dispatch(c, b, &enc)) return;
+    Program* p = find<Program>(b->computeProgram);
+    const int gx = static_cast<int32_t>(x[1]);
+    const int gy = static_cast<int32_t>(x[2]);
+    const int gz = static_cast<int32_t>(x[3]);
+    if (!p || gx < 0 || gy < 0 || gz < 0) {
+        log_once("nvnCommandBufferDispatchCompute.groups", 1);
+        [enc endEncoding];
+        return;
+    }
+    [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(gx),
+                                         static_cast<NSUInteger>(gy),
+                                         static_cast<NSUInteger>(gz))
+        threadsPerThreadgroup:MTLSizeMake(
+            static_cast<NSUInteger>(p->computeThreadgroup[0]),
+            static_cast<NSUInteger>(p->computeThreadgroup[1]),
+            static_cast<NSUInteger>(p->computeThreadgroup[2]))];
+    [enc endEncoding];
+    mark_compute_image_writes(b);
+}
+
+/* nvnCommandBufferDispatchComputeIndirect(NVNcommandBuffer*, NVNbufferAddress)
+ * The group counts are read by the GPU when the dispatch runs, so a kernel
+ * earlier in the same command buffer may have written them. */
+void cmdbuf_dispatch_compute_indirect(nvngfx_ctx* ctx, uint64_t* x) {
+    Ctx* c = ctx_of(ctx);
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    id<MTLComputeCommandEncoder> enc = nil;
+    if (!begin_compute_dispatch(c, b, &enc)) return;
+    Program* p = find<Program>(b->computeProgram);
+    id<MTLBuffer> args = nil;
+    size_t off = 0;
+    if (!p || !pool_span(x[1], 12, &args, &off)) {
+        log_once("nvnCommandBufferDispatchComputeIndirect.arguments", 1);
+        [enc endEncoding];
+        return;
+    }
+    [enc dispatchThreadgroupsWithIndirectBuffer:args
+                           indirectBufferOffset:static_cast<NSUInteger>(off)
+                              threadsPerThreadgroup:MTLSizeMake(
+            static_cast<NSUInteger>(p->computeThreadgroup[0]),
+            static_cast<NSUInteger>(p->computeThreadgroup[1]),
+            static_cast<NSUInteger>(p->computeThreadgroup[2]))];
+    [enc endEncoding];
+    mark_compute_image_writes(b);
+}
+
 /* Binds one MTLBuffer per stream that a bound attribute reads.
  *
  * A stream whose guest address is not inside any memory pool is not bindable:
@@ -2840,20 +3081,35 @@ void prog_finalize(nvngfx_ctx*, uint64_t* x) {
     forget<Program>(x[0]);
 }
 
-/* nvnCommandBufferBindProgram(NVNcommandBuffer*, const NVNprogram*, int)
+/* nvnCommandBufferBindProgram(NVNcommandBuffer*, const NVNprogram*, int
+ * stages)
  *
- * The third argument is a "what changed" flag; it does not affect the state
- * this layer keeps, so it is ignored rather than guessed at. */
+ * `stages` is NVN's stage mask: bits 0..4 are the graphics stages and bit 5
+ * is compute.  A compute program has its own slot, because a dispatch between
+ * two draws must not replace the program the second draw uses.  The self-test's
+ * older graphics calls pass 0; preserving their graphics-only meaning keeps
+ * that path honest.
+ */
 void cmdbuf_bind_program(nvngfx_ctx* ctx, uint64_t* x) {
     Ctx* c = ctx_of(ctx);
     CmdBuf* b = find_or_add<CmdBuf>(x[0]);
     if (!b) return;
-    b->program = x[1];
-    b->pso = nil;
-    /* BindProgram may run before the targets are known; ensure_pipeline()
-     * then returns false here and the draw path retries once the pass knows
-     * its colour format. */
-    ensure_pipeline(c, b);
+    const uint32_t stages = static_cast<uint32_t>(x[2]);
+    const bool graphics = stages == 0 || (stages & 0x1Fu) != 0;
+    const bool compute = (stages & 0x20u) != 0;
+    if (!graphics && !compute) {
+        log_once("nvnCommandBufferBindProgram.stages", stages);
+        return;
+    }
+    if (graphics) {
+        b->program = x[1];
+        b->pso = nil;
+        /* BindProgram may run before the targets are known; ensure_pipeline()
+         * then returns false here and the draw path retries once the pass
+         * knows its colour format. */
+        ensure_pipeline(c, b);
+    }
+    if (compute) b->computeProgram = x[1];
 }
 
 /* nvnCommandBufferBindVertexBuffer(NVNcommandBuffer*, int index,
@@ -4274,9 +4530,9 @@ void cmdbuf_bind_coverage_table(nvngfx_ctx*, uint64_t* x) {
     b->pso = nil;
 }
 
-/* nvnCommandBufferBindImage(s): recorded, but Metal image blocks / UAVs are
- * not wired into the argument buffer yet.  The handle is still kept so the
- * compute path can use it without another guest call. */
+/* nvnCommandBufferBindImage(s): consumed by the compute path as a direct
+ * [[texture(slot)]] binding.  Render-stage image binds remain recorded because
+ * the render argument-buffer path does not use them. */
 void cmdbuf_bind_image(nvngfx_ctx*, uint64_t* x) {
     CmdBuf* b = find_or_add<CmdBuf>(x[0]);
     if (!b) return;
@@ -4287,7 +4543,6 @@ void cmdbuf_bind_image(nvngfx_ctx*, uint64_t* x) {
         return;
     }
     b->image[si][slot] = x[3];
-    log_once("nvnCommandBufferBindImage.unsupported", static_cast<unsigned>(x[1]));
 }
 void cmdbuf_bind_images(nvngfx_ctx*, uint64_t* x) {
     CmdBuf* b = find_or_add<CmdBuf>(x[0]);
@@ -4302,10 +4557,10 @@ void cmdbuf_bind_images(nvngfx_ctx*, uint64_t* x) {
         return;
     }
     for (int i = 0; i < n; ++i) b->image[si][first + i] = hs[i];
-    log_once("nvnCommandBufferBindImages.unsupported", static_cast<unsigned>(x[1]));
 }
 
-/* nvnCommandBufferBindStorageBuffer(s): recorded for compute. */
+/* nvnCommandBufferBindStorageBuffer(s): consumed by the compute path as
+ * direct [[buffer(16 + slot)]] bindings. */
 void cmdbuf_bind_storage_buffer(nvngfx_ctx*, uint64_t* x) {
     CmdBuf* b = find_or_add<CmdBuf>(x[0]);
     if (!b) return;
@@ -4317,7 +4572,6 @@ void cmdbuf_bind_storage_buffer(nvngfx_ctx*, uint64_t* x) {
     }
     b->storage[si][slot] = x[3];
     b->storageSize[si][slot] = x[4];
-    log_once("nvnCommandBufferBindStorageBuffer.unsupported", static_cast<unsigned>(x[1]));
 }
 void cmdbuf_bind_storage_buffers(nvngfx_ctx*, uint64_t* x) {
     CmdBuf* b = find_or_add<CmdBuf>(x[0]);
@@ -4335,7 +4589,6 @@ void cmdbuf_bind_storage_buffers(nvngfx_ctx*, uint64_t* x) {
         b->storage[si][first + i] = rg[2 * i];
         b->storageSize[si][first + i] = rg[2 * i + 1];
     }
-    log_once("nvnCommandBufferBindStorageBuffers.unsupported", static_cast<unsigned>(x[1]));
 }
 
 /* nvnCommandBufferBindTransformFeedbackBuffer(s): recorded for the later
@@ -6039,6 +6292,9 @@ const Binding kBindings[] = {
     BIND("nvnCommandBufferSetViewport", cmdbuf_set_viewport),
     BIND("nvnCommandBufferSetScissor", cmdbuf_set_scissor),
     BIND("nvnCommandBufferBindProgram", cmdbuf_bind_program),
+    BIND("nvnCommandBufferDispatchCompute", cmdbuf_dispatch_compute),
+    BIND("nvnCommandBufferDispatchComputeIndirect",
+         cmdbuf_dispatch_compute_indirect),
     BIND("nvnCommandBufferBindVertexBuffer", cmdbuf_bind_vertex_buffer),
     BIND("nvnCommandBufferBindVertexBuffers", cmdbuf_bind_vertex_buffers),
     BIND("nvnCommandBufferBindVertexAttribState", cmdbuf_bind_vertex_attrib_state),
@@ -6278,6 +6534,9 @@ extern "C" int nvngfx_metal_selftest(void) {
     /* MRT test: a second colour target, same size/format as texObject. */
     alignas(16) unsigned char texMrtObject[0x80] = {};
     alignas(16) unsigned char texMrtBuilder[0x80] = {};
+    /* Compute test: a 16x16 RGBA8 image plus its builder. */
+    alignas(16) unsigned char texComputeObject[0x80] = {};
+    alignas(16) unsigned char texComputeBuilder[0x80] = {};
     /* Integer-clear test: one R32Uint and one R32Sint target, sharing a
      * builder because only the format changes between creations. */
     alignas(16) unsigned char texClearUIObject[0x80] = {};
@@ -6301,6 +6560,9 @@ extern "C" int nvngfx_metal_selftest(void) {
     const uint64_t kTexDepthBuilder = reinterpret_cast<uint64_t>(texDepthBuilder);
     const uint64_t kTexMrt = reinterpret_cast<uint64_t>(texMrtObject);
     const uint64_t kTexMrtBuilder = reinterpret_cast<uint64_t>(texMrtBuilder);
+    const uint64_t kTexCompute = reinterpret_cast<uint64_t>(texComputeObject);
+    const uint64_t kTexComputeBuilder =
+        reinterpret_cast<uint64_t>(texComputeBuilder);
     const uint64_t kTexClearUI = reinterpret_cast<uint64_t>(texClearUIObject);
     const uint64_t kTexClearI = reinterpret_cast<uint64_t>(texClearIObject);
     const uint64_t kTexIntBuilder = reinterpret_cast<uint64_t>(texIntBuilder);
@@ -10787,6 +11049,188 @@ extern "C" int nvngfx_metal_selftest(void) {
         }
 
         {
+            /* --- Compute dispatches: storage buffer and image ------------
+             * The host self-test kernel reads storage buffer 0, writes
+             * storage buffer 1 and a 16x16 RGBA8 image, then runs a second
+             * time through an indirect group-count buffer.  The threadgroup
+             * size (16x1x1) travels in the kernel's nvngfx-threadgroup
+             * sidecar; NVN's group counts (1x16x1) travel separately. */
+            const uint64_t kProgCompute = 0x9A00;
+            const uint64_t kCbCompute = 0x9B00;
+            const unsigned kComputeSrc = 8192;
+            const unsigned kComputeDst = 9216;
+            const unsigned kComputeIndirectDst = 10240;
+            const unsigned kComputeIndirectArgs = 11264;
+            const size_t kComputeBytes = 16 * 16 * sizeof(uint32_t);
+            unsigned char* const vpoolCompute =
+                poolRaw2 ? reinterpret_cast<unsigned char*>(
+                               (reinterpret_cast<uintptr_t>(poolRaw2) + 16383u) &
+                               ~static_cast<uintptr_t>(16383u))
+                         : nullptr;
+            if (!vpoolCompute) {
+                std::fprintf(stderr,
+                             "[selftest] compute: the second pool is missing\n");
+                rc = 16420;
+                goto done;
+            }
+
+            x[0] = kTexComputeBuilder;
+            tex_builder_set_defaults(ctx, x);
+            x[0] = kTexComputeBuilder; x[1] = 0;
+            tex_builder_set_target(ctx, x);
+            x[0] = kTexComputeBuilder; x[1] = 0x25;
+            tex_builder_set_format(ctx, x);
+            x[0] = kTexComputeBuilder; x[1] = 16; x[2] = 16;
+            tex_builder_set_size2d(ctx, x);
+            x[0] = kTexComputeBuilder; x[1] = 1;
+            tex_builder_set_levels(ctx, x);
+            x[0] = kTexComputeBuilder; x[1] = 1;
+            tex_builder_set_samples(ctx, x);
+            x[0] = kTexCompute; x[1] = kTexComputeBuilder;
+            tex_initialize(ctx, x);
+            Tex* const computeTex = find<Tex>(kTexCompute);
+            if (x[0] != 1 || !computeTex || !computeTex->mtl) {
+                std::fprintf(stderr,
+                             "[selftest] compute: image texture initialization "
+                             "failed\n");
+                rc = 16420;
+                goto done;
+            }
+            x[0] = kTexPool; x[1] = 14; x[2] = kTexCompute; x[3] = 0;
+            tex_pool_register_image(ctx, x);
+
+            uint32_t* const src = reinterpret_cast<uint32_t*>(
+                vpoolCompute + kComputeSrc);
+            uint32_t* const dst = reinterpret_cast<uint32_t*>(
+                vpoolCompute + kComputeDst);
+            uint32_t* const indirectDst = reinterpret_cast<uint32_t*>(
+                vpoolCompute + kComputeIndirectDst);
+            uint32_t* const indirect = reinterpret_cast<uint32_t*>(
+                vpoolCompute + kComputeIndirectArgs);
+            std::memset(src, 0, kComputeBytes);
+            std::memset(dst, 0xFF, kComputeBytes);
+            std::memset(indirectDst, 0xFF, kComputeBytes);
+            src[0] = 1000;
+            indirect[0] = 1;
+            indirect[1] = 16;
+            indirect[2] = 1;
+            const uint64_t srcAddr =
+                reinterpret_cast<uint64_t>(vpoolCompute + kComputeSrc);
+            const uint64_t dstAddr =
+                reinterpret_cast<uint64_t>(vpoolCompute + kComputeDst);
+            const uint64_t indirectDstAddr = reinterpret_cast<uint64_t>(
+                vpoolCompute + kComputeIndirectDst);
+            const uint64_t indirectAddr = reinterpret_cast<uint64_t>(
+                vpoolCompute + kComputeIndirectArgs);
+
+            {
+                struct { uint64_t data; uint64_t control; } sd[1];
+                sd[0].data = reinterpret_cast<uint64_t>(const_cast<char*>(
+                    nvngfx_shader_selftest_msl(NVNGFX_STAGE_COMPUTE)));
+                sd[0].control = 0;
+                x[0] = kProgCompute; x[1] = 0;
+                prog_initialize(ctx, x);
+                x[0] = kProgCompute; x[1] = 1;
+                x[2] = reinterpret_cast<uint64_t>(&sd[0]);
+                prog_set_shaders(ctx, x);
+                if (x[0] != 1) {
+                    std::fprintf(stderr,
+                                 "[selftest] compute: SetShaders failed\n");
+                    rc = 16420;
+                    goto done;
+                }
+            }
+
+            x[0] = kCbCompute;
+            cmdbuf_begin_recording(ctx, x);
+            x[0] = kCbCompute; x[1] = kTexPool;
+            cmdbuf_set_texture_pool(ctx, x);
+            x[0] = kCbCompute; x[1] = 5; x[2] = 0; x[3] = srcAddr;
+            x[4] = kComputeBytes;
+            cmdbuf_bind_storage_buffer(ctx, x);
+            x[0] = kCbCompute; x[1] = 5; x[2] = 1; x[3] = dstAddr;
+            x[4] = kComputeBytes;
+            cmdbuf_bind_storage_buffer(ctx, x);
+            x[0] = 0; x[1] = 14;
+            dev_get_image_handle(ctx, x);
+            const uint64_t computeImageHandle = x[0];
+            x[0] = kCbCompute; x[1] = 5; x[2] = 0;
+            x[3] = computeImageHandle;
+            cmdbuf_bind_image(ctx, x);
+            x[0] = kCbCompute; x[1] = kProgCompute; x[2] = 0x20;
+            cmdbuf_bind_program(ctx, x);
+            x[0] = kCbCompute; x[1] = 1; x[2] = 16; x[3] = 1;
+            cmdbuf_dispatch_compute(ctx, x);
+
+            x[0] = kCbCompute; x[1] = 5; x[2] = 1;
+            x[3] = indirectDstAddr; x[4] = kComputeBytes;
+            cmdbuf_bind_storage_buffer(ctx, x);
+            x[0] = kCbCompute; x[1] = indirectAddr;
+            cmdbuf_dispatch_compute_indirect(ctx, x);
+            x[0] = kCbCompute;
+            cmdbuf_end_recording(ctx, x);
+
+            CmdBuf* const bc = find<CmdBuf>(kCbCompute);
+            if (!bc || !bc->last) {
+                std::fprintf(stderr,
+                             "[selftest] compute: nothing committed\n");
+                rc = 16420;
+                goto done;
+            }
+            [bc->last waitUntilCompleted];
+            if (bc->last.status == MTLCommandBufferStatusError) {
+                std::fprintf(stderr,
+                             "[selftest] compute command buffer error: %s\n",
+                             bc->last.error
+                                 ? [[bc->last.error localizedDescription] UTF8String]
+                                 : "(no description)");
+                rc = 16420;
+                goto done;
+            }
+            for (unsigned y = 0; y < 16; ++y) {
+                for (unsigned x = 0; x < 16; ++x) {
+                    const uint32_t want = 1000u + x + y;
+                    const uint32_t i = y * 16u + x;
+                    if (dst[i] != want || indirectDst[i] != want) {
+                        std::fprintf(stderr,
+                                     "[selftest] compute storage word (%u,%u) "
+                                     "is 0x%08x / 0x%08x, want 0x%08x\n",
+                                     x, y, dst[i], indirectDst[i], want);
+                        rc = 16420;
+                        goto done;
+                    }
+                }
+            }
+            {
+                const int want00[4] = {0, 0, 191, 255};
+                const int want15[4] = {255, 255, 191, 255};
+                unsigned char px[4] = {0, 0, 0, 0};
+                if (!read_pixel_at(dev, c->queue, computeTex->mtl, 16, 0, 0, px) ||
+                    !pixels_near(px, want00, 2)) {
+                    std::fprintf(stderr,
+                                 "[selftest] compute image (0,0) is "
+                                 "(%u,%u,%u,%u)\n",
+                                 px[0], px[1], px[2], px[3]);
+                    rc = 16420;
+                    goto done;
+                }
+                if (!read_pixel_at(dev, c->queue, computeTex->mtl, 16,
+                                   15, 15, px) ||
+                    !pixels_near(px, want15, 2)) {
+                    std::fprintf(stderr,
+                                 "[selftest] compute image (15,15) is "
+                                 "(%u,%u,%u,%u)\n",
+                                 px[0], px[1], px[2], px[3]);
+                    rc = 16420;
+                    goto done;
+                }
+            }
+            std::fprintf(stderr,
+                         "[selftest] compute: direct and indirect dispatches "
+                         "wrote 256 storage words and a 16x16 image\n");
+        }
+
+        {
             /* --- Per-program PSO cache capacity --------------------------
              * Fill every MRU slot with a distinct key, then look each one up.
              * A four-slot cache would have evicted twelve of these keys.  The
@@ -10900,6 +11344,10 @@ extern "C" int nvngfx_metal_selftest(void) {
         forget<Tex>(0x8D00);
         forget<Tex>(0x8F00);
         g_tex_specs.erase(0x8C00);
+        forget<Program>(0x9A00);
+        forget<CmdBuf>(0x9B00);
+        forget<Tex>(kTexCompute);
+        g_tex_specs.erase(kTexComputeBuilder);
         forget<CmdBuf>(0x9300);
         forget<CmdBuf>(0x9900);
         forget<Tex>(0x9200);

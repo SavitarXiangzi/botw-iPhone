@@ -13,7 +13,7 @@ SDK/NVN 调用整层接管（HLE）**，而不是跑一个通用模拟器。
 ios/BotW/       SwiftUI + Metal 壳（CAMetalLayer 视图、CADisplayLink 驱动、NVN 覆盖数 HUD）
 ios/nvn/        NVN host-HLE：513 入口点注册表、生成的分发表、Metal 后端
   registry.json   从标题自己的 getproc 字符串提取，29 个域
-  src/nvn_metal.mm 201 个入口点的 Metal 实现（其余是日志桩）
+  src/nvn_metal.mm 204 个入口点的 Metal 实现（其余是日志桩）
   src/nvn_shader.c 着色器翻译接口（现在只会返回 NULL + 理由）
   src/nvn_texture.c 157 项 NVNformat -> MTLPixelFormat 映射表（带 lossy 标记）
   src/nvn_bcn.c   BC1/BC2/BC3/BC4U/BC5U -> RGBA8 解码器（iOS 没有 BCn 像素格式）
@@ -60,8 +60,8 @@ docs/           路线图、HLE 边界、NVN 覆盖表、iOS 移植手册、着�
 | M3.94 | BC1/BC2/BC3/BC4U/BC5U 在首次采样时解成 RGBA8；sRGB 变体保留 transfer function | ✅ 第十五条 draw 左红右蓝，run 41086648054 |
 | M3.95 | `nvnTextureWriteTexels*` 按 guest 布局做整级 RMW，`FlushTexels` 标脏；下次采样重传 | ✅ 第十六条 draw 在两次显式更新后都回读正确，run 41090664172 |
 | M3.96 | 私有 harness：`nvnCommandBufferDraw*` 补齐、Yaz0 双缓冲源、0x414E01BC 去重表 | ✅ 真实 guest draw 701 / present 301（660 s 严格门禁） |
-| iOS 骨架 | 513 入口点注册表 + 生成分发表 + Metal 后端 202 项 + 三重门禁 | 🟡 十八条合成 draw，其中十七条默认在 CI 模拟器执行，另加七类清屏回归（无 draw 的颜色清屏、深度/模板组合清屏、双目标 MRT 清屏、R32Uint/R32Sint 整数清屏、部分通道 ClearColor、ClearTexture 的完整/区域/掩码/整数/cube 六面/mip 1 清屏、8 位部分模板掩码清屏）和一个 ClearBuffer 计算填充回归；第十三条 cube array 需 `BOTW_SELFTEST_CUBE_ARRAY=1`，模拟器的 Metal 建 CubeArray 会崩。含 bindless、顶点参数缓冲区、c1 常量段、guest pool 解块/BCn 上传、显式纹理更新和离线 MSL bundle；客体仍无画面 |
-| M4 | NVN → Metal 回放（管线/纹理/命令缓冲） | 🟡 六类固定功能状态已接入：blend / write mask / alpha-to-coverage / 深度模板格式进入 `MTLRenderPipelineDescriptor`，cull / winding / fill、`MTLDepthStencilState`、模板 ref/掩码、depth clamp 与 polygon offset 在编码器逐 draw 应用；`ClearDepthStencil` 的完整掩码通过深度/模板附件的 load action 落地，即使整段只有清屏也会提交 pass；Metal 入口 202/513。深度边界测试只有记录与明确上报（Metal 无对应能力）；支持 1–8 个颜色目标（MRT），每个目标有自己的格式、混合、写掩码与清屏值，模拟器已验证双目标清屏及双颜色输出；0 颜色附件的纯深度 pass 也已打开，模拟器通过“深度写入后 EQUAL 测试”确认深度值真的落盘；ClearColor / ClearColori / ClearColorui 已共用同一条 load action 路径，R32Uint/R32Sint 清屏字节回读通过；ClearBuffer 用宿主 compute kernel 填充任意 32 位模式（4 字节对齐），0xA1B2C3D4 回读通过；每个 Program 的管线缓存已扩到 16 槽 MRU，模拟器填满 16 个不同状态键并逐一回查；ClearColor 的部分通道掩码改为 Load + 全屏三角形按写掩码清除，RGBA8 的 R/G 合并清屏与 RGBA8Uint 的 R/G 掩码清屏字节回读通过；ClearTexture / ClearTexturei / ClearTextureui 共用逐 level、逐 slice 的颜色清屏：完整级别走 load action，region 或部分通道 mask 走 scissor + 全屏三角形；代码路径覆盖 2D / 2D array / cube / cube array / 2D MSAA，支持完整多 mip 清屏，显式 region 仅接受单 level 视图；模拟器回读完整、区域、mask、整数、cube 六面与 mip 1，1D / 3D / depth-stencil 明确拒绝；`ClearDepthStencil` 的 8 位模板部分掩码通过独立 depth/stencil-only pass 落地（加载旧模板、全屏三角形 + ALWAYS/REPLACE + 写掩码），完整 0xFF 仍走 load action；模拟器以 0xF0 → mask 0x0F + 0x5A → 0xFA 的 EQUAL 测试验证高低半字节，无真机画面 |
+| iOS 骨架 | 513 入口点注册表 + 生成分发表 + Metal 后端 204 项 + 三重门禁 | 🟡 十八条合成 draw，其中十七条默认在 CI 模拟器执行，另加七类清屏回归（无 draw 的颜色清屏、深度/模板组合清屏、双目标 MRT 清屏、R32Uint/R32Sint 整数清屏、部分通道 ClearColor、ClearTexture 的完整/区域/掩码/整数/cube 六面/mip 1 清屏、8 位部分模板掩码清屏）、一个 ClearBuffer 计算填充回归，以及一个 guest compute dispatch 回归（compute-only 程序、direct / indirect threadgroups、storage buffer 与 image 写入）；第十三条 cube array 需 `BOTW_SELFTEST_CUBE_ARRAY=1`，模拟器的 Metal 建 CubeArray 会崩。含 bindless、顶点参数缓冲区、c1 常量段、guest pool 解块/BCn 上传、显式纹理更新和离线 MSL bundle；客体仍无画面 |
+| M4 | NVN → Metal 回放（管线/纹理/命令缓冲） | 🟡 六类固定功能状态已接入：blend / write mask / alpha-to-coverage / 深度模板格式进入 `MTLRenderPipelineDescriptor`，cull / winding / fill、`MTLDepthStencilState`、模板 ref/掩码、depth clamp 与 polygon offset 在编码器逐 draw 应用；`ClearDepthStencil` 的完整掩码通过深度/模板附件的 load action 落地，即使整段只有清屏也会提交 pass；Metal 入口 204/513。深度边界测试只有记录与明确上报（Metal 无对应能力）；支持 1–8 个颜色目标（MRT），每个目标有自己的格式、混合、写掩码与清屏值，模拟器已验证双目标清屏及双颜色输出；0 颜色附件的纯深度 pass 也已打开，模拟器通过“深度写入后 EQUAL 测试”确认深度值真的落盘；ClearColor / ClearColori / ClearColorui 已共用同一条 load action 路径，R32Uint/R32Sint 清屏字节回读通过；ClearBuffer 用宿主 compute kernel 填充任意 32 位模式（4 字节对齐），0xA1B2C3D4 回读通过；guest `DispatchCompute` / `DispatchComputeIndirect` 已接上 compute-only 程序的 direct-binding 路径：storage buffer 走 `[[buffer(16 + slot)]]`、image 走 `[[texture(slot)]]`，线程组大小取自 MSL 侧车 `// nvngfx-threadgroup X Y Z`，indirect 的组数由 GPU 从 guest pool 读取；模拟器用 16×16 网格分别验证 direct 与 indirect 的 storage word 和 RGBA8 像素。compute 的 sampled texture / sampler / uniform buffer、image 写回 guest 存储与 CPU 回读，以及真实标题 compute blob 仍未接。每个 Program 的管线缓存已扩到 16 槽 MRU，模拟器填满 16 个不同状态键并逐一回查；ClearColor 的部分通道掩码改为 Load + 全屏三角形按写掩码清除，RGBA8 的 R/G 合并清屏与 RGBA8Uint 的 R/G 掩码清屏字节回读通过；ClearTexture / ClearTexturei / ClearTextureui 共用逐 level、逐 slice 的颜色清屏：完整级别走 load action，region 或部分通道 mask 走 scissor + 全屏三角形；代码路径覆盖 2D / 2D array / cube / cube array / 2D MSAA，支持完整多 mip 清屏，显式 region 仅接受单 level 视图；模拟器回读完整、区域、mask、整数、cube 六面与 mip 1，1D / 3D / depth-stencil 明确拒绝；`ClearDepthStencil` 的 8 位模板部分掩码通过独立 depth/stencil-only pass 落地（加载旧模板、全屏三角形 + ALWAYS/REPLACE + 写掩码），完整 0xFF 仍走 load action；模拟器以 0xF0 → mask 0x0F + 0x5A → 0xFA 的 EQUAL 测试验证高低半字节，无真机画面 |
 | M5 | 音频（nn::audio → AVAudioEngine）、输入 | ⬜ |
 | M6 | 真机性能与内存（6 GB 机型起步） | ⬜ |
 
@@ -218,8 +218,8 @@ guest 业务代码
 |---|---:|---|
 | NVN 入口点 | **513** | 扫 `main.reloc.bin` 里会被 `nvnDeviceGetProcAddress` 按名解析的字符串 |
 | 域 | 29 | 按前缀归类（CommandBuffer 144、Texture 45、TextureBuilder 43…） |
-| Metal 后端已实现 | **202**（39.4%） | 真实 `BIND(...)`，不是靠注释声称 |
-| 未实现 | 311 | 按"挡住第一个 draw call"排序，见 `docs/IOS_PORTING.md` |
+| Metal 后端已实现 | **204**（39.8%） | 真实 `BIND(...)`，不是靠注释声称 |
+| 未实现 | 309 | 按"挡住第一个 draw call"排序，见 `docs/IOS_PORTING.md` |
 | 生成的代码 | 2 个文件 | `gen_nvn.py` 生成 `nvn_api.h` / `nvn_dispatch.cpp`，`--check` 防手改 |
 | 参数形状 | 470 个 | `signatures.json`，解析公开 nxnative 原型表（MIT），最大 arity 8 |
 
@@ -232,7 +232,7 @@ guest 业务代码
 2. **客体的 draw 仍然一条都不执行**：program、管线、draw 编码都写好了，
    但 `nvngfx_shader_to_msl()` 没有翻译器（NVN 给的是 Maxwell SASS），
    所以管线建不出来，draw 停在一条 `noPipeline` 日志。
-   **例外且刻意**：`nvngfx_metal_selftest()` 用内置 MSL 和离线 bundle 跑到第十六条合成 draw（cube array 是第十三条，模拟器跳过），
+   **例外且刻意**：`nvngfx_metal_selftest()` 用内置 MSL 和离线 bundle 跑到第十八条合成 draw，并加 direct / indirect compute dispatch 回归（cube array 是第十三条，模拟器跳过），
    由 CI 用 `simctl` 启动 App（`BOTW_SELFTEST=1`）执行并回读像素。它证明的是
    Metal 这半边，不是客体能跑。
 3. **采样纹理是宿主分配的 `MTLTexture`，首次采样时才从 guest 池填充**：
@@ -272,7 +272,7 @@ nvn_pipeline_test: ok (defaults, enum tables, write-mask order, blend targets, u
 nvn_shader_bundle_test: ok (manifest, merge, c1, refusals)  exit=0
 test_gen_blobs: ok (ids, packed slots, bindless, c1, bundle, holes, refusals)
 syntax_check_metal: ok (clang++.exe)
-verify_ios: ok (metal bindings: 202/513)
+verify_ios: ok (metal bindings: 204/513)
 build_abi_test: all tests passed
 ```
 
@@ -280,7 +280,7 @@ Mac 侧还有一条**真的执行**的测试：CI 用 `simctl` 在 iOS 模拟器
 `--selftest` 让 App 在 `init()` 里跑完
 texture -> target -> clear -> pipeline -> draw -> 回读然后 `exit(rc)`，
 结果写进 App 容器的 `Documents/selftest.txt` 由工作流断言。
-自检列到第十六条 draw，模拟器实际执行十五条；M3.85 的 run 41042618062、block-linear 布局的 run 41047317230、
+自检列到第十八条 draw，模拟器实际执行十七条，另加 direct / indirect compute dispatch 回归；M3.85 的 run 41042618062、block-linear 布局的 run 41047317230、
 从 guest 池解块上传纹理的 run 41051685313、离线 MSL bundle 的 run 41064580709、
 分层纹理的 run 41070475247 均已通过。第十条真正从 `<app>/shaders/manifest.tsv` 取 MSL、按 guest key
 建管线并回读橙色像素；第十一条从 guest pool 上传两层 2D 数组，片段着色器

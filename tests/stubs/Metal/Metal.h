@@ -506,8 +506,12 @@ destinationBytesPerImage:(NSUInteger)bpi;
 - (void)setBytes:(const void*)bytes
           length:(NSUInteger)length
          atIndex:(NSUInteger)index;
+- (void)setTexture:(id<MTLTexture>)texture atIndex:(NSUInteger)index;
 - (void)dispatchThreadgroups:(MTLSize)threadgroups
       threadsPerThreadgroup:(MTLSize)threadsPerThreadgroup;
+- (void)dispatchThreadgroupsWithIndirectBuffer:(id<MTLBuffer>)indirectBuffer
+                          indirectBufferOffset:(NSUInteger)indirectBufferOffset
+                             threadsPerThreadgroup:(MTLSize)threadsPerThreadgroup;
 @end
 
 @protocol MTLRenderCommandEncoder

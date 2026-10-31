@@ -36,6 +36,24 @@ static const char* const kVs =
     "    return v;\n"
     "}\n";
 
+/* The compute self-test: one dispatch fills a 16x16 uint buffer and a 16x16
+ * RGBA8 image.  The comment is the threadgroup-size sidecar the backend reads;
+ * it is deliberately machine-readable and lives in the MSL so a translated
+ * compute blob can carry the same information later. */
+static const char* const kCs =
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "// nvngfx-threadgroup 16 1 1\n"
+    "kernel void nvngfx_main_cs(device const uint* src [[buffer(16)]],\n"
+    "                           device uint* dst [[buffer(17)]],\n"
+    "                           texture2d<float, access::write> image [[texture(0)]],\n"
+    "                           uint2 gid [[thread_position_in_grid]]) {\n"
+    "    if (gid.x >= 16 || gid.y >= 16) return;\n"
+    "    dst[gid.y * 16 + gid.x] = src[0] + gid.x + gid.y;\n"
+    "    image.write(float4(float(gid.x) / 15.0,\n"
+    "                       float(gid.y) / 15.0, 0.75, 1.0), gid);\n"
+    "}\n";
+
 static const char* const kFs =
     "#include <metal_stdlib>\n"
     "using namespace metal;\n"
@@ -457,7 +475,9 @@ int nvngfx_shader_set_blobs(const nvngfx_shader_blob* blobs, size_t count) {
     for (i = 0; i < count; ++i) {
         const nvngfx_shader_blob* b = &blobs[i];
         if (!key_valid(b->key)) return -(int)(i + 1);
-        if (b->stage != NVNGFX_STAGE_VERTEX && b->stage != NVNGFX_STAGE_FRAGMENT)
+        if (b->stage != NVNGFX_STAGE_VERTEX &&
+            b->stage != NVNGFX_STAGE_FRAGMENT &&
+            b->stage != NVNGFX_STAGE_COMPUTE)
             return -(int)(i + 1);
         if (b->msl == NULL || b->msl[0] == '\0') return -(int)(i + 1);
         if (!args_valid(b)) return -(int)(i + 1);
@@ -519,6 +539,33 @@ unsigned nvngfx_shader_copy_args(const nvngfx_shader_blob* blob,
     if (cap < blob->num_args) return 0;
     for (i = 0; i < blob->num_args; ++i) out[i] = blob->args[i];
     return blob->num_args;
+}
+
+int nvngfx_shader_threadgroup_size(const char* msl, unsigned out[3]) {
+    static const char marker[] = "nvngfx-threadgroup";
+    if (!msl || !out) return -1;
+    const char* p = strstr(msl, marker);
+    if (!p) return -1;
+    p += sizeof marker - 1;
+    for (int i = 0; i < 3; ++i) {
+        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') ++p;
+        if (*p < '0' || *p > '9') return -1;
+        unsigned v = 0;
+        while (*p >= '0' && *p <= '9') {
+            const unsigned digit = (unsigned)(*p - '0');
+            if (v > 1024u / 10u || v * 10u + digit > 1024u) return -1;
+            v = v * 10u + digit;
+            ++p;
+        }
+        if (!v) return -1;
+        out[i] = v;
+    }
+    if (*p && *p != ' ' && *p != '\t' && *p != '\r' && *p != '\n' &&
+        *p != '/')
+        return -1;
+    if (out[0] > 1024u / out[1]) return -1;
+    if (out[0] * out[1] > 1024u / out[2]) return -1;
+    return 0;
 }
 
 void nvngfx_shader_set_msl_passthrough(int on) { g_passthrough = on ? 1 : 0; }
@@ -598,6 +645,7 @@ const char* nvngfx_shader_selftest_msl_variant(nvngfx_stage stage, int variant) 
     }
     if (stage == NVNGFX_STAGE_VERTEX) return kVs;
     if (stage == NVNGFX_STAGE_FRAGMENT) return kFs;
+    if (stage == NVNGFX_STAGE_COMPUTE) return kCs;
     return NULL;
 }
 

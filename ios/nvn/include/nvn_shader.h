@@ -132,7 +132,7 @@ typedef struct nvngfx_shader_arg {
 
 typedef struct nvngfx_shader_blob {
     const char* key;   /* exactly 16 hex digits, any case */
-    int stage;         /* nvngfx_stage; compute blobs are not accepted yet */
+    int stage;         /* nvngfx_stage; compute uses the direct-binding path */
     const char* msl;   /* NUL-terminated MSL source, entry point renamed below */
     /* Sorted by id, ids unique, 0..NVNGFX_MAX_ARGS entries.  NULL/0 when the
      * generator had no layout for this shader: the backend then falls back to
@@ -216,6 +216,7 @@ unsigned nvngfx_shader_copy_args(const nvngfx_shader_blob* blob,
  * two halves cannot drift. */
 #define NVNGFX_ENTRY_VERTEX "nvngfx_main_vs"
 #define NVNGFX_ENTRY_FRAGMENT "nvngfx_main_fs"
+#define NVNGFX_ENTRY_COMPUTE "nvngfx_main_cs"
 
 
 /* Computes a shader's key straight from the guest's control section and code
@@ -247,6 +248,13 @@ int nvngfx_shader_msl_passthrough(void);
  * [[vertex_id]] plus a constant colour.  Written for this repository; it is
  * not derived from, and does not contain, any title data. */
 const char* nvngfx_shader_selftest_msl(nvngfx_stage stage);
+
+/* Reads the compute threadgroup size from the machine-readable comment
+ * `// nvngfx-threadgroup X Y Z` in a compute MSL blob.  Metal does not encode
+ * the launch size in the kernel function, so NVN's group counts cannot be
+ * replayed without this sidecar.  Returns 0 on success, -1 when the marker is
+ * missing or the three dimensions are not positive / exceed 1024 total. */
+int nvngfx_shader_threadgroup_size(const char* msl, unsigned out[3]);
 
 /* Same, with a variant selector:
  *   0  the full-screen triangle built from [[vertex_id]] (no vertex buffer)
