@@ -12,11 +12,13 @@
  *   DONE  device / queue / window / swapchain lifecycle
  *         memory pool -> zero-copy MTLBuffer over guest memory
  *         command buffer -> MTLCommandBuffer, viewport / scissor / drawArrays
- *         render targets + one render pass (colour[0]) + ClearColor /
+ *         render targets + one render pass (1-8 colour attachments) +
+ *           ClearColor /
  *           ClearDepthStencil as load actions, flushed even without a draw
  *         texture objects, built from the values nvnTextureBuilderSet* was
  *           given (no guest struct offsets are read)
- *         program objects; the pipeline cache is keyed by colour format and
+ *         program objects; the pipeline cache is keyed by every colour
+ *           attachment format and
  *           vertex layout and fed by the shader key -> offline MSL blob
  *           (docs/SHADER_CHAIN.md), with nvngfx_shader_to_msl() as the
  *           fallback for a host that supplies MSL directly
@@ -30,8 +32,8 @@
  *         on a computer, never in the repository.  Everything else on that
  *         path -- pipeline creation with a real vertex descriptor, buffer
  *         binding, draw encoding, pixel readback -- is executed by
- *         nvngfx_metal_selftest() in CI's iOS Simulator: sixteen draws, two
- *         clear-only regressions, a bindless table probe, and a vertex-stage
+ *         nvngfx_metal_selftest() in CI's iOS Simulator: seventeen draws,
+ *         three clear-only regressions, a bindless table probe, and a vertex-stage
  *         argument-buffer draw whose shifted pixels are read back.  The ninth builds a block-linear
  *         texture in a guest memory pool and proves that the sampled pixels
  *         came from that storage, not from a host-side upload.  The tenth
@@ -39,7 +41,7 @@
  *         reads back orange.  The eleventh uploads a two-layer 2D array and
  *         reads red from layer 0 and yellow from layer 1.  A sampler state
  *         object is also created, compared and read back.
- *         MRT / pure-depth passes / texture views / compute / sync-fence
+ *         pure-depth passes / texture views / compute / sync-fence
  *         BC6H/BC7 and signed BCn (unsigned BC1-BC5 decode to RGBA8)
  *
  * Argument ABI: measured, not guessed
@@ -256,10 +258,10 @@ struct CmdBuf {
      * separately because one render pass can clear colour, depth and stencil
      * together, and because a clear must still happen when EndRecording is
      * reached without a following draw. */
-    bool pendingClear = false;
+    bool pendingClear[NVNGFX_MAX_COLOR_TARGETS] = {};
     bool pendingDepthClear = false;
     bool pendingStencilClear = false;
-    float clear[4] = {0, 0, 0, 0};
+    float clear[NVNGFX_MAX_COLOR_TARGETS][4] = {};
     double clearDepth = 1.0;
     uint32_t clearStencil = 0;
     /* Program bound by nvnCommandBufferBindProgram and the pipeline it
@@ -1933,7 +1935,11 @@ struct Program {
      * on a device costs milliseconds).  slots[0] is the most recent. */
     struct PsoSlot {
         id<MTLRenderPipelineState> pso = nil;
-        MTLPixelFormat format = static_cast<MTLPixelFormat>(0);
+        /* MRT bakes each colour format into the pipeline.  The unused tail
+         * stays zero and is part of the comparison, so a 1-target and a
+         * 2-target pipeline can never collide. */
+        MTLPixelFormat colorFormat[8] = {};
+        unsigned numColors = 0;
         unsigned long long layout = 0;   /* nvngfx_vertex_layout_id() */
         bool hasLayout = false;          /* false: no vertex descriptor */
         /* Fixed-function state that was current at the draw.  A pipeline is
@@ -1981,7 +1987,14 @@ struct Program {
 /* The cached pipeline for the complete (colour/depth/stencil format, sample
  * count, vertex layout, fixed-function state) key, or nil.  Also records the
  * hit in slot 0 so the next draw with the same key finds it first. */
-id<MTLRenderPipelineState> pso_lookup(Program* p, MTLPixelFormat fmt,
+bool same_color_formats(const MTLPixelFormat* a, const MTLPixelFormat* b) {
+    for (unsigned i = 0; i < NVNGFX_MAX_COLOR_TARGETS; ++i)
+        if (a[i] != b[i]) return false;
+    return true;
+}
+
+id<MTLRenderPipelineState> pso_lookup(Program* p, const MTLPixelFormat* colorFormats,
+                                     unsigned numColors,
                                      unsigned long long layout, bool hasLayout,
                                      unsigned long long stateKey,
                                      MTLPixelFormat depthFormat,
@@ -1989,7 +2002,9 @@ id<MTLRenderPipelineState> pso_lookup(Program* p, MTLPixelFormat fmt,
                                      unsigned sampleCount) {
     for (unsigned i = 0; i < 4; ++i) {
         Program::PsoSlot& s = p->slots[i];
-        if (s.pso && s.format == fmt && s.layout == layout && s.hasLayout == hasLayout &&
+        if (s.pso && s.numColors == numColors &&
+            same_color_formats(s.colorFormat, colorFormats) &&
+            s.layout == layout && s.hasLayout == hasLayout &&
             s.stateKey == stateKey && s.depthFormat == depthFormat &&
             s.stencilFormat == stencilFormat && s.sampleCount == sampleCount) {
             if (i != 0) {
@@ -2003,7 +2018,8 @@ id<MTLRenderPipelineState> pso_lookup(Program* p, MTLPixelFormat fmt,
     return nil;
 }
 
-void pso_store(Program* p, id<MTLRenderPipelineState> pso, MTLPixelFormat fmt,
+void pso_store(Program* p, id<MTLRenderPipelineState> pso,
+               const MTLPixelFormat* colorFormats, unsigned numColors,
                unsigned long long layout, bool hasLayout,
                unsigned long long stateKey, MTLPixelFormat depthFormat,
                MTLPixelFormat stencilFormat, unsigned sampleCount) {
@@ -2011,7 +2027,9 @@ void pso_store(Program* p, id<MTLRenderPipelineState> pso, MTLPixelFormat fmt,
      * the command buffers that used it keep their own reference. */
     for (unsigned i = 3; i > 0; --i) p->slots[i] = p->slots[i - 1];
     p->slots[0].pso = pso;
-    p->slots[0].format = fmt;
+    for (unsigned i = 0; i < NVNGFX_MAX_COLOR_TARGETS; ++i)
+        p->slots[0].colorFormat[i] = colorFormats[i];
+    p->slots[0].numColors = numColors;
     p->slots[0].layout = layout;
     p->slots[0].hasLayout = hasLayout;
     p->slots[0].stateKey = stateKey;
@@ -2023,7 +2041,9 @@ void pso_store(Program* p, id<MTLRenderPipelineState> pso, MTLPixelFormat fmt,
 void pso_drop(Program* p) {
     for (unsigned i = 0; i < 4; ++i) {
         p->slots[i].pso = nil;
-        p->slots[i].format = static_cast<MTLPixelFormat>(0);
+        for (unsigned j = 0; j < NVNGFX_MAX_COLOR_TARGETS; ++j)
+            p->slots[i].colorFormat[j] = static_cast<MTLPixelFormat>(0);
+        p->slots[i].numColors = 0;
         p->slots[i].layout = 0;
         p->slots[i].hasLayout = false;
         p->slots[i].stateKey = 0;
@@ -2330,7 +2350,9 @@ id<MTLDepthStencilState> build_depth_stencil(Ctx* c, const nvngfx_pipeline_state
     }
 }
 
-id<MTLRenderPipelineState> program_pipeline(Ctx* c, Program* p, MTLPixelFormat fmt,
+id<MTLRenderPipelineState> program_pipeline(Ctx* c, Program* p,
+                                            const MTLPixelFormat* colorFormats,
+                                            unsigned numColors,
                                             MTLPixelFormat depthFmt,
                                             MTLPixelFormat stencilFmt,
                                             unsigned colorSamples,
@@ -2353,7 +2375,8 @@ id<MTLRenderPipelineState> program_pipeline(Ctx* c, Program* p, MTLPixelFormat f
 
     const unsigned long long stateKey = nvngfx_pipeline_key(&st);
     if (id<MTLRenderPipelineState> hit =
-            pso_lookup(p, fmt, layout, hasLayout, stateKey, depthFmt, stencilFmt, raster))
+            pso_lookup(p, colorFormats, numColors, layout, hasLayout, stateKey,
+                       depthFmt, stencilFmt, raster))
         return hit;
 
     const char* whyVs = nullptr;
@@ -2435,18 +2458,20 @@ id<MTLRenderPipelineState> program_pipeline(Ctx* c, Program* p, MTLPixelFormat f
         /* Every field the guest actually set lands here.  Anything without a
          * Metal equivalent was already reported by report_unsupported(), so
          * this descriptor is an honest description of what can be honoured. */
-        MTLRenderPipelineColorAttachmentDescriptor* ca = pd.colorAttachments[0];
-        ca.pixelFormat = fmt;
-        ca.writeMask = static_cast<MTLColorWriteMask>(st.write_mask[0]);
-        const bool blend = st.blend_enable[0] != 0;
-        ca.blendingEnabled = blend ? YES : NO;
-        if (blend) {
-            ca.sourceRGBBlendFactor = to_mtl_blend(st.src_rgb[0]);
-            ca.destinationRGBBlendFactor = to_mtl_blend(st.dst_rgb[0]);
-            ca.rgbBlendOperation = to_mtl_blend_op(st.eq_rgb[0]);
-            ca.sourceAlphaBlendFactor = to_mtl_blend(st.src_a[0]);
-            ca.destinationAlphaBlendFactor = to_mtl_blend(st.dst_a[0]);
-            ca.alphaBlendOperation = to_mtl_blend_op(st.eq_a[0]);
+        for (unsigned i = 0; i < numColors; ++i) {
+            MTLRenderPipelineColorAttachmentDescriptor* ca = pd.colorAttachments[i];
+            ca.pixelFormat = colorFormats[i];
+            ca.writeMask = static_cast<MTLColorWriteMask>(st.write_mask[i]);
+            const bool blend = st.blend_enable[i] != 0;
+            ca.blendingEnabled = blend ? YES : NO;
+            if (blend) {
+                ca.sourceRGBBlendFactor = to_mtl_blend(st.src_rgb[i]);
+                ca.destinationRGBBlendFactor = to_mtl_blend(st.dst_rgb[i]);
+                ca.rgbBlendOperation = to_mtl_blend_op(st.eq_rgb[i]);
+                ca.sourceAlphaBlendFactor = to_mtl_blend(st.src_a[i]);
+                ca.destinationAlphaBlendFactor = to_mtl_blend(st.dst_a[i]);
+                ca.alphaBlendOperation = to_mtl_blend_op(st.eq_a[i]);
+            }
         }
         /* Alpha-to-coverage is only defined for attachment 0, and Metal
          * rejects it when the pass is not multisampled.  If the guest asked
@@ -2473,7 +2498,8 @@ id<MTLRenderPipelineState> program_pipeline(Ctx* c, Program* p, MTLPixelFormat f
                          err ? [[err localizedDescription] UTF8String] : "nil pipeline");
             return nil;
         }
-        pso_store(p, pso, fmt, layout, hasLayout, stateKey, depthFmt, stencilFmt, raster);
+        pso_store(p, pso, colorFormats, numColors, layout, hasLayout, stateKey,
+                  depthFmt, stencilFmt, raster);
         return pso;
     }
 }
@@ -2536,8 +2562,25 @@ bool ensure_pipeline(Ctx* c, CmdBuf* b) {
     if (!b->program) return false;
     if (!c || !c->ready || b->numColor < 1) return false;
     Program* p = find<Program>(b->program);
-    Tex* t = find<Tex>(b->color[0]);
-    if (!p || !t || !t->mtl) return false;
+    if (!p) return false;
+    MTLPixelFormat colorFormats[NVNGFX_MAX_COLOR_TARGETS] = {};
+    const unsigned numColors =
+        b->numColor > NVNGFX_MAX_COLOR_TARGETS ? NVNGFX_MAX_COLOR_TARGETS
+                                               : b->numColor;
+    const Tex* t0 = find<Tex>(b->color[0]);
+    if (!t0 || !t0->mtl) return false;
+    for (unsigned i = 0; i < numColors; ++i) {
+        const Tex* ti = find<Tex>(b->color[i]);
+        if (!ti || !ti->mtl) {
+            log_once("nvnCommandBufferDraw.missingColorTarget", i);
+            return false;
+        }
+        if (ti->mtl.sampleCount != t0->mtl.sampleCount) {
+            log_once("nvnCommandBufferDraw.colorSampleMismatch", i);
+            return false;
+        }
+        colorFormats[i] = ti->mtl.pixelFormat;
+    }
     nvngfx_pipeline_state st;
     pipeline_state_of(b, &st);
     report_unsupported(st);
@@ -2549,8 +2592,8 @@ bool ensure_pipeline(Ctx* c, CmdBuf* b) {
     const MTLPixelFormat stencilFmt =
         mtl_format_has_stencil(attachmentFmt) ? attachmentFmt : static_cast<MTLPixelFormat>(0);
     const char* why = nullptr;
-    b->pso = program_pipeline(c, p, t->mtl.pixelFormat, depthFmt, stencilFmt,
-                              static_cast<unsigned>(t->mtl.sampleCount), st, b, &why);
+    b->pso = program_pipeline(c, p, colorFormats, numColors, depthFmt, stencilFmt,
+                              static_cast<unsigned>(t0->mtl.sampleCount), st, b, &why);
     b->psoHasDepthStencil = b->pso != nil && (depthFmt || stencilFmt);
     b->psoHasDepth = b->pso != nil && depthFmt != 0;
     b->psoHasStencil = b->pso != nil && stencilFmt != 0;
@@ -3265,19 +3308,36 @@ bool ensure_encoder(Ctx* c, CmdBuf* b) {
     if (b->enc) return true;
     if (!c || !c->ready || !b->cb || b->numColor < 1) return false;
 
-    Tex* t0 = find<Tex>(b->color[0]);
+    const unsigned numColors =
+        b->numColor > NVNGFX_MAX_COLOR_TARGETS ? NVNGFX_MAX_COLOR_TARGETS
+                                               : b->numColor;
+    const Tex* t0 = find<Tex>(b->color[0]);
     if (!t0 || !t0->mtl) return false;
+    for (unsigned i = 0; i < numColors; ++i) {
+        const Tex* ti = find<Tex>(b->color[i]);
+        if (!ti || !ti->mtl) {
+            log_once("nvnRenderPass.missingColorTarget", i);
+            return false;
+        }
+        if (ti->mtl.sampleCount != t0->mtl.sampleCount) {
+            log_once("nvnRenderPass.colorSampleMismatch", i);
+            return false;
+        }
+    }
 
     @autoreleasepool {
         MTLRenderPassDescriptor* rpd = [MTLRenderPassDescriptor renderPassDescriptor];
-        rpd.colorAttachments[0].texture = t0->mtl;
-        rpd.colorAttachments[0].loadAction =
-            b->pendingClear ? MTLLoadActionClear : MTLLoadActionLoad;
-        if (b->pendingClear) {
-            rpd.colorAttachments[0].clearColor = MTLClearColorMake(
-                b->clear[0], b->clear[1], b->clear[2], b->clear[3]);
+        for (unsigned i = 0; i < numColors; ++i) {
+            const Tex* ti = find<Tex>(b->color[i]);
+            rpd.colorAttachments[i].texture = ti->mtl;
+            rpd.colorAttachments[i].loadAction =
+                b->pendingClear[i] ? MTLLoadActionClear : MTLLoadActionLoad;
+            if (b->pendingClear[i]) {
+                rpd.colorAttachments[i].clearColor = MTLClearColorMake(
+                    b->clear[i][0], b->clear[i][1], b->clear[i][2], b->clear[i][3]);
+            }
+            rpd.colorAttachments[i].storeAction = MTLStoreActionStore;
         }
-        rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
         /* The pipeline declares attachment formats only when a depth/stencil
          * texture is bound, so the pass has to attach the same texture(s) or
          * the two disagree.  A pending ClearDepthStencil becomes the matching
@@ -3321,7 +3381,8 @@ bool ensure_encoder(Ctx* c, CmdBuf* b) {
                                 alpha:b->blendColor[3]];
         }
     }
-    b->pendingClear = false;
+    for (unsigned i = 0; i < NVNGFX_MAX_COLOR_TARGETS; ++i)
+        b->pendingClear[i] = false;
     b->pendingDepthClear = false;
     b->pendingStencilClear = false;
     return b->enc != nil;
@@ -3332,13 +3393,17 @@ bool ensure_encoder(Ctx* c, CmdBuf* b) {
  * no pass at all: ensure_encoder() is otherwise only called by a draw. */
 bool flush_pending_clears(Ctx* c, CmdBuf* b) {
     if (!b) return true;
-    if (!b->pendingClear && !b->pendingDepthClear && !b->pendingStencilClear)
+    bool anyColorClear = false;
+    for (unsigned i = 0; i < NVNGFX_MAX_COLOR_TARGETS; ++i)
+        anyColorClear = anyColorClear || b->pendingClear[i];
+    if (!anyColorClear && !b->pendingDepthClear && !b->pendingStencilClear)
         return true;
     const bool ok = ensure_encoder(c, b);
     if (b->enc) end_encoder(b);
     if (!ok) log_once("nvnCommandBufferClear.noRenderPass", 1);
     /* Never carry a clear onto a later render-target set. */
-    b->pendingClear = false;
+    for (unsigned i = 0; i < NVNGFX_MAX_COLOR_TARGETS; ++i)
+        b->pendingClear[i] = false;
     b->pendingDepthClear = false;
     b->pendingStencilClear = false;
     return ok;
@@ -3361,7 +3426,8 @@ void cmdbuf_begin_recording(nvngfx_ctx* ctx, uint64_t* x) {
     b->psoHasDepthStencil = false;
     b->psoHasDepth = false;
     b->psoHasStencil = false;
-    b->pendingClear = false;
+    for (unsigned i = 0; i < NVNGFX_MAX_COLOR_TARGETS; ++i)
+        b->pendingClear[i] = false;
     b->pendingDepthClear = false;
     b->pendingStencilClear = false;
     b->clearDepth = 1.0;
@@ -3459,7 +3525,7 @@ void cmdbuf_set_render_targets(nvngfx_ctx* ctx, uint64_t* x) {
         if (Tex* t = find<Tex>(b->color[i])) t->rendered = true;
     }
     if (Tex* dt = find<Tex>(b->depth)) dt->rendered = true;
-    /* A pipeline is compiled for one colour format. */
+    /* The pipeline's colour-attachment set changed. */
     b->pso = nil;
     b->psoHasDepthStencil = false;
     b->psoHasDepth = false;
@@ -3467,7 +3533,8 @@ void cmdbuf_set_render_targets(nvngfx_ctx* ctx, uint64_t* x) {
     /* Texture views are not supported yet; passing a view is legal but the
      * base texture format is what gets attached. */
     if (x[3] || x[5]) log_once("nvnCommandBufferSetRenderTargets.views", 1);
-    b->pendingClear = false;
+    for (unsigned i = 0; i < NVNGFX_MAX_COLOR_TARGETS; ++i)
+        b->pendingClear[i] = false;
     b->pendingDepthClear = false;
     b->pendingStencilClear = false;
 }
@@ -3483,16 +3550,16 @@ void cmdbuf_clear_color(nvngfx_ctx*, uint64_t* x) {
      * cannot be expressed without a separate pass + stored readback, so do
      * not pretend: leaving the old contents is safer than clearing bits the
      * guest asked to preserve. */
-    if (index != 0) {
-        log_once("nvnCommandBufferClearColor.target", index);
+    if (index >= b->numColor || index >= NVNGFX_MAX_COLOR_TARGETS) {
+        log_once("nvnCommandBufferClearColor.unboundTarget", index);
         return;
     }
     if (mask != 0xFu) {
         log_once("nvnCommandBufferClearColor.mask", mask);
         return;
     }
-    for (int i = 0; i < 4; ++i) b->clear[i] = rgba[i];
-    b->pendingClear = true;
+    for (int i = 0; i < 4; ++i) b->clear[index][i] = rgba[i];
+    b->pendingClear[index] = true;
     /* A clear mid-pass cannot be expressed as a load action, so close the pass;
      * the next draw, SetRenderTargets or EndRecording opens one that clears. */
     end_encoder(b);
@@ -5191,6 +5258,9 @@ extern "C" int nvngfx_metal_selftest(void) {
      * DEPTH24_STENCIL8 texture. */
     alignas(16) unsigned char texDepthObject[0x80] = {};
     alignas(16) unsigned char texDepthBuilder[0x80] = {};
+    /* MRT test: a second colour target, same size/format as texObject. */
+    alignas(16) unsigned char texMrtObject[0x80] = {};
+    alignas(16) unsigned char texMrtBuilder[0x80] = {};
     alignas(8) unsigned char depthStateObject[8] = {};
     const uint64_t kTex = reinterpret_cast<uint64_t>(texObject);
     const uint64_t kTexBuilder = reinterpret_cast<uint64_t>(texBuilder);
@@ -5207,6 +5277,8 @@ extern "C" int nvngfx_metal_selftest(void) {
     const uint64_t kSampler5 = reinterpret_cast<uint64_t>(samplerObject5);
     const uint64_t kTexDepth = reinterpret_cast<uint64_t>(texDepthObject);
     const uint64_t kTexDepthBuilder = reinterpret_cast<uint64_t>(texDepthBuilder);
+    const uint64_t kTexMrt = reinterpret_cast<uint64_t>(texMrtObject);
+    const uint64_t kTexMrtBuilder = reinterpret_cast<uint64_t>(texMrtBuilder);
     const uint64_t kDepthState = reinterpret_cast<uint64_t>(depthStateObject);
     const uint64_t kCb = 0x5200;
     const uint64_t kProg = 0x5300;
@@ -8367,7 +8439,7 @@ extern "C" int nvngfx_metal_selftest(void) {
             x[2] = reinterpret_cast<uint64_t>(blue); x[3] = 0xF;
             cmdbuf_clear_color(ctx, x);
             CmdBuf* bc = find<CmdBuf>(kCbClear);
-            if (!bc || !bc->pendingClear) {
+            if (!bc || !bc->pendingClear[0]) {
                 std::fprintf(stderr,
                              "[selftest] clear-only: ClearColor was not queued\n");
                 rc = 16412;
@@ -8544,6 +8616,168 @@ extern "C" int nvngfx_metal_selftest(void) {
                          "[selftest] depth/stencil clear entered a combined pass\n");
         }
 
+        {
+            /* --- MRT: two colour attachments, two shader outputs ----------
+             * Declaring attachment 1 is not enough; the fragment shader writes
+             * a different constant to each colour slot and both textures are
+             * read back.  This exercises the multi-format pipeline key, the
+             * per-attachment render pass, and the per-target clear state. */
+            const uint64_t kProgMrt = 0x8300;
+            const uint64_t kCbMrt = 0x8400;
+            x[0] = kTexMrtBuilder;
+            tex_builder_set_defaults(ctx, x);
+            x[0] = kTexMrtBuilder; x[1] = 0;      /* 2D */
+            tex_builder_set_target(ctx, x);
+            x[0] = kTexMrtBuilder; x[1] = 0x25;   /* RGBA8_UNORM */
+            tex_builder_set_format(ctx, x);
+            x[0] = kTexMrtBuilder;
+            x[1] = static_cast<uint64_t>(kSide);
+            x[2] = static_cast<uint64_t>(kSide);
+            tex_builder_set_size2d(ctx, x);
+            x[0] = kTexMrtBuilder; x[1] = 1;
+            tex_builder_set_levels(ctx, x);
+            x[0] = kTexMrtBuilder; x[1] = 1;
+            tex_builder_set_samples(ctx, x);
+            x[0] = kTexMrt; x[1] = kTexMrtBuilder;
+            tex_initialize(ctx, x);
+            Tex* mrtTex = find<Tex>(kTexMrt);
+            if (x[0] != 1 || !mrtTex || !mrtTex->mtl) {
+                std::fprintf(stderr,
+                             "[selftest] MRT: second colour target was not created\n");
+                rc = 16415;
+                goto done;
+            }
+
+            {
+                struct { uint64_t data; uint64_t control; } sdMrt[2];
+                sdMrt[0].data = reinterpret_cast<uint64_t>(const_cast<char*>(
+                    nvngfx_shader_selftest_msl_variant(NVNGFX_STAGE_VERTEX, 12)));
+                sdMrt[0].control = 0;
+                sdMrt[1].data = reinterpret_cast<uint64_t>(const_cast<char*>(
+                    nvngfx_shader_selftest_msl_variant(NVNGFX_STAGE_FRAGMENT, 12)));
+                sdMrt[1].control = 0;
+                x[0] = kProgMrt; x[1] = 0;
+                prog_initialize(ctx, x);
+                x[0] = kProgMrt; x[1] = 2;
+                x[2] = reinterpret_cast<uint64_t>(&sdMrt[0]);
+                prog_set_shaders(ctx, x);
+                if (x[0] != 1) {
+                    std::fprintf(stderr,
+                                 "[selftest] MRT: SetShaders failed\n");
+                    rc = 16415;
+                    goto done;
+                }
+            }
+
+            const uint64_t targets[2] = {kTex, kTexMrt};
+            const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+            const float magenta[4] = {1.0f, 0.0f, 1.0f, 1.0f};
+            unsigned char px0[4] = {0, 0, 0, 0};
+            unsigned char px1[4] = {0, 0, 0, 0};
+
+            /* Phase 1: a clear-only pass with a different colour per target.
+             * If the attachment loop reuses clear[0] for both, target 1 is
+             * black instead of magenta and this fails. */
+            x[0] = kCbMrt;
+            cmdbuf_begin_recording(ctx, x);
+            CmdBuf* bm = find<CmdBuf>(kCbMrt);
+            x[0] = kCbMrt; x[1] = 2;
+            x[2] = reinterpret_cast<uint64_t>(&targets[0]);
+            x[3] = 0; x[4] = 0; x[5] = 0;
+            cmdbuf_set_render_targets(ctx, x);
+            x[0] = kCbMrt; x[1] = 0;
+            x[2] = reinterpret_cast<uint64_t>(black); x[3] = 0xF;
+            cmdbuf_clear_color(ctx, x);
+            x[0] = kCbMrt; x[1] = 1;
+            x[2] = reinterpret_cast<uint64_t>(magenta); x[3] = 0xF;
+            cmdbuf_clear_color(ctx, x);
+            x[0] = kCbMrt;
+            cmdbuf_end_recording(ctx, x);
+            if (!bm || !bm->last) {
+                std::fprintf(stderr,
+                             "[selftest] MRT clear-only: nothing committed\n");
+                rc = 16415;
+                goto done;
+            }
+            [bm->last waitUntilCompleted];
+            if (bm->last.status == MTLCommandBufferStatusError) {
+                std::fprintf(stderr,
+                             "[selftest] MRT clear-only command buffer error: %s\n",
+                             bm->last.error
+                                 ? [[bm->last.error localizedDescription] UTF8String]
+                                 : "(no description)");
+                rc = 16415;
+                goto done;
+            }
+            const int wantBlack[4] = {0, 0, 0, 255};
+            const int wantMagenta[4] = {255, 0, 255, 255};
+            if (!read_center_pixel(dev, c->queue, find<Tex>(kTex)->mtl, kSide, px0) ||
+                !read_center_pixel(dev, c->queue, mrtTex->mtl, kSide, px1) ||
+                !pixels_near(px0, wantBlack, 2) ||
+                !pixels_near(px1, wantMagenta, 2)) {
+                std::fprintf(stderr,
+                             "[selftest] MRT clear-only pixels are "
+                             "(%u,%u,%u,%u) / (%u,%u,%u,%u), want black / magenta\n",
+                             px0[0], px0[1], px0[2], px0[3],
+                             px1[0], px1[1], px1[2], px1[3]);
+                rc = 16415;
+                goto done;
+            }
+
+            /* Phase 2: the same two targets, now with a shader that writes a
+             * distinct value to each colour slot. */
+            x[0] = kCbMrt;
+            cmdbuf_begin_recording(ctx, x);
+            x[0] = kCbMrt; x[1] = 2;
+            x[2] = reinterpret_cast<uint64_t>(&targets[0]);
+            x[3] = 0; x[4] = 0; x[5] = 0;
+            cmdbuf_set_render_targets(ctx, x);
+            x[0] = kCbMrt; x[1] = kProgMrt; x[2] = 0;
+            cmdbuf_bind_program(ctx, x);
+            x[0] = kCbMrt; x[1] = 0; x[2] = 0; x[3] = 3;
+            cmdbuf_draw_arrays(ctx, x);
+            if (bm->numColor != 2 || !bm->pso || bm->encoded != 1) {
+                std::fprintf(stderr,
+                             "[selftest] MRT: draw was not encoded for two targets\n");
+                rc = 16415;
+                goto done;
+            }
+            x[0] = kCbMrt;
+            cmdbuf_end_recording(ctx, x);
+            if (!bm->last) {
+                std::fprintf(stderr,
+                             "[selftest] MRT draw: nothing committed\n");
+                rc = 16415;
+                goto done;
+            }
+            [bm->last waitUntilCompleted];
+            if (bm->last.status == MTLCommandBufferStatusError) {
+                std::fprintf(stderr,
+                             "[selftest] MRT draw command buffer error: %s\n",
+                             bm->last.error
+                                 ? [[bm->last.error localizedDescription] UTF8String]
+                                 : "(no description)");
+                rc = 16415;
+                goto done;
+            }
+
+            const int want0[4] = {255, 0, 0, 255};
+            const int want1[4] = {0, 0, 255, 255};
+            if (!read_center_pixel(dev, c->queue, find<Tex>(kTex)->mtl, kSide, px0) ||
+                !read_center_pixel(dev, c->queue, mrtTex->mtl, kSide, px1) ||
+                !pixels_near(px0, want0, 2) || !pixels_near(px1, want1, 2)) {
+                std::fprintf(stderr,
+                             "[selftest] MRT draw pixels are (%u,%u,%u,%u) / "
+                             "(%u,%u,%u,%u), want red / blue\n",
+                             px0[0], px0[1], px0[2], px0[3],
+                             px1[0], px1[1], px1[2], px1[3]);
+                rc = 16415;
+                goto done;
+            }
+            std::fprintf(stderr,
+                         "[selftest] MRT cleared two targets and wrote red / blue\n");
+        }
+
     done:
         nvngfx_shader_set_msl_passthrough(0);
         forget<CmdBuf>(kCb);
@@ -8596,6 +8830,10 @@ extern "C" int nvngfx_metal_selftest(void) {
         forget<Tex>(kTexDepth);
         forget<CmdBuf>(0x8000);
         forget<CmdBuf>(0x8100);
+        forget<CmdBuf>(0x8400);
+        forget<Program>(0x8300);
+        forget<Tex>(kTexMrt);
+        g_tex_specs.erase(kTexMrtBuilder);
         g_tex_specs.erase(kTexDepthBuilder);
         forget<Pool>(0x7300);
         g_pool_specs.erase(0x7400);

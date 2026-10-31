@@ -60,8 +60,8 @@ docs/           路线图、HLE 边界、NVN 覆盖表、iOS 移植手册、着�
 | M3.94 | BC1/BC2/BC3/BC4U/BC5U 在首次采样时解成 RGBA8；sRGB 变体保留 transfer function | ✅ 第十五条 draw 左红右蓝，run 41086648054 |
 | M3.95 | `nvnTextureWriteTexels*` 按 guest 布局做整级 RMW，`FlushTexels` 标脏；下次采样重传 | ✅ 第十六条 draw 在两次显式更新后都回读正确，run 41090664172 |
 | M3.96 | 私有 harness：`nvnCommandBufferDraw*` 补齐、Yaz0 双缓冲源、0x414E01BC 去重表 | ✅ 真实 guest draw 701 / present 301（660 s 严格门禁） |
-| iOS 骨架 | 513 入口点注册表 + 生成分发表 + Metal 后端 202 项 + 三重门禁 | 🟡 十六条合成 draw，其中十五条默认在 CI 模拟器执行，另加两项清屏回归（无 draw 的颜色清屏、深度/模板组合清屏）；第十三条 cube array 需 `BOTW_SELFTEST_CUBE_ARRAY=1`，模拟器的 Metal 建 CubeArray 会崩。含 bindless、顶点参数缓冲区、c1 常量段、guest pool 解块/BCn 上传、显式纹理更新和离线 MSL bundle；客体仍无画面 |
-| M4 | NVN → Metal 回放（管线/纹理/命令缓冲） | 🟡 六类固定功能状态已接入：blend / write mask / alpha-to-coverage / 深度模板格式进入 `MTLRenderPipelineDescriptor`，cull / winding / fill、`MTLDepthStencilState`、模板 ref/掩码、depth clamp 与 polygon offset 在编码器逐 draw 应用；`ClearDepthStencil` 通过深度/模板附件的 load action 落地，即使整段只有清屏也会提交 pass；Metal 入口 202/513。深度边界测试只有记录与明确上报（Metal 无对应能力）；仍只有单颜色目标，部分模板清屏掩码、整数清屏和纯深度 pass 未支持，无真机画面 |
+| iOS 骨架 | 513 入口点注册表 + 生成分发表 + Metal 后端 202 项 + 三重门禁 | 🟡 十七条合成 draw，其中十六条默认在 CI 模拟器执行，另加三项清屏回归（无 draw 的颜色清屏、深度/模板组合清屏、双目标 MRT 清屏）；第十三条 cube array 需 `BOTW_SELFTEST_CUBE_ARRAY=1`，模拟器的 Metal 建 CubeArray 会崩。含 bindless、顶点参数缓冲区、c1 常量段、guest pool 解块/BCn 上传、显式纹理更新和离线 MSL bundle；客体仍无画面 |
+| M4 | NVN → Metal 回放（管线/纹理/命令缓冲） | 🟡 六类固定功能状态已接入：blend / write mask / alpha-to-coverage / 深度模板格式进入 `MTLRenderPipelineDescriptor`，cull / winding / fill、`MTLDepthStencilState`、模板 ref/掩码、depth clamp 与 polygon offset 在编码器逐 draw 应用；`ClearDepthStencil` 通过深度/模板附件的 load action 落地，即使整段只有清屏也会提交 pass；Metal 入口 202/513。深度边界测试只有记录与明确上报（Metal 无对应能力）；支持 1–8 个颜色目标（MRT），每个目标有自己的格式、混合、写掩码与清屏值，模拟器已验证双目标清屏及双颜色输出；部分模板清屏掩码、整数清屏和纯深度 pass 未支持，无真机画面 |
 | M5 | 音频（nn::audio → AVAudioEngine）、输入 | ⬜ |
 | M6 | 真机性能与内存（6 GB 机型起步） | ⬜ |
 

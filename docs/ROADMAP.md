@@ -4210,7 +4210,7 @@ verify_ios: ok (metal bindings: 196/513)
 
 ### 还没有的
 
-* 只有 0 号颜色目标进入描述符和 render pass；MRT 要等 pass 支持多附件；
+* 只有 0 号颜色目标进入描述符和 render pass；MRT 要等 pass 支持多附件（M4 续三已补上）；
 * 管线缓存只有 4 个槽，状态组合一多就会反复重编译（真机上每次数毫秒）；
 * 这一轮结束时 `ClearDepthStencil` 仍是日志占位；下一节已把它接入 load action；
 * 没有真机运行，不能声称画面正确。
@@ -4301,7 +4301,64 @@ build_abi_test: all tests passed
 
 仍未支持：
 
-* 只有 0 号颜色目标，MRT 还没有；
+* 没有颜色目标的纯深度 pass 仍打不开 encoder；
+* `SetDepthBounds` 只有记录与上报，Metal 没有深度边界测试；
+* 部分模板清屏掩码；
+* `ClearColori/ui`、`ClearBuffer`、`ClearTexture*` 仍是日志占位；
+* 没有真机像素验证，不能声称画面正确。
+
+## M4 续三：多颜色附件（MRT）
+
+`nvnCommandBufferSetRenderTargets` 一直能记录 8 个颜色目标，但管线、render pass 和
+清屏都只用了 0 号槽。这一轮把 1–7 号真正接进 Metal 路径。
+
+### 1. 管线与缓存
+
+`MTLRenderPipelineColorAttachmentDescriptor[0..numColors-1]` 现在逐个填写：
+
+* 每个附件用自己的 `pixelFormat`；
+* 每个附件用自己的 blend enable / factor / equation 与 write mask；
+* alpha-to-coverage 仍只作用于 0 号附件，这是 Metal 的定义；
+* 管线缓存键从单个 `format` 扩成 8 个格式加附件数量，未使用的槽保持 0 并参与比较。
+
+`ensure_pipeline()` 从 `CmdBuf::color[]` 收集全部格式；任一目标缺失或采样数不一致时
+拒绝建管线并明确上报，避免把一个只声明了部分附件的 pipeline 交给 Metal。
+
+### 2. Render pass 与逐目标清屏
+
+`ensure_encoder()` 按 `numColor` 循环挂载所有颜色附件。清屏状态从一组标量改成
+`pendingClear[8]` / `clear[8][4]`，因此同一 pass 可以给每个目标不同的
+`MTLLoadActionClear` 和 clear colour；未清屏的目标用 `MTLLoadActionLoad`。
+
+`ClearColor` 的 `index` 现在接受任何已绑定的颜色目标（仍要求完整 `0xF` 通道掩码），
+不再只接受 0 号。`BeginRecording`、`SetRenderTargets` 和 `flush_pending_clears()`
+都会清掉整组 pending 状态，避免旧目标的清屏值泄漏到新 pass。
+
+### 3. 模拟器自测
+
+新增 MRT 用例，使用同一张 RGBA8 纹理作为 0 号目标，另建一张同尺寸 RGBA8 作为 1 号目标：
+
+1. 只清屏，0 号清黑、1 号清洋红；回读两张纹理的中心像素，分别必须是黑和洋红。
+   这直接验证逐目标 clear colour，而不是两个目标共用 0 号的值。
+2. 同一组目标上绑定一个输出 `[[color(0)]]` 红、`[[color(1)]]` 蓝的 MSL fixture，draw
+   全屏三角形；回读 0 号为红、1 号为蓝，验证 MRT 管线描述符、render pass 和 shader
+   输出槽三者一致。
+
+任一阶段失败都会以 non-zero rc 退出，不会把“声明了第二附件”误报成 MRT 可用。
+
+### 4. 覆盖与仍然缺的
+
+这一轮没有新增 NVN 入口，覆盖率保持 **202/513（39.4%）**，未实现 311；CommandBuffer
+域 **57/144**。门禁输出：
+
+```text
+syntax_check_metal: ok (clang++.exe)
+verify_ios: ok (metal bindings: 202/513)
+build_abi_test: all tests passed
+```
+
+仍未支持：
+
 * 没有颜色目标的纯深度 pass 仍打不开 encoder；
 * `SetDepthBounds` 只有记录与上报，Metal 没有深度边界测试；
 * 部分模板清屏掩码；

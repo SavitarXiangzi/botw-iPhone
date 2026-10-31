@@ -44,6 +44,26 @@ static const char* const kFs =
     "    return float4(0.25, 0.5, 0.75, 1.0);\n"
     "}\n";
 
+/* MRT fixture: two colour outputs with distinct, exact 8-bit values.  The
+ * render-pass self-test reads both attachments back, so a pass that merely
+ * declares a second attachment but never routes the shader output to it
+ * fails instead of looking successful. */
+static const char* const kFsMrt =
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "\n"
+    "struct NvngfxMrtOut {\n"
+    "    float4 color0 [[color(0)]];\n"
+    "    float4 color1 [[color(1)]];\n"
+    "};\n"
+    "\n"
+    "fragment NvngfxMrtOut nvngfx_main_fs() {\n"
+    "    NvngfxMrtOut o;\n"
+    "    o.color0 = float4(1.0, 0.0, 0.0, 1.0);\n"
+    "    o.color1 = float4(0.0, 0.0, 1.0, 1.0);\n"
+    "    return o;\n"
+    "}\n";
+
 /* Variant 1: the positions come from [[attribute(0)]] instead of
  * [[vertex_id]].  The fragment colour differs from variant 0, so a readback
  * shows which program drew the pixel.
@@ -536,6 +556,11 @@ const char* nvngfx_shader_selftest_msl_variant(nvngfx_stage stage, int variant) 
     if (variant == 11) {
         if (stage == NVNGFX_STAGE_VERTEX) return kVsUv;
         if (stage == NVNGFX_STAGE_FRAGMENT) return kFsTextureCubeArray;
+        return NULL;
+    }
+    if (variant == 12) {
+        if (stage == NVNGFX_STAGE_VERTEX) return kVs;
+        if (stage == NVNGFX_STAGE_FRAGMENT) return kFsMrt;
         return NULL;
     }
     if (stage == NVNGFX_STAGE_VERTEX) return kVs;
