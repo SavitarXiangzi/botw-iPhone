@@ -64,18 +64,20 @@ const char* nvngfx_shader_to_msl(const void* code, unsigned long long size,
  *
  *     vp_c<N> / fp_c<N>          constant bank N -> uniform buffer slot N - 3
  *     vp_c1 / fp_c1              the embedded c1 segment (blob->c1)
+ *     fp_c2                      the NVN driver c[2] handle tables
+ *     support_buffer             Ryujinx's static support buffer
  *     fp_t_tcb_<handle>          combined texture (the c2 handle table)
  *     fp_t_tcb_<handle>Smplr     the sampler carried by that combined handle
  *     fp_t_cb<N>_<handle>        a texture handle stored in uniform buffer N
  *     fp_t_cb<N>_<handle>Smplr   the sampler half of that bindless handle
- *     fp_i_... / fp_s<N>         image / storage buffer
+ *     fp_i_... / fp_s<N> / fp_c0 image / storage buffer / c[0] driver table
  *
  * The generator (scripts/shader_chain/gen_blobs.py) decodes that naming into
  * the table below and ships it next to the MSL, so the backend never has to
  * guess an [[id(k)]] ordering at run time.  Anything the replay layer cannot
- * fill yet -- the c0/c2 driver tables, images, typed buffers, a type-3
- * constant sampler -- is recorded as NVNGFX_ARG_UNSUPPORTED, and a draw that
- * needs one is dropped instead of reading an unset word.
+ * fill yet -- the c[0] driver table, images, typed buffers, a type-3 constant
+ * sampler -- is recorded as NVNGFX_ARG_UNSUPPORTED, and a draw that needs one
+ * is dropped instead of reading an unset word.
  *
  * Two real Breath of the Wild shaders measured on 2026-10-30: the vertex one
  * has 7 members (highest id 6), the fragment one 42 (highest id 41, of which
@@ -112,7 +114,14 @@ typedef enum nvngfx_arg_kind {
      * bits 0..19 name the texture and bits 20..31 the sampler. */
     NVNGFX_ARG_TEXTURE_IN_UBO = 8,     /* use the low 20 bits */
     NVNGFX_ARG_SAMPLER_OF_UBO_TEXTURE = 9, /* use the high 12 bits of the same word */
-    NVNGFX_ARG_SAMPLER_IN_UBO = 10     /* type-1 handle: sampler word in another UBO */
+    NVNGFX_ARG_SAMPLER_IN_UBO = 10,   /* type-1 handle: sampler word in another UBO */
+    /* The translator's support buffer (Ryujinx SupportBuffer): a static
+     * 64 KiB block whose render-scale entries are 1.0.  slot = -1. */
+    NVNGFX_ARG_SUPPORT = 11,
+    /* The NVN driver constant segment c[2]: the compiler's zero-filled
+     * texture / image / separate handle tables, filled per draw from the
+     * current bindings.  slot = -1. */
+    NVNGFX_ARG_DRIVER_C2 = 12
 } nvngfx_arg_kind;
 
 typedef struct nvngfx_shader_arg {

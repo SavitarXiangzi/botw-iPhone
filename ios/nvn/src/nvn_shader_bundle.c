@@ -20,7 +20,7 @@
  *            empty c1, which is not the same thing as "no c1".
  *   args     '-' for none, otherwise comma separated
  *            id:slot:packed:kind[:offset], where kind is the numeric
- *            nvngfx_arg_kind (1..10), not the C enum name
+ *            nvngfx_arg_kind (1..12), not the C enum name
  *
  * Everything is validated by nvngfx_shader_set_blobs() before it goes live, so
  * a bad manifest fails the load and leaves the previously installed table

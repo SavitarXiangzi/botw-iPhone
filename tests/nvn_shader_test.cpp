@@ -270,6 +270,25 @@ int main() {
               b->args[2].slot == 5 && b->args[2].offset == 0x20);
         CHECK(nvngfx_shader_set_blobs(with_args, 1) == 0);
 
+        /* The translator's support buffer and NVN's c[2] driver table have no
+         * NVN slot of their own; both carry slot -1 and no offset. */
+        static const nvngfx_shader_arg driver_layout[] = {
+            {0, NVNGFX_ARG_SUPPORT, -1, 0, 0},
+            {1, NVNGFX_ARG_DRIVER_C2, -1, 1, 0},
+        };
+        static const nvngfx_shader_blob driver_blob[] = {
+            {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", driver_layout, 2,
+             nullptr, 0},
+        };
+        CHECK(nvngfx_shader_set_blobs(driver_blob, 1) == 0);
+        b = nvngfx_shader_lookup_blob("0011223344556677",
+                                      NVNGFX_STAGE_FRAGMENT, &why);
+        CHECK(b != nullptr && b->args[0].kind == NVNGFX_ARG_SUPPORT &&
+              b->args[0].slot == -1);
+        CHECK(b != nullptr && b->args[1].kind == NVNGFX_ARG_DRIVER_C2 &&
+              b->args[1].slot == -1);
+        CHECK(nvngfx_shader_set_blobs(with_args, 1) == 0);
+
         /* packed is a permutation independent of id order: sorted-by-id rows
          * may carry reversed packed values, and are still valid. */
         static const nvngfx_shader_arg reordered[] = {
@@ -331,6 +350,12 @@ int main() {
         static const nvngfx_shader_arg c1_with_slot[] = {
             {1, NVNGFX_ARG_C1, 0, 0, 0},
         };
+        static const nvngfx_shader_arg support_with_slot[] = {
+            {1, NVNGFX_ARG_SUPPORT, 0, 0, 0},
+        };
+        static const nvngfx_shader_arg c2_with_offset[] = {
+            {1, NVNGFX_ARG_DRIVER_C2, -1, 0, 4},
+        };
         static const nvngfx_shader_arg c1_with_offset[] = {
             {1, NVNGFX_ARG_C1, -1, 0, 4},
         };
@@ -361,6 +386,8 @@ int main() {
             {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", unsupported_with_slot, 1, nullptr, 0},
             {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", unsupported_with_offset, 1, nullptr, 0},
             {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", c1_with_slot, 1, c1, sizeof c1},
+            {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", support_with_slot, 1, nullptr, 0},
+            {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", c2_with_offset, 1, nullptr, 0},
             {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", c1_with_offset, 1, c1, sizeof c1},
             {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", c1_without_bytes, 1, nullptr, 0},
             {"0011223344556677", NVNGFX_STAGE_FRAGMENT, "x", c1_without_bytes, 1, c1,

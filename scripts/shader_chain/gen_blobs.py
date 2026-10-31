@@ -19,7 +19,10 @@ here is what lets the backend fill `[[id(k)]]` without guessing:
     driver handle table and decodes like any other texture
     fp_c1                    NVNGFX_ARG_C1, with the raw bytes from the
                              matching <key>_<stage>.c1 sidecar (empty is valid)
-    fp_i_... / fp_s<N> / the c0-c2 driver banks: NVNGFX_ARG_UNSUPPORTED
+    fp_c2                    NVNGFX_ARG_DRIVER_C2, the handle tables the
+                             backend fills from the current bindings
+    support_buffer           NVNGFX_ARG_SUPPORT, the translator's static block
+    fp_i_... / fp_s<N> / fp_c0: NVNGFX_ARG_UNSUPPORTED
     (a draw that needs one is dropped, not fed an unset word)
 
 The committed copy of that file installs nothing; this is the only step that
@@ -128,6 +131,8 @@ def classify(msl_type, name):
 
     slot is the NVN binding slot, or -1 when unsupported.  offset is nonzero
     only for a bindless handle stored in a uniform buffer."""
+    if name == "support_buffer":
+        return "NVNGFX_ARG_SUPPORT", -1, 0     # Ryujinx's support buffer
     m = re.fullmatch(r"[a-z]+_c(\d+)", name)
     if m:
         n = int(m.group(1))
@@ -135,7 +140,9 @@ def classify(msl_type, name):
             return "NVNGFX_ARG_UBO", n - 3, 0
         if n == 1:
             return "NVNGFX_ARG_C1", -1, 0       # filled from blob->c1
-        return "NVNGFX_ARG_UNSUPPORTED", -1, 0  # c0, c2 driver tables
+        if n == 2:
+            return "NVNGFX_ARG_DRIVER_C2", -1, 0  # filled from bindings
+        return "NVNGFX_ARG_UNSUPPORTED", -1, 0  # c0 driver table
     if re.fullmatch(r"[a-z]+_s\d+", name):
         return "NVNGFX_ARG_UNSUPPORTED", -1, 0  # storage buffer
     if re.match(r"[a-z]+_i", name):
@@ -254,6 +261,8 @@ ARG_NUMBER = {
     "NVNGFX_ARG_TEXTURE_IN_UBO": 8,
     "NVNGFX_ARG_SAMPLER_OF_UBO_TEXTURE": 9,
     "NVNGFX_ARG_SAMPLER_IN_UBO": 10,
+    "NVNGFX_ARG_SUPPORT": 11,
+    "NVNGFX_ARG_DRIVER_C2": 12,
 }
 
 

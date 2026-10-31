@@ -246,9 +246,11 @@ M3.83 之后这**已经**是资源绑定的一部分：`nvnSamplerPoolInitialize
 | `fp_t_tcb_1CSmplr` | 同一合并句柄中的采样器 | `SAMPLER_OF_TEXTURE` 10 |
 | `fp_t_tcb_5A` | 独立纹理 | `SEPARATE_TEXTURE` 0 |
 | `fp_t_cb2_1C` | c2 驱动表纹理 | `TEXTURE` |
-| `fp_t_cb7_2A` | bindless，句柄在统一缓冲里 | `UNSUPPORTED` |
+| `fp_t_cb7_2A` | bindless，句柄在统一缓冲里 | `TEXTURE_IN_UBO` |
 | `fp_c1` | c1 常量段（`<key>_<stage>.c1`） | `C1`，slot -1 |
-| `fp_i_*` / `fp_s3` | image / storage buffer | `UNSUPPORTED` |
+| `fp_c2` | NVN c2 句柄表 | `DRIVER_C2`，slot -1 |
+| `support_buffer` | Ryujinx 支撑缓冲 | `SUPPORT`，slot -1 |
+| `fp_i_*` / `fp_s3` / `fp_c0` | image / storage buffer / c0 驱动表 | `UNSUPPORTED` |
 
 本地 `Bootup_Graphics` 的两个真实 shader（数据不入库）暴露了尺寸问题：
 
@@ -278,6 +280,12 @@ packed slot 写进 blob，尚未接（M3.85 的自检暴露了这一点）。
 但当前不消费——`buffer(0)` 还是第一条顶点流，顶点参数缓冲区的槽位偏移
 约定未定。
 
+`SUPPORT` 和 `DRIVER_C2` 已由后端填好。前者是一块 64 KiB 静态缓冲，
+`render_scale[0..72]` 全为 1.0（偏移 192 起，每项 16 字节）；后者按当前
+绑定重建 4 KiB c2 段：合并纹理槽 r 在 `0x20+8r`、图像在 `0x120+8r`、
+独立纹理在 `0x168+8r`、独立采样器在 `0x568+8r`。每次 draw 新建一份，
+避免同一 Metal 命令缓冲里的后续 draw 覆盖前一份内容。
+
 ### 模拟器上走直连，Metal 3 上走参数缓冲区
 
 自检打印了真实 ID：模拟器 `apple7=0 metal3=0 unifiedMemory=0`，
@@ -294,8 +302,9 @@ packed slot 写进 blob，尚未接（M3.85 的自检暴露了这一点）。
 - 纹理注册只保存客体地址；`nvnTextureFinalize` 后再采样会解析失败并丢 draw。
 - `nvnTexturePoolGetMemoryPool` / `nvnSamplerPoolGetMemoryPool` 已在
   `signatures.json` 的 477 个形状里（指针返回类型此前被提取器漏掉），但后端仍未绑。
-- c1 已由 M3.85 侧车接上；bindless、image / storage buffer 仍标为
-  `UNSUPPORTED`。
+- c1 已由 M3.85 侧车接上；M4 续三十一又接上了 bindless、
+  `support_buffer` 和 c2 句柄表。image / storage buffer、typed buffer 和
+  c0 驱动表仍标为 `UNSUPPORTED`。
 - 参数缓冲区的 texture / sampler 条目要写 `gpuResourceID`。iOS 模拟器
   （`apple7=0 metal3=0`）的纹理 ID 恒为 0，所以那里只能走直连绑定；
   该条目本身**只在 Metal 3 硬件上有意义，尚未验证**。

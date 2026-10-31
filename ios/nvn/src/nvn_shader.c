@@ -405,6 +405,30 @@ static const char* const kFsC1 =
     "    return *s0.c1;\n"
     "}\n";
 
+/* Variant 16: the translator's support buffer and the NVN driver's c[2]
+ * handle table.  support_buffer[48] is render_scale[0] at byte 192 and must
+ * be 1.0; fp_c2[2].x is c[2] + 0x20, the combined texture slot 0 word.  The
+ * self-test binds texture ID 2 / sampler ID 7 there and reads the packed
+ * word back on the GPU.  Nothing is sampled, so the x86_64 simulator's
+ * gpuResourceID == 0 cannot mask a wrong table. */
+static const char* const kFsDriverTables =
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "\n"
+    "struct spvDescriptorSetBuffer0 {\n"
+    "    constant float* support_buffer [[id(0)]];\n"
+    "    constant float4* fp_c2 [[id(1)]];\n"
+    "};\n"
+    "\n"
+    "fragment float4 nvngfx_main_fs(constant spvDescriptorSetBuffer0& s0 [[buffer(0)]]) {\n"
+    "    const uint h = as_type<uint>(s0.fp_c2[2].x);\n"
+    "    const bool scale_ok = s0.support_buffer[48] == 1.0f;\n"
+    "    const bool handle_ok = (h & 0xFFFFFu) == 2u &&\n"
+    "                           ((h >> 20) & 0xFFFu) == 7u;\n"
+    "    return scale_ok && handle_ok ? float4(0.0, 1.0, 0.0, 1.0)\n"
+    "                                  : float4(1.0, 0.0, 0.0, 1.0);\n"
+    "}\n";
+
 /* ------------------------------------------------------------------------- *
  * Offline MSL blobs
  *
@@ -466,14 +490,16 @@ static int args_valid(const nvngfx_shader_blob* b) {
             if (a->packed >= b->num_args || packed_seen[a->packed]) return 0;
             packed_seen[a->packed] = 1;
             if (a->kind < NVNGFX_ARG_UBO ||
-                a->kind > NVNGFX_ARG_SAMPLER_IN_UBO)
+                a->kind > NVNGFX_ARG_DRIVER_C2)
                 return 0;
             if (a->kind == NVNGFX_ARG_C1) {
                 if (a->slot != -1 || a->offset != 0) return 0;
                 has_c1 = 1;
                 continue;
             }
-            if (a->kind == NVNGFX_ARG_UNSUPPORTED) {
+            if (a->kind == NVNGFX_ARG_UNSUPPORTED ||
+                a->kind == NVNGFX_ARG_SUPPORT ||
+                a->kind == NVNGFX_ARG_DRIVER_C2) {
                 if (a->slot != -1 || a->offset != 0) return 0;
                 continue;
             }
@@ -684,6 +710,11 @@ const char* nvngfx_shader_selftest_msl_variant(nvngfx_stage stage, int variant) 
     if (variant == 15) {
         if (stage == NVNGFX_STAGE_VERTEX) return kVsInstancedAttr;
         if (stage == NVNGFX_STAGE_FRAGMENT) return kFsGreen;
+        return NULL;
+    }
+    if (variant == 16) {
+        if (stage == NVNGFX_STAGE_VERTEX) return kVs;
+        if (stage == NVNGFX_STAGE_FRAGMENT) return kFsDriverTables;
         return NULL;
     }
     if (stage == NVNGFX_STAGE_VERTEX) return kVs;

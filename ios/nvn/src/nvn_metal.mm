@@ -256,6 +256,9 @@ struct Ctx {
     ClearStencilDssEntry clearStencilDss[kClearStencilDssSlots];
     unsigned clearStencilDssCount = 0;
     unsigned clearStencilDssNext = 0;
+    /* Ryujinx's support buffer, allocated once and read by every shader that
+     * names support_buffer.  Its contents are constant in this backend. */
+    id<MTLBuffer> supportBuffer = nil;
 };
 
 struct Win {
@@ -402,6 +405,26 @@ constexpr unsigned kComputeSampledSlots = 15;
 constexpr unsigned kComputeSamplerSlots = 16;
 constexpr unsigned kComputeUniformSlots = 16;
 constexpr unsigned kComputeStorageSlots = 15;
+
+/* The NVN driver's c[2] handle tables, one 32-bit word every 8 bytes:
+ * combined texture slot r at 0x20 + 8r, image slot r at 0x120 + 8r,
+ * separate texture r at 0x168 + 8r and separate sampler r at 0x568 + 8r.
+ * A 4 KiB block covers every table the backend can bind. */
+constexpr size_t kDriverC2Bytes = 0x1000;
+constexpr size_t kDriverC2 = 0x20;
+constexpr size_t kDriverC2Image = 0x120;
+constexpr size_t kDriverC2SeparateTexture = 0x168;
+constexpr size_t kDriverC2SeparateSampler = 0x568;
+constexpr size_t kDriverC2Row = 8;
+
+/* Ryujinx's support buffer: alpha_test at 0, is_bgra[8] at 16,
+ * viewport_inverse at 144, viewport_size at 160, frag_scale_count at 176,
+ * render_scale[73] (float4 each) at 192.  The backend currently reads only
+ * the first render scale (the boot shaders divide gl_FragCoord by it), so
+ * every entry is 1.0 and the viewport fields stay 0, matching nxnative. */
+constexpr size_t kSupportBufferBytes = 64u * 1024u;
+constexpr size_t kSupportRenderScale = 192;
+constexpr unsigned kSupportRenderScaleCount = 73;
 
 struct DebugGroup {
     uint32_t id = 0;
@@ -574,6 +597,11 @@ struct CmdBuf {
      * changes and dropped when a new recording starts (the previous one may
      * still be in flight). */
     id<MTLBuffer> argbuf[2] = {nil, nil};
+    /* Per-draw driver c[2] snapshots.  Metal reads the buffer contents when
+     * the command buffer executes, so a later draw must not overwrite an
+     * earlier one's table; these keep the snapshots alive until the recording
+     * is replaced. */
+    std::vector<__strong id<MTLBuffer>> transientBuffers;
     /* The last committed buffer.  nvnQueueSubmitCommands is not implemented,
      * so a frame is committed at EndRecording; keeping the handle lets a
      * caller (the self-test) wait for it and keeps the door open for real
@@ -6925,6 +6953,7 @@ void cmdbuf_begin_recording(nvngfx_ctx* ctx, uint64_t* x) {
     b->clearDepth = 1.0;
     b->clearStencil = 0;
     b->argbuf[0] = b->argbuf[1] = nil;
+    b->transientBuffers.clear();
     b->hasViewport = false;
     b->hasScissor = false;
     for (unsigned i = 0; i < NVNGFX_MAX_COLOR_TARGETS; ++i) b->hasBlendState[i] = false;
@@ -7906,6 +7935,63 @@ void cmdbuf_bind_uniform_buffers(nvngfx_ctx* ctx, uint64_t* x) {
  * argument buffer: constants, a combined texture (which carries its
  * sampler), or a separate texture/sampler.  `si` is 0 for vertex, 1 for
  * fragment. */
+/* Creates the static support buffer once.  It is shared read-only, so a
+ * single allocation can serve every draw and every command buffer. */
+id<MTLBuffer> support_buffer(Ctx* c) {
+    if (!c || !c->device) return nil;
+    if (c->supportBuffer) return c->supportBuffer;
+    c->supportBuffer = [c->device newBufferWithLength:kSupportBufferBytes
+                                               options:MTLResourceStorageModeShared];
+    if (!c->supportBuffer) return nil;
+    unsigned char* p = static_cast<unsigned char*>([c->supportBuffer contents]);
+    if (!p) {
+        c->supportBuffer = nil;
+        return nil;
+    }
+    std::memset(p, 0, kSupportBufferBytes);
+    for (unsigned i = 0; i < kSupportRenderScaleCount; ++i) {
+        const float one = 1.0f;
+        std::memcpy(p + kSupportRenderScale + 16u * i, &one, sizeof one);
+    }
+    return c->supportBuffer;
+}
+
+/* A c[2] handle word: NVN packs the texture ID in the low 20 bits and the
+ * sampler ID in the next 12.  nvngfx handles keep 20 bits for the sampler;
+ * mask it to the hardware field rather than spilling into the next row. */
+uint32_t driver_c2_word(uint64_t handle) {
+    const uint32_t tex = static_cast<uint32_t>(handle & NVNGFX_POOL_INDEX_MASK);
+    const uint32_t samp =
+        static_cast<uint32_t>((handle >> NVNGFX_POOL_INDEX_BITS) & 0xfffu);
+    return tex | (samp << NVNGFX_POOL_INDEX_BITS);
+}
+
+/* Builds a fresh c[2] segment for one draw.  A table read before its slot is
+ * bound sees zero, which is the empty-handle value; the shader can still be
+ * dispatched, unlike a missing c[2] pointer. */
+id<MTLBuffer> driver_c2_buffer(Ctx* c, const CmdBuf* b, int si) {
+    if (!c || !c->device || !b || si < 0 || si > 1) return nil;
+    id<MTLBuffer> buf = [c->device newBufferWithLength:kDriverC2Bytes
+                                               options:MTLResourceStorageModeShared];
+    if (!buf) return nil;
+    unsigned char* p = static_cast<unsigned char*>([buf contents]);
+    if (!p) return nil;
+    std::memset(p, 0, kDriverC2Bytes);
+    auto put = [p](size_t off, uint64_t handle) {
+        const uint32_t word = driver_c2_word(handle);
+        std::memcpy(p + off, &word, sizeof word);
+    };
+    for (unsigned r = 0; r < NVNGFX_MAX_TEXTURE_SLOTS; ++r)
+        put(kDriverC2 + kDriverC2Row * r, b->texHandle[si][r]);
+    for (unsigned r = 0; r < 8u; ++r)
+        put(kDriverC2Image + kDriverC2Row * r, b->image[si][r]);
+    for (unsigned r = 0; r < NVNGFX_MAX_TEXTURE_SLOTS; ++r)
+        put(kDriverC2SeparateTexture + kDriverC2Row * r, b->sepTexHandle[si][r]);
+    for (unsigned r = 0; r < NVNGFX_MAX_SAMPLER_SLOTS; ++r)
+        put(kDriverC2SeparateSampler + kDriverC2Row * r, b->sepSampHandle[si][r]);
+    return buf;
+}
+
 bool has_arguments(const CmdBuf* b, int si) {
     for (unsigned i = 0; i < NVNGFX_MAX_UBO_SLOTS; ++i)
         if (b->ubo[si][i]) return true;
@@ -8308,7 +8394,10 @@ int argument_buffer(Ctx* c, CmdBuf* b, nvngfx_stage stage, id<MTLBuffer>* out) {
     /* c1 is not a command-buffer binding: it belongs to the shader.  A
      * c1-only shader therefore needs buffer(0) even though has_arguments()
      * sees no UBO, texture or sampler on the command buffer. */
-    if (!has_arguments(b, si) && !hasC1) return 0;
+    /* A support buffer or the c[2] driver table is an argument even though
+     * neither is a command-buffer binding.  Only the no-sidecar fallback may
+     * skip the table. */
+    if (numLayout == 0 && !has_arguments(b, si) && !hasC1) return 0;
     if (!declaresTable) {
         /* The sidecar names resources but the MSL has no table to put them
          * in: the two halves of the blob disagree, so nothing is bindable. */
@@ -8401,6 +8490,25 @@ int argument_buffer(Ctx* c, CmdBuf* b, nvngfx_stage stage, id<MTLBuffer>* out) {
                 return -1;
             }
             slots[e.packed] = static_cast<uint64_t>(smp->mtl.gpuResourceID._impl);
+        } break;
+        case NVNGFX_ARG_SUPPORT: {
+            id<MTLBuffer> sb = support_buffer(c);
+            if (!sb) {
+                log_once("nvnCommandBufferDraw.supportBuffer", 1);
+                return -1;
+            }
+            slots[e.packed] = static_cast<uint64_t>([sb gpuAddress]);
+            [b->enc useResource:sb usage:MTLResourceUsageRead stages:stageFlag];
+        } break;
+        case NVNGFX_ARG_DRIVER_C2: {
+            id<MTLBuffer> c2 = driver_c2_buffer(c, b, si);
+            if (!c2) {
+                log_once("nvnCommandBufferDraw.driverC2", 1);
+                return -1;
+            }
+            b->transientBuffers.push_back(c2);
+            slots[e.packed] = static_cast<uint64_t>([c2 gpuAddress]);
+            [b->enc useResource:c2 usage:MTLResourceUsageRead stages:stageFlag];
         } break;
         case NVNGFX_ARG_C1: {
             if (!hasC1) {
@@ -12810,6 +12918,127 @@ extern "C" int nvngfx_metal_selftest(void) {
                                  : "(no description)");
                 rc = 16394;
                 goto done;
+            }
+        }
+
+        {
+            /* --- Draw 16: support buffer and the c[2] driver table ------
+             * The fragment shader reads render_scale[0] from Ryujinx's
+             * support_buffer and the combined texture slot 0 word from the
+             * NVN driver's c[2] handle table.  The backend must supply two
+             * buffers that are not command-buffer bindings; a zero or wrong
+             * pointer makes the pixel red instead of green.  The handle names
+             * texture ID 2 / sampler ID 7 even though no texture object is
+             * sampled, so this runs on the simulator where gpuResourceID is
+             * zero. */
+            const uint64_t kProg16 = 0x6400;
+            const uint64_t kCb16 = 0x6500;
+            struct { uint64_t data; uint64_t control; } sd16[2];
+            sd16[0].data = reinterpret_cast<uint64_t>(const_cast<char*>(
+                nvngfx_shader_selftest_msl_variant(NVNGFX_STAGE_VERTEX, 16)));
+            sd16[0].control = 0;
+            sd16[1].data = reinterpret_cast<uint64_t>(const_cast<char*>(
+                nvngfx_shader_selftest_msl_variant(NVNGFX_STAGE_FRAGMENT, 16)));
+            sd16[1].control = 0;
+            x[0] = kProg16; x[1] = 0;
+            prog_initialize(ctx, x);
+            x[0] = kProg16; x[1] = 2;
+            x[2] = reinterpret_cast<uint64_t>(&sd16[0]);
+            prog_set_shaders(ctx, x);
+            if (x[0] != 1) {
+                std::fprintf(stderr, "[selftest] driver-table program: SetShaders failed\n");
+                rc = 16443;
+                goto done;
+            }
+
+            const nvngfx_shader_arg driverArgs[] = {
+                {0, NVNGFX_ARG_SUPPORT, -1, 0, 0},
+                {1, NVNGFX_ARG_DRIVER_C2, -1, 1, 0},
+            };
+            const nvngfx_shader_blob driverBlob[] = {
+                {"00000000000000a8", NVNGFX_STAGE_FRAGMENT,
+                 nvngfx_shader_selftest_msl_variant(NVNGFX_STAGE_FRAGMENT, 16),
+                 driverArgs, 2, nullptr, 0},
+            };
+            size_t saved16Count = 0;
+            const nvngfx_shader_blob* saved16 =
+                nvngfx_shader_blob_table(&saved16Count);
+            if (nvngfx_shader_set_blobs(driverBlob, 1) != 0) {
+                std::fprintf(stderr, "[selftest] driver-table test blob was refused\n");
+                rc = 16443;
+                goto done;
+            }
+            {
+                const nvngfx_shader_blob* found = nvngfx_shader_lookup_blob(
+                    "00000000000000a8", NVNGFX_STAGE_FRAGMENT, nullptr);
+                Program* p16 = find<Program>(kProg16);
+                if (!found || !p16) {
+                    nvngfx_shader_set_blobs(saved16, saved16Count);
+                    std::fprintf(stderr, "[selftest] driver-table blob lookup failed\n");
+                    rc = 16443;
+                    goto done;
+                }
+                prog_apply_arg_layout(p16, found, NVNGFX_STAGE_FRAGMENT);
+            }
+            nvngfx_shader_set_blobs(saved16, saved16Count);
+
+            const uint64_t target16 = kTex;
+            const float clear16[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+            x[0] = kCb16;
+            cmdbuf_begin_recording(ctx, x);
+            x[0] = kCb16; x[1] = 1;
+            x[2] = reinterpret_cast<uint64_t>(&target16);
+            x[3] = 0; x[4] = 0; x[5] = 0;
+            cmdbuf_set_render_targets(ctx, x);
+            x[0] = kCb16; x[1] = 0;
+            x[2] = reinterpret_cast<uint64_t>(clear16);
+            x[3] = 0xF;
+            cmdbuf_clear_color(ctx, x);
+            x[0] = kCb16; x[1] = 1; x[2] = 0;
+            x[3] = nvngfx_texture_handle(2, 7);
+            cmdbuf_bind_texture(ctx, x);
+            x[0] = kCb16; x[1] = kProg16; x[2] = 0;
+            cmdbuf_bind_program(ctx, x);
+            x[0] = kCb16; x[1] = 0; x[2] = 0; x[3] = 3;
+            cmdbuf_draw_arrays(ctx, x);
+            x[0] = kCb16;
+            cmdbuf_end_recording(ctx, x);
+
+            CmdBuf* b16 = find<CmdBuf>(kCb16);
+            if (!b16 || !b16->last || b16->encoded != 1) {
+                std::fprintf(stderr,
+                             "[selftest] driver-table draw was not encoded (asked %u, "
+                             "encoded %u)\n",
+                             b16 ? b16->draws : 0u, b16 ? b16->encoded : 0u);
+                rc = 16443;
+                goto done;
+            }
+            [b16->last waitUntilCompleted];
+            if (b16->last.status == MTLCommandBufferStatusError) {
+                std::fprintf(stderr,
+                             "[selftest] driver-table draw command buffer error: %s\n",
+                             b16->last.error
+                                 ? [[b16->last.error localizedDescription] UTF8String]
+                                 : "(no description)");
+                rc = 16443;
+                goto done;
+            }
+            {
+                unsigned char px[4] = {0, 0, 0, 0};
+                const int want[4] = {0, 255, 0, 255};
+                if (!read_center_pixel(dev, c->queue, t->mtl, kSide, px) ||
+                    !pixels_near(px, want, 2)) {
+                    std::fprintf(stderr,
+                                 "[selftest] driver-table centre pixel is "
+                                 "(%u,%u,%u,%u), want (%d,%d,%d,%d)\n",
+                                 px[0], px[1], px[2], px[3], want[0], want[1],
+                                 want[2], want[3]);
+                    rc = 16443;
+                    goto done;
+                }
+                std::fprintf(stderr,
+                             "[selftest] support buffer and c[2] tables reached "
+                             "the shader\n");
             }
         }
 

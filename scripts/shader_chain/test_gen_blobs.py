@@ -32,6 +32,8 @@ struct spvDescriptorSetBuffer0
     sampler fp_t_cb7_2ASmplr [[id(7)]];
     texture2d<float> fp_i_tcb_8 [[id(8)]];
     constant _16* fp_s3 [[id(9)]];
+    constant _10* support_buffer [[id(10)]];
+    constant _16* fp_c2 [[id(11)]];
 };
 
 fragment float4 nvngfx_main_fs(constant spvDescriptorSetBuffer0& s0 [[buffer(0)]])
@@ -62,6 +64,8 @@ EXPECTED_PS = [
     "{7, NVNGFX_ARG_SAMPLER_OF_UBO_TEXTURE, 4, 7, 168},",
     "{8, NVNGFX_ARG_UNSUPPORTED, -1, 8, 0},",     # image
     "{9, NVNGFX_ARG_UNSUPPORTED, -1, 9, 0},",     # storage buffer
+    "{10, NVNGFX_ARG_SUPPORT, -1, 10, 0},",       # Ryujinx support buffer
+    "{11, NVNGFX_ARG_DRIVER_C2, -1, 11, 0},",     # c2 handle tables
 ]
 
 failures = 0
@@ -105,6 +109,12 @@ def main():
     check(tb == (2, 160) and hs == ("id", 0x104), "type-3 bindless decode: %r %r" % (tb, hs))
     check(gen_blobs.decode_ubo_tex("fp_t_cb2_1C") is None,
           "c2 is the driver table, not a bindless UBO handle")
+    check(gen_blobs.classify("constant _10*", "support_buffer") ==
+          ("NVNGFX_ARG_SUPPORT", -1, 0), "support buffer is recognised")
+    check(gen_blobs.classify("constant _16*", "fp_c2") ==
+          ("NVNGFX_ARG_DRIVER_C2", -1, 0), "c2 driver table is recognised")
+    check(gen_blobs.classify("constant _16*", "fp_c0") ==
+          ("NVNGFX_ARG_UNSUPPORTED", -1, 0), "c0 stays unsupported")
     check(gen_blobs.classify("sampler", "fp_t_cb5_%XSmplr" % h3) ==
           ("NVNGFX_ARG_UNSUPPORTED", -1, 0), "type-3 constant sampler is refused")
     # IDs may differ from declaration order; packed remains the declaration
@@ -159,10 +169,12 @@ def main():
         check("kC1_aaaaaaaaaaaaaaaa_ps" in text,
               "ps blob should carry the c1 byte array")
         check(re.search(r'"aaaaaaaaaaaaaaaa", NVNGFX_STAGE_FRAGMENT,\s*\n\s*".*?", '
-                        r'kArgs_aaaaaaaaaaaaaaaa_ps, 10, kC1_aaaaaaaaaaaaaaaa_ps, 16\},',
+                        r'kArgs_aaaaaaaaaaaaaaaa_ps, 12, kC1_aaaaaaaaaaaaaaaa_ps, 16\},',
                         text, re.S) is not None,
               "ps blob row should reference its layout and c1 bytes")
         check("unsupported=3" in r.stdout, "summary should count 3 unsupported: " + r.stdout)
+        check("support=1" in r.stdout and "driver_c2=1" in r.stdout,
+              "summary should count support and c2: " + r.stdout)
         check("texture_in_ubo=1" in r.stdout and "sampler_of_ubo_texture=1" in r.stdout,
               "summary should count both bindless halves: " + r.stdout)
         check("c1=1 shader(s), 16 bytes" in r.stdout,

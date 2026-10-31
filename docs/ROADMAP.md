@@ -6482,3 +6482,82 @@ the simulator” 步骤通过，说明 `16442` 在模拟器里实际返回 0。
   没有出现，因此不把它们加进这份“标题按名解析”的注册表。
 * 真实标题仍没有离线 MSL blob，`draw` 依然为 0；`16442` 通过只证明延迟
   纹理句柄的回放语义，不证明游戏已经出画面。
+
+## M4 续三十一：support_buffer 与 NVN c[2] 句柄表
+
+离线 `Bootup_Graphics` 全量的 123 个 unsupported 参数只有两类，且全部
+被 shader 真正读取、全部出现在 pixel stage：
+
+| 参数 | 数量 | 含义 |
+|---|---:|---|
+| `fp_c2` | 81 | NVN 驱动常量段 c[2] 的纹理 / 图像 / 独立采样器句柄表 |
+| `support_buffer` | 42 | Ryujinx 翻译器注入的静态支撑缓冲 |
+
+之前把两者都记为 `UNSUPPORTED`，因此这 123 个 shader 所在的 draw 会被
+整批丢掉。这不是“少量边角”，而是 BOTW 后处理、粒子、UI 等路径的常见
+输入。本轮把它们变成真实的参数类型。
+
+### 1. 生成器
+
+* `nvngfx_arg_kind` 增加 `NVNGFX_ARG_SUPPORT = 11` 与
+  `NVNGFX_ARG_DRIVER_C2 = 12`；两者都要求 `slot = -1`、`offset = 0`。
+* `gen_blobs.py` 把成员名 `support_buffer` 解成 `SUPPORT`，把
+  `fp_c2` 解成 `DRIVER_C2`；`fp_c0`、image、storage buffer 仍是
+  `UNSUPPORTED`。
+* bundle manifest 的 kind 数值范围从 1..10 扩到 1..12；
+  `nvngfx_shader_set_blobs()` 的校验同步接受新 kind。
+
+### 2. 运行时
+
+* `Ctx` 增加一块 64 KiB、只读的 support buffer：偏移 192 起是
+  `render_scale[73]`，每项 16 字节，全部写 1.0；其余字段保持 0，
+  与 nxnative 的“视口字段未被读取”结论一致。
+* 每次 draw 需要 `DRIVER_C2` 时新建 4 KiB c2 段并清零，然后写：
+  * 合并纹理槽 r：`0x20 + 8r`；
+  * 图像槽 r：`0x120 + 8r`；
+  * 独立纹理槽 r：`0x168 + 8r`；
+  * 独立采样器槽 r：`0x568 + 8r`。
+* 句柄按硬件格式压成 32 位：低 20 位纹理 ID、高 12 位采样器 ID。
+  后端内部句柄的采样器字段是 20 位，这里显式截到 12 位，避免溢出到
+  下一行。
+* c2 段按 draw 单独保存到 `CmdBuf::transientBuffers`，并由
+  `useResource` 保活；不能在同一个 Metal 命令缓冲里复用一块会被后续
+  draw 覆盖的缓冲。
+
+### 3. 自检 16443
+
+新增 variant 16：fragment shader 同时读取
+`support_buffer[48]`（render_scale[0]）和 `fp_c2[2].x`
+（c[2] + 0x20，合并纹理槽 0）。自检绑定纹理 ID 2 / 采样器 ID 7，
+GPU 端检查两个字段都正确时输出绿色，否则红色。该路径不采样纹理，
+所以模拟器 `gpuResourceID == 0` 也不会掩盖 c2 表错误。
+
+### 4. 离线验证
+
+用 `build/shader-chain/msl-boot-all` 重新生成 bundle：
+
+```text
+gen_blobs: 5102 shader(s)
+gen_blobs: 65386 argument(s): c1=3353, driver_c2=81,
+  sampler_of_texture=23549, support=42, texture=23549, ubo=14812
+```
+
+`unsupported` 从 123 降到 0；`Bootup_Graphics` 的 5,102 个 stage
+现在全部有可填充的参数布局。注意这仍只是 Bootup 包，不是全游戏
+约 19,595 个 stage。
+
+### 5. 门禁
+
+```text
+python scripts/syntax_check_metal.py --require
+python scripts/gen_nvn.py --repo . --check
+python scripts/extract_nvn_signatures.py --check
+python scripts/shader_chain/test_gen_blobs.py
+python scripts/verify_ios.py
+powershell -ExecutionPolicy Bypass -File scripts/build_abi_test.ps1
+git diff --check
+```
+
+本机已全部通过；`16443` 的实际 Metal 执行仍要等 macOS CI 的 iOS
+Simulator job。真实标题的 `draw` 仍为 0，本轮只证明参数布局和填充
+路径，不证明游戏已经出画面。
