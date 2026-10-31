@@ -187,12 +187,15 @@ control + code 上，和 Python 命名文件用的 key 逐个比。5102 个全�
    为什么不用 `MTLArgumentEncoder`：模拟器返回的对象 `encodedLength == 0`，
    而模拟器的纹理 `gpuResourceID` 又是 0——"让 Metal 自己算布局"这条路在那里
    走不通。固定 8 字节 ABI 与 d2r-mobile 的翻译产物一致，也不需要运行时编译。
-3. 几何路径：`DrawArrays` 与 `DrawElements`（16/32 位索引）都已编码，
-   顶点与索引都按 pool 零拷贝绑定（M3.79 / M3.80）。也就是说**画什么形状
-   已经不缺了**；常量、纹理、sampler 三条绑定都通了（模拟器上纹理/sampler
-   走直连，见 §5.5），真实 shader 的槽位映射也已由 M3.84 侧车补上；但 c1、
-   bindless、guest 纹理上传仍未解，所以仍然没有一条**真实** shader 在 Metal
-   里执行过。
+3. 几何路径：`DrawArrays` / `DrawElements`（16/32 位索引）以及
+   `DrawArraysInstanced` / `DrawElementsInstanced` / `DrawElementsBaseVertex` /
+   两种 indirect draw 都已编码，顶点与索引都按 pool 零拷贝绑定（M3.79 /
+   M3.80；实例化与 indirect 见 M4 续十二）。也就是说**画什么形状已经不缺了**；
+   常量、纹理、sampler 三条绑定都通了（模拟器上纹理/sampler 走直连，见 §5.5），
+   真实 shader 的槽位映射也已由 M3.84 侧车补上；但 c1、bindless、guest 纹理
+   上传仍未解，所以仍然没有一条**真实** shader 在 Metal 里执行过。u8 索引仍
+   需要 CPU/GPU 转换为 u16；indirect record 的合法性由 GPU 读取，CPU 只校验
+   pool span 与对齐。
 
 ### 5.4 Sampler 状态对象（M3.82）
 

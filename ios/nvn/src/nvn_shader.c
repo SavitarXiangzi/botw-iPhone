@@ -141,6 +141,32 @@ static const char* const kVsAttr =
     "    return v;\n"
     "}\n";
 
+/* Variant 15: instanced vertex input.  Positions still arrive through
+ * [[attribute(0)]], while [[instance_id]] moves instance 0 to the left and
+ * instance 1 to the right.  Any other instance is moved off-screen so the
+ * self-test can prove baseInstance is passed through: a two-instance draw
+ * starting at base instance 1 leaves only the right triangle visible. */
+static const char* const kVsInstancedAttr =
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "\n"
+    "struct NvngfxVaryings { float4 position [[position]]; };\n"
+    "\n"
+    "struct NvngfxVertexIn {\n"
+    "    float2 position [[attribute(0)]];\n"
+    "};\n"
+    "\n"
+    "vertex NvngfxVaryings nvngfx_main_vs(\n"
+    "    NvngfxVertexIn in [[stage_in]],\n"
+    "    uint iid [[instance_id]]) {\n"
+    "    const float2 shift = iid == 0 ? float2(-0.6, 0.0)\n"
+    "                        : iid == 1 ? float2(0.6, 0.0)\n"
+    "                                   : float2(3.0, 3.0);\n"
+    "    NvngfxVaryings v;\n"
+    "    v.position = float4(in.position + shift, 0.0, 1.0);\n"
+    "    return v;\n"
+    "}\n";
+
 /* Variant 2: everything the fragment shader knows comes through the
  * argument buffer at buffer(0), which is the shape spirv-cross emits for
  * a real program (`constant spvDescriptorSetBuffer0& spvDescriptorSet0
@@ -652,6 +678,11 @@ const char* nvngfx_shader_selftest_msl_variant(nvngfx_stage stage, int variant) 
     }
     if (variant == 14) {
         if (stage == NVNGFX_STAGE_VERTEX) return kVsDepthHalf;
+        if (stage == NVNGFX_STAGE_FRAGMENT) return kFsGreen;
+        return NULL;
+    }
+    if (variant == 15) {
+        if (stage == NVNGFX_STAGE_VERTEX) return kVsInstancedAttr;
         if (stage == NVNGFX_STAGE_FRAGMENT) return kFsGreen;
         return NULL;
     }

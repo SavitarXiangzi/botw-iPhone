@@ -520,11 +520,33 @@ destinationBytesPerImage:(NSUInteger)bpi;
 - (void)drawPrimitives:(MTLPrimitiveType)type
            vertexStart:(NSUInteger)start
            vertexCount:(NSUInteger)count;
+- (void)drawPrimitives:(MTLPrimitiveType)type
+           vertexStart:(NSUInteger)start
+           vertexCount:(NSUInteger)count
+         instanceCount:(NSUInteger)instanceCount
+          baseInstance:(NSUInteger)baseInstance;
+- (void)drawPrimitives:(MTLPrimitiveType)type
+        indirectBuffer:(id<MTLBuffer>)indirectBuffer
+  indirectBufferOffset:(NSUInteger)indirectBufferOffset;
 - (void)drawIndexedPrimitives:(MTLPrimitiveType)type
                    indexCount:(NSUInteger)count
                     indexType:(MTLIndexType)type
                   indexBuffer:(id<MTLBuffer>)buffer
             indexBufferOffset:(NSUInteger)offset;
+- (void)drawIndexedPrimitives:(MTLPrimitiveType)type
+                   indexCount:(NSUInteger)count
+                    indexType:(MTLIndexType)type
+                  indexBuffer:(id<MTLBuffer>)buffer
+            indexBufferOffset:(NSUInteger)offset
+                instanceCount:(NSUInteger)instanceCount
+                   baseVertex:(NSInteger)baseVertex
+               baseInstance:(NSUInteger)baseInstance;
+- (void)drawIndexedPrimitives:(MTLPrimitiveType)type
+                    indexType:(MTLIndexType)type
+                  indexBuffer:(id<MTLBuffer>)buffer
+            indexBufferOffset:(NSUInteger)offset
+               indirectBuffer:(id<MTLBuffer>)indirectBuffer
+         indirectBufferOffset:(NSUInteger)indirectBufferOffset;
 - (void)setViewport:(MTLViewport)viewport;
 - (void)setScissorRect:(MTLScissorRect)rect;
 - (void)setBlendColorRed:(float)red green:(float)green blue:(float)blue alpha:(float)alpha;

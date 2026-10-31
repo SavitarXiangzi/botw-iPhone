@@ -4775,3 +4775,101 @@ build_abi_test: all tests passed
 * compute image 写回 guest 存储 / CPU 回读的完整一致性；
 * texture view 与 compute 的 bindless / 参数缓冲区路径；
 * 没有真机像素验证，不能声称画面正确。
+
+## M4 续十二：实例化、base-vertex 与 indirect draw
+
+真实标题是 Unity，绝大多数网格走 `DrawElements`，并大量使用实例化和
+GPU-driven 的 indirect draw。上一轮只有 `DrawArrays` / `DrawElements`，所以
+这一轮补上五个入口，Metal 覆盖从 **204/513（39.8%）** 提到
+**209/513（40.7%）**，未实现 304；CommandBuffer 域从 **59/144** 到
+**64/144**。
+
+### 1. 五个入口与参数
+
+按 nxnative 的公开原型（MIT）核对，参数顺序如下：
+
+```text
+DrawArraysInstanced(
+    cb, primitive, first, count, baseInstance, instanceCount)
+DrawElementsInstanced(
+    cb, primitive, indexType, count, indexBuffer,
+    baseVertex, baseInstance, instanceCount)
+DrawElementsBaseVertex(
+    cb, primitive, indexType, count, indexBuffer, baseVertex)
+DrawArraysIndirect(cb, primitive, indirectAddress)
+DrawElementsIndirect(
+    cb, primitive, indexType, indexBuffer, indirectAddress)
+```
+
+实例化直接映射到 Metal：
+
+```text
+drawPrimitives:vertexStart:vertexCount:instanceCount:baseInstance:
+drawIndexedPrimitives:indexCount:indexType:indexBuffer:
+    indexBufferOffset:instanceCount:baseVertex:baseInstance:
+```
+
+`baseVertex` 作为 Metal 参数传入，不修改 guest 索引缓冲；`baseInstance`
+作为实例 ID 的起点传给 Metal，因此 shader 的 `[[instance_id]]` 与 NVN 语义
+一致。普通 `DrawElements` 也复用了同一套索引解析，并额外检查
+`indexBufferOffset` 必须按索引宽度对齐。
+
+### 2. Indirect record 与 GPU 读取
+
+两种 indirect record 的布局和 Metal 的
+`MTLDrawPrimitivesIndirectArguments` / `MTLDrawIndexedPrimitivesIndirectArguments`
+一致：
+
+```text
+DrawArraysIndirect:   { vertexCount, instanceCount, firstVertex, baseInstance }
+DrawElementsIndirect: { indexCount, instanceCount, firstIndex, baseVertex,
+                        baseInstance }
+```
+
+地址通过 `pool_span()` 映射到对应的 `MTLBuffer`，不把 guest 指针直接交给
+Metal。CPU 只检查 span 长度（16 / 20 字节）和 4 字节偏移对齐；record 内容
+由 GPU 在提交时读取，因此同一 command buffer 里 compute 先写出的参数可见。
+索引缓冲仍要求至少有一个元素在 pool 内，且偏移按索引宽度对齐。
+
+### 3. 边界行为
+
+* `count == 0` 或 `instanceCount == 0` 是合法 no-op，不编码 Metal draw，
+  也不要求先建管线；避免 Metal 校验层拒绝零实例 draw；
+* 负 count / first / baseVertex / baseInstance / instanceCount 明确拒绝并
+  `log_once`；
+* u8 索引仍不接（Metal 没有对应的 `MTLIndexType`），只接受 u16 / u32；
+* 索引或 indirect 地址不在任何已注册 pool、或偏移不对齐时，整条 draw 丢弃，
+  不猜测地址；
+* 仍未接 `MultiDraw*IndirectCount`、u8 索引转换和真实标题的 GPU-driven 场景。
+
+### 4. 模拟器回归
+
+新增一组共七个阶段，目标仍是 64×64 RGBA8，使用 guest pool 中的顶点流、
+索引缓冲和两份 indirect record。顶点 0 是故意放在屏幕外的哨兵，顶点 1..3
+组成真实三角形；实例 0 移到左边，实例 1 移到右边，其他实例移到屏幕外：
+
+1. 零 instance：不编码，目标保持黑色；
+2. `DrawArraysInstanced(instanceCount=2, baseInstance=0)`：左右都绿；
+3. `DrawArraysInstanced(instanceCount=2, baseInstance=1)`：左黑右绿，
+   证明 baseInstance 真的传给了 Metal；
+4. `DrawElementsInstanced(baseVertex=1, instanceCount=2)`：左右都绿；
+5. `DrawElementsBaseVertex(baseVertex=1)`：只有左侧绿，证明非实例化
+   base-vertex 路径也生效；
+6. `DrawArraysIndirect`（record 中 `firstVertex=1`, `instanceCount=2`）：
+   左右都绿，证明参数由 GPU 读取且顺序正确；
+7. `DrawElementsIndirect`（record 中 `baseVertex=1`, `instanceCount=2`）：
+   左右都绿，证明 indexed indirect 与 record 内的 baseVertex 都生效。
+
+### 5. 门禁
+
+```text
+python scripts/syntax_check_metal.py
+python scripts/gen_nvn.py --repo .
+python scripts/gen_nvn.py --repo . --check
+python scripts/verify_ios.py
+powershell -ExecutionPolicy Bypass -File scripts/build_abi_test.ps1
+```
+
+本地已通过；iOS 模拟器的实际像素断言由 GitHub Actions 的 macOS job 执行。
+这些结果只证明**合成 MSL** 的实例化 / indirect 路径，不证明真实标题 shader、
+真实资源或真机画面已经可玩。

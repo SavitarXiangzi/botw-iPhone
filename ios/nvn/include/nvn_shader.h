@@ -270,7 +270,9 @@ int nvngfx_shader_threadgroup_size(const char* msl, unsigned out[3]);
  *      the table's stride and holes come from the layout sidecar
  *   6  a c1-only fragment shader
  *   7  two bindless resources (ids 9 / 12, packed 0 / 1) whose 32-bit handle
- *      lives in a uniform buffer */
+ *      lives in a uniform buffer
+ *  15  instanced [[attribute(0)]] positions: instance 0 draws on the left,
+ *      instance 1 on the right, and other instance ids are off-screen */
 const char* nvngfx_shader_selftest_msl_variant(nvngfx_stage stage, int variant);
 
 #ifdef __cplusplus

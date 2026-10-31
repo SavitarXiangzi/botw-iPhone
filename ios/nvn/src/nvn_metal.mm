@@ -11,7 +11,8 @@
  *
  *   DONE  device / queue / window / swapchain lifecycle
  *         memory pool -> zero-copy MTLBuffer over guest memory
- *         command buffer -> MTLCommandBuffer, viewport / scissor / drawArrays
+ *         command buffer -> MTLCommandBuffer, viewport / scissor / drawArrays,
+ *           drawElements, instanced, base-vertex and GPU-read indirect draws
  *         render targets + one render pass (1-8 colour attachments) +
  *           ClearColor / ClearColori / ClearColorui / ClearDepthStencil full masks as
  *           load actions, ClearDepthStencil partial 8-bit stencil masks as a
@@ -49,7 +50,9 @@
  *         stencil / partial-stencil and MRT clears), a
  *         buffer-fill compute probe, direct and indirect guest compute
  *         dispatch probes (uniform offset, sampled texel and RGBA8 pixels
- *         read back), a bindless table probe, and a vertex-stage
+ *         read back), seven instanced / base-vertex / indirect draw phases
+ *         (including a zero-instance no-op), a bindless table probe, and a
+ *         vertex-stage
  *         argument-buffer draw whose shifted pixels are read back.  The ninth
  *         builds a block-linear texture in a guest memory pool and proves that
  *         the sampled pixels came from that storage, not from a host-side
@@ -5487,33 +5490,60 @@ bool bind_arguments(Ctx* c, CmdBuf* b) {
     return true;
 }
 
+/* Shared prologue for every graphics draw.  A zero-sized draw is handled by
+ * the caller before this runs; otherwise this performs exactly the order NVN
+ * state requires: build/lookup the pipeline, upload sampled textures before a
+ * pass opens, open the pass, then apply encoder state and bind arguments. */
+bool prepare_render_draw(Ctx* c, CmdBuf* b, const char* noPipelineTag) {
+    if (!ensure_pipeline(c, b)) {
+        /* The honest line: there is no translated shader, so there is no
+         * pipeline, so this draw is dropped.  Once per process. */
+        log_once(noPipelineTag, 1);
+        return false;
+    }
+    /* Opening the pass is what makes a recorded ClearColor happen. */
+    if (!prepare_textures(c, b)) return false;
+    if (!ensure_encoder(c, b)) return false;
+    [b->enc setRenderPipelineState:b->pso];
+    apply_fixed_state(c, b);
+    if (!bind_arguments(c, b)) return false;
+    /* No attribute state bound (the self-test's [[vertex_id]] program) means
+     * no vertex descriptor and nothing to bind. */
+    if (b->numAttrib > 0 && !bind_vertex_streams(b)) return false;
+    return true;
+}
+
+/* Resolves an NVN index buffer to the MTLBuffer that wraps its pool.  Metal
+ * requires indexBufferOffset to be a multiple of the index size; NVN callers
+ * normally satisfy this, but a malformed recording is rejected rather than
+ * handed to Metal's validation layer. */
+bool index_buffer_span(uint64_t address, unsigned count, unsigned indexSize,
+                       id<MTLBuffer>* buf, size_t* off) {
+    if (!indexSize) return false;
+    if (!pool_span(address, static_cast<size_t>(count) * indexSize, buf, off))
+        return false;
+    return (*off % indexSize) == 0;
+}
+
 /* nvnCommandBufferDrawArrays(NVNcommandBuffer*, NVNdrawPrimitive, int first, int count) */
 void cmdbuf_draw_arrays(nvngfx_ctx* ctx, uint64_t* x) {
     Ctx* c = ctx_of(ctx);
     CmdBuf* b = find<CmdBuf>(x[0]);
     if (!b) return;
     b->draws++;
-    if (!ensure_pipeline(c, b)) {
-        /* The honest line: there is no translated shader, so there is no
-         * pipeline, so this draw is dropped.  Once per process. */
-        log_once("nvnCommandBufferDrawArrays.noPipeline", 1);
+    const int first = static_cast<int>(x[2]);
+    const int count = static_cast<int>(x[3]);
+    if (first < 0 || count < 0) {
+        log_once("nvnCommandBufferDrawArrays.range", 1);
         return;
     }
-    if (!prepare_textures(c, b)) return;
-    /* Opening the pass is what makes a recorded ClearColor happen. */
-    if (!ensure_encoder(c, b)) return;
-    const uint32_t primitive = static_cast<uint32_t>(x[1]);
-    const unsigned first = static_cast<unsigned>(x[2]);
-    const unsigned count = static_cast<unsigned>(x[3]);
-    [b->enc setRenderPipelineState:b->pso];
-    apply_fixed_state(c, b);
-    if (!bind_arguments(c, b)) return;
-    /* No attribute state bound (the self-test's [[vertex_id]] program) means
-     * no vertex descriptor and nothing to bind. */
-    if (b->numAttrib > 0 && !bind_vertex_streams(b)) return;
-    [b->enc drawPrimitives:to_metal_primitive(primitive)
-               vertexStart:first
-               vertexCount:count];
+    if (count == 0) return;
+    if (!prepare_render_draw(c, b,
+                             "nvnCommandBufferDrawArrays.noPipeline"))
+        return;
+    [b->enc drawPrimitives:to_metal_primitive(static_cast<uint32_t>(x[1]))
+               vertexStart:static_cast<NSUInteger>(first)
+               vertexCount:static_cast<NSUInteger>(count)];
     b->encoded++;
 }
 
@@ -5529,35 +5559,235 @@ void cmdbuf_draw_elements(nvngfx_ctx* ctx, uint64_t* x) {
     CmdBuf* b = find<CmdBuf>(x[0]);
     if (!b) return;
     b->draws++;
-    if (!ensure_pipeline(c, b)) {
-        log_once("nvnCommandBufferDrawElements.noPipeline", 1);
-        return;
-    }
-    if (!prepare_textures(c, b)) return;
-    if (!ensure_encoder(c, b)) return;
-    const uint32_t primitive = static_cast<uint32_t>(x[1]);
     const uint32_t indexType = static_cast<uint32_t>(x[2]);
-    const unsigned count = static_cast<unsigned>(x[3]);
-    const unsigned indexSize = indexType == 1 ? 2u : indexType == 2 ? 4u : 0u;
+    const int count = static_cast<int>(x[3]);
+    const unsigned indexSize =
+        indexType == 1 ? 2u : indexType == 2 ? 4u : 0u;
     if (indexSize == 0) {
         log_once("nvnCommandBufferDrawElements.indexType", indexType);
         return;
     }
+    if (count < 0) {
+        log_once("nvnCommandBufferDrawElements.range", 1);
+        return;
+    }
+    if (count == 0) return;
     id<MTLBuffer> ibuf = nil;
     size_t ioff = 0;
-    if (!pool_span(x[4], static_cast<size_t>(count) * indexSize, &ibuf, &ioff)) {
+    if (!index_buffer_span(x[4], static_cast<unsigned>(count), indexSize,
+                           &ibuf, &ioff)) {
         log_once("nvnCommandBufferDrawElements.indexBuffer", indexType);
         return;
     }
-    [b->enc setRenderPipelineState:b->pso];
-    apply_fixed_state(c, b);
-    if (!bind_arguments(c, b)) return;
-    if (b->numAttrib > 0 && !bind_vertex_streams(b)) return;
-    [b->enc drawIndexedPrimitives:to_metal_primitive(primitive)
-                       indexCount:count
-                        indexType:indexSize == 2 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32
+    if (!prepare_render_draw(c, b,
+                             "nvnCommandBufferDrawElements.noPipeline"))
+        return;
+    [b->enc drawIndexedPrimitives:to_metal_primitive(
+                                      static_cast<uint32_t>(x[1]))
+                       indexCount:static_cast<NSUInteger>(count)
+                        indexType:indexSize == 2 ? MTLIndexTypeUInt16
+                                                 : MTLIndexTypeUInt32
                       indexBuffer:ibuf
                 indexBufferOffset:ioff];
+    b->encoded++;
+}
+
+/* nvnCommandBufferDrawArraysInstanced(NVNcommandBuffer*, NVNdrawPrimitive,
+ *                                     int first, int count, int baseInstance,
+ *                                     int instanceCount) */
+void cmdbuf_draw_arrays_instanced(nvngfx_ctx* ctx, uint64_t* x) {
+    Ctx* c = ctx_of(ctx);
+    CmdBuf* b = find<CmdBuf>(x[0]);
+    if (!b) return;
+    b->draws++;
+    const int first = static_cast<int>(x[2]);
+    const int count = static_cast<int>(x[3]);
+    const int baseInstance = static_cast<int>(x[4]);
+    const int instanceCount = static_cast<int>(x[5]);
+    if (first < 0 || count < 0 || baseInstance < 0 || instanceCount < 0) {
+        log_once("nvnCommandBufferDrawArraysInstanced.range", 1);
+        return;
+    }
+    /* Both are legal no-ops and must not reach Metal: its validation layer
+     * rejects a zero instance count. */
+    if (count == 0 || instanceCount == 0) return;
+    if (!prepare_render_draw(c, b,
+                             "nvnCommandBufferDrawArraysInstanced.noPipeline"))
+        return;
+    [b->enc drawPrimitives:to_metal_primitive(static_cast<uint32_t>(x[1]))
+               vertexStart:static_cast<NSUInteger>(first)
+               vertexCount:static_cast<NSUInteger>(count)
+             instanceCount:static_cast<NSUInteger>(instanceCount)
+              baseInstance:static_cast<NSUInteger>(baseInstance)];
+    b->encoded++;
+}
+
+/* nvnCommandBufferDrawElementsInstanced(
+ *     NVNcommandBuffer*, NVNdrawPrimitive, NVNindexType, int count,
+ *     NVNbufferAddress, int baseVertex, int baseInstance, int instanceCount) */
+void cmdbuf_draw_elements_instanced(nvngfx_ctx* ctx, uint64_t* x) {
+    Ctx* c = ctx_of(ctx);
+    CmdBuf* b = find<CmdBuf>(x[0]);
+    if (!b) return;
+    b->draws++;
+    const uint32_t indexType = static_cast<uint32_t>(x[2]);
+    const int count = static_cast<int>(x[3]);
+    const int baseVertex = static_cast<int>(x[5]);
+    const int baseInstance = static_cast<int>(x[6]);
+    const int instanceCount = static_cast<int>(x[7]);
+    const unsigned indexSize =
+        indexType == 1 ? 2u : indexType == 2 ? 4u : 0u;
+    if (indexSize == 0) {
+        log_once("nvnCommandBufferDrawElementsInstanced.indexType", indexType);
+        return;
+    }
+    if (count < 0 || baseVertex < 0 || baseInstance < 0 ||
+        instanceCount < 0) {
+        log_once("nvnCommandBufferDrawElementsInstanced.range", 1);
+        return;
+    }
+    if (count == 0 || instanceCount == 0) return;
+    id<MTLBuffer> ibuf = nil;
+    size_t ioff = 0;
+    if (!index_buffer_span(x[4], static_cast<unsigned>(count), indexSize,
+                           &ibuf, &ioff)) {
+        log_once("nvnCommandBufferDrawElementsInstanced.indexBuffer",
+                 indexType);
+        return;
+    }
+    if (!prepare_render_draw(
+            c, b, "nvnCommandBufferDrawElementsInstanced.noPipeline"))
+        return;
+    [b->enc drawIndexedPrimitives:to_metal_primitive(
+                                      static_cast<uint32_t>(x[1]))
+                       indexCount:static_cast<NSUInteger>(count)
+                        indexType:indexSize == 2 ? MTLIndexTypeUInt16
+                                                 : MTLIndexTypeUInt32
+                      indexBuffer:ibuf
+                indexBufferOffset:ioff
+                    instanceCount:static_cast<NSUInteger>(instanceCount)
+                         baseVertex:static_cast<NSInteger>(baseVertex)
+                     baseInstance:static_cast<NSUInteger>(baseInstance)];
+    b->encoded++;
+}
+
+/* nvnCommandBufferDrawElementsBaseVertex(
+ *     NVNcommandBuffer*, NVNdrawPrimitive, NVNindexType, int count,
+ *     NVNbufferAddress, int baseVertex) */
+void cmdbuf_draw_elements_base_vertex(nvngfx_ctx* ctx, uint64_t* x) {
+    Ctx* c = ctx_of(ctx);
+    CmdBuf* b = find<CmdBuf>(x[0]);
+    if (!b) return;
+    b->draws++;
+    const uint32_t indexType = static_cast<uint32_t>(x[2]);
+    const int count = static_cast<int>(x[3]);
+    const int baseVertex = static_cast<int>(x[5]);
+    const unsigned indexSize =
+        indexType == 1 ? 2u : indexType == 2 ? 4u : 0u;
+    if (indexSize == 0) {
+        log_once("nvnCommandBufferDrawElementsBaseVertex.indexType", indexType);
+        return;
+    }
+    if (count < 0 || baseVertex < 0) {
+        log_once("nvnCommandBufferDrawElementsBaseVertex.range", 1);
+        return;
+    }
+    if (count == 0) return;
+    id<MTLBuffer> ibuf = nil;
+    size_t ioff = 0;
+    if (!index_buffer_span(x[4], static_cast<unsigned>(count), indexSize,
+                           &ibuf, &ioff)) {
+        log_once("nvnCommandBufferDrawElementsBaseVertex.indexBuffer",
+                 indexType);
+        return;
+    }
+    if (!prepare_render_draw(
+            c, b, "nvnCommandBufferDrawElementsBaseVertex.noPipeline"))
+        return;
+    [b->enc drawIndexedPrimitives:to_metal_primitive(
+                                      static_cast<uint32_t>(x[1]))
+                       indexCount:static_cast<NSUInteger>(count)
+                        indexType:indexSize == 2 ? MTLIndexTypeUInt16
+                                                 : MTLIndexTypeUInt32
+                      indexBuffer:ibuf
+                indexBufferOffset:ioff
+                    instanceCount:1
+                         baseVertex:static_cast<NSInteger>(baseVertex)
+                     baseInstance:0];
+    b->encoded++;
+}
+
+/* nvnCommandBufferDrawArraysIndirect(NVNcommandBuffer*, NVNdrawPrimitive,
+ *                                    NVNbufferAddress)
+ *
+ * The GPU reads the 16-byte record {vertexCount, instanceCount, firstVertex,
+ * baseInstance}; its layout is MTLDrawPrimitivesIndirectArguments.  The guest
+ * address must live in a wrapped memory pool, and the offset must satisfy
+ * Metal's 4-byte indirect-buffer alignment. */
+void cmdbuf_draw_arrays_indirect(nvngfx_ctx* ctx, uint64_t* x) {
+    Ctx* c = ctx_of(ctx);
+    CmdBuf* b = find<CmdBuf>(x[0]);
+    if (!b) return;
+    b->draws++;
+    id<MTLBuffer> args = nil;
+    size_t aoff = 0;
+    if (!pool_span(x[2], 16, &args, &aoff) || (aoff & 3u) != 0) {
+        log_once("nvnCommandBufferDrawArraysIndirect.arguments", 1);
+        return;
+    }
+    if (!prepare_render_draw(c, b,
+                             "nvnCommandBufferDrawArraysIndirect.noPipeline"))
+        return;
+    [b->enc drawPrimitives:to_metal_primitive(static_cast<uint32_t>(x[1]))
+            indirectBuffer:args
+      indirectBufferOffset:aoff];
+    b->encoded++;
+}
+
+/* nvnCommandBufferDrawElementsIndirect(NVNcommandBuffer*, NVNdrawPrimitive,
+ *                                      NVNindexType, NVNbufferAddress,
+ *                                      NVNbufferAddress)
+ *
+ * The 20-byte record is {indexCount, instanceCount, firstIndex, baseVertex,
+ * baseInstance}, matching MTLDrawIndexedPrimitivesIndirectArguments.  The
+ * index-count is intentionally not read on the CPU: a compute pass may write
+ * it earlier in the same command buffer. */
+void cmdbuf_draw_elements_indirect(nvngfx_ctx* ctx, uint64_t* x) {
+    Ctx* c = ctx_of(ctx);
+    CmdBuf* b = find<CmdBuf>(x[0]);
+    if (!b) return;
+    b->draws++;
+    const uint32_t indexType = static_cast<uint32_t>(x[2]);
+    const unsigned indexSize =
+        indexType == 1 ? 2u : indexType == 2 ? 4u : 0u;
+    if (indexSize == 0) {
+        log_once("nvnCommandBufferDrawElementsIndirect.indexType", indexType);
+        return;
+    }
+    id<MTLBuffer> ibuf = nil;
+    size_t ioff = 0;
+    if (!index_buffer_span(x[3], 1, indexSize, &ibuf, &ioff)) {
+        log_once("nvnCommandBufferDrawElementsIndirect.indexBuffer",
+                 indexType);
+        return;
+    }
+    id<MTLBuffer> args = nil;
+    size_t aoff = 0;
+    if (!pool_span(x[4], 20, &args, &aoff) || (aoff & 3u) != 0) {
+        log_once("nvnCommandBufferDrawElementsIndirect.arguments", 1);
+        return;
+    }
+    if (!prepare_render_draw(c, b,
+                             "nvnCommandBufferDrawElementsIndirect.noPipeline"))
+        return;
+    [b->enc drawIndexedPrimitives:to_metal_primitive(
+                                      static_cast<uint32_t>(x[1]))
+                        indexType:indexSize == 2 ? MTLIndexTypeUInt16
+                                                 : MTLIndexTypeUInt32
+                      indexBuffer:ibuf
+                indexBufferOffset:ioff
+                   indirectBuffer:args
+             indirectBufferOffset:aoff];
     b->encoded++;
 }
 
@@ -6469,7 +6699,15 @@ const Binding kBindings[] = {
     BIND("nvnCommandBufferSetRenderTargets", cmdbuf_set_render_targets),
     BIND("nvnCommandBufferClearColor", cmdbuf_clear_color),
     BIND("nvnCommandBufferDrawArrays", cmdbuf_draw_arrays),
+    BIND("nvnCommandBufferDrawArraysInstanced", cmdbuf_draw_arrays_instanced),
+    BIND("nvnCommandBufferDrawArraysIndirect", cmdbuf_draw_arrays_indirect),
     BIND("nvnCommandBufferDrawElements", cmdbuf_draw_elements),
+    BIND("nvnCommandBufferDrawElementsBaseVertex",
+         cmdbuf_draw_elements_base_vertex),
+    BIND("nvnCommandBufferDrawElementsInstanced",
+         cmdbuf_draw_elements_instanced),
+    BIND("nvnCommandBufferDrawElementsIndirect",
+         cmdbuf_draw_elements_indirect),
     BIND("nvnCommandBufferSetViewport", cmdbuf_set_viewport),
     BIND("nvnCommandBufferSetScissor", cmdbuf_set_scissor),
     BIND("nvnCommandBufferBindProgram", cmdbuf_bind_program),
@@ -11527,6 +11765,276 @@ extern "C" int nvngfx_metal_selftest(void) {
         }
 
         {
+            /* --- Instanced, base-vertex and indirect draws ---------------
+             * One vertex stream holds a throw-away vertex at index 0 and a
+             * small triangle at indices 1..3.  Variant 15 places instance 0
+             * on the left and instance 1 on the right.  Every phase clears
+             * the same target, so a black pixel proves the draw was gated
+             * correctly and a green pixel proves it reached Metal.
+             *
+             * The phases exercise DrawArraysInstanced with baseInstance 0 and
+             * 1, DrawElementsInstanced and DrawElementsBaseVertex with
+             * baseVertex 1, then both indirect entry points with their
+             * argument records read by the GPU from a guest memory pool. */
+            const uint64_t kProgInst = 0x9D00;
+            const uint64_t kCbInst = 0x9E00;
+            const unsigned kVboOffset = 12288;
+            const unsigned kIndexOffset = 12352;
+            const unsigned kArrayArgsOffset = 12416;
+            const unsigned kIndexArgsOffset = 12480;
+            unsigned char* const vpoolInst =
+                poolRaw2 ? reinterpret_cast<unsigned char*>(
+                               (reinterpret_cast<uintptr_t>(poolRaw2) + 16383u) &
+                               ~static_cast<uintptr_t>(16383u))
+                         : nullptr;
+            if (!vpoolInst) {
+                std::fprintf(stderr,
+                             "[selftest] instanced draws: the second pool is "
+                             "missing\n");
+                rc = 16423;
+                goto done;
+            }
+
+            {
+                float* const v = reinterpret_cast<float*>(
+                    vpoolInst + kVboOffset);
+                /* Vertex 0 is only reached when baseVertex is ignored. */
+                v[0] = 2.0f;  v[1] = 2.0f;
+                v[2] = -0.25f; v[3] = -0.35f;
+                v[4] = 0.25f;  v[5] = -0.35f;
+                v[6] = 0.0f;   v[7] = 0.35f;
+                uint16_t* const indices = reinterpret_cast<uint16_t*>(
+                    vpoolInst + kIndexOffset);
+                indices[0] = 0;
+                indices[1] = 1;
+                indices[2] = 2;
+                uint32_t* const arrayArgs = reinterpret_cast<uint32_t*>(
+                    vpoolInst + kArrayArgsOffset);
+                arrayArgs[0] = 3;   /* vertexCount */
+                arrayArgs[1] = 2;   /* instanceCount */
+                arrayArgs[2] = 1;   /* firstVertex */
+                arrayArgs[3] = 0;   /* baseInstance */
+                uint32_t* const indexArgs = reinterpret_cast<uint32_t*>(
+                    vpoolInst + kIndexArgsOffset);
+                indexArgs[0] = 3;   /* indexCount */
+                indexArgs[1] = 2;   /* instanceCount */
+                indexArgs[2] = 0;   /* firstIndex */
+                indexArgs[3] = 1;   /* baseVertex */
+                indexArgs[4] = 0;   /* baseInstance */
+            }
+
+            alignas(16) unsigned char instAttribState[8] = {};
+            alignas(16) unsigned char instStreamState[8] = {};
+            const uint64_t kInstAttrib =
+                reinterpret_cast<uint64_t>(instAttribState);
+            const uint64_t kInstStream =
+                reinterpret_cast<uint64_t>(instStreamState);
+            x[0] = kInstAttrib;
+            vattrib_set_defaults(ctx, x);
+            x[0] = kInstAttrib; x[1] = 0x16; x[2] = 0;
+            vattrib_set_format(ctx, x);
+            x[0] = kInstAttrib; x[1] = 0;
+            vattrib_set_stream(ctx, x);
+            x[0] = kInstStream;
+            vstream_set_defaults(ctx, x);
+            x[0] = kInstStream; x[1] = 8;
+            vstream_set_stride(ctx, x);
+
+            {
+                struct { uint64_t data; uint64_t control; } sdInst[2];
+                sdInst[0].data = reinterpret_cast<uint64_t>(const_cast<char*>(
+                    nvngfx_shader_selftest_msl_variant(NVNGFX_STAGE_VERTEX,
+                                                       15)));
+                sdInst[0].control = 0;
+                sdInst[1].data = reinterpret_cast<uint64_t>(const_cast<char*>(
+                    nvngfx_shader_selftest_msl_variant(NVNGFX_STAGE_FRAGMENT,
+                                                       15)));
+                sdInst[1].control = 0;
+                x[0] = kProgInst; x[1] = 0;
+                prog_initialize(ctx, x);
+                x[0] = kProgInst; x[1] = 2;
+                x[2] = reinterpret_cast<uint64_t>(&sdInst[0]);
+                prog_set_shaders(ctx, x);
+                if (x[0] != 1) {
+                    std::fprintf(stderr,
+                                 "[selftest] instanced draws: SetShaders "
+                                 "failed\n");
+                    rc = 16423;
+                    goto done;
+                }
+            }
+
+            const uint64_t instTarget = kTex;
+            const float instClear[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+            const uint64_t instVbo =
+                reinterpret_cast<uint64_t>(vpoolInst + kVboOffset);
+            const uint64_t instIndices =
+                reinterpret_cast<uint64_t>(vpoolInst + kIndexOffset);
+            const uint64_t instArrayArgs =
+                reinterpret_cast<uint64_t>(vpoolInst + kArrayArgsOffset);
+            const uint64_t instIndexArgs =
+                reinterpret_cast<uint64_t>(vpoolInst + kIndexArgsOffset);
+
+            auto instPrelude = [&]() {
+                x[0] = kCbInst;
+                cmdbuf_begin_recording(ctx, x);
+                x[0] = kCbInst; x[1] = 1;
+                x[2] = reinterpret_cast<uint64_t>(&instTarget);
+                x[3] = 0; x[4] = 0; x[5] = 0;
+                cmdbuf_set_render_targets(ctx, x);
+                x[0] = kCbInst; x[1] = 0;
+                x[2] = reinterpret_cast<uint64_t>(instClear); x[3] = 0xF;
+                cmdbuf_clear_color(ctx, x);
+                x[0] = kCbInst; x[1] = 1;
+                x[2] = reinterpret_cast<uint64_t>(&instAttribState[0]);
+                cmdbuf_bind_vertex_attrib_state(ctx, x);
+                x[0] = kCbInst; x[1] = 1;
+                x[2] = reinterpret_cast<uint64_t>(&instStreamState[0]);
+                cmdbuf_bind_vertex_stream_state(ctx, x);
+                x[0] = kCbInst; x[1] = 0; x[2] = instVbo; x[3] = 32;
+                cmdbuf_bind_vertex_buffer(ctx, x);
+                x[0] = kCbInst; x[1] = kProgInst; x[2] = 0;
+                cmdbuf_bind_program(ctx, x);
+            };
+            auto instFinish = [&](const char* what) -> CmdBuf* {
+                x[0] = kCbInst;
+                cmdbuf_end_recording(ctx, x);
+                CmdBuf* const b = find<CmdBuf>(kCbInst);
+                if (!b || !b->last) {
+                    std::fprintf(stderr,
+                                 "[selftest] instanced draws %s: nothing "
+                                 "committed\n", what);
+                    return nullptr;
+                }
+                [b->last waitUntilCompleted];
+                if (b->last.status == MTLCommandBufferStatusError) {
+                    std::fprintf(stderr,
+                                 "[selftest] instanced draws %s: command "
+                                 "buffer error: %s\n", what,
+                                 b->last.error
+                                     ? [[b->last.error localizedDescription]
+                                           UTF8String]
+                                     : "(no description)");
+                    return nullptr;
+                }
+                return b;
+            };
+            auto instPixel = [&](NSUInteger px, NSUInteger py,
+                                 const int want[4], const char* what) -> bool {
+                unsigned char got[4] = {0, 0, 0, 0};
+                if (!read_pixel_at(dev, c->queue, t->mtl, kSide, px, py,
+                                   got) ||
+                    !pixels_near(got, want, 2)) {
+                    std::fprintf(stderr,
+                                 "[selftest] instanced draws %s at (%lu,%lu) "
+                                 "is (%u,%u,%u,%u), want (%d,%d,%d,%d)\n",
+                                 what, static_cast<unsigned long>(px),
+                                 static_cast<unsigned long>(py), got[0],
+                                 got[1], got[2], got[3], want[0], want[1],
+                                 want[2], want[3]);
+                    return false;
+                }
+                return true;
+            };
+            const int green[4] = {0, 255, 0, 255};
+            const int blackPx[4] = {0, 0, 0, 255};
+
+            /* A zero instance count is a legal no-op. */
+            instPrelude();
+            x[0] = kCbInst; x[1] = 0; x[2] = 1; x[3] = 3; x[4] = 0; x[5] = 0;
+            cmdbuf_draw_arrays_instanced(ctx, x);
+            CmdBuf* bi = instFinish("zero-instance");
+            if (!bi || bi->encoded != 0 ||
+                !instPixel(12, 32, blackPx, "zero-instance left") ||
+                !instPixel(52, 32, blackPx, "zero-instance right")) {
+                rc = 16423;
+                goto done;
+            }
+
+            /* Instance 0 left, instance 1 right. */
+            instPrelude();
+            x[0] = kCbInst; x[1] = 0; x[2] = 1; x[3] = 3; x[4] = 0; x[5] = 2;
+            cmdbuf_draw_arrays_instanced(ctx, x);
+            bi = instFinish("arrays-instanced");
+            if (!bi || bi->encoded != 1 ||
+                !instPixel(12, 32, green, "arrays-instanced left") ||
+                !instPixel(52, 32, green, "arrays-instanced right")) {
+                rc = 16423;
+                goto done;
+            }
+
+            /* Starting at instance 1 leaves only the right triangle. */
+            instPrelude();
+            x[0] = kCbInst; x[1] = 0; x[2] = 1; x[3] = 3; x[4] = 1; x[5] = 2;
+            cmdbuf_draw_arrays_instanced(ctx, x);
+            bi = instFinish("base-instance");
+            if (!bi || bi->encoded != 1 ||
+                !instPixel(12, 32, blackPx, "base-instance left") ||
+                !instPixel(52, 32, green, "base-instance right")) {
+                rc = 16423;
+                goto done;
+            }
+
+            /* Indexed instancing with a non-zero baseVertex. */
+            instPrelude();
+            x[0] = kCbInst; x[1] = 0; x[2] = 1; x[3] = 3;
+            x[4] = instIndices; x[5] = 1; x[6] = 0; x[7] = 2;
+            cmdbuf_draw_elements_instanced(ctx, x);
+            bi = instFinish("elements-instanced");
+            if (!bi || bi->encoded != 1 ||
+                !instPixel(12, 32, green, "elements-instanced left") ||
+                !instPixel(52, 32, green, "elements-instanced right")) {
+                rc = 16423;
+                goto done;
+            }
+
+            /* The non-instanced base-vertex entry point draws one instance. */
+            instPrelude();
+            x[0] = kCbInst; x[1] = 0; x[2] = 1; x[3] = 3;
+            x[4] = instIndices; x[5] = 1;
+            cmdbuf_draw_elements_base_vertex(ctx, x);
+            bi = instFinish("elements-base-vertex");
+            if (!bi || bi->encoded != 1 ||
+                !instPixel(12, 32, green, "elements-base-vertex left") ||
+                !instPixel(52, 32, blackPx, "elements-base-vertex right")) {
+                rc = 16423;
+                goto done;
+            }
+
+            /* The GPU reads {count, instances, first, baseInstance}. */
+            instPrelude();
+            x[0] = kCbInst; x[1] = 0; x[2] = instArrayArgs;
+            cmdbuf_draw_arrays_indirect(ctx, x);
+            bi = instFinish("arrays-indirect");
+            if (!bi || bi->encoded != 1 ||
+                !instPixel(12, 32, green, "arrays-indirect left") ||
+                !instPixel(52, 32, green, "arrays-indirect right")) {
+                rc = 16423;
+                goto done;
+            }
+
+            /* The GPU reads {indexCount, instances, firstIndex, baseVertex,
+             * baseInstance}; baseVertex=1 selects the real triangle. */
+            instPrelude();
+            x[0] = kCbInst; x[1] = 0; x[2] = 1; x[3] = instIndices;
+            x[4] = instIndexArgs;
+            cmdbuf_draw_elements_indirect(ctx, x);
+            bi = instFinish("elements-indirect");
+            if (!bi || bi->encoded != 1 ||
+                !instPixel(12, 32, green, "elements-indirect left") ||
+                !instPixel(52, 32, green, "elements-indirect right")) {
+                rc = 16423;
+                goto done;
+            }
+
+            std::fprintf(stderr,
+                         "[selftest] instanced/base-vertex/indirect: five "
+                         "entry points drew on both sides, baseInstance and "
+                         "baseVertex were honoured, and zero instances stayed "
+                         "a no-op\n");
+        }
+
+        {
             /* --- Per-program PSO cache capacity --------------------------
              * Fill every MRU slot with a distinct key, then look each one up.
              * A four-slot cache would have evicted twelve of these keys.  The
@@ -11643,6 +12151,8 @@ extern "C" int nvngfx_metal_selftest(void) {
         forget<Program>(0x9A00);
         forget<CmdBuf>(0x9B00);
         forget<Tex>(0x9C00);
+        forget<Program>(0x9D00);
+        forget<CmdBuf>(0x9E00);
         forget<Tex>(kTexCompute);
         g_tex_specs.erase(kTexComputeBuilder);
         forget<CmdBuf>(0x9300);
