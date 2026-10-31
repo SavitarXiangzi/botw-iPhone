@@ -16621,8 +16621,8 @@ extern "C" int nvngfx_metal_selftest(void) {
             y[2] = reinterpret_cast<uint64_t>(&xsw[1]);
             y[3] = reinterpret_cast<uint64_t>(&xsw[2]);
             y[4] = reinterpret_cast<uint64_t>(&xsw[3]);
+            /* GetSwizzle is void: it only writes the four out-pointers. */
             tex_builder_get_swizzle(ctx, y);
-            const uint64_t swzSet = y[0];
             const int sw0 = xsw[0], sw1 = xsw[1], sw2 = xsw[2], sw3 = xsw[3];
             y[0] = kXtb;
             tex_builder_get_dsmode(ctx, y);
@@ -16630,15 +16630,14 @@ extern "C" int nvngfx_metal_selftest(void) {
             y[0] = kXtb;
             tex_builder_get_gl_name(ctx, y);
             const uint64_t glSet = y[0];
-            if (deviceBack != 0xB0B0 || swzSet != 1 || sw0 != 5 ||
+            if (deviceBack != 0xB0B0 || sw0 != 5 ||
                 sw1 != 4 || sw2 != 3 || sw3 != 2 || dsSet != 1 ||
                 glSet != 0x1234ABCDu) {
                 std::fprintf(stderr,
                              "[selftest] texture state: builder round-trip "
-                             "failed (device=%#llx swz=%llu/%d,%d,%d,%d "
+                             "failed (device=%#llx swz=%d,%d,%d,%d "
                              "ds=%llu gl=%#llx)\n",
                              static_cast<unsigned long long>(deviceBack),
-                             static_cast<unsigned long long>(swzSet),
                              sw0, sw1, sw2, sw3,
                              static_cast<unsigned long long>(dsSet),
                              static_cast<unsigned long long>(glSet));
@@ -16655,19 +16654,18 @@ extern "C" int nvngfx_metal_selftest(void) {
             y[2] = reinterpret_cast<uint64_t>(&xsw[1]);
             y[3] = reinterpret_cast<uint64_t>(&xsw[2]);
             y[4] = reinterpret_cast<uint64_t>(&xsw[3]);
+            /* nvnTextureGetSwizzle is void as well. */
             tex_get_swizzle(ctx, y);
-            const uint64_t swzObj = y[0];
             y[0] = kXta;
             tex_get_dsmode(ctx, y);
             const uint64_t dsObj = y[0];
-            if (taOk != 1 || swzObj != 1 || xsw[0] != 5 || xsw[1] != 4 ||
+            if (taOk != 1 || xsw[0] != 5 || xsw[1] != 4 ||
                 xsw[2] != 3 || xsw[3] != 2 || dsObj != 1) {
                 std::fprintf(stderr,
                              "[selftest] texture state: object getters did "
-                             "not match the builder (init=%llu swz=%llu "
+                             "not match the builder (init=%llu swz="
                              "%d,%d,%d,%d ds=%llu)\n",
                              static_cast<unsigned long long>(taOk),
-                             static_cast<unsigned long long>(swzObj),
                              xsw[0], xsw[1], xsw[2], xsw[3],
                              static_cast<unsigned long long>(dsObj));
                 rc = 16433;
