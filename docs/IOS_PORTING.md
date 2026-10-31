@@ -80,7 +80,7 @@ nvn_shader_test: ok (seam, blob table, packed slots, bindless, c1, SHA-256, shad
 nvn_vertex_test: ok (packing, 26 formats, layout id)  exit=0
 nvn_texlayout_test: ok (block shapes, sizes, offsets, round trip, linear, write region, refusals)  exit=0
 syntax_check_metal: ok (clang++.exe)
-verify_ios: ok (metal bindings: 476/513)
+verify_ios: ok (metal bindings: 481/513)
 build_abi_test: all tests passed
 ```
 
@@ -224,15 +224,15 @@ iOS 是统一内存，guest 堆本来就是宿主可读的，所以
 
 ---
 
-## 6. 已经实现的 476 个入口点
+## 6. 已经实现的 481 个入口点
 
 按域分布（完整明细见 `docs/NVN_COVERAGE.md`）：
 
 | 域 | 已实现/总数 | 说明 |
 |---|---:|---|
-| CommandBuffer | 117/144 | recording/commit、普通与实例化 draw、base-vertex、两种 indirect draw、buffer/vertex/index、viewport/scissor、clear、render target、program、texture/sampler 绑定；M4 增加六个固定功能状态 bind、state object setter 转发、Barrier、UpdateUniformBuffer、CopyBufferToBuffer、Buffer↔Texture / Texture↔Texture copy 与 copy row/image stride，以及 initialize / finalize / is-recording、command / control memory 记账、memory callback、debug label / marker / group、13 个逐 draw 固定功能状态入口，以及纹理对象查询（14 个 getter + label / finalize / invalidate）、fence sync / signal event / wait event / wait sync |
-| Texture | 44/45 | initialize 建 `MTLTexture`；14 个对象 getter 加 storage class / raw storage class；ReadTexels / ReadTexelsStrided 从 guest 存储按 view 的 level/layer/slice 读回；WriteTexels/WriteTexelsStrided 写回 guest 布局并标脏，FlushTexels 标脏，下次采样重传；14 个 texture view 状态入口（16 字节实测布局）；Compare / GetViewOffset / GetDepthStencilMode |
-| TextureBuilder | 42/43 | packaged data / layout 读写与两个 storage class getter 已接；defaults + 17 个 setter（target/format/尺寸/levels/samples/storage/stride/flags/device/swizzle/GL 名称/depth-stencil mode）与 17 个查询入口：标量、storage size/alignment、device、swizzle 四路、GL 名称、depth-stencil mode |
+| CommandBuffer | 119/144 | recording/commit、普通与实例化 draw、base-vertex、两种 indirect draw、buffer/vertex/index、viewport/scissor、clear、render target、program、texture/sampler 绑定；M4 增加六个固定功能状态 bind、state object setter 转发、Barrier、UpdateUniformBuffer、CopyBufferToBuffer、Buffer↔Texture / Texture↔Texture copy 与 copy row/image stride，以及 initialize / finalize / is-recording、command / control memory 记账、memory callback、debug label / marker / group、13 个逐 draw 固定功能状态入口，以及纹理对象查询（14 个 getter + label / finalize / invalidate）、fence sync / signal event / wait event / wait sync；DiscardColor / DiscardDepthStencil 把旧附件内容声明的丢弃映射成下一次 pass 的 DontCare，GetMemoryCallbackData 回读 guest 指针 |
+| Texture | 45/45 | initialize 建 `MTLTexture`；14 个对象 getter 加 storage class / raw storage class 与 sparse tile 布局；ReadTexels / ReadTexelsStrided 从 guest 存储按 view 的 level/layer/slice 读回；WriteTexels/WriteTexelsStrided 写回 guest 布局并标脏，FlushTexels 标脏，下次采样重传；14 个 texture view 状态入口（16 字节实测布局）；Compare / GetViewOffset / GetDepthStencilMode |
+| TextureBuilder | 43/43 | packaged data / layout 读写、两个 storage class getter 与 sparse tile 布局已接；defaults + 17 个 setter（target/format/尺寸/levels/samples/storage/stride/flags/device/swizzle/GL 名称/depth-stencil mode）与 17 个查询入口：标量、storage size/alignment、device、swizzle 四路、GL 名称、depth-stencil mode |
 | Device | 27/27 | initialize / getProcAddress / 纹理与采样器句柄查询；M4 补齐 finalize / deferred finalize / debug domain 与 label / debug callback / walk database / fast-clear 注册 / 深度与窗口原点模式 / 中间 shader cache / 时间戳 / `GetInteger` 属性表 |
 | SamplerBuilder | 25/25 | 状态 setter/getter、device 回读与 Metal 采样器创建 |
 | Sampler | 15/15 | builder -> `MTLSamplerState`；对象 getter 与 host debug ID |
@@ -251,7 +251,7 @@ iOS 是统一内存，guest 堆本来就是宿主可读的，所以
 | DepthStencilState / PolygonState | 13/13 + 9/9 | 默认值、深度/模板/剔除/偏移 setter 与全部 getter；双面 stencil func/op 可分别回读 |
 | MultisampleState / ChannelMaskState | 22/23 + 3/3 | 默认值、采样数、coverage 相关 setter、写掩码与 10 个单字节 getter；SampleLocationsGrid 因状态里没有网格尺寸保留 |
 
-上表是主要域；完整 29 个域共 **476/513**，逐项状态见 `docs/NVN_COVERAGE.md`。
+上表是主要域；完整 29 个域共 **481/513**，逐项状态见 `docs/NVN_COVERAGE.md`。
 
 纹理侧最近两批：14 个 `NVNtextureView` 状态入口（16 字节实测布局，7 个 setter / 6 个 getter /
 字段比较）；texture builder 的 device / swizzle / GL 名称 / depth-stencil mode 三组读写、
@@ -695,7 +695,7 @@ constexpr int kEnumsVerified = 0;
 
 ---
 
-## 10. 剩余 37 个入口点的优先级
+## 10. 剩余 32 个入口点的优先级
 
 不要按字母序做。按“挡住第一个 draw call 的”排序：
 
@@ -705,7 +705,7 @@ constexpr int kEnumsVerified = 0;
 | P0 | ~~`nvnCommandBufferBindProgram` / `nvnProgramInitialize`~~ | ✅ 本轮已实现（管线建到 `nvngfx_shader_to_msl` 为止） |
 | P0 | ~~`nvnCommandBufferBindVertexAttribState`~~ | ✅ 本轮已实现（含 `nvnVertexAttribState*` / `nvnVertexStreamState*` 与 `BindVertexStreamState`） |
 | P0 | 真实 shader 的第一次 draw | UBO/texture/sampler、`[[id(k)]]` 侧车、c1、packed slot、bindless、顶点参数缓冲区、分层/LINEAR/BC1–BC5 纹理上传都已接上；仍缺把标题 shader 真正翻成 MSL 的离线链路，以及 BC6H/BC7、texture view 和任意 mapped write 的精确脏页跟踪 |
-| P2 | `nvnTextureBuilder*` 剩余 1 个 | 已做 42/43；只剩 `nvnTextureBuilderGetSparseTileLayout`（BOTW 1.9.0 的 usage 里没有调用） |
+| P2 | ~~`nvnTextureBuilder*` 剩余 1 个~~ | ✅ 已做 43/43：`GetSparseTileLayout` 报 64 KiB tile 的 tiled level 数与尺寸 |
 | P1 | ~~`nvnSamplerBuilder*` + `nvnSampler*` + sampler pool~~ | ✅ M3.82/M3.83：38 个 sampler 入口、8 个 pool/bind 入口，能建 `MTLSamplerState` 并从 pool 解析句柄；`SamplerBuilderGetDevice` 无已知形状、`SamplerGetDebugID` 的返回值语义未定 |
 | P1 | `NVNindexType` 枚举值核对 | nxnative 的 `nvn.h` 给出 0=u8 / 1=u16 / 2=u32；后端只接 1/2，u8 未知值不画，且该头文件是 reimplementation 而非 Nintendo SDK |
 | P0 | Maxwell SASS -> MSL 翻译器 | 不是入口点，是整条链的墙 |

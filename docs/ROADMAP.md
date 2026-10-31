@@ -6235,7 +6235,88 @@ padding"。`tests/nvn_texlayout_test.cpp` 的写入测试补了回归：同一�
 ### 6. 仍然没有闭环的部分
 
 渲染目标的 GPU 读回（blit + 格式转换）没有接；`ReadTexels` 不做脏页跟踪，读的是
-拷贝那一刻的 guest 存储；`nvnTextureGetSparseTileLayout` /
-`nvnTextureBuilderGetSparseTileLayout` 仍未实现。标题真正用到而尚未实现的入口依旧
-只有 `nvnCommandBufferCallCommands`，下一堵墙是把“录制时立即编码”改成可重放的
-命令流。真实标题的 draw 依然为 0 条。
+拷贝那一刻的 guest 存储。两个 `GetSparseTileLayout` 在下一批补上（见“续二十八”）。
+标题真正用到而尚未实现的入口依旧只有 `nvnCommandBufferCallCommands`，下一堵墙是
+把“录制时立即编码”改成可重放的命令流。真实标题的 draw 依然为 0 条。
+
+## M4 续二十八：稀疏 tile 布局、附件丢弃与回调数据
+
+上一批补完 `ReadTexels` 后，`Texture` 与 `TextureBuilder` 各只剩一个
+`GetSparseTileLayout`。这两个查询不是摆设：稀疏纹理的 mip tail 大小等于
+“整条链的存储 − 前 numTiledLevels 级的存储”。参考实现里有一个 Unreal 标题就是按
+这个公式建池；查询返回栈上的垃圾值时，它会把整张纹理再分配一遍。
+
+### 1. 64 KiB tile 的形状
+
+`nvngfx_tex_sparse_tiles`（`ios/nvn/src/nvn_texlayout.c`）与布局走同一套 GOB 计算：
+
+```text
+gw = 128 >> (tile_h + tile_d)      // 一个 tile 的 GOB 列数
+tileWidth  = gw * 64 / bpb * bw / sx
+tileHeight = (8 << tile_h) * bh / sy
+tileDepth  = 1 << tile_d
+```
+
+`tile_h` 由 sparse 格式的字节块高决定（bpb 1/2/4/8/16 → 5/4/4/3/3），`tile_d`
+只对 3D 有效。随后从 level 0 开始数“宽、高、深都放得下一整个 tile”的连续级别，
+遇到第一个放不下的就停——和 `level_walk` 判定一个级别是否整块布局的条件完全一致，
+所以 `storage(全部级别) − storage(numTiledLevels)` 就是 mip tail 的真实大小。
+
+两个 NVN 入口（builder / texture）都把结果写成一个 0x20 字节的
+`NVNtextureSparseTileLayout`：四个 int 加 16 字节保留区。保留区也一起清零，避免
+guest 复用结构体时读到上一轮的尾巴。
+
+### 2. DiscardColor / DiscardDepthStencil
+
+`nvnCommandBufferDiscardColor(cb, index)` 与 `DiscardDepthStencil(cb)` 的语义是
+“旧内容我不再读”。后端把每个颜色附件一位、深度和模板各一位记在命令缓冲里，
+下一次打开 render pass 时对应附件用 `MTLLoadActionDontCare`，随后清掉标志：
+这个 pass 之后附件里是 pass 自己写的内容，再下一个 pass 正常 `Load`。
+
+整附件清屏仍然优先于丢弃（清屏自己定义内容）；区域级的 discard 无法在 Metal 的
+load action 里表达，`DiscardColor` 只按附件索引生效。
+
+### 3. GetMemoryCallbackData
+
+`SetMemoryCallbackData` 存的 guest 指针现在可以读回。回调本身仍然从不被调用
+（后端不需要 guest 提供命令内存），所以这里只做原样回读，不假装回调跑过。
+
+### 4. 测试
+
+* `tests/nvn_texlayout_test.cpp::test_sparse_tiles`：非 sparse（0 级、尺寸清零）、
+  sparse 4x4 RGBA8（0 级但 tile 为 128x128x1）、1024² RGBA8 五级（4 级）、
+  1024² BC1 五级（2 级）、256²x64 3D 三级（2 级、tile 128x8x16）、
+  LINEAR+sparse（0 级）、未知格式（0 级）、空指针（-1）。
+* 模拟器自测 `16439`：packaged 4x4 纹理不是 sparse，builder 与 texture 两个查询
+  必须都报 0，并且把 32 字节记录整体写零（含保留区）。
+* 模拟器自测 `16440`：discard 记录颜色/深度/模板标志，索引 99 被拒绝。
+* 回调数据在 `16426` 的生命周期自测里往返。
+
+覆盖从 **476/513（92.8%）** 到 **481/513（93.8%）**，未实现 32；Texture
+**45/45**、TextureBuilder **43/43**、CommandBuffer **119/144**。
+
+### 5. 门禁
+
+```text
+python scripts/syntax_check_metal.py
+python scripts/gen_nvn.py --repo . --check
+python scripts/extract_nvn_signatures.py --check
+python scripts/verify_ios.py
+powershell -ExecutionPolicy Bypass -File scripts/build_abi_test.ps1
+git diff --check
+```
+
+本地已通过（513 procs / 481 implemented / 477 measured + 28 inferred）。
+
+### 6. 仍然没有闭环的部分
+
+* 稀疏布局回答的是**本后端的布局**：tile 形状按我们的 GOB/块高规则推导，没有在
+  真机上和 NVN 的 tiling 逐项比对；稀疏纹理仍然只是一段连续 guest 存储，
+  没有按 tile 的驻留位图或页表，`MapVirtual` 也只支持单段连续别名。
+* `DiscardColor` 只覆盖整个附件；区域 discard 和“丢弃后不再 store”都没有接。
+* `nvnBlendStateGet/SetAdvancedNormalizedDst`、
+  `nvnMultisampleStateGetSampleLocationsGrid`、`nvnEventBuilderGetStorage` 仍然故意
+  不绑定：前两者在实测状态布局里没有对应字段，后者没有公开原型，任何返回值都是猜的。
+* 标题实际用到而尚未实现的入口仍然只有 `nvnCommandBufferCallCommands`
+  （nxnative 的 1.9.0 usage 里约 790 万次）；真正的下一堵墙是把“录制时立即编码”
+  改成可重放的命令流。真实标题 draw 依然为 0 条。

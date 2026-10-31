@@ -316,6 +316,44 @@ int nvngfx_tex_layout(const nvngfx_texdesc* d, nvngfx_texlayout* o) {
     return 0;
 }
 
+/* The sparse tile shape follows the same GOB columns level_walk uses, so a
+ * guest that subtracts the tiled levels' storage from the whole chain gets
+ * the size of the mip tail this backend actually lays out. */
+int nvngfx_tex_sparse_tiles(const nvngfx_texdesc* d, unsigned* tw,
+                            unsigned* th, unsigned* td) {
+    fmt_t t;
+    unsigned dpl, w, h, z, sx, sy, sh, gw, levels, n;
+    int layered;
+    nvngfx_texlayout L;
+
+    if (tw) *tw = 0;
+    if (th) *th = 0;
+    if (td) *td = 0;
+    if (!d) return -1;
+    t = fmt_of(d->format);
+    shape(d, &dpl, &layered, &w, &h, &z);
+    (void)layered;
+    if (!sparse_of(d) || !t.bpb) return 0;   /* nothing is tiled */
+    if (nvngfx_tex_layout(d, &L) != 0) return -1;
+    samples_xy(d->samples, &sx, &sy);
+    sh = tile_shape_h(d, dpl, t, L.tile_h);
+    gw = 128u >> (sh + L.tile_d);
+    if (!gw) gw = 1;
+    /* gw GOB columns of 64 bytes make one 64 KiB tile. */
+    if (tw) *tw = gw * 64u / t.bpb * t.bw / sx;
+    if (th) *th = dpl >= 2 ? (8u << sh) * t.bh / sy : 1u;
+    if (td) *td = dpl >= 3 ? 1u << L.tile_d : 1u;
+
+    levels = d->levels ? (unsigned)d->levels : 1u;
+    for (n = 0; n < levels; ++n) {
+        const unsigned lwb = blk(mip(w * sx, n), t.bw) * t.bpb;
+        const unsigned lh = dpl >= 2 ? blk(mip(h * sy, n), t.bh) : 1u;
+        const unsigned ld = dpl >= 3 ? mip(z, n) : 1u;
+        if (lwb < gw * 64u || lh < (8u << sh) || ld < (1u << L.tile_d)) break;
+    }
+    return (int)n;
+}
+
 unsigned long long nvngfx_tex_level_offset(const nvngfx_texdesc* d,
                                            unsigned level) {
     fmt_t t;

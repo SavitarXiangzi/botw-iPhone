@@ -619,6 +619,56 @@ static void test_refusals() {
     CHECK(nvngfx_tex_layout(&d, &L) != 0);
 }
 
+/* The sparse-tile query: a 64 KiB tile is gw GOB columns wide and 8 << sh
+ * block rows high, and only levels that can hold a whole tile are counted. */
+static void test_sparse_tiles() {
+    unsigned tw = 77, th = 77, td = 77;
+
+    /* Not sparse: no tiles, and the outputs are cleared rather than stale. */
+    nvngfx_texdesc d = make_desc(0x25, 4, 4, 1);
+    CHECK(nvngfx_tex_sparse_tiles(&d, &tw, &th, &td) == 0);
+    CHECK(tw == 0 && th == 0 && td == 0);
+
+    /* Sparse 4x4 RGBA8: one tile is 128x128x1, but the level is too small. */
+    d.flags = 0x20;
+    CHECK(nvngfx_tex_sparse_tiles(&d, &tw, &th, &td) == 0);
+    CHECK(tw == 128 && th == 128 && td == 1);
+
+    /* 1024x1024 RGBA8, 5 levels: levels 0..3 hold a whole tile. */
+    d = make_desc(0x25, 1024, 1024, 5);
+    d.flags = 0x20;
+    CHECK(nvngfx_tex_sparse_tiles(&d, &tw, &th, &td) == 4);
+    CHECK(tw == 128 && th == 128 && td == 1);
+
+    /* BC1 counts blocks: a tile is 512x256 texels, so only 2 levels fit. */
+    d = make_desc(0x42, 1024, 1024, 5);
+    d.flags = 0x20;
+    CHECK(nvngfx_tex_sparse_tiles(&d, &tw, &th, &td) == 2);
+    CHECK(tw == 512 && th == 256 && td == 1);
+
+    /* 3D: the tile gains a depth of 1 << tile_d texels. */
+    d = make_desc(0x25, 256, 256, 3);
+    d.flags = 0x20;
+    d.rank = 3;              /* what nvnTextureBuilderSetSize3D records */
+    d.depth = 64;
+    CHECK(nvngfx_tex_sparse_tiles(&d, &tw, &th, &td) == 2);
+    CHECK(tw == 128 && th == 8 && td == 16);
+
+    /* LINEAR overrides sparse: nothing is tiled. */
+    d = make_desc(0x25, 1024, 1024, 5);
+    d.flags = 0x30;
+    CHECK(nvngfx_tex_sparse_tiles(&d, &tw, &th, &td) == 0);
+    CHECK(tw == 0 && th == 0 && td == 0);
+
+    /* Unknown format: no tile shape to report. */
+    d = make_desc(0, 1024, 1024, 5);
+    d.flags = 0x20;
+    CHECK(nvngfx_tex_sparse_tiles(&d, &tw, &th, &td) == 0);
+
+    /* A null descriptor is a caller bug, not an empty answer. */
+    CHECK(nvngfx_tex_sparse_tiles(nullptr, &tw, &th, &td) == -1);
+}
+
 int main() {
     test_block_shapes();
     test_sizes();
@@ -627,12 +677,14 @@ int main() {
     test_linear();
     test_write_region();
     test_read_region();
+    test_sparse_tiles();
     test_refusals();
     if (g_failures) {
         std::printf("nvn_texlayout_test: %d failure(s)\n", g_failures);
         return 1;
     }
     std::printf("nvn_texlayout_test: ok (block shapes, sizes, offsets, "
-                "round trip, linear, write region, read region, refusals)\n");
+                "round trip, linear, write region, read region, sparse tiles, "
+                "refusals)\n");
     return 0;
 }

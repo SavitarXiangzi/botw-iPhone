@@ -637,6 +637,13 @@ struct CmdBuf {
     unsigned commandMemorySegments = 0;
     uint64_t memoryCallback = 0;
     uint64_t memoryCallbackData = 0;
+    /* Attachments the guest marked with DiscardColor / DiscardDepthStencil.
+     * The next render pass opens them with MTLLoadActionDontCare and consumes
+     * the flags: NVN lets a discard leave the old contents undefined, so not
+     * loading them is a legal realization and saves the tile fetch. */
+    uint32_t discardColor = 0;      /* bit i = color attachment i */
+    bool discardDepth = false;
+    bool discardStencil = false;
     /* Event signals queued during this recording, published by one Metal
      * completion handler each. */
     std::vector<PendingEventSignal> eventSignals;
@@ -2103,6 +2110,42 @@ void tex_builder_get_storage_alignment(nvngfx_ctx*, uint64_t* x) {
     x[0] = nvngfx_tex_layout(&d, &L) == 0 ? L.alignment : 0;
 }
 
+/* NVNtextureSparseTileLayout: four ints plus 16 reserved bytes (0x20).  The
+ * whole record is written, reserved tail included, so a guest that clears the
+ * struct once and reuses it cannot keep a stale tail. */
+struct SparseTileLayout {
+    int32_t numTiledLevels;
+    int32_t tileWidth;
+    int32_t tileHeight;
+    int32_t tileDepth;
+    char reserved[16];
+};
+static_assert(sizeof(SparseTileLayout) == 0x20, "sparse tile layout size");
+
+bool sparse_tile_layout_write(uint64_t dst, const nvngfx_texdesc& d) {
+    unsigned tw = 0, th = 0, td = 0;
+    const int levels = nvngfx_tex_sparse_tiles(&d, &tw, &th, &td);
+    if (levels < 0 || !guest_range(dst, sizeof(SparseTileLayout)))
+        return false;
+    SparseTileLayout out = {};
+    out.numTiledLevels = levels;
+    out.tileWidth = static_cast<int32_t>(tw);
+    out.tileHeight = static_cast<int32_t>(th);
+    out.tileDepth = static_cast<int32_t>(td);
+    std::memcpy(guest_ptr<void>(dst), &out, sizeof out);
+    return true;
+}
+
+/* nvnTextureBuilderGetSparseTileLayout(const NVNtextureBuilder*,
+ *                                      NVNtextureSparseTileLayout*) */
+void tex_builder_get_sparse_tile_layout(nvngfx_ctx*, uint64_t* x) {
+    const nvngfx_texdesc d = tex_spec_or_default(x[0]);
+    if (!sparse_tile_layout_write(x[1], d)) {
+        log_once("nvnTextureBuilderGetSparseTileLayout.state",
+                 static_cast<unsigned>(d.format));
+    }
+}
+
 /* nvnTextureBuilderGetSwizzle(builder, r, g, b, a) */
 void tex_builder_get_swizzle(nvngfx_ctx*, uint64_t* x) {
     const nvngfx_texdesc& d = tex_spec_or_default(x[0]);
@@ -2701,6 +2744,21 @@ void tex_get_storage_size(nvngfx_ctx*, uint64_t* x) {
  * ZCull allocation on Metal, so the storage size is zero. */
 void tex_get_zcull_storage_size(nvngfx_ctx*, uint64_t* x) {
     x[0] = 0;
+}
+
+/* nvnTextureGetSparseTileLayout(const NVNtexture*,
+ *                               NVNtextureSparseTileLayout*).  The answer comes
+ * from the descriptor the builder handed to Initialize, so it cannot drift
+ * from what the storage layout uses. */
+void tex_get_sparse_tile_layout(nvngfx_ctx*, uint64_t* x) {
+    Tex* t = find<Tex>(x[0]);
+    if (!t) {
+        log_once("nvnTextureGetSparseTileLayout.state", 0);
+        return;
+    }
+    if (!sparse_tile_layout_write(x[1], t->desc)) {
+        log_once("nvnTextureGetSparseTileLayout.pointer", 0);
+    }
 }
 
 /* nvnTextureGetSwizzle(tex, r, g, b, a).  Four out-pointers, each an
@@ -5060,6 +5118,29 @@ void cmdbuf_get_copy_image_stride(nvngfx_ctx*, uint64_t* x) {
     x[0] = b ? static_cast<uint64_t>(b->copyImageStride) : 0;
 }
 
+/* nvnCommandBufferDiscardColor(cb, int index) /
+ * nvnCommandBufferDiscardDepthStencil(cb).  The guest declares the old
+ * attachment contents unreadable; the next pass opens that attachment with
+ * MTLLoadActionDontCare and the flags are consumed there.  A full clear still
+ * wins, because it defines the contents itself. */
+void cmdbuf_discard_color(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    const int index = static_cast<int>(x[1]);
+    if (!b) return;
+    if (index < 0 || index >= NVNGFX_MAX_COLOR_TARGETS) {
+        log_once("nvnCommandBufferDiscardColor.index",
+                 static_cast<unsigned>(index));
+        return;
+    }
+    b->discardColor |= 1u << static_cast<unsigned>(index);
+}
+void cmdbuf_discard_depth_stencil(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    if (!b) return;
+    b->discardDepth = true;
+    b->discardStencil = true;
+}
+
 /* Binds one MTLBuffer per stream that a bound attribute reads.
  *
  * A stream whose guest address is not inside any memory pool is not bindable:
@@ -6641,8 +6722,11 @@ bool ensure_encoder(Ctx* c, CmdBuf* b) {
              * previous contents and is encoded as a masked draw below. */
             const bool fullClear =
                 b->pendingClear[i] && b->clearMask[i] == 0xFu;
+            const bool discard = (b->discardColor >> i) & 1u;
             rpd.colorAttachments[i].loadAction =
-                fullClear ? MTLLoadActionClear : MTLLoadActionLoad;
+                fullClear ? MTLLoadActionClear
+                          : (discard ? MTLLoadActionDontCare
+                                     : MTLLoadActionLoad);
             if (fullClear) {
                 rpd.colorAttachments[i].clearColor = MTLClearColorMake(
                     b->clear[i][0], b->clear[i][1], b->clear[i][2], b->clear[i][3]);
@@ -6664,7 +6748,10 @@ bool ensure_encoder(Ctx* c, CmdBuf* b) {
             if (hasDepthPlane) {
                 rpd.depthAttachment.texture = dt->mtl;
                 rpd.depthAttachment.loadAction =
-                    b->pendingDepthClear ? MTLLoadActionClear : MTLLoadActionLoad;
+                    b->pendingDepthClear
+                        ? MTLLoadActionClear
+                        : (b->discardDepth ? MTLLoadActionDontCare
+                                           : MTLLoadActionLoad);
                 if (b->pendingDepthClear)
                     rpd.depthAttachment.clearDepth = b->clearDepth;
                 rpd.depthAttachment.storeAction = MTLStoreActionStore;
@@ -6672,7 +6759,10 @@ bool ensure_encoder(Ctx* c, CmdBuf* b) {
             if (hasStencilPlane) {
                 rpd.stencilAttachment.texture = dt->mtl;
                 rpd.stencilAttachment.loadAction =
-                    b->pendingStencilClear ? MTLLoadActionClear : MTLLoadActionLoad;
+                    b->pendingStencilClear
+                        ? MTLLoadActionClear
+                        : (b->discardStencil ? MTLLoadActionDontCare
+                                             : MTLLoadActionLoad);
                 if (b->pendingStencilClear)
                     rpd.stencilAttachment.clearStencil = b->clearStencil;
                 rpd.stencilAttachment.storeAction = MTLStoreActionStore;
@@ -6682,6 +6772,15 @@ bool ensure_encoder(Ctx* c, CmdBuf* b) {
             log_once("nvnCommandBufferClearDepthStencil.noDepth", 1);
         if (b->pendingStencilClear && !hasStencilPlane)
             log_once("nvnCommandBufferClearDepthStencil.noStencil", 1);
+        /* Consume only what this pass actually attached: a discard aimed at
+         * an attachment this pass does not use stays pending for the next one
+         * that does. */
+        if (numColors)
+            b->discardColor &= ~((1u << numColors) - 1u);
+        if (dt && dt->mtl) {
+            if (hasDepthPlane) b->discardDepth = false;
+            if (hasStencilPlane) b->discardStencil = false;
+        }
         b->enc = [b->cb renderCommandEncoderWithDescriptor:rpd];
         if (b->enc && b->hasViewport) [b->enc setViewport:b->viewport];
         if (b->enc && b->hasScissor) [b->enc setScissorRect:b->scissor];
@@ -7030,6 +7129,13 @@ void cmdbuf_get_memory_callback(nvngfx_ctx*, uint64_t* x) {
 void cmdbuf_set_memory_callback_data(nvngfx_ctx*, uint64_t* x) {
     CmdBuf* b = find_or_add<CmdBuf>(x[0]);
     if (b) b->memoryCallbackData = x[1];
+}
+/* nvnCommandBufferGetMemoryCallbackData(const NVNcommandBuffer*).  The guest
+ * pointer is handed back unchanged; the backend never invokes the callback,
+ * so there is nothing to synthesize. */
+void cmdbuf_get_memory_callback_data(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find<CmdBuf>(x[0]);
+    x[0] = b ? b->memoryCallbackData : 0u;
 }
 
 /* nvnCommandBufferSetDebugLabel(cb, const char*) */
@@ -10095,6 +10201,8 @@ const Binding kBindings[] = {
     BIND("nvnTextureBuilderGetStorageSize", tex_builder_get_storage_size),
     BIND("nvnTextureBuilderGetStorageAlignment",
          tex_builder_get_storage_alignment),
+    BIND("nvnTextureBuilderGetSparseTileLayout",
+         tex_builder_get_sparse_tile_layout),
     BIND("nvnTextureBuilderGetSwizzle", tex_builder_get_swizzle),
     BIND("nvnTextureBuilderGetDevice", tex_builder_get_device),
     BIND("nvnTextureBuilderSetSwizzle", tex_builder_set_swizzle),
@@ -10125,6 +10233,7 @@ const Binding kBindings[] = {
     BIND("nvnTextureGetDebugID", tex_get_debug_id),
     BIND("nvnTextureGetTextureAddress", tex_get_texture_address),
     BIND("nvnTextureGetStorageSize", tex_get_storage_size),
+    BIND("nvnTextureGetSparseTileLayout", tex_get_sparse_tile_layout),
     BIND("nvnTextureGetZCullStorageSize", tex_get_zcull_storage_size),
     BIND("nvnTextureReadTexels", tex_read_texels),
     BIND("nvnTextureReadTexelsStrided", tex_read_texels_strided),
@@ -10223,6 +10332,8 @@ const Binding kBindings[] = {
     BIND("nvnCommandBufferBeginRecording", cmdbuf_begin_recording),
     BIND("nvnCommandBufferEndRecording", cmdbuf_end_recording),
     BIND("nvnCommandBufferSetRenderTargets", cmdbuf_set_render_targets),
+    BIND("nvnCommandBufferDiscardColor", cmdbuf_discard_color),
+    BIND("nvnCommandBufferDiscardDepthStencil", cmdbuf_discard_depth_stencil),
     BIND("nvnCommandBufferClearColor", cmdbuf_clear_color),
     BIND("nvnCommandBufferDrawArrays", cmdbuf_draw_arrays),
     BIND("nvnCommandBufferDrawArraysInstanced", cmdbuf_draw_arrays_instanced),
@@ -10370,6 +10481,7 @@ const Binding kBindings[] = {
     BIND("nvnCommandBufferSetMemoryCallback", cmdbuf_set_memory_callback),
     BIND("nvnCommandBufferGetMemoryCallback", cmdbuf_get_memory_callback),
     BIND("nvnCommandBufferSetMemoryCallbackData", cmdbuf_set_memory_callback_data),
+    BIND("nvnCommandBufferGetMemoryCallbackData", cmdbuf_get_memory_callback_data),
     BIND("nvnCommandBufferSetDebugLabel", cmdbuf_set_debug_label),
     BIND("nvnCommandBufferInsertDebugMarker", cmdbuf_insert_debug_marker),
     BIND("nvnCommandBufferInsertDebugMarkerStatic", cmdbuf_insert_debug_marker_static),
@@ -16058,6 +16170,51 @@ extern "C" int nvngfx_metal_selftest(void) {
                 goto done;
             }
 
+            x[0] = kCbLife;
+            x[1] = 0xC0FFEEu;
+            cmdbuf_set_memory_callback_data(ctx, x);
+            x[0] = kCbLife;
+            cmdbuf_get_memory_callback_data(ctx, x);
+            if (x[0] != 0xC0FFEEu) {
+                std::fprintf(stderr,
+                             "[selftest] lifecycle: the memory callback data "
+                             "did not round-trip\n");
+                rc = 16426;
+                goto done;
+            }
+
+            /* DiscardColor / DiscardDepthStencil record attachment state that
+             * the next pass turns into MTLLoadActionDontCare.  Only the
+             * recording side is checked here; the flags are cleared again so
+             * the pass tests below do not start from discarded targets. */
+            {
+                CmdBuf* const dcb = find<CmdBuf>(kCbLife);
+                x[0] = kCbLife;
+                x[1] = 0;
+                cmdbuf_discard_color(ctx, x);
+                x[0] = kCbLife;
+                cmdbuf_discard_depth_stencil(ctx, x);
+                if (!dcb || dcb->discardColor != 1u || !dcb->discardDepth ||
+                    !dcb->discardStencil) {
+                    std::fprintf(stderr,
+                                 "[selftest] discard: flags were not recorded\n");
+                    rc = 16440;
+                    goto done;
+                }
+                x[0] = kCbLife;
+                x[1] = 99;
+                cmdbuf_discard_color(ctx, x);
+                if (dcb->discardColor != 1u) {
+                    std::fprintf(stderr,
+                                 "[selftest] discard: index 99 was accepted\n");
+                    rc = 16440;
+                    goto done;
+                }
+                dcb->discardColor = 0;
+                dcb->discardDepth = false;
+                dcb->discardStencil = false;
+            }
+
             /* Popping an empty stack must be reported, not underflow. */
             x[0] = kCbLife;
             cmdbuf_pop_debug_group(ctx, x);
@@ -18491,11 +18648,11 @@ extern "C" int nvngfx_metal_selftest(void) {
                     std::memcmp(wsrc, rdst2, 8) == 0 &&
                     std::memcmp(wsrc + 8, rdst2 + 16, 8) == 0;
 
+                std::fprintf(stderr,
+                             "[selftest] readtexels: packed=%d strided=%d\n",
+                             static_cast<int>(readBack),
+                             static_cast<int>(readStrided));
                 if (!readBack || !readStrided) {
-                    std::fprintf(stderr,
-                                 "[selftest] readtexels: packed=%d strided=%d\n",
-                                 static_cast<int>(readBack),
-                                 static_cast<int>(readStrided));
                     rc = 16438;
                     goto done;
                 }
@@ -18512,6 +18669,32 @@ extern "C" int nvngfx_metal_selftest(void) {
                 x[0] = kPkgObject;
                 tex_get_raw_storage_class(ctx, x);
                 const uint64_t textureRaw = x[0];
+
+                /* SparseTileLayout: this 4x4 packaged texture is not
+                 * sparse, so both queries must report zero tiled levels and
+                 * write all 0x20 bytes (reserved tail included). */
+                int sparseB[8], sparseT[8];
+                std::memset(sparseB, 0x5A, sizeof sparseB);
+                std::memset(sparseT, 0x5A, sizeof sparseT);
+                x[0] = kPkgBuilder2;
+                x[1] = reinterpret_cast<uint64_t>(sparseB);
+                tex_builder_get_sparse_tile_layout(ctx, x);
+                x[0] = kPkgObject;
+                x[1] = reinterpret_cast<uint64_t>(sparseT);
+                tex_get_sparse_tile_layout(ctx, x);
+                bool sparseOk =
+                    std::memcmp(sparseB, sparseT, sizeof sparseB) == 0;
+                for (int i = 0; i < 8; ++i)
+                    sparseOk = sparseOk && sparseB[i] == 0;
+                if (!sparseOk) {
+                    std::fprintf(stderr,
+                                 "[selftest] sparse tile layout: "
+                                 "builder=%d/%d/%d/%d texture=%d/%d/%d/%d\n",
+                                 sparseB[0], sparseB[1], sparseB[2], sparseB[3],
+                                 sparseT[0], sparseT[1], sparseT[2], sparseT[3]);
+                    rc = 16439;
+                    goto done;
+                }
 
                 if (virtualInit != 1 || unmappedAddress != 0 ||
                     partialMap != 0 || fullMap != 1 ||

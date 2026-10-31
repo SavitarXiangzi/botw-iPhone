@@ -61,6 +61,13 @@ unsigned long long nvngfx_tex_level_offset(const nvngfx_texdesc* d,
  * exceed the level's own byte count. */
 unsigned nvngfx_tex_level_gobs(const nvngfx_texdesc* d, unsigned level);
 
+/* Tiled levels of a sparse texture: the number of leading mip levels laid out
+ * in whole 64 KiB tiles, plus one tile's width/height/depth in texels.  A
+ * texture without the sparse flag returns 0 and leaves the three dimensions
+ * zero.  Returns -1 for a descriptor whose format or layout is unknown. */
+int nvngfx_tex_sparse_tiles(const nvngfx_texdesc* d, unsigned* tile_width,
+                            unsigned* tile_height, unsigned* tile_depth);
+
 /* Geometry of one level/layer, the way nvngfx_tex_deswizzle addresses it.
  * rows counts block rows; slices is 1 for anything but 3D. */
 int nvngfx_tex_level_geometry(const nvngfx_texdesc* d, unsigned level,
