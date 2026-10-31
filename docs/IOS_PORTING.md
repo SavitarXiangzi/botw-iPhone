@@ -3,15 +3,16 @@
 本文是 `ios/` 目录的操作手册。它描述的是**已经写进仓库的东西**和
 **机器能验证的事实**，不是你付钱就能玩到游戏的承诺。当前状态一句话：
 
-> iOS 侧的壳、C ABI、513 个 NVN 入口点的分发表、396 个 Metal 后端入口，
+> iOS 侧的壳、C ABI、513 个 NVN 入口点的分发表、422 个 Metal 后端入口，
 > 都能在非 Apple 主机上编译并跑通自测；纹理能建、渲染目标能绑、encoder
 > 能开，program -> pipeline -> draw -> 回读这条链已经在 **CI 的 iOS 模拟器**
 > 里跑通了十八条合成 draw（模拟器实际执行十七条）与七阶段 instanced / base-vertex / indirect draw 回归，其中包括从 guest 内存池
 > 解块上传的纹理、从离线 MSL bundle 按 guest key 命中的 shader，以及
 > `WriteTexels` / `FlushTexels` 触发重传的连续纹理更新。
 > **但客体的 draw 依然一条都不执行**：首要缺口仍是 Maxwell SASS -> MSL 的
-> 翻译器；通用 texture view、任意 mapped write 的精确脏页跟踪、BC6H/BC7 和
-> 同步也还没有闭环。
+> 翻译器；NVNtextureView 的 16 字节状态对象已可读写，但通用 view 的
+> swizzle/depth-stencil mode 尚未应用到采样/渲染目标，多队列、跨队列同步与
+> present blit 等待仍不完整；任意 mapped write 的精确脏页跟踪、BC6H/BC7 也还没有闭环。
 
 ---
 
@@ -27,16 +28,16 @@ ios/BotW/BotWBridge.h         Swift/ObjC 桥接头，只 #import botw_core.h
 ios/project.yml               XcodeGen 工程描述（不提交 .xcodeproj）
 ios/nvn/registry.json         513 个入口点，从标题自己的 getproc 字符串提取
 ios/nvn/signatures.json       477 个参数形状（公开 nxnative 原型表，MIT）
-ios/nvn/inferred_signatures.json  16 个按命名对称性推断的形状，单独标注
+ios/nvn/inferred_signatures.json  17 个按命名对称性推断的形状，单独标注
 ios/nvn/include/nvn_api.h     生成：名字表 + 函数指针 ABI
 ios/nvn/src/nvn_dispatch.cpp  生成：二分查找 + 缺失上报
 ios/nvn/include/nvn_backend.h 后端接口（null / metal 二选一）
 ios/nvn/src/nvn_null.cpp      空后端，任何主机都能编译
-ios/nvn/src/nvn_metal.mm      Metal 后端（396 个入口，含大量 TODO）
+ios/nvn/src/nvn_metal.mm      Metal 后端（422 个入口，含大量 TODO）
 ios/nvn/src/nvn_texture.c     157 项 NVNformat -> MTLPixelFormat 表（附 lossy 标记）
 ios/nvn/include/nvn_texture.h 纹理描述结构 + 表查询接口
 ios/nvn/src/nvn_shader.c      着色器翻译的唯一接口：现在只会说"没有翻译器"
-ios/nvn/implemented_metal.txt 396 行，和 BIND(...) 列表由门禁强制相等
+ios/nvn/implemented_metal.txt 422 行，和 BIND(...) 列表由门禁强制相等
 ios/nvn/shaders/              空目录 + 路线说明（见该目录 README）
 docs/NVN_COVERAGE.md          生成的逐域覆盖表
 scripts/                      提取、生成、校验、编译脚本
@@ -79,7 +80,7 @@ nvn_shader_test: ok (seam, blob table, packed slots, bindless, c1, SHA-256, shad
 nvn_vertex_test: ok (packing, 26 formats, layout id)  exit=0
 nvn_texlayout_test: ok (block shapes, sizes, offsets, round trip, linear, write region, refusals)  exit=0
 syntax_check_metal: ok (clang++.exe)
-verify_ios: ok (metal bindings: 396/513)
+verify_ios: ok (metal bindings: 422/513)
 build_abi_test: all tests passed
 ```
 
@@ -192,7 +193,7 @@ typedef void (*nvngfx_proc)(nvngfx_ctx* ctx, nvngfx_args* args);
 参数形状从哪来：`scripts/extract_nvn_signatures.py` 解析公开项目
 [nxnative](https://github.com/seedds/nxnative) 的 `dm/gfx/nvn/nvn_protos.h`
 （MIT），只保留**名字 / 返回类型 / 参数类型**，头文件本身不入库。477 个入口有
-源码可依；剩下 16 个（`nvnDeviceBuilderGetFlags`、10 个 QueueBuilder 入口等）在
+源码可依；剩下 17 个（`nvnDeviceBuilderGetFlags`、10 个 QueueBuilder 入口等）在
 `ios/nvn/inferred_signatures.json` 里单独标注为"按命名对称性推断"，
 `verify_ios.py` 分开计数，不会被悄悄算进已验证的一类。
 
@@ -223,19 +224,19 @@ iOS 是统一内存，guest 堆本来就是宿主可读的，所以
 
 ---
 
-## 6. 已经实现的 396 个入口点
+## 6. 已经实现的 422 个入口点
 
 按域分布（完整明细见 `docs/NVN_COVERAGE.md`）：
 
 | 域 | 已实现/总数 | 说明 |
 |---|---:|---|
 | CommandBuffer | 114/144 | recording/commit、普通与实例化 draw、base-vertex、两种 indirect draw、buffer/vertex/index、viewport/scissor、clear、render target、program、texture/sampler 绑定；M4 增加六个固定功能状态 bind、state object setter 转发、Barrier、UpdateUniformBuffer、CopyBufferToBuffer、Buffer↔Texture / Texture↔Texture copy 与 copy row/image stride，以及 initialize / finalize / is-recording、command / control memory 记账、memory callback、debug label / marker / group、13 个逐 draw 固定功能状态入口，以及纹理对象查询（14 个 getter + label / finalize / invalidate）、fence sync / signal event / wait event / wait sync |
-| Texture | 22/45 | initialize 建 `MTLTexture`；WriteTexels/WriteTexelsStrided 写回 guest 布局并标脏，FlushTexels 标脏，下次采样重传 |
-| TextureBuilder | 28/43 | defaults + 13 个 setter（target/format/尺寸/levels/samples/storage/stride/flags）与 14 个查询入口：11 个标量、storage size/alignment、swizzle 四路 |
+| Texture | 39/45 | initialize 建 `MTLTexture`；14 个对象 getter；WriteTexels/WriteTexelsStrided 写回 guest 布局并标脏，FlushTexels 标脏，下次采样重传；14 个 texture view 状态入口（16 字节实测布局）；Compare / GetViewOffset / GetDepthStencilMode |
+| TextureBuilder | 35/43 | defaults + 17 个 setter（target/format/尺寸/levels/samples/storage/stride/flags/device/swizzle/GL 名称/depth-stencil mode）与 17 个查询入口：标量、storage size/alignment、device、swizzle 四路、GL 名称、depth-stencil mode |
 | Device | 7/27 | initialize、getProcAddress、纹理/采样器句柄查询等 |
 | SamplerBuilder | 24/25 | 状态 setter/getter 与 Metal 采样器创建 |
 | Sampler | 14/15 | builder -> `MTLSamplerState` |
-| SamplerPool / TexturePool | 7/8 + 7/8 | 注册、句柄和 pool 绑定 |
+| SamplerPool / TexturePool | 8/8 + 8/8 | 注册、句柄、pool 绑定与 `GetMemoryPool` |
 | Window / WindowBuilder | 6/12 + 5/12 | CAMetalLayer、acquire、present interval、active textures |
 | MemoryPool / MemoryPoolBuilder | 9/10 + 8/8 | storage/flags/device、initialize(零拷贝)、地址/映射/尺寸查询、mapped-range coherency 空操作 |
 | Buffer / BufferBuilder | 11/11 + 7/7 | builder storage(pool, offset, size) -> 地址/映射/尺寸/调试 ID；buffer 是 pool 的视图，不另拷贝 |
@@ -250,9 +251,14 @@ iOS 是统一内存，guest 堆本来就是宿主可读的，所以
 | DepthStencilState / PolygonState | 13/13 + 9/9 | 默认值、深度/模板/剔除/偏移 setter 与全部 getter；双面 stencil func/op 可分别回读 |
 | MultisampleState / ChannelMaskState | 22/23 + 3/3 | 默认值、采样数、coverage 相关 setter、写掩码与 10 个单字节 getter；SampleLocationsGrid 因状态里没有网格尺寸保留 |
 
-上表是主要域；完整 29 个域共 **396/513**，逐项状态见 `docs/NVN_COVERAGE.md`。
+上表是主要域；完整 29 个域共 **422/513**，逐项状态见 `docs/NVN_COVERAGE.md`。
 
-**必须说清楚的六件事**，否则这张表会误导人：
+纹理侧最近两批：14 个 `NVNtextureView` 状态入口（16 字节实测布局，7 个 setter / 6 个 getter /
+字段比较）；texture builder 的 device / swizzle / GL 名称 / depth-stencil mode 三组读写、
+`nvnTextureGetDepthStencilMode`、`nvnTextureGetViewOffset`、`nvnTextureCompare`，以及 texture /
+sampler descriptor pool 的 `GetMemoryPool`。自测码 `16432`（view）与 `16433`（texture state）。
+
+**必须说清楚的七件事**，否则这张表会误导人：
 
 0. 所有入口的参数解码都按 `signatures.json` 的真实原型写，不是猜的。
    `SetViewport`/`SetScissor` 是 4 个 `int`（曾被当成 double 读），
@@ -272,23 +278,29 @@ iOS 是统一内存，guest 堆本来就是宿主可读的，所以
    显式 `nvnTextureWriteTexels*` 会按 guest 布局做整级读改写并标脏，
    `nvnTextureFlushTexels` 也会标脏；下一次 draw 会重传整条 mip 链。仍没有
    通用脏页跟踪，guest 绕过这些入口直接改 mapped storage 时不会自动同步。
-2. `nvnCommandBufferClearColor` 不再丢弃：它先关掉当前 encoder，把颜色记成
-   `pendingClear`，下一次 draw 前的 `ensure_encoder()` 把它变成
-   `loadAction = .clear`。mask 仍只记录（那是未验证的枚举）。
+2. ClearColor / ClearColori / ClearColorui 的完整清屏走 `loadAction = .clear`；
+   部分通道 mask 走 Load + 全屏三角形按写掩码清除（RGBA8 的 R/G 合并与
+   RGBA8Uint 的 R/G 掩码已在模拟器回读）。
 3. `MTLRenderCommandEncoder` 会在绑了渲染目标之后由 `ensure_encoder()` 创建，
    draw 也确实走到 encoder。`BindProgram` 之后 `ensure_pipeline()` 会调用
    `nvngfx_shader_to_msl()`；**它现在返回 NULL**（没有翻译器），所以
    `DrawArrays` 打一条 `noPipeline` 日志就返回。**客体的 draw 仍然是 0 条。**
    但这条链本身已经能跑：`nvngfx_metal_selftest()` 用内置 MSL 走完
    program -> pipeline -> draw -> 回读，并由 CI 用 `simctl` 在模拟器里执行 App 的自检钩子。
-4. 只挂 `colorAttachments[0]`：`numColor > 1` 的 MRT、以及 `setRenderTargets`
-   的 texture view 参数都只记日志。`EndRecording` 直接 `[cb commit]`，
-   `nvnQueueSubmitCommands` 还没实现，所以“提交”这件事目前不等队列。
+4. MRT 已支持 1–8 个颜色目标（每个目标独立格式、混合、写掩码与清屏）；
+   `setRenderTargets` 的 texture view 参数仍只记日志。`EndRecording` 直接
+   `[cb commit]`；`nvnQueueSubmitCommands` 目前只做 command/control 内存记账，
+   不改变 Metal 的提交顺序。
 
 5. 顶点缓冲与顶点参数缓冲区已经接通：stream 从 pool 零拷贝绑定，顶点常量在
    `buffer(0)`，stream 从 `NVNGFX_VERTEX_STREAM_BASE`（16）开始。自检 draw 2/3
    使用真实顶点缓冲，draw 8 使用顶点阶段参数缓冲区并回读平移后的像素。客体尚未
    跑到这些路径。
+
+6. texture view 的 16 字节状态对象可读写，但通用 view 的 swizzle /
+   depth-stencil mode 还没有应用到采样或渲染目标；GL 名称只是记录，没有 GL
+   interop；`nvnTextureCompare` 的字段集按 nxnative 选择（描述符、存储身份、
+   通道映射），Nintendo 的精确语义未核实。
 
 ---
 
@@ -641,7 +653,7 @@ constexpr int kEnumsVerified = 0;
 
 ---
 
-## 10. 剩余 117 个入口点的优先级
+## 10. 剩余 91 个入口点的优先级
 
 不要按字母序做。按“挡住第一个 draw call 的”排序：
 
@@ -709,4 +721,4 @@ Swift 侧同理：`Renderer.swift` / `GameView.swift` 只做了括号与结构�
 | `[nvn] nvnCommandBufferDraw.pipeline: no translator...` | 正常，这条就是当前的墙；自检不经过它 |
 | 屏幕全黑且 `frame` 不动 | `MTKView.delegate` 是 weak，Pump 必须被 Coordinator 强引用（已在 `GameView.swift` 修过一次） |
 | `[nvn] UNVERIFIED xxx = 0x...` | 正常，那是诚实闸门在报未验证的枚举 |
-| `[nvn] not implemented: nvnYyy` | 该入口不在 396 个里，按第 10 节排期 |
+| `[nvn] not implemented: nvnYyy` | 该入口不在 422 个里，按第 10 节排期 |

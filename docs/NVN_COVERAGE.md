@@ -7,8 +7,8 @@
 `nvn*` 字符串（运行时按名解析，所以名字本身就暴露了完整接口面）。
 
 - 接口总数：**513**
-- Metal 后端已实现：**410**（79.9%）
-- 仍未实现：**103**
+- Metal 后端已实现：**422**（82.3%）
+- 仍未实现：**91**
 
 > 只有出现在 `ios/nvn/implemented_metal.txt` 里、且确实在
 > `ios/nvn/src/nvn_metal.mm` 中定义过的名字才算“已实现”。
@@ -19,8 +19,8 @@
 | 域 | 已实现 | 总数 | 进度 |
 |---|---:|---:|---|
 | CommandBuffer | 114 | 144 | `########  ` |
-| Texture | 36 | 45 | `########  ` |
-| TextureBuilder | 28 | 43 | `#######   ` |
+| Texture | 39 | 45 | `######### ` |
+| TextureBuilder | 35 | 43 | `########  ` |
 | Device | 7 | 27 | `###       ` |
 | SamplerBuilder | 24 | 25 | `##########` |
 | MultisampleState | 22 | 23 | `##########` |
@@ -35,8 +35,8 @@
 | MemoryPool | 9 | 10 | `######### ` |
 | PolygonState | 9 | 9 | `##########` |
 | MemoryPoolBuilder | 8 | 8 | `##########` |
-| SamplerPool | 7 | 8 | `######### ` |
-| TexturePool | 7 | 8 | `######### ` |
+| SamplerPool | 8 | 8 | `##########` |
+| TexturePool | 8 | 8 | `##########` |
 | BufferBuilder | 7 | 7 | `##########` |
 | ColorState | 7 | 7 | `##########` |
 | Event | 6 | 7 | `######### ` |
@@ -479,11 +479,11 @@
 - [x] `nvnSamplerBuilderSetReductionFilter`
 - [x] `nvnSamplerBuilderSetWrapMode`
 
-### SamplerPool (7/8)
+### SamplerPool (8/8)
 
 - [x] `nvnSamplerPoolFinalize`
 - [x] `nvnSamplerPoolGetMemoryOffset`
-- [ ] `nvnSamplerPoolGetMemoryPool`
+- [x] `nvnSamplerPoolGetMemoryPool`
 - [x] `nvnSamplerPoolGetSize`
 - [x] `nvnSamplerPoolInitialize`
 - [x] `nvnSamplerPoolRegisterSampler`
@@ -499,14 +499,14 @@
 - [x] `nvnSyncSetDebugLabel`
 - [x] `nvnSyncWait`
 
-### Texture (36/45)
+### Texture (39/45)
 
-- [ ] `nvnTextureCompare`
+- [x] `nvnTextureCompare`
 - [x] `nvnTextureFinalize`
 - [x] `nvnTextureFlushTexels`
 - [x] `nvnTextureGetDebugID`
 - [x] `nvnTextureGetDepth`
-- [ ] `nvnTextureGetDepthStencilMode`
+- [x] `nvnTextureGetDepthStencilMode`
 - [x] `nvnTextureGetFlags`
 - [x] `nvnTextureGetFormat`
 - [x] `nvnTextureGetHeight`
@@ -522,7 +522,7 @@
 - [x] `nvnTextureGetSwizzle`
 - [x] `nvnTextureGetTarget`
 - [x] `nvnTextureGetTextureAddress`
-- [ ] `nvnTextureGetViewOffset`
+- [x] `nvnTextureGetViewOffset`
 - [x] `nvnTextureGetWidth`
 - [ ] `nvnTextureGetZCullStorageSize`
 - [x] `nvnTextureInitialize`
@@ -547,14 +547,14 @@
 - [x] `nvnTextureWriteTexels`
 - [x] `nvnTextureWriteTexelsStrided`
 
-### TextureBuilder (28/43)
+### TextureBuilder (35/43)
 
 - [x] `nvnTextureBuilderGetDepth`
-- [ ] `nvnTextureBuilderGetDepthStencilMode`
-- [ ] `nvnTextureBuilderGetDevice`
+- [x] `nvnTextureBuilderGetDepthStencilMode`
+- [x] `nvnTextureBuilderGetDevice`
 - [x] `nvnTextureBuilderGetFlags`
 - [x] `nvnTextureBuilderGetFormat`
-- [ ] `nvnTextureBuilderGetGLTextureName`
+- [x] `nvnTextureBuilderGetGLTextureName`
 - [x] `nvnTextureBuilderGetHeight`
 - [x] `nvnTextureBuilderGetLevels`
 - [x] `nvnTextureBuilderGetMemoryOffset`
@@ -574,11 +574,11 @@
 - [ ] `nvnTextureBuilderGetZCullStorageSize`
 - [x] `nvnTextureBuilderSetDefaults`
 - [x] `nvnTextureBuilderSetDepth`
-- [ ] `nvnTextureBuilderSetDepthStencilMode`
-- [ ] `nvnTextureBuilderSetDevice`
+- [x] `nvnTextureBuilderSetDepthStencilMode`
+- [x] `nvnTextureBuilderSetDevice`
 - [x] `nvnTextureBuilderSetFlags`
 - [x] `nvnTextureBuilderSetFormat`
-- [ ] `nvnTextureBuilderSetGLTextureName`
+- [x] `nvnTextureBuilderSetGLTextureName`
 - [x] `nvnTextureBuilderSetHeight`
 - [x] `nvnTextureBuilderSetLevels`
 - [ ] `nvnTextureBuilderSetPackagedTextureData`
@@ -589,15 +589,15 @@
 - [x] `nvnTextureBuilderSetSize3D`
 - [x] `nvnTextureBuilderSetStorage`
 - [x] `nvnTextureBuilderSetStride`
-- [ ] `nvnTextureBuilderSetSwizzle`
+- [x] `nvnTextureBuilderSetSwizzle`
 - [x] `nvnTextureBuilderSetTarget`
 - [x] `nvnTextureBuilderSetWidth`
 
-### TexturePool (7/8)
+### TexturePool (8/8)
 
 - [x] `nvnTexturePoolFinalize`
 - [x] `nvnTexturePoolGetMemoryOffset`
-- [ ] `nvnTexturePoolGetMemoryPool`
+- [x] `nvnTexturePoolGetMemoryPool`
 - [x] `nvnTexturePoolGetSize`
 - [x] `nvnTexturePoolInitialize`
 - [x] `nvnTexturePoolRegisterImage`

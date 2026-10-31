@@ -40,6 +40,13 @@ typedef struct {
     unsigned long long pool;   /* guest NVNmemoryPool address, 0 = none */
     long long offset;
     long long stride;
+    /* Builder state that does not describe the storage: the device the
+     * builder was created against (preserved across SetDefaults), the
+     * GL texture name (opaque, no GL interop exists), and the plane a
+     * sample reads (0 depth, 1 stencil). */
+    unsigned long long device;
+    unsigned gl_name;
+    int dsmode;
     unsigned char swz[4];      /* channel swizzle, R/G/B/A order */
     /* SetPackagedTextureLayout's first byte (0 when the guest never called
      * it): low nibble = log2 block height, high nibble = log2 block depth.

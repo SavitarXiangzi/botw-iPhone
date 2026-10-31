@@ -1,7 +1,7 @@
 {
   "source": "hand-written: derived from the Set/Get naming symmetry, NOT from a header",
-  "note": "These entry points are absent from the public nvn_protos.h. Their shapes are inferred from their siblings: the window/device/buffer getters mirror their Set siblings, and the QueueBuilder getters mirror QueueBuilderSet* plus QueueBuilderGetQueueMemorySize. verify_ios.py counts them separately so a guess is never silently folded into the verified set.",
-  "count": 16,
+  "note": "These entry points are absent from the public nvn_protos.h. Their shapes are inferred from their siblings: the window/device/buffer/texture-builder getters mirror their Set siblings, and the QueueBuilder getters mirror QueueBuilderSet* plus QueueBuilderGetQueueMemorySize. verify_ios.py counts them separately so a guess is never silently folded into the verified set.",
+  "count": 17,
   "procs": [
     {
       "name": "nvnBufferBuilderGetDevice",
@@ -119,6 +119,15 @@
         "int"
       ],
       "arity": 2,
+      "inferred": true
+    },
+    {
+      "name": "nvnTextureBuilderGetDevice",
+      "ret": "NVNdevice*",
+      "params": [
+        "const NVNtextureBuilder*"
+      ],
+      "arity": 1,
       "inferred": true
     },
     {

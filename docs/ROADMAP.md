@@ -5570,3 +5570,178 @@ git diff --check
 CI run `41188353513` 的 `portable` 与 macOS `ios` job 均成功；模拟器自测包含新增的
 16431 回归（失败会以 rc=16431 退出并使 job 失败），设备 Debug 构建与 Release 拒绝
 门禁也通过。
+
+## M4 续二十一：NVNtextureView 状态对象
+
+上一轮把六类固定功能状态的 getter 接上后，纹理侧下一个低风险缺口是
+`NVNtextureView`：游戏会在栈上放一个 view，先 `SetDefaults`，再按需设
+level / layer / format / target，然后把它传给采样或渲染目标。此前这些入口
+全部是日志桩，`Get*` 也返回 0，guest 只要读一次就会把“没有 view”当成
+“view 的 level 0 / 整个纹理”。
+
+本轮补齐 14 个入口：
+
+* 7 个 setter：`SetDefaults`、`SetLevels`、`SetLayers`、`SetFormat`、
+  `SetTarget`、`SetSwizzle`、`SetDepthStencilMode`；
+* 6 个 getter：`GetLevels`、`GetLayers`、`GetFormat`、`GetTarget`、
+  `GetSwizzle`、`GetDepthStencilMode`；
+* `nvnTextureViewCompare`。
+
+Metal 覆盖从 **396/513（77.2%）** 到 **410/513（79.9%）**，未实现 103。
+
+### 1. 16 字节实测布局
+
+布局来自 nxnative（MIT）的 `dm/gfx/nvn/nvn_obj.h`，不是猜的：
+
+```text
+byte 0: bit0 set_levels  bit1 set_layers  bit2 set_format
+        bit3 set_target  bit4 set_swizzle bit5 set_dsmode
+        bit6-7 dsmode
+byte 1: target
+byte 2: base_level
+byte 3: num_levels
+byte 4-5: format (u16)
+byte 6-7: min_layer (u16)
+byte 8-9: num_layers (u16)
+byte 10-13: swizzle[4]
+byte 14-15: reserved
+```
+
+setter 直接写 guest 的 16 字节对象，getter 从 guest 字节解包，没有地址键控
+旁表；因此客体 memcpy 一个 view 后仍然能读到正确值。未设置 swizzle 时，
+getter 返回 identity `2/3/4/5`（R/G/B/A）。
+
+### 2. Compare 只比较有效字段
+
+`nvnTextureViewCompare` 比较 flags、target、base/number of levels、
+format、min/number of layers 与 swizzle，不比较 reserved 字节。这样处理是
+保守选择：guest 可能把一个未完整初始化的 view 原样拷贝，reserved 字节不同
+不应让两个语义相同的 view 判为不同。Nintendo 的精确语义未核实，文档与注释
+都按“字段比较”描述，没有声称与官方逐字节 memcmp 一致。
+
+### 3. 模拟器自测
+
+新增失败码 `16432`：
+
+1. `SetDefaults` 把 16 字节全部清零；
+2. 默认 getter 返回 0 / 0 / 0 / 0 / identity swizzle / dsmode 0；
+3. 六个 setter 全部置位后，byte 0 必须是 `0x7F`；
+4. 六个 getter 逐个回读 level / layer / format / target / swizzle / dsmode；
+5. 四个 swizzle 输出指针全为 null 时跳过，不解引用；
+6. 相同副本比较为真；只改 reserved 字节仍为真；改 base level 后为假。
+
+### 4. 门禁
+
+```text
+python scripts/syntax_check_metal.py
+python scripts/gen_nvn.py --repo . --check
+python scripts/extract_nvn_signatures.py --check
+python scripts/verify_ios.py
+powershell -ExecutionPolicy Bypass -File scripts/build_abi_test.ps1
+git diff --check
+```
+
+本地已通过（513 procs / 410 implemented / 477 measured + 16 inferred）。
+CI run `41189358752` 的 `portable` 与 macOS `ios` job 均成功；模拟器自测包含
+16432 回归，设备 Debug 构建与 Release 拒绝门禁也通过。
+
+### 5. 仍然没有闭环的部分
+
+view 状态对象本身可读写了，但通用 view 绑定还没有把 `swizzle` 应用到采样，
+也没有把 depth-stencil mode 应用到深度/模板采样；渲染目标的 view 参数仍只
+记日志。这一轮不能声称“通用 texture view 已经闭环”。
+
+## M4 续二十二：纹理 builder / 对象状态、view offset 与 compare
+
+续二十一之后，texture builder 仍缺 device / swizzle / GL 名称 /
+depth-stencil mode 的读写，texture 对象也缺 `GetViewOffset` 与 `Compare`。
+这些入口不碰 GPU 像素，只回答 guest 自己写进 builder/object 的值，属于低风险
+补齐；本轮新增 12 个入口：
+
+* `nvnTextureBuilderSetDevice` / `GetDevice`（后者不在公开原型表里，按
+  `nvnBufferBuilderGetDevice` 的命名对称性推断，单独记入
+  `inferred_signatures.json`，推断总数 16 → 17）；
+* `nvnTextureBuilderSetSwizzle`（四路写入 `swz[4]`，低 3 位，与 nxnative 一致）；
+* `nvnTextureBuilderSetGLTextureName` / `GetGLTextureName`；
+* `nvnTextureBuilderSetDepthStencilMode` / `GetDepthStencilMode` 与
+  `nvnTextureGetDepthStencilMode`；
+* `nvnTextureGetViewOffset`；
+* `nvnTextureCompare`；
+* `nvnTexturePoolGetMemoryPool` 与 `nvnSamplerPoolGetMemoryPool`。
+
+Metal 覆盖从 **410/513（79.9%）** 到 **422/513（82.3%）**，未实现 91。
+
+### 1. Builder 的新字段
+
+`nvngfx_texdesc` 增加三个字段：
+
+* `device`：`SetDevice` 记录；`SetDefaults` 会重置描述符但**保留** device，
+  与 nxnative 的 builder 行为一致；
+* `gl_name`：原样保存 32 位值。Switch NVN 没有 GL，后端也没有 GL interop，
+  getter 只是把 setter 的值还回去，不承诺背后存在一个 GL 纹理；
+* `dsmode`：0 = depth，1 = stencil；其他值按 depth 记录，和 nxnative 的
+  布尔语义一致。这个字段不影响存储布局，只说明采样时读哪个平面。
+
+SWIZZLE 的 NVN 通道枚举是 0 zero / 1 one / 2 R / 3 G / 4 B / 5 A，
+setter 存低 3 位；未调用 setter 时默认仍是 identity `2/3/4/5`。
+
+### 2. GetViewOffset 的公式与边界
+
+`nvnTextureGetViewOffset(texture, view)` 返回 view 第一个 texel 相对纹理存储
+起点的字节偏移。公式与 nxnative 相同：
+
+```text
+offset = (view.set_levels ? nvngfx_tex_level_offset(desc, base_level) : 0)
+       + (view.set_layers ? min_layer * layout.layer_size : 0)
+```
+
+`layer_size` 来自 `nvngfx_tex_layout`，即一整层所有 mip 的字节数。view 为
+null 时返回 0。与 nxnative 不同的是，本实现对越界的 `base_level` /
+`min_layer` 返回 0 并打一条一次性日志，而不是继续算出存储外的偏移；这是
+保守选择，避免 guest 拿到一个必然越界的地址。
+
+### 3. nvnTextureCompare 的字段集
+
+比较以下字段：rank、target、format、flags、samples、width、height、depth、
+levels、pool、offset、stride、四路 swizzle 与 packaged block height。
+device、GL 名称、depth-stencil mode、debug id、label 与 MTLTexture 都是
+宿主侧元数据，不参与比较。字段集参考 nxnative 的 `nvnTextureCompare`（描述符
++ 存储身份 + 通道映射），Nintendo 的精确语义未核实。只有后端初始化过的两个
+对象才能比较；未知对象返回 0。
+
+### 4. 模拟器自测
+
+新增失败码 `16433`：
+
+1. `SetDevice(0xB0B0)` 后 `SetDefaults`，`GetDevice` 仍返回 `0xB0B0`；
+2. swizzle 设 `5/4/3/2`、dsmode 设 stencil、GL 名称设 `0x1234ABCD`，
+   builder getter 逐个回读；
+3. 用同一个 builder 建 8×4、两层、三 mip 的 RGBA8 2D array，texture 对象的
+   `GetSwizzle` / `GetDepthStencilMode` 与 builder 一致；
+4. view 设 level 1 + layer 1，`GetViewOffset` 必须等于
+   `level_offset(1) + layer_size`；无 view 与无 flag 的 view 返回 0；越界
+   level 3 返回 0；
+5. 同一 builder 再建一个对象，`Compare` 为真；改成 identity swizzle 再建，
+   `Compare` 为假；与未初始化地址比较为假；
+6. texture / sampler descriptor pool 用已知值重新 Initialize，
+   `GetMemoryPool` 分别回读该值。
+
+### 5. 门禁
+
+```text
+python scripts/syntax_check_metal.py
+python scripts/gen_nvn.py --repo . --check
+python scripts/extract_nvn_signatures.py --check
+python scripts/verify_ios.py
+powershell -ExecutionPolicy Bypass -File scripts/build_abi_test.ps1
+git diff --check
+```
+
+本地已通过（513 procs / 422 implemented / 477 measured + 17 inferred）。
+本轮 CI 结果在推送后补记。
+
+### 6. 仍然没有闭环的部分
+
+GL 名称没有 interop；view 的 swizzle/dsmode 仍未应用到实际采样；`Compare`
+与 `GetViewOffset` 的语义来自公开实现而非 Nintendo 文档。真实标题的 draw
+仍是 0 条，不能据此声称游戏已经能在 iPhone 上运行。

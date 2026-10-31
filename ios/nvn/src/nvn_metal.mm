@@ -1294,7 +1294,12 @@ void buffer_set_debug_label(nvngfx_ctx*, uint64_t* x) {
 /* nvnTextureBuilderSetDefaults(NVNtextureBuilder*) */
 void tex_builder_set_defaults(nvngfx_ctx*, uint64_t* x) {
     if (x[0]) (void)guest_write(x[0], 0x80);
+    /* NVN's defaults reset the descriptor but keep the device the builder
+     * was created against (nxnative's tex_builder_set_defaults does the
+     * same). */
+    const uint64_t device = g_tex_specs[x[0]].device;
     nvngfx_texdesc_defaults(&g_tex_specs[x[0]]);
+    g_tex_specs[x[0]].device = device;
 }
 
 /* The rest of the builder setters only record what the guest told us.  Their
@@ -1353,6 +1358,37 @@ void tex_builder_set_stride(nvngfx_ctx*, uint64_t* x) {
 void tex_builder_set_flags(nvngfx_ctx*, uint64_t* x) {
     g_tex_specs[x[0]].flags = static_cast<int>(x[1]);
 }
+/* nvnTextureBuilderSetDevice(NVNtextureBuilder*, NVNdevice*).  Recorded so
+ * SetDefaults can preserve it; this backend owns one Metal device and does
+ * not validate the guest pointer. */
+void tex_builder_set_device(nvngfx_ctx*, uint64_t* x) {
+    if (!x[0]) return;
+    g_tex_specs[x[0]].device = x[1];
+}
+/* nvnTextureBuilderSetSwizzle(builder, r, g, b, a).  The NVN channel enum
+ * is 0 zero / 1 one / 2 R / 3 G / 4 B / 5 A; like nxnative, the low three
+ * bits are stored.  GetSwizzle above answers from the same four bytes. */
+void tex_builder_set_swizzle(nvngfx_ctx*, uint64_t* x) {
+    if (!x[0]) return;
+    nvngfx_texdesc& d = g_tex_specs[x[0]];
+    for (unsigned i = 0; i < 4; ++i)
+        d.swz[i] = static_cast<unsigned char>(x[1 + i] & 7u);
+}
+/* nvnTextureBuilderSetGLTextureName / GetGLTextureName.  Switch NVN has no
+ * GL, so the name is opaque builder state; storing it does not promise GL
+ * interop or a GL texture behind the NVNtexture. */
+void tex_builder_set_gl_name(nvngfx_ctx*, uint64_t* x) {
+    if (!x[0]) return;
+    g_tex_specs[x[0]].gl_name = static_cast<unsigned>(x[1] & 0xFFFFFFFFu);
+}
+/* nvnTextureBuilderSetDepthStencilMode(builder, mode).  0 = depth,
+ * 1 = stencil; any other value is stored as depth, which is how nxnative's
+ * boolean records it.  No storage bytes move: the mode selects which plane
+ * a later sample reads. */
+void tex_builder_set_dsmode(nvngfx_ctx*, uint64_t* x) {
+    if (!x[0]) return;
+    g_tex_specs[x[0]].dsmode = x[1] == 1 ? 1 : 0;
+}
 
 /* The builder is a guest object whose layout we never read; every getter
  * answers from the spec the setters recorded.  A builder that was never
@@ -1404,6 +1440,20 @@ void tex_builder_get_memory_offset(nvngfx_ctx*, uint64_t* x) {
 }
 void tex_builder_get_stride(nvngfx_ctx*, uint64_t* x) {
     x[0] = static_cast<uint64_t>(tex_spec_or_default(x[0]).stride);
+}
+/* nvnTextureBuilderGetDevice.  Absent from the public prototype table, so
+ * its shape is inferred from nvnBufferBuilderGetDevice (and listed in
+ * inferred_signatures.json). */
+void tex_builder_get_device(nvngfx_ctx*, uint64_t* x) {
+    auto it = g_tex_specs.find(x[0]);
+    x[0] = it == g_tex_specs.end() ? 0 : it->second.device;
+}
+void tex_builder_get_gl_name(nvngfx_ctx*, uint64_t* x) {
+    x[0] = tex_spec_or_default(x[0]).gl_name;
+}
+void tex_builder_get_dsmode(nvngfx_ctx*, uint64_t* x) {
+    x[0] = static_cast<uint64_t>(
+        static_cast<uint32_t>(tex_spec_or_default(x[0]).dsmode));
 }
 
 /* nvnTextureBuilderGetStorageSize / GetStorageAlignment: the same layout
@@ -1901,6 +1951,40 @@ void tex_get_swizzle(nvngfx_ctx*, uint64_t* x) {
     }
 }
 
+/* Field-wise descriptor equality for nvnTextureCompare.  Padding is never
+ * read; the host-only fields (device, GL name, depth-stencil mode, debug id,
+ * label, MTLTexture) do not describe the image and are excluded.  This is
+ * the set nxnative compares: descriptor fields, storage identity and the
+ * effective channel swizzle. */
+bool tex_desc_equal(const nvngfx_texdesc& a, const nvngfx_texdesc& b) {
+    return a.rank == b.rank && a.target == b.target &&
+           a.format == b.format && a.flags == b.flags &&
+           a.samples == b.samples && a.width == b.width &&
+           a.height == b.height && a.depth == b.depth &&
+           a.levels == b.levels && a.pool == b.pool &&
+           a.offset == b.offset && a.stride == b.stride &&
+           a.swz[0] == b.swz[0] && a.swz[1] == b.swz[1] &&
+           a.swz[2] == b.swz[2] && a.swz[3] == b.swz[3] &&
+           a.pkg_block_h == b.pkg_block_h;
+}
+
+/* nvnTextureCompare(const NVNtexture*, const NVNtexture*) -> NVNboolean.
+ * Both objects must have been initialized through this backend; a guest
+ * object the backend never saw has no descriptor to compare. */
+void tex_compare(nvngfx_ctx*, uint64_t* x) {
+    const Tex* a = find<Tex>(x[0]);
+    const Tex* b = find<Tex>(x[1]);
+    x[0] = (a && b && tex_desc_equal(a->desc, b->desc)) ? 1u : 0u;
+}
+
+/* nvnTextureGetDepthStencilMode(const NVNtexture*). */
+void tex_get_dsmode(nvngfx_ctx*, uint64_t* x) {
+    const Tex* t = find<Tex>(x[0]);
+    x[0] = t ? static_cast<uint64_t>(
+                   static_cast<uint32_t>(t->desc.dsmode))
+             : 0u;
+}
+
 /* nvnTextureSetDebugLabel(NVNtexture*, const char*) */
 void tex_set_debug_label(nvngfx_ctx*, uint64_t* x) {
     Tex* t = find<Tex>(x[0]);
@@ -2362,6 +2446,13 @@ void tex_pool_get_size(nvngfx_ctx*, uint64_t* x) {
     const TexturePool* p = find<TexturePool>(x[0]);
     x[0] = p ? static_cast<uint64_t>(p->count) : 0;
 }
+/* nvnTexturePoolGetMemoryPool(const NVNtexturePool*) -> const NVNmemoryPool*.
+ * Exactly the pointer Initialize was given; the backend never dereferences
+ * it here. */
+void tex_pool_get_memory_pool(nvngfx_ctx*, uint64_t* x) {
+    const TexturePool* p = find<TexturePool>(x[0]);
+    x[0] = p ? p->memory : 0;
+}
 void tex_pool_set_debug_label(nvngfx_ctx*, uint64_t* x) {
     TexturePool* p = find<TexturePool>(x[0]);
     if (!p) return;
@@ -2413,6 +2504,11 @@ void samp_pool_get_memory_offset(nvngfx_ctx*, uint64_t* x) {
 void samp_pool_get_size(nvngfx_ctx*, uint64_t* x) {
     const SamplerPool* p = find<SamplerPool>(x[0]);
     x[0] = p ? static_cast<uint64_t>(p->count) : 0;
+}
+/* nvnSamplerPoolGetMemoryPool, the texture-pool getter's sibling. */
+void samp_pool_get_memory_pool(nvngfx_ctx*, uint64_t* x) {
+    const SamplerPool* p = find<SamplerPool>(x[0]);
+    x[0] = p ? p->memory : 0;
 }
 void samp_pool_set_debug_label(nvngfx_ctx*, uint64_t* x) {
     SamplerPool* p = find<SamplerPool>(x[0]);
@@ -8893,6 +8989,51 @@ void tex_view_compare(nvngfx_ctx*, uint64_t* x) {
     x[0] = same ? 1u : 0u;
 }
 
+/* nvnTextureGetViewOffset(const NVNtexture*, const NVNtextureView*).
+ * Byte offset of the view's first texel from the start of the texture's
+ * storage.  nxnative computes exactly this: the base level's offset inside
+ * one layer plus min_layer whole layers, and zero when no view is given.
+ * A level/layer outside the descriptor is refused (0 + a one-shot log)
+ * rather than reading past the storage.  Format/target overrides do not
+ * move the offset and are not consulted. */
+void tex_get_view_offset(nvngfx_ctx*, uint64_t* x) {
+    const Tex* t = find<Tex>(x[0]);
+    if (!t || !x[1]) { x[0] = 0; return; }
+    TexView16 v;
+    if (!read_view16(x[1], &v)) {
+        log_once("nvnTextureGetViewOffset.view", 1);
+        x[0] = 0;
+        return;
+    }
+    nvngfx_texlayout L = {};
+    if (nvngfx_tex_layout(&t->desc, &L) != 0) {
+        log_once("nvnTextureGetViewOffset.layout",
+                 static_cast<unsigned>(t->desc.format));
+        x[0] = 0;
+        return;
+    }
+    uint64_t off = 0;
+    if (v.bits & 0x01u) {
+        if (v.baseLevel >= static_cast<unsigned>(t->desc.levels)) {
+            log_once("nvnTextureGetViewOffset.level",
+                     static_cast<unsigned>(v.baseLevel));
+            x[0] = 0;
+            return;
+        }
+        off += nvngfx_tex_level_offset(&t->desc, v.baseLevel);
+    }
+    if (v.bits & 0x02u) {
+        if (L.layers && v.minLayer >= L.layers) {
+            log_once("nvnTextureGetViewOffset.layer",
+                     static_cast<unsigned>(v.minLayer));
+            x[0] = 0;
+            return;
+        }
+        off += static_cast<uint64_t>(v.minLayer) * L.layer_size;
+    }
+    x[0] = off;
+}
+
 /* ------------------------------------------------------------------ */
 /* resolve table                                                       */
 /* ------------------------------------------------------------------ */
@@ -8979,6 +9120,7 @@ const Binding kBindings[] = {
     BIND("nvnTextureBuilderSetStorage", tex_builder_set_storage),
     BIND("nvnTextureBuilderSetStride", tex_builder_set_stride),
     BIND("nvnTextureBuilderSetFlags", tex_builder_set_flags),
+    BIND("nvnTextureBuilderSetDevice", tex_builder_set_device),
     BIND("nvnTextureBuilderGetWidth", tex_builder_get_width),
     BIND("nvnTextureBuilderGetHeight", tex_builder_get_height),
     BIND("nvnTextureBuilderGetDepth", tex_builder_get_depth),
@@ -8994,6 +9136,12 @@ const Binding kBindings[] = {
     BIND("nvnTextureBuilderGetStorageAlignment",
          tex_builder_get_storage_alignment),
     BIND("nvnTextureBuilderGetSwizzle", tex_builder_get_swizzle),
+    BIND("nvnTextureBuilderGetDevice", tex_builder_get_device),
+    BIND("nvnTextureBuilderSetSwizzle", tex_builder_set_swizzle),
+    BIND("nvnTextureBuilderSetGLTextureName", tex_builder_set_gl_name),
+    BIND("nvnTextureBuilderGetGLTextureName", tex_builder_get_gl_name),
+    BIND("nvnTextureBuilderSetDepthStencilMode", tex_builder_set_dsmode),
+    BIND("nvnTextureBuilderGetDepthStencilMode", tex_builder_get_dsmode),
     BIND("nvnTextureInitialize", tex_initialize),
     BIND("nvnTextureWriteTexels", tex_write_texels),
     BIND("nvnTextureGetWidth", tex_get_width),
@@ -9011,6 +9159,9 @@ const Binding kBindings[] = {
     BIND("nvnTextureGetTextureAddress", tex_get_texture_address),
     BIND("nvnTextureGetStorageSize", tex_get_storage_size),
     BIND("nvnTextureGetSwizzle", tex_get_swizzle),
+    BIND("nvnTextureGetDepthStencilMode", tex_get_dsmode),
+    BIND("nvnTextureCompare", tex_compare),
+    BIND("nvnTextureGetViewOffset", tex_get_view_offset),
     BIND("nvnTextureSetDebugLabel", tex_set_debug_label),
     BIND("nvnTextureFinalize", tex_finalize),
     BIND("nvnTextureInvalidateTexels", tex_invalidate_texels),
@@ -9035,6 +9186,7 @@ const Binding kBindings[] = {
     BIND("nvnTexturePoolFinalize", tex_pool_finalize),
     BIND("nvnTexturePoolGetMemoryOffset", tex_pool_get_memory_offset),
     BIND("nvnTexturePoolGetSize", tex_pool_get_size),
+    BIND("nvnTexturePoolGetMemoryPool", tex_pool_get_memory_pool),
     BIND("nvnTexturePoolSetDebugLabel", tex_pool_set_debug_label),
     BIND("nvnTexturePoolRegisterTexture", tex_pool_register_texture),
     BIND("nvnTexturePoolRegisterImage", tex_pool_register_image),
@@ -9082,6 +9234,7 @@ const Binding kBindings[] = {
     BIND("nvnSamplerPoolFinalize", samp_pool_finalize),
     BIND("nvnSamplerPoolGetMemoryOffset", samp_pool_get_memory_offset),
     BIND("nvnSamplerPoolGetSize", samp_pool_get_size),
+    BIND("nvnSamplerPoolGetMemoryPool", samp_pool_get_memory_pool),
     BIND("nvnSamplerPoolSetDebugLabel", samp_pool_set_debug_label),
     BIND("nvnSamplerPoolRegisterSampler", samp_pool_register_sampler),
     BIND("nvnSamplerPoolRegisterSamplerBuilder", samp_pool_register_builder),
@@ -16416,6 +16569,225 @@ extern "C" int nvngfx_metal_selftest(void) {
                          "[selftest] texture view: 16-byte layout, six "
                          "setters, six getters and field-wise compare "
                          "round-tripped\n");
+        }
+
+        {
+            /* --- texture object state, view offset, compare ------------ */
+            alignas(16) unsigned char xtb[0x80] = {};
+            alignas(16) unsigned char xta[0x80] = {};
+            alignas(16) unsigned char xtbCopy[0x80] = {};
+            alignas(16) unsigned char xtbOther[0x80] = {};
+            const uint64_t kXtb = reinterpret_cast<uint64_t>(xtb);
+            const uint64_t kXta = reinterpret_cast<uint64_t>(xta);
+            const uint64_t kXtbCopy = reinterpret_cast<uint64_t>(xtbCopy);
+            const uint64_t kXtbOther = reinterpret_cast<uint64_t>(xtbOther);
+            uint64_t y[8] = {};
+            int xsw[4] = {-1, -1, -1, -1};
+
+            /* SetDevice survives SetDefaults, as NVN's builder does. */
+            y[0] = kXtb; y[1] = 0xB0B0;
+            tex_builder_set_device(ctx, y);
+            y[0] = kXtb;
+            tex_builder_set_defaults(ctx, y);
+            y[0] = kXtb;
+            tex_builder_get_device(ctx, y);
+            const uint64_t deviceBack = y[0];
+
+            /* An 8x4 two-layer RGBA8 array with three mip levels, so the
+             * view offset has both a non-zero level and a non-zero layer. */
+            y[0] = kXtb; y[1] = 4;
+            tex_builder_set_target(ctx, y);          /* 2D_ARRAY */
+            y[0] = kXtb; y[1] = 0x25;
+            tex_builder_set_format(ctx, y);
+            y[0] = kXtb; y[1] = 8; y[2] = 4;
+            tex_builder_set_size2d(ctx, y);
+            y[0] = kXtb; y[1] = 2;
+            tex_builder_set_depth(ctx, y);
+            y[0] = kXtb; y[1] = 3;
+            tex_builder_set_levels(ctx, y);
+            y[0] = kXtb; y[1] = 0x1000; y[2] = 128;
+            tex_builder_set_storage(ctx, y);
+            y[0] = kXtb; y[1] = 256;
+            tex_builder_set_stride(ctx, y);
+            y[0] = kXtb; y[1] = 5; y[2] = 4; y[3] = 3; y[4] = 2;
+            tex_builder_set_swizzle(ctx, y);
+            y[0] = kXtb; y[1] = 1;
+            tex_builder_set_dsmode(ctx, y);          /* STENCIL */
+            y[0] = kXtb; y[1] = 0x1234ABCDu;
+            tex_builder_set_gl_name(ctx, y);
+
+            y[0] = kXtb;
+            y[1] = reinterpret_cast<uint64_t>(&xsw[0]);
+            y[2] = reinterpret_cast<uint64_t>(&xsw[1]);
+            y[3] = reinterpret_cast<uint64_t>(&xsw[2]);
+            y[4] = reinterpret_cast<uint64_t>(&xsw[3]);
+            tex_builder_get_swizzle(ctx, y);
+            const uint64_t swzSet = y[0];
+            const int sw0 = xsw[0], sw1 = xsw[1], sw2 = xsw[2], sw3 = xsw[3];
+            y[0] = kXtb;
+            tex_builder_get_dsmode(ctx, y);
+            const uint64_t dsSet = y[0];
+            y[0] = kXtb;
+            tex_builder_get_gl_name(ctx, y);
+            const uint64_t glSet = y[0];
+            if (deviceBack != 0xB0B0 || swzSet != 1 || sw0 != 5 ||
+                sw1 != 4 || sw2 != 3 || sw3 != 2 || dsSet != 1 ||
+                glSet != 0x1234ABCDu) {
+                std::fprintf(stderr,
+                             "[selftest] texture state: builder round-trip "
+                             "failed (device=%#llx swz=%llu/%d,%d,%d,%d "
+                             "ds=%llu gl=%#llx)\n",
+                             static_cast<unsigned long long>(deviceBack),
+                             static_cast<unsigned long long>(swzSet),
+                             sw0, sw1, sw2, sw3,
+                             static_cast<unsigned long long>(dsSet),
+                             static_cast<unsigned long long>(glSet));
+                rc = 16433;
+                goto done;
+            }
+
+            y[0] = kXta; y[1] = kXtb;
+            tex_initialize(ctx, y);
+            const uint64_t taOk = y[0];
+            xsw[0] = xsw[1] = xsw[2] = xsw[3] = -1;
+            y[0] = kXta;
+            y[1] = reinterpret_cast<uint64_t>(&xsw[0]);
+            y[2] = reinterpret_cast<uint64_t>(&xsw[1]);
+            y[3] = reinterpret_cast<uint64_t>(&xsw[2]);
+            y[4] = reinterpret_cast<uint64_t>(&xsw[3]);
+            tex_get_swizzle(ctx, y);
+            const uint64_t swzObj = y[0];
+            y[0] = kXta;
+            tex_get_dsmode(ctx, y);
+            const uint64_t dsObj = y[0];
+            if (taOk != 1 || swzObj != 1 || xsw[0] != 5 || xsw[1] != 4 ||
+                xsw[2] != 3 || xsw[3] != 2 || dsObj != 1) {
+                std::fprintf(stderr,
+                             "[selftest] texture state: object getters did "
+                             "not match the builder (init=%llu swz=%llu "
+                             "%d,%d,%d,%d ds=%llu)\n",
+                             static_cast<unsigned long long>(taOk),
+                             static_cast<unsigned long long>(swzObj),
+                             xsw[0], xsw[1], xsw[2], xsw[3],
+                             static_cast<unsigned long long>(dsObj));
+                rc = 16433;
+                goto done;
+            }
+
+            const Tex* taTex = find<Tex>(kXta);
+            nvngfx_texlayout taLayout = {};
+            const int taLayoutOk =
+                taTex ? nvngfx_tex_layout(&taTex->desc, &taLayout) : -1;
+            const uint64_t taLevelOff =
+                taTex ? nvngfx_tex_level_offset(&taTex->desc, 1) : 0;
+
+            alignas(16) unsigned char xview[16] = {};
+            alignas(16) unsigned char xview0[16] = {};
+            const uint64_t kXview = reinterpret_cast<uint64_t>(xview);
+            y[0] = kXview;
+            tex_view_set_defaults(ctx, y);
+            y[0] = kXview; y[1] = 1; y[2] = 2;
+            tex_view_set_levels(ctx, y);             /* level 1, two levels */
+            y[0] = kXview; y[1] = 1; y[2] = 1;
+            tex_view_set_layers(ctx, y);             /* layer 1 */
+            y[0] = kXta; y[1] = kXview;
+            tex_get_view_offset(ctx, y);
+            const uint64_t viewOff = y[0];
+            y[0] = kXta; y[1] = 0;
+            tex_get_view_offset(ctx, y);
+            const uint64_t nullOff = y[0];
+            y[0] = kXta;
+            y[1] = reinterpret_cast<uint64_t>(xview0);
+            tex_get_view_offset(ctx, y);
+            const uint64_t plainOff = y[0];
+            /* Level 3 does not exist in a three-level texture. */
+            y[0] = kXview; y[1] = 3; y[2] = 1;
+            tex_view_set_levels(ctx, y);
+            y[0] = kXta; y[1] = kXview;
+            tex_get_view_offset(ctx, y);
+            const uint64_t badOff = y[0];
+            const uint64_t wantOff =
+                taLevelOff + taLayout.layer_size;      /* one whole layer */
+            if (taLayoutOk != 0 || taLayout.layers != 2 ||
+                viewOff != wantOff || nullOff != 0 || plainOff != 0 ||
+                badOff != 0) {
+                std::fprintf(stderr,
+                             "[selftest] texture state: view offset failed "
+                             "(layout=%d layers=%u level=%llu layer=%llu "
+                             "got=%llu/%llu/%llu/%llu want=%llu)\n",
+                             taLayoutOk, taLayout.layers,
+                             static_cast<unsigned long long>(taLevelOff),
+                             static_cast<unsigned long long>(taLayout.layer_size),
+                             static_cast<unsigned long long>(viewOff),
+                             static_cast<unsigned long long>(nullOff),
+                             static_cast<unsigned long long>(plainOff),
+                             static_cast<unsigned long long>(badOff),
+                             static_cast<unsigned long long>(wantOff));
+                rc = 16433;
+                goto done;
+            }
+
+            y[0] = kXtbCopy; y[1] = kXtb;
+            tex_initialize(ctx, y);
+            const uint64_t copyOk = y[0];
+            y[0] = kXta; y[1] = kXtbCopy;
+            tex_compare(ctx, y);
+            const uint64_t cmpSame = y[0];
+            /* Same builder, identity swizzle instead of BGRA: different. */
+            y[0] = kXtb; y[1] = 2; y[2] = 3; y[3] = 4; y[4] = 5;
+            tex_builder_set_swizzle(ctx, y);
+            y[0] = kXtbOther; y[1] = kXtb;
+            tex_initialize(ctx, y);
+            const uint64_t otherOk = y[0];
+            y[0] = kXta; y[1] = kXtbOther;
+            tex_compare(ctx, y);
+            const uint64_t cmpOther = y[0];
+            y[0] = kXta; y[1] = 0xDEAD;
+            tex_compare(ctx, y);
+            const uint64_t cmpUnknown = y[0];
+
+            /* The draw tests above initialized both descriptor pools with a
+             * null memory pool.  Re-initialize the same addresses with a
+             * value so the new getters have something to return; the pool
+             * map keeps one base per address. */
+            y[0] = kTexPool; y[1] = 0xC0C0; y[2] = 64; y[3] = 16;
+            tex_pool_initialize(ctx, y);
+            const uint64_t texPoolOk = y[0];
+            y[0] = kTexPool;
+            tex_pool_get_memory_pool(ctx, y);
+            const uint64_t texPoolMem = y[0];
+            y[0] = kSampPool; y[1] = 0xD0D0; y[2] = 64; y[3] = 16;
+            samp_pool_initialize(ctx, y);
+            y[0] = kSampPool;
+            samp_pool_get_memory_pool(ctx, y);
+            const uint64_t sampPoolMem = y[0];
+            if (copyOk != 1 || cmpSame != 1 || otherOk != 1 ||
+                cmpOther != 0 || cmpUnknown != 0 || texPoolOk != 1 ||
+                texPoolMem != 0xC0C0 || sampPoolMem != 0xD0D0) {
+                std::fprintf(stderr,
+                             "[selftest] texture state: compare/pool failed "
+                             "(copy=%llu same=%llu other=%llu/%llu "
+                             "unknown=%llu pool=%llu/%#llx/%#llx)\n",
+                             static_cast<unsigned long long>(copyOk),
+                             static_cast<unsigned long long>(cmpSame),
+                             static_cast<unsigned long long>(otherOk),
+                             static_cast<unsigned long long>(cmpOther),
+                             static_cast<unsigned long long>(cmpUnknown),
+                             static_cast<unsigned long long>(texPoolOk),
+                             static_cast<unsigned long long>(texPoolMem),
+                             static_cast<unsigned long long>(sampPoolMem));
+                rc = 16433;
+                goto done;
+            }
+            std::fprintf(stderr,
+                         "[selftest] texture state: device/swizzle/GL "
+                         "name/depth-stencil round-tripped, view offset "
+                         "included level and layer, compare and pool "
+                         "getters agreed\n");
+            forget<Tex>(kXta);
+            forget<Tex>(kXtbCopy);
+            forget<Tex>(kXtbOther);
+            g_tex_specs.erase(kXtb);
         }
 
     done:
