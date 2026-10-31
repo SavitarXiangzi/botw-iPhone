@@ -5489,3 +5489,84 @@ git diff --check
 本地已通过（513 procs / 363 implemented / 477 measured + 16 inferred）。CI run
 `41187102748` 的 `portable` 与 macOS `ios` job 均通过；模拟器执行新增的 16430 回归后
 写出 `BOTW_SELFTEST rc=0`，设备 Debug 构建与 Release 拒绝门禁也通过。
+## M4 续二十：六类固定功能状态 getter
+
+上一轮接完 Queue / Sync / Event 后，客体已经能建队列，但状态对象仍然只能写、不能读。
+NVN 允许游戏把 `NVNblendState` / `NVNcolorState` 等小对象按值拷贝后再查询，所以 getter
+必须从 guest 自己的字节里解包回答，不能靠宿主侧旁表。本轮补齐：
+
+* BlendState：4/15 → 13/15（+9：6 个 getter + 3 个 advanced setter）
+* MultisampleState：12/23 → 22/23（+10）
+* DepthStencilState：7/13 → 13/13（+6）
+* PolygonState：5/9 → 9/9（+4）
+* ColorState：4/7 → 7/7（+3）
+* ChannelMaskState：2/3 → 3/3（+1）
+
+Metal 覆盖从 **363/513（70.8%）** 到 **396/513（77.2%）**，未实现 117。
+
+### 1. 先进混合的真实位布局
+
+nxnative 的实测 `nvn_obj.h`（MIT）把 advanced blend 放在同一个 64 位对象里：
+
+```text
+target:3  src_rgb:7  dst_rgb:7  src_a:7  dst_a:7  eq_rgb:3  eq_a:3
+adv:6 (bit 37)   adv_npm:1 (bit 43)   adv_ovl:2 (bit 44)
+```
+
+`adv_npm` 存的是 `SetAdvancedPremultipliedSrc` 的**反值**，所以
+`GetAdvancedPremultipliedSrc` 要再取反；默认 0 表示“源已预乘”。
+`SetAdvancedMode` 对大于 `0x32`（`HSL_LUMINOSITY`）的值回落为 0，
+`SetAdvancedOverlap` 只保留低 2 位。这三个 setter 与三个 getter 都已接上。
+
+`Get/SetAdvancedNormalizedDst` 仍然不绑定：nxnative 的实测布局和 HLE 里都没有这个
+字段，公开原型只给了名字，返回任何值都是猜的。
+
+### 2. getter 直接从 guest 对象解包
+
+状态对象仍是 guest 的 4 / 8 / 10 字节存储。getter 走既有的
+`read_blend` / `read_color` / `read_channel` / `read_multisample` /
+`read_polygon` / `read_depth`，先解包再回答，没有地址键控的旁表，因此客体 memcpy
+或复制状态对象后不会读到陈旧值。
+
+* 输出指针为 null 时跳过，不解引用；
+* `NVNboolean` 统一写成 0/1；
+* 双面 stencil：setter 仍接受 face=3 同时更新正面和背面；getter 跟 nxnative 一致，
+  只有 `NVN_FACE_BACK`（2）才取背面，其余取正面；
+* Multisample 的 10 个单字节字段逐个回读；`GetSampleLocationsGrid` 不绑定，因为
+  10 字节状态里只有 grid-enable 字节，没有网格宽高，公开实现也没有说明两个 `int*`
+  应该收到什么。
+
+### 3. 模拟器自测
+
+新增失败码 `16431`：
+
+1. 六类状态先 `SetDefaults`，核对默认值（blend ONE/ZERO/ADD、color COPY/ALWAYS、
+   channel 全开、multisample 仅 enable=1、polygon 无剔除/CCW/FILL、depth 写开/LESS/
+   stencil ALWAYS+KEEP）；
+2. blend 设 target 3、func 5/6/7/8、equation 2/3，再设 advanced SCREEN（0x16）、
+   非预乘源、conjoined，逐个 getter 回读；
+3. color：target 3 开 blend、target 2 显式关闭，另设 logic op 0xC、alpha test 7；
+4. channel mask：target 1 只开 R/B，读回 1/0/1/0；
+5. multisample：10 个字节设成不同值后逐个回读；
+6. polygon：背面剔除、CW、LINE、offset 5；
+7. depth/stencil：深度测试开、写关、func 3、stencil 测试开，正面 func 2 / 背面 4，
+   正面 op 2/3/4、背面 5/6/7，分别回读。
+
+这一组证明状态对象的 setter/getter 回环；advanced blend 目前只记录，还没有翻译成
+Metal 的 blend operation，不能据此声称高级混合已经能画。
+
+### 4. 门禁
+
+```text
+python scripts/syntax_check_metal.py
+python scripts/gen_nvn.py --repo . --check
+python scripts/extract_nvn_signatures.py --check
+python scripts/verify_ios.py
+powershell -ExecutionPolicy Bypass -File scripts/build_abi_test.ps1
+git diff --check
+```
+
+本地已通过（513 procs / 396 implemented / 477 measured + 16 inferred）。
+CI run `41188353513` 的 `portable` 与 macOS `ios` job 均成功；模拟器自测包含新增的
+16431 回归（失败会以 rc=16431 退出并使 job 失败），设备 Debug 构建与 Release 拒绝
+门禁也通过。
