@@ -44,6 +44,29 @@ static const char* const kFs =
     "    return float4(0.25, 0.5, 0.75, 1.0);\n"
     "}\n";
 
+/* Depth-only fixtures.  The vertex shader puts the triangle at z=0.5; the
+ * fragment shader writes no colour, which is what a pass with zero colour
+ * attachments needs.  The matching colour shader is used by the follow-up
+ * EQUAL test to prove the depth-only pass really wrote the buffer. */
+static const char* const kVsDepthHalf =
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "\n"
+    "struct NvngfxVaryings { float4 position [[position]]; };\n"
+    "\n"
+    "vertex NvngfxVaryings nvngfx_main_vs(uint vid [[vertex_id]]) {\n"
+    "    const float2 p[3] = { float2(-1.0, -1.0), float2(3.0, -1.0), float2(-1.0, 3.0) };\n"
+    "    NvngfxVaryings v;\n"
+    "    v.position = float4(p[vid], 0.5, 1.0);\n"
+    "    return v;\n"
+    "}\n";
+
+static const char* const kFsDepthOnly =
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "\n"
+    "fragment void nvngfx_main_fs() {}\n";
+
 /* MRT fixture: two colour outputs with distinct, exact 8-bit values.  The
  * render-pass self-test reads both attachments back, so a pass that merely
  * declares a second attachment but never routes the shader output to it
@@ -561,6 +584,16 @@ const char* nvngfx_shader_selftest_msl_variant(nvngfx_stage stage, int variant) 
     if (variant == 12) {
         if (stage == NVNGFX_STAGE_VERTEX) return kVs;
         if (stage == NVNGFX_STAGE_FRAGMENT) return kFsMrt;
+        return NULL;
+    }
+    if (variant == 13) {
+        if (stage == NVNGFX_STAGE_VERTEX) return kVsDepthHalf;
+        if (stage == NVNGFX_STAGE_FRAGMENT) return kFsDepthOnly;
+        return NULL;
+    }
+    if (variant == 14) {
+        if (stage == NVNGFX_STAGE_VERTEX) return kVsDepthHalf;
+        if (stage == NVNGFX_STAGE_FRAGMENT) return kFsGreen;
         return NULL;
     }
     if (stage == NVNGFX_STAGE_VERTEX) return kVs;

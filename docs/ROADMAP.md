@@ -4301,7 +4301,6 @@ build_abi_test: all tests passed
 
 仍未支持：
 
-* 没有颜色目标的纯深度 pass 仍打不开 encoder；
 * `SetDepthBounds` 只有记录与上报，Metal 没有深度边界测试；
 * 部分模板清屏掩码；
 * `ClearColori/ui`、`ClearBuffer`、`ClearTexture*` 仍是日志占位；
@@ -4360,6 +4359,53 @@ build_abi_test: all tests passed
 仍未支持：
 
 * 没有颜色目标的纯深度 pass 仍打不开 encoder；
+* `SetDepthBounds` 只有记录与上报，Metal 没有深度边界测试；
+* 部分模板清屏掩码；
+* `ClearColori/ui`、`ClearBuffer`、`ClearTexture*` 仍是日志占位；
+* 没有真机像素验证，不能声称画面正确。
+
+## M4 续四：纯深度 pass
+
+前两轮把颜色附件和 MRT 打开，但 `ensure_pipeline()` / `ensure_encoder()` 仍要求
+`numColor >= 1`，所以 `SetRenderTargets(0, ..., depth)` 加深度清屏和 draw 会静默没有
+render pass。这一轮去掉这个前提。
+
+### 1. 管线与 render pass
+
+* `ensure_pipeline()` 在 `numColor == 0` 时改用深度纹理的采样数，并要求至少存在一个
+  深度目标；颜色与深度采样数不一致时拒绝建管线。
+* `program_pipeline()` 允许 `numColors == 0`，此时不填任何颜色附件，只填
+  `depthAttachmentPixelFormat` / `stencilAttachmentPixelFormat`。alpha-to-coverage 在
+  没有颜色附件时关闭，避免 Metal 拒绝无效组合。
+* `ensure_encoder()` 在没有颜色目标时只挂载深度/模板附件；若所谓 depth 纹理没有任何
+  深度/模板平面，则明确上报并拒绝打开 pass，而不是交给 Metal 报一个难懂的验证错误。
+* 管线缓存键仍包含附件数量；0 颜色 + 深度格式和 1 颜色 + 深度格式不会互相命中。
+
+### 2. 模拟器自测
+
+新增两段 pass：
+
+1. `SetRenderTargets(0, depth)`，清深度到 1.0，绑定深度测试 LESS / 写使能，draw 一个
+   z=0.5 的全屏三角形。
+2. 把同一张深度纹理挂到“颜色 + 深度”pass，颜色清黑，深度测试改为 EQUAL、写关闭，
+   再 draw 同一 z 的三角形。只有第一段真的把 0.5 写进深度缓冲，第二段才会通过 EQUAL
+   并输出绿色；若纯深度 pass 没打开，颜色保持黑色，自测以 non-zero rc 失败。
+
+这比只检查“draw 被编码”多走了一步：它验证了深度写入的实际结果。
+
+### 3. 覆盖与仍然缺的
+
+没有新增 NVN 入口，覆盖率保持 **202/513（39.4%）**，未实现 311；CommandBuffer 域
+**57/144**。门禁输出：
+
+```text
+syntax_check_metal: ok (clang++.exe)
+verify_ios: ok (metal bindings: 202/513)
+build_abi_test: all tests passed
+```
+
+仍未支持：
+
 * `SetDepthBounds` 只有记录与上报，Metal 没有深度边界测试；
 * 部分模板清屏掩码；
 * `ClearColori/ui`、`ClearBuffer`、`ClearTexture*` 仍是日志占位；

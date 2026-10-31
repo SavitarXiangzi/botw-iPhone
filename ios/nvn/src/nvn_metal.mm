@@ -32,7 +32,7 @@
  *         on a computer, never in the repository.  Everything else on that
  *         path -- pipeline creation with a real vertex descriptor, buffer
  *         binding, draw encoding, pixel readback -- is executed by
- *         nvngfx_metal_selftest() in CI's iOS Simulator: seventeen draws,
+ *         nvngfx_metal_selftest() in CI's iOS Simulator: eighteen draws,
  *         three clear-only regressions, a bindless table probe, and a vertex-stage
  *         argument-buffer draw whose shifted pixels are read back.  The ninth builds a block-linear
  *         texture in a guest memory pool and proves that the sampled pixels
@@ -41,7 +41,7 @@
  *         reads back orange.  The eleventh uploads a two-layer 2D array and
  *         reads red from layer 0 and yellow from layer 1.  A sampler state
  *         object is also created, compared and read back.
- *         pure-depth passes / texture views / compute / sync-fence
+ *         texture views / compute / sync-fence
  *         BC6H/BC7 and signed BCn (unsigned BC1-BC5 decode to RGBA8)
  *
  * Argument ABI: measured, not guessed
@@ -2477,7 +2477,7 @@ id<MTLRenderPipelineState> program_pipeline(Ctx* c, Program* p,
          * rejects it when the pass is not multisampled.  If the guest asked
          * for it on a single-sample target, disabling it is the only valid
          * description; report instead of making pipeline creation fail. */
-        bool a2c = st.alpha_to_coverage != 0;
+        bool a2c = st.alpha_to_coverage != 0 && numColors > 0;
         if (a2c && raster < 2) {
             log_once("nvnPipeline.alphaToCoverageWithoutMSAA", 1);
             a2c = false;
@@ -2560,15 +2560,19 @@ bool bind_vertex_streams(CmdBuf* b) {
 bool ensure_pipeline(Ctx* c, CmdBuf* b) {
     if (b->pso) return true;
     if (!b->program) return false;
-    if (!c || !c->ready || b->numColor < 1) return false;
+    if (!c || !c->ready) return false;
+    const bool hasColor = b->numColor > 0;
+    /* A depth-only pass is legal NVN and Metal; it just has no colour
+     * attachment to take the sample count or format from. */
+    if (!hasColor && !b->depth) return false;
     Program* p = find<Program>(b->program);
     if (!p) return false;
     MTLPixelFormat colorFormats[NVNGFX_MAX_COLOR_TARGETS] = {};
     const unsigned numColors =
         b->numColor > NVNGFX_MAX_COLOR_TARGETS ? NVNGFX_MAX_COLOR_TARGETS
                                                : b->numColor;
-    const Tex* t0 = find<Tex>(b->color[0]);
-    if (!t0 || !t0->mtl) return false;
+    const Tex* t0 = hasColor ? find<Tex>(b->color[0]) : nullptr;
+    if (hasColor && (!t0 || !t0->mtl)) return false;
     for (unsigned i = 0; i < numColors; ++i) {
         const Tex* ti = find<Tex>(b->color[i]);
         if (!ti || !ti->mtl) {
@@ -2591,9 +2595,18 @@ bool ensure_pipeline(Ctx* c, CmdBuf* b) {
         mtl_format_has_depth(attachmentFmt) ? attachmentFmt : static_cast<MTLPixelFormat>(0);
     const MTLPixelFormat stencilFmt =
         mtl_format_has_stencil(attachmentFmt) ? attachmentFmt : static_cast<MTLPixelFormat>(0);
+    unsigned sampleCount = hasColor ? static_cast<unsigned>(t0->mtl.sampleCount) : 0;
+    if (dt && dt->mtl) {
+        if (sampleCount && dt->mtl.sampleCount != sampleCount) {
+            log_once("nvnCommandBufferDraw.depthSampleMismatch", 1);
+            return false;
+        }
+        if (!sampleCount) sampleCount = static_cast<unsigned>(dt->mtl.sampleCount);
+    }
+    if (!sampleCount) sampleCount = 1;
     const char* why = nullptr;
     b->pso = program_pipeline(c, p, colorFormats, numColors, depthFmt, stencilFmt,
-                              static_cast<unsigned>(t0->mtl.sampleCount), st, b, &why);
+                              sampleCount, st, b, &why);
     b->psoHasDepthStencil = b->pso != nil && (depthFmt || stencilFmt);
     b->psoHasDepth = b->pso != nil && depthFmt != 0;
     b->psoHasStencil = b->pso != nil && stencilFmt != 0;
@@ -3306,13 +3319,13 @@ void end_encoder(CmdBuf* b) {
 bool ensure_encoder(Ctx* c, CmdBuf* b) {
     if (!b) return false;
     if (b->enc) return true;
-    if (!c || !c->ready || !b->cb || b->numColor < 1) return false;
+    if (!c || !c->ready || !b->cb) return false;
 
     const unsigned numColors =
         b->numColor > NVNGFX_MAX_COLOR_TARGETS ? NVNGFX_MAX_COLOR_TARGETS
                                                : b->numColor;
-    const Tex* t0 = find<Tex>(b->color[0]);
-    if (!t0 || !t0->mtl) return false;
+    const Tex* t0 = numColors ? find<Tex>(b->color[0]) : nullptr;
+    if (numColors && (!t0 || !t0->mtl)) return false;
     for (unsigned i = 0; i < numColors; ++i) {
         const Tex* ti = find<Tex>(b->color[i]);
         if (!ti || !ti->mtl) {
@@ -3323,6 +3336,22 @@ bool ensure_encoder(Ctx* c, CmdBuf* b) {
             log_once("nvnRenderPass.colorSampleMismatch", i);
             return false;
         }
+    }
+    const Tex* dtProbe = b->depth ? find<Tex>(b->depth) : nullptr;
+    if (numColors == 0) {
+        if (!dtProbe || !dtProbe->mtl) {
+            log_once("nvnRenderPass.noAttachments", 1);
+            return false;
+        }
+        const MTLPixelFormat df = dtProbe->mtl.pixelFormat;
+        if (!mtl_format_has_depth(df) && !mtl_format_has_stencil(df)) {
+            log_once("nvnRenderPass.depthTargetHasNoDepth", 1);
+            return false;
+        }
+    }
+    if (dtProbe && dtProbe->mtl && t0 && dtProbe->mtl.sampleCount != t0->mtl.sampleCount) {
+        log_once("nvnRenderPass.depthSampleMismatch", 1);
+        return false;
     }
 
     @autoreleasepool {
@@ -3345,7 +3374,7 @@ bool ensure_encoder(Ctx* c, CmdBuf* b) {
          * loading the other from a combined depth/stencil texture. */
         bool hasDepthPlane = false;
         bool hasStencilPlane = false;
-        Tex* dt = b->depth ? find<Tex>(b->depth) : nullptr;
+        const Tex* dt = dtProbe;
         if (dt && dt->mtl) {
             const MTLPixelFormat df = dt->mtl.pixelFormat;
             hasDepthPlane = mtl_format_has_depth(df);
@@ -8778,6 +8807,179 @@ extern "C" int nvngfx_metal_selftest(void) {
                          "[selftest] MRT cleared two targets and wrote red / blue\n");
         }
 
+        {
+            /* --- Pure depth pass ----------------------------------------
+             * The first pass has zero colour attachments: SetRenderTargets(0)
+             * plus a depth texture, a depth clear, and a triangle at z=0.5.
+             * A second pass then draws the same z with depth EQUAL into a
+             * colour target.  It can only produce green if the depth-only
+             * pass really wrote 0.5; a pass that silently never opened leaves
+             * the clear value 1.0 and the pixel stays black. */
+            const uint64_t kProgDepthOnly = 0x8500;
+            const uint64_t kCbDepthOnly = 0x8600;
+            const uint64_t kProgDepthEqual = 0x8700;
+            const uint64_t kCbDepthEqual = 0x8800;
+
+            {
+                struct { uint64_t data; uint64_t control; } sdDepth[2];
+                sdDepth[0].data = reinterpret_cast<uint64_t>(const_cast<char*>(
+                    nvngfx_shader_selftest_msl_variant(NVNGFX_STAGE_VERTEX, 13)));
+                sdDepth[0].control = 0;
+                sdDepth[1].data = reinterpret_cast<uint64_t>(const_cast<char*>(
+                    nvngfx_shader_selftest_msl_variant(NVNGFX_STAGE_FRAGMENT, 13)));
+                sdDepth[1].control = 0;
+                x[0] = kProgDepthOnly; x[1] = 0;
+                prog_initialize(ctx, x);
+                x[0] = kProgDepthOnly; x[1] = 2;
+                x[2] = reinterpret_cast<uint64_t>(&sdDepth[0]);
+                prog_set_shaders(ctx, x);
+                if (x[0] != 1) {
+                    std::fprintf(stderr,
+                                 "[selftest] depth-only: SetShaders failed\n");
+                    rc = 16416;
+                    goto done;
+                }
+            }
+            {
+                struct { uint64_t data; uint64_t control; } sdEqual[2];
+                sdEqual[0].data = reinterpret_cast<uint64_t>(const_cast<char*>(
+                    nvngfx_shader_selftest_msl_variant(NVNGFX_STAGE_VERTEX, 14)));
+                sdEqual[0].control = 0;
+                sdEqual[1].data = reinterpret_cast<uint64_t>(const_cast<char*>(
+                    nvngfx_shader_selftest_msl_variant(NVNGFX_STAGE_FRAGMENT, 14)));
+                sdEqual[1].control = 0;
+                x[0] = kProgDepthEqual; x[1] = 0;
+                prog_initialize(ctx, x);
+                x[0] = kProgDepthEqual; x[1] = 2;
+                x[2] = reinterpret_cast<uint64_t>(&sdEqual[0]);
+                prog_set_shaders(ctx, x);
+                if (x[0] != 1) {
+                    std::fprintf(stderr,
+                                 "[selftest] depth EQUAL: SetShaders failed\n");
+                    rc = 16416;
+                    goto done;
+                }
+            }
+
+            x[0] = kDepthState;
+            depth_set_defaults(ctx, x);
+            x[0] = kDepthState; x[1] = 1;
+            depth_set_test(ctx, x);
+            x[0] = kDepthState; x[1] = 1;
+            depth_set_write(ctx, x);
+            x[0] = kDepthState; x[1] = NVNGFX_CMP_LESS;
+            depth_set_func(ctx, x);
+
+            x[0] = kCbDepthOnly;
+            cmdbuf_begin_recording(ctx, x);
+            x[0] = kCbDepthOnly; x[1] = 0; x[2] = 0;
+            x[3] = 0; x[4] = kTexDepth; x[5] = 0;
+            cmdbuf_set_render_targets(ctx, x);
+            x[0] = kCbDepthOnly; x[1] = kDepthState;
+            cmdbuf_bind_depth_state(ctx, x);
+            {
+                nvngfx_args a{};
+                nvngfx_arg_set_f32(&a, 0, 1.0f);
+                a.x[0] = kCbDepthOnly;
+                a.x[1] = 0; a.x[2] = 1; a.x[3] = 0; a.x[4] = 0;
+                cmdbuf_clear_depth_stencil(ctx, a.x);
+            }
+            x[0] = kCbDepthOnly; x[1] = kProgDepthOnly; x[2] = 0;
+            cmdbuf_bind_program(ctx, x);
+            x[0] = kCbDepthOnly; x[1] = 0; x[2] = 0; x[3] = 3;
+            cmdbuf_draw_arrays(ctx, x);
+
+            CmdBuf* bdOnly = find<CmdBuf>(kCbDepthOnly);
+            if (!bdOnly || bdOnly->numColor != 0 || !bdOnly->pso ||
+                bdOnly->encoded != 1) {
+                std::fprintf(stderr,
+                             "[selftest] depth-only: draw was not encoded\n");
+                rc = 16416;
+                goto done;
+            }
+            x[0] = kCbDepthOnly;
+            cmdbuf_end_recording(ctx, x);
+            if (!bdOnly->last) {
+                std::fprintf(stderr,
+                             "[selftest] depth-only: nothing committed\n");
+                rc = 16416;
+                goto done;
+            }
+            [bdOnly->last waitUntilCompleted];
+            if (bdOnly->last.status == MTLCommandBufferStatusError) {
+                std::fprintf(stderr,
+                             "[selftest] depth-only command buffer error: %s\n",
+                             bdOnly->last.error
+                                 ? [[bdOnly->last.error localizedDescription] UTF8String]
+                                 : "(no description)");
+                rc = 16416;
+                goto done;
+            }
+
+            const uint64_t target = kTex;
+            const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+            x[0] = kDepthState; x[1] = 0;
+            depth_set_write(ctx, x);
+            x[0] = kDepthState; x[1] = NVNGFX_CMP_EQUAL;
+            depth_set_func(ctx, x);
+            x[0] = kCbDepthEqual;
+            cmdbuf_begin_recording(ctx, x);
+            x[0] = kCbDepthEqual; x[1] = 1;
+            x[2] = reinterpret_cast<uint64_t>(&target);
+            x[3] = 0; x[4] = kTexDepth; x[5] = 0;
+            cmdbuf_set_render_targets(ctx, x);
+            x[0] = kCbDepthEqual; x[1] = kDepthState;
+            cmdbuf_bind_depth_state(ctx, x);
+            x[0] = kCbDepthEqual; x[1] = 0;
+            x[2] = reinterpret_cast<uint64_t>(black); x[3] = 0xF;
+            cmdbuf_clear_color(ctx, x);
+            x[0] = kCbDepthEqual; x[1] = kProgDepthEqual; x[2] = 0;
+            cmdbuf_bind_program(ctx, x);
+            x[0] = kCbDepthEqual; x[1] = 0; x[2] = 0; x[3] = 3;
+            cmdbuf_draw_arrays(ctx, x);
+
+            CmdBuf* bdEqual = find<CmdBuf>(kCbDepthEqual);
+            if (!bdEqual || bdEqual->encoded != 1) {
+                std::fprintf(stderr,
+                             "[selftest] depth EQUAL: draw was not encoded\n");
+                rc = 16416;
+                goto done;
+            }
+            x[0] = kCbDepthEqual;
+            cmdbuf_end_recording(ctx, x);
+            if (!bdEqual->last) {
+                std::fprintf(stderr,
+                             "[selftest] depth EQUAL: nothing committed\n");
+                rc = 16416;
+                goto done;
+            }
+            [bdEqual->last waitUntilCompleted];
+            if (bdEqual->last.status == MTLCommandBufferStatusError) {
+                std::fprintf(stderr,
+                             "[selftest] depth EQUAL command buffer error: %s\n",
+                             bdEqual->last.error
+                                 ? [[bdEqual->last.error localizedDescription] UTF8String]
+                                 : "(no description)");
+                rc = 16416;
+                goto done;
+            }
+
+            unsigned char px[4] = {0, 0, 0, 0};
+            const int wantGreen[4] = {0, 255, 0, 255};
+            if (!read_center_pixel(dev, c->queue, find<Tex>(kTex)->mtl, kSide, px) ||
+                !pixels_near(px, wantGreen, 2)) {
+                std::fprintf(stderr,
+                             "[selftest] depth EQUAL pixel is (%u,%u,%u,%u), "
+                             "want green; the depth-only pass did not write 0.5\n",
+                             px[0], px[1], px[2], px[3]);
+                rc = 16416;
+                goto done;
+            }
+            std::fprintf(stderr,
+                         "[selftest] depth-only pass wrote z=0.5 and the EQUAL "
+                         "test passed\n");
+        }
+
     done:
         nvngfx_shader_set_msl_passthrough(0);
         forget<CmdBuf>(kCb);
@@ -8832,6 +9034,10 @@ extern "C" int nvngfx_metal_selftest(void) {
         forget<CmdBuf>(0x8100);
         forget<CmdBuf>(0x8400);
         forget<Program>(0x8300);
+        forget<CmdBuf>(0x8800);
+        forget<Program>(0x8700);
+        forget<CmdBuf>(0x8600);
+        forget<Program>(0x8500);
         forget<Tex>(kTexMrt);
         g_tex_specs.erase(kTexMrtBuilder);
         g_tex_specs.erase(kTexDepthBuilder);
