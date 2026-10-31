@@ -95,8 +95,10 @@ int nvngfx_tex_swizzle(const nvngfx_texdesc* d, unsigned level, unsigned layer,
  * for a compressed format they must be multiples of the format's block
  * dimensions, because a BCn block cannot be partially updated without
  * re-encoding it.  `z` selects a slice of a 3D level and must be zero for a
- * 2D/array layer.  `src_row` and `src_image` are byte strides, with zero
- * meaning tightly packed.  The usual read-modify-write is used: the level is
+ * 2D/array layer.  `src_row` and `src_image` are byte strides: a zero row
+ * stride is the tightly packed row, and a zero image stride is the resolved
+ * row stride times the region's block rows.  The usual read-modify-write is
+ * used: the level is
  * deswizzled, the region copied in, and the level swizzled back, so the
  * bytes outside the region (including LINEAR row padding) are preserved.
  * Returns 0, or -1 for a region/format/stride this path refuses. */
@@ -107,11 +109,13 @@ int nvngfx_tex_write_region(const nvngfx_texdesc* d, unsigned level,
 
 /* The inverse of nvngfx_tex_write_region: reads one rectangular region of one
  * level/layer/slice out of the guest's block-linear (or LINEAR) storage into a
- * linear image.  `dst_row` and `dst_image` are byte strides, with zero meaning
- * tightly packed; a stride narrower than the tightly packed region is refused
- * rather than truncating rows.  Same region/format/stride rules as the write
- * path, including block alignment for compressed formats.  Returns 0, or -1
- * for a region/format/stride this path refuses. */
+ * linear image.  `dst_row` and `dst_image` are byte strides: a zero row stride
+ * is the tightly packed row, and a zero image stride is the resolved row
+ * stride times the region's block rows.  A stride below that minimum is
+ * refused rather than letting rows or slices overlap.  Same region, format
+ * and stride rules as the write path, including block alignment for
+ * compressed formats.  Returns 0, or -1 for a region/format/stride this path
+ * refuses. */
 int nvngfx_tex_read_region(const nvngfx_texdesc* d, unsigned level,
                            unsigned layer, int x, int y, int z,
                            int width, int height, void* dst,

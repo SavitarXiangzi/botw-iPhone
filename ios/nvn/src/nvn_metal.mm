@@ -2407,11 +2407,6 @@ bool tex_region_prepare(uint64_t texGuest, uint64_t viewGuest,
     const unsigned wblocks = (static_cast<unsigned>(r.width) + bw - 1u) / bw;
     const unsigned hblocks = (static_cast<unsigned>(r.height) + bh - 1u) / bh;
     const size_t tightRow = static_cast<size_t>(wblocks) * bpb;
-    if (hblocks && tightRow > SIZE_MAX / hblocks) {
-        log_once_str(who, "region size overflows");
-        return false;
-    }
-    const size_t tightImage = tightRow * hblocks;
 
     const int64_t rowArgS = strided ? static_cast<int64_t>(rowArg) : 0;
     const int64_t imgArgS = strided ? static_cast<int64_t>(imgArg) : 0;
@@ -2420,10 +2415,23 @@ bool tex_region_prepare(uint64_t texGuest, uint64_t viewGuest,
         return false;
     }
     const size_t row = rowArgS ? static_cast<size_t>(rowArgS) : tightRow;
-    const size_t image = imgArgS ? static_cast<size_t>(imgArgS) : tightImage;
-    if (row < tightRow || image < tightImage) {
-        log_once_str(who,
-                     "stride is narrower than a tightly packed region");
+    if (row < tightRow) {
+        log_once_str(who, "row stride is narrower than a region row");
+        return false;
+    }
+    /* One image holds hblocks rows at the caller's row stride, so the natural
+     * image stride follows the *resolved* row, not the tight row.  A zero
+     * image stride means exactly that -- both NVN and
+     * nvngfx_tex_read/write_region resolve it the same way -- and anything
+     * narrower would make successive slices overlap. */
+    if (hblocks && row > SIZE_MAX / hblocks) {
+        log_once_str(who, "image stride overflows");
+        return false;
+    }
+    const size_t imageMin = row * hblocks;
+    const size_t image = imgArgS ? static_cast<size_t>(imgArgS) : imageMin;
+    if (image < imageMin) {
+        log_once_str(who, "image stride is narrower than the region's rows");
         return false;
     }
 

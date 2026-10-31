@@ -374,6 +374,21 @@ static void test_write_region() {
                     ok = ok && std::memcmp(p, src.data() + (y * 4 + x) * 4, 4) == 0;
             }
         CHECK(ok);
+
+        /* The same patch written with a 16-byte row stride and a zero image
+         * stride must land identically: one image is hblocks rows at the
+         * caller's stride, which is how NVN resolves the strided variant. */
+        const std::vector<unsigned char> compact = out;
+        unsigned char padded[32];
+        std::memset(padded, 0xEE, sizeof padded);
+        std::memcpy(padded, patch, 8);
+        std::memcpy(padded + 16, patch + 8, 8);
+        CHECK(nvngfx_tex_write_region(&d, 0, 0, 1, 1, 0, 2, 2, padded, 16, 0,
+                                      storage.data()) == 0);
+        CHECK(nvngfx_tex_deswizzle(&d, 0, 0, storage.data(), out.data(),
+                                   16) == 0);
+        CHECK(std::memcmp(out.data(), compact.data(), out.size()) == 0);
+
         /* A 2D level has no z slice 1. */
         CHECK(nvngfx_tex_write_region(&d, 0, 0, 0, 0, 1, 4, 4, patch, 8, 0,
                                       storage.data()) == -1);
