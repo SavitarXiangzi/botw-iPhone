@@ -13,8 +13,8 @@
  *         memory pool -> zero-copy MTLBuffer over guest memory
  *         command buffer -> MTLCommandBuffer, viewport / scissor / drawArrays
  *         render targets + one render pass (1-8 colour attachments) +
- *           ClearColor /
- *           ClearDepthStencil as load actions, flushed even without a draw
+ *           ClearColor / ClearColori / ClearColorui / ClearDepthStencil as
+ *           load actions, flushed even without a draw
  *         texture objects, built from the values nvnTextureBuilderSet* was
  *           given (no guest struct offsets are read)
  *         program objects; the pipeline cache is keyed by every colour
@@ -33,7 +33,8 @@
  *         path -- pipeline creation with a real vertex descriptor, buffer
  *         binding, draw encoding, pixel readback -- is executed by
  *         nvngfx_metal_selftest() in CI's iOS Simulator: eighteen draws,
- *         three clear-only regressions, a bindless table probe, and a vertex-stage
+ *         four clear-only regressions (including R32Uint / R32Sint clears), a
+ *         bindless table probe, and a vertex-stage
  *         argument-buffer draw whose shifted pixels are read back.  The ninth builds a block-linear
  *         texture in a guest memory pool and proves that the sampled pixels
  *         came from that storage, not from a host-side upload.  The tenth
@@ -261,7 +262,7 @@ struct CmdBuf {
     bool pendingClear[NVNGFX_MAX_COLOR_TARGETS] = {};
     bool pendingDepthClear = false;
     bool pendingStencilClear = false;
-    float clear[NVNGFX_MAX_COLOR_TARGETS][4] = {};
+    double clear[NVNGFX_MAX_COLOR_TARGETS][4] = {};
     double clearDepth = 1.0;
     uint32_t clearStencil = 0;
     /* Program bound by nvnCommandBufferBindProgram and the pipeline it
@@ -3568,30 +3569,43 @@ void cmdbuf_set_render_targets(nvngfx_ctx* ctx, uint64_t* x) {
     b->pendingStencilClear = false;
 }
 
-/* nvnCommandBufferClearColor(NVNcommandBuffer*, int index, const float* rgba, int mask) */
-void cmdbuf_clear_color(nvngfx_ctx*, uint64_t* x) {
-    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
-    const float* rgba = guest_ptr<const float>(x[2]);
-    if (!b || !rgba) return;
-    const unsigned index = static_cast<unsigned>(x[1]);
-    const unsigned mask = static_cast<unsigned>(x[3]);
-    /* Metal's clear load action replaces all four channels.  A partial clear
-     * cannot be expressed without a separate pass + stored readback, so do
-     * not pretend: leaving the old contents is safer than clearing bits the
-     * guest asked to preserve. */
+/* Shared queueing for ClearColor / ClearColori / ClearColorui.
+ *
+ * Metal's load-action clear replaces all four channels.  A partial mask cannot
+ * be expressed without a separate pass + stored readback, so do not pretend:
+ * leaving the old contents is safer than clearing bits the guest asked to
+ * preserve.  The colour is kept as double because that is MTLClearColor's
+ * component type and an integer clear must survive without a float round-trip. */
+bool queue_color_clear(CmdBuf* b, unsigned index, const double rgba[4],
+                       unsigned mask, const char* targetReason,
+                       const char* maskReason) {
+    if (!b) return false;
     if (index >= b->numColor || index >= NVNGFX_MAX_COLOR_TARGETS) {
-        log_once("nvnCommandBufferClearColor.unboundTarget", index);
-        return;
+        log_once(targetReason, index);
+        return false;
     }
     if (mask != 0xFu) {
-        log_once("nvnCommandBufferClearColor.mask", mask);
-        return;
+        log_once(maskReason, mask);
+        return false;
     }
     for (int i = 0; i < 4; ++i) b->clear[index][i] = rgba[i];
     b->pendingClear[index] = true;
     /* A clear mid-pass cannot be expressed as a load action, so close the pass;
      * the next draw, SetRenderTargets or EndRecording opens one that clears. */
     end_encoder(b);
+    return true;
+}
+
+/* nvnCommandBufferClearColor(NVNcommandBuffer*, int index, const float* rgba, int mask) */
+void cmdbuf_clear_color(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    const float* rgba = guest_ptr<const float>(x[2]);
+    if (!b || !rgba) return;
+    const double d[4] = {rgba[0], rgba[1], rgba[2], rgba[3]};
+    queue_color_clear(b, static_cast<unsigned>(x[1]), d,
+                      static_cast<unsigned>(x[3]),
+                      "nvnCommandBufferClearColor.unboundTarget",
+                      "nvnCommandBufferClearColor.mask");
 }
 
 /* NVNshaderStage from nxnative's nvn.h: VERTEX=0, FRAGMENT=1, GEOMETRY=2,
@@ -4592,22 +4606,37 @@ void cmdbuf_set_scissor(nvngfx_ctx* ctx, uint64_t* x) {
 /* remaining M4 command-buffer state                                   */
 /* ------------------------------------------------------------------ */
 
-/* nvnCommandBufferClearColori / ClearColorui.
+/* nvnCommandBufferClearColori(NVNcommandBuffer*, int, const int* rgba, int mask)
+ * nvnCommandBufferClearColorui(NVNcommandBuffer*, int, const uint32_t* rgba, int mask)
  *
- * Metal's load-action clear takes doubles, not integer components.  Applying
- * an integer clear through that path would depend on the attachment's pixel
- * format and would quietly reinterpret the bits.  These two calls therefore
- * record that a clear happened and report once; the float entry point above
- * remains the implemented clear. */
+ * MTLClearColor's components are doubles.  Every int32 and uint32 is exactly
+ * representable in a double, so the integer value reaches Metal unchanged;
+ * Metal converts it to the attachment's integer format. */
 void cmdbuf_clear_color_i(nvngfx_ctx*, uint64_t* x) {
     CmdBuf* b = find_or_add<CmdBuf>(x[0]);
-    if (!b) return;
-    log_once("nvnCommandBufferClearColori.unsupported", static_cast<unsigned>(x[1]));
+    const int* rgba = guest_ptr<const int>(x[2]);
+    if (!b || !rgba) return;
+    const double d[4] = {static_cast<double>(rgba[0]),
+                         static_cast<double>(rgba[1]),
+                         static_cast<double>(rgba[2]),
+                         static_cast<double>(rgba[3])};
+    queue_color_clear(b, static_cast<unsigned>(x[1]), d,
+                      static_cast<unsigned>(x[3]),
+                      "nvnCommandBufferClearColori.unboundTarget",
+                      "nvnCommandBufferClearColori.mask");
 }
 void cmdbuf_clear_color_ui(nvngfx_ctx*, uint64_t* x) {
     CmdBuf* b = find_or_add<CmdBuf>(x[0]);
-    if (!b) return;
-    log_once("nvnCommandBufferClearColorui.unsupported", static_cast<unsigned>(x[1]));
+    const uint32_t* rgba = guest_ptr<const uint32_t>(x[2]);
+    if (!b || !rgba) return;
+    const double d[4] = {static_cast<double>(rgba[0]),
+                         static_cast<double>(rgba[1]),
+                         static_cast<double>(rgba[2]),
+                         static_cast<double>(rgba[3])};
+    queue_color_clear(b, static_cast<unsigned>(x[1]), d,
+                      static_cast<unsigned>(x[3]),
+                      "nvnCommandBufferClearColorui.unboundTarget",
+                      "nvnCommandBufferClearColorui.mask");
 }
 
 /* nvnCommandBufferClearDepthStencil(cb, float depth, uint32_t depthMask,
@@ -5290,6 +5319,11 @@ extern "C" int nvngfx_metal_selftest(void) {
     /* MRT test: a second colour target, same size/format as texObject. */
     alignas(16) unsigned char texMrtObject[0x80] = {};
     alignas(16) unsigned char texMrtBuilder[0x80] = {};
+    /* Integer-clear test: one R32Uint and one R32Sint target, sharing a
+     * builder because only the format changes between creations. */
+    alignas(16) unsigned char texClearUIObject[0x80] = {};
+    alignas(16) unsigned char texClearIObject[0x80] = {};
+    alignas(16) unsigned char texIntBuilder[0x80] = {};
     alignas(8) unsigned char depthStateObject[8] = {};
     const uint64_t kTex = reinterpret_cast<uint64_t>(texObject);
     const uint64_t kTexBuilder = reinterpret_cast<uint64_t>(texBuilder);
@@ -5308,6 +5342,9 @@ extern "C" int nvngfx_metal_selftest(void) {
     const uint64_t kTexDepthBuilder = reinterpret_cast<uint64_t>(texDepthBuilder);
     const uint64_t kTexMrt = reinterpret_cast<uint64_t>(texMrtObject);
     const uint64_t kTexMrtBuilder = reinterpret_cast<uint64_t>(texMrtBuilder);
+    const uint64_t kTexClearUI = reinterpret_cast<uint64_t>(texClearUIObject);
+    const uint64_t kTexClearI = reinterpret_cast<uint64_t>(texClearIObject);
+    const uint64_t kTexIntBuilder = reinterpret_cast<uint64_t>(texIntBuilder);
     const uint64_t kDepthState = reinterpret_cast<uint64_t>(depthStateObject);
     const uint64_t kCb = 0x5200;
     const uint64_t kProg = 0x5300;
@@ -8980,6 +9017,134 @@ extern "C" int nvngfx_metal_selftest(void) {
                          "test passed\n");
         }
 
+        {
+            /* --- Integer colour clears ----------------------------------
+             * R32Uint and R32Sint attachments, cleared with values that are
+             * not exactly representable as float.  Reading the raw four bytes
+             * back catches both a wrong conversion and a float round-trip. */
+            const uint64_t kCbClearInt = 0x8900;
+
+            x[0] = kTexIntBuilder;
+            tex_builder_set_defaults(ctx, x);
+            x[0] = kTexIntBuilder; x[1] = 0;      /* 2D */
+            tex_builder_set_target(ctx, x);
+            x[0] = kTexIntBuilder; x[1] = 0x0B;   /* R32Uint */
+            tex_builder_set_format(ctx, x);
+            x[0] = kTexIntBuilder;
+            x[1] = static_cast<uint64_t>(kSide);
+            x[2] = static_cast<uint64_t>(kSide);
+            tex_builder_set_size2d(ctx, x);
+            x[0] = kTexIntBuilder; x[1] = 1;
+            tex_builder_set_levels(ctx, x);
+            x[0] = kTexIntBuilder; x[1] = 1;
+            tex_builder_set_samples(ctx, x);
+            x[0] = kTexClearUI; x[1] = kTexIntBuilder;
+            tex_initialize(ctx, x);
+            Tex* tui = find<Tex>(kTexClearUI);
+            if (x[0] != 1 || !tui || !tui->mtl ||
+                tui->mtl.pixelFormat != MTLPixelFormatR32Uint) {
+                std::fprintf(stderr,
+                             "[selftest] ClearColorui: R32Uint target was not created\n");
+                rc = 16417;
+                goto done;
+            }
+
+            const uint32_t uiValue[4] = {0x12345678u, 0, 0, 0};
+            x[0] = kCbClearInt;
+            cmdbuf_begin_recording(ctx, x);
+            x[0] = kCbClearInt; x[1] = 1;
+            x[2] = reinterpret_cast<uint64_t>(&kTexClearUI);
+            x[3] = 0; x[4] = 0; x[5] = 0;
+            cmdbuf_set_render_targets(ctx, x);
+            x[0] = kCbClearInt; x[1] = 0;
+            x[2] = reinterpret_cast<uint64_t>(uiValue); x[3] = 0xF;
+            cmdbuf_clear_color_ui(ctx, x);
+            x[0] = kCbClearInt;
+            cmdbuf_end_recording(ctx, x);
+            CmdBuf* bci = find<CmdBuf>(kCbClearInt);
+            if (!bci || !bci->last) {
+                std::fprintf(stderr,
+                             "[selftest] ClearColorui: nothing committed\n");
+                rc = 16417;
+                goto done;
+            }
+            [bci->last waitUntilCompleted];
+            if (bci->last.status == MTLCommandBufferStatusError) {
+                std::fprintf(stderr,
+                             "[selftest] ClearColorui command buffer error: %s\n",
+                             bci->last.error
+                                 ? [[bci->last.error localizedDescription] UTF8String]
+                                 : "(no description)");
+                rc = 16417;
+                goto done;
+            }
+            unsigned char pxi[4] = {0, 0, 0, 0};
+            const int wantUI[4] = {0x78, 0x56, 0x34, 0x12};
+            if (!read_center_pixel(dev, c->queue, tui->mtl, kSide, pxi) ||
+                !pixels_near(pxi, wantUI, 0)) {
+                std::fprintf(stderr,
+                             "[selftest] ClearColorui bytes are "
+                             "(%u,%u,%u,%u), want 0x12345678\n",
+                             pxi[0], pxi[1], pxi[2], pxi[3]);
+                rc = 16417;
+                goto done;
+            }
+
+            x[0] = kTexIntBuilder; x[1] = 0x0C;   /* R32Sint */
+            tex_builder_set_format(ctx, x);
+            x[0] = kTexClearI; x[1] = kTexIntBuilder;
+            tex_initialize(ctx, x);
+            Tex* ti = find<Tex>(kTexClearI);
+            if (x[0] != 1 || !ti || !ti->mtl ||
+                ti->mtl.pixelFormat != MTLPixelFormatR32Sint) {
+                std::fprintf(stderr,
+                             "[selftest] ClearColori: R32Sint target was not created\n");
+                rc = 16417;
+                goto done;
+            }
+
+            const int iValue[4] = {-123456789, 0, 0, 0};
+            x[0] = kCbClearInt;
+            cmdbuf_begin_recording(ctx, x);
+            x[0] = kCbClearInt; x[1] = 1;
+            x[2] = reinterpret_cast<uint64_t>(&kTexClearI);
+            x[3] = 0; x[4] = 0; x[5] = 0;
+            cmdbuf_set_render_targets(ctx, x);
+            x[0] = kCbClearInt; x[1] = 0;
+            x[2] = reinterpret_cast<uint64_t>(iValue); x[3] = 0xF;
+            cmdbuf_clear_color_i(ctx, x);
+            x[0] = kCbClearInt;
+            cmdbuf_end_recording(ctx, x);
+            if (!bci->last) {
+                std::fprintf(stderr,
+                             "[selftest] ClearColori: nothing committed\n");
+                rc = 16417;
+                goto done;
+            }
+            [bci->last waitUntilCompleted];
+            if (bci->last.status == MTLCommandBufferStatusError) {
+                std::fprintf(stderr,
+                             "[selftest] ClearColori command buffer error: %s\n",
+                             bci->last.error
+                                 ? [[bci->last.error localizedDescription] UTF8String]
+                                 : "(no description)");
+                rc = 16417;
+                goto done;
+            }
+            const int wantI[4] = {0xEB, 0x32, 0xA4, 0xF8};
+            if (!read_center_pixel(dev, c->queue, ti->mtl, kSide, pxi) ||
+                !pixels_near(pxi, wantI, 0)) {
+                std::fprintf(stderr,
+                             "[selftest] ClearColori bytes are "
+                             "(%u,%u,%u,%u), want -123456789\n",
+                             pxi[0], pxi[1], pxi[2], pxi[3]);
+                rc = 16417;
+                goto done;
+            }
+            std::fprintf(stderr,
+                         "[selftest] integer clears kept 0x12345678 and -123456789\n");
+        }
+
     done:
         nvngfx_shader_set_msl_passthrough(0);
         forget<CmdBuf>(kCb);
@@ -9038,6 +9203,10 @@ extern "C" int nvngfx_metal_selftest(void) {
         forget<Program>(0x8700);
         forget<CmdBuf>(0x8600);
         forget<Program>(0x8500);
+        forget<CmdBuf>(0x8900);
+        forget<Tex>(kTexClearUI);
+        forget<Tex>(kTexClearI);
+        g_tex_specs.erase(kTexIntBuilder);
         forget<Tex>(kTexMrt);
         g_tex_specs.erase(kTexMrtBuilder);
         g_tex_specs.erase(kTexDepthBuilder);

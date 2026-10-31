@@ -4117,7 +4117,7 @@ CI（run 41151003231，commit `ecfd58e`）两个 job 都通过：portable
 |---|---|
 | iOS 侧 `cmdbuf_end_recording` 仍在 EndRecording 里直接 commit 并返回 handle 0 | 客体拿不到可提交的句柄，回放层没有命令流可重放 |
 | iOS 侧未实现 `nvnCommandBufferCallCommands` / `nvnQueueSubmitCommands` | harness 记录得出来，回放层展不开 |
-| `ClearColori/ui` / `ClearBuffer` / `ClearTexture*` 只 `log_once`（该轮状态） | 整数清屏与纹理清屏仍是占位；`ClearColor`（float）有真路径；`ClearDepthStencil` 已在下一轮接入 |
+| `ClearColori/ui` / `ClearBuffer` / `ClearTexture*` 只 `log_once`（该轮状态） | 该轮整数清屏与纹理清屏仍是占位；整数清屏已在 M4 续五接入，`ClearColor`（float）有真路径；`ClearDepthStencil` 已在下一轮接入 |
 | storage buffer / image / transform feedback 只记录句柄 | 计算与 UAV 路径未接线 |
 | harness 的 `nvnSamplerCompare` 只比较部分已实现字段，`SamplerBuilder` 缺 wrap / compare / border setter | 采样器状态不完整 |
 | 没有真机运行 | 不能声称画面，任何"能玩"的说法都不成立 |
@@ -4303,7 +4303,7 @@ build_abi_test: all tests passed
 
 * `SetDepthBounds` 只有记录与上报，Metal 没有深度边界测试；
 * 部分模板清屏掩码；
-* `ClearColori/ui`、`ClearBuffer`、`ClearTexture*` 仍是日志占位；
+* `ClearBuffer`、`ClearTexture*` 仍是日志占位（整数清屏已在 M4 续五落地）；
 * 没有真机像素验证，不能声称画面正确。
 
 ## M4 续三：多颜色附件（MRT）
@@ -4361,7 +4361,7 @@ build_abi_test: all tests passed
 * 没有颜色目标的纯深度 pass 仍打不开 encoder；
 * `SetDepthBounds` 只有记录与上报，Metal 没有深度边界测试；
 * 部分模板清屏掩码；
-* `ClearColori/ui`、`ClearBuffer`、`ClearTexture*` 仍是日志占位；
+* `ClearBuffer`、`ClearTexture*` 仍是日志占位（整数清屏已在 M4 续五落地）；
 * 没有真机像素验证，不能声称画面正确。
 
 ## M4 续四：纯深度 pass
@@ -4408,5 +4408,51 @@ build_abi_test: all tests passed
 
 * `SetDepthBounds` 只有记录与上报，Metal 没有深度边界测试；
 * 部分模板清屏掩码；
-* `ClearColori/ui`、`ClearBuffer`、`ClearTexture*` 仍是日志占位；
+* `ClearBuffer`、`ClearTexture*` 仍是日志占位（整数清屏已在 M4 续五落地）；
+* 没有真机像素验证，不能声称画面正确。
+
+## M4 续五：整数颜色清屏
+
+`nvnCommandBufferClearColori` 与 `nvnCommandBufferClearColorui` 之前只记录日志。Metal 的
+`MTLClearColor` 以 double 保存四个分量，而 int32 / uint32 都能被 double 精确表示，因此整数
+清屏不需要猜测附件格式或改写位模式。
+
+### 1. 统一 pending-clear 路径
+
+* `CmdBuf::clear` 从 `float[8][4]` 扩成 `double[8][4]`；
+* `ClearColor`、`ClearColori`、`ClearColorui` 共用 `queue_color_clear()`，统一做目标下标与
+  完整 `0xF` 掩码检查，再写入 pending clear；
+* 浮点入口先把四个 float 提升为 double；整数入口分别读取 guest 的 `int32_t[4]` 或
+  `uint32_t[4]`，逐项精确转换成 double，避免经过 float 丢失整数位；
+* 三者仍在清屏时关闭当前 encoder，由下一次 `ensure_encoder()` 通过附件的
+  `MTLLoadActionClear` 落地。部分通道掩码继续明确上报，不冒充已执行。
+
+### 2. 模拟器自测
+
+新增 `0x8900` 命令缓冲用例：
+
+1. 建 `R32Uint` 目标，调用 `ClearColorui(0, {0x12345678, 0, 0, 0}, 0xF)`，回读原始字节必须是
+   `78 56 34 12`；
+2. 建 `R32Sint` 目标，调用 `ClearColori(0, {-123456789, 0, 0, 0}, 0xF)`，回读原始字节必须是
+   `EB 32 A4 F8`。
+
+两步都用零容差比较，并检查 Metal command buffer 没有进入 error 状态。这样验证的不只是
+“入口被调用”，而是整数分量真的到达整数 render target。
+
+### 3. 覆盖与仍然缺的
+
+没有新增 NVN 入口，覆盖率保持 **202/513（39.4%）**，未实现 311；CommandBuffer 域
+**57/144**。门禁输出：
+
+```text
+syntax_check_metal: ok (clang++.exe)
+verify_ios: ok (metal bindings: 202/513)
+build_abi_test: all tests passed
+```
+
+仍未支持：
+
+* `SetDepthBounds` 只有记录与上报，Metal 没有深度边界测试；
+* 模板与颜色清屏的部分通道掩码；
+* `ClearBuffer`、`ClearTexture{i,ui}`；
 * 没有真机像素验证，不能声称画面正确。

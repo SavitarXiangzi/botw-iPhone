@@ -85,13 +85,16 @@ enum {
 
 @protocol MTLBuffer;
 
-/* MTLPixelFormat: only the two names nvn_metal.mm mentions.
+/* MTLPixelFormat: the subset used by nvn_metal.mm and its simulator selftest.
  *
  * The real SDK declares this as NS_ENUM(NSUInteger, MTLPixelFormat), i.e. a
  * distinct enum type, not a typedef to NSUInteger.  Keeping it an enum here
  * is deliberate: CI caught a real "NSUInteger assigned to MTLPixelFormat"
  * that an integer typedef had hidden. */
 typedef enum MTLPixelFormat : NSUInteger {
+    MTLPixelFormatR32Uint = 53,
+    MTLPixelFormatR32Sint = 54,
+    MTLPixelFormatR32Float = 55,
     MTLPixelFormatRGBA8Unorm = 70,
     MTLPixelFormatRGBA8Unorm_sRGB = 71,
     MTLPixelFormatBGRA8Unorm = 80,

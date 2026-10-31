@@ -500,9 +500,11 @@ guest storage，再调用 `nvnTextureFlushTexels` 改成棕/钢蓝/橙/天蓝并
   管线缓存键含每个目标的格式，描述符按目标填混合/写掩码，render pass 按目标挂载并允许各自的
   清屏值。模拟器用两个颜色目标验证了独立清屏和双颜色输出。0 颜色附件的纯深度 pass
   也已支持：`SetRenderTargets(0, depth)`、深度清屏和 draw 能打开只有深度附件的 pass；
-  模拟器用“先以 LESS 写 z=0.5，再以 EQUAL 画进颜色目标”验证深度值真的写入。仍缺
-  `SetStencilCullCriteria`；部分模板清屏掩码无法用 Metal load action 表达，会明确上报
-  而不是错误清除。
+  模拟器用“先以 LESS 写 z=0.5，再以 EQUAL 画进颜色目标”验证深度值真的写入。
+  ClearColor / ClearColori / ClearColorui 共用 pending-clear 路径：整数分量先精确提升为
+  double 再交给 MTLClearColor，模拟器在 R32Uint / R32Sint 目标上回读 0x12345678 与
+  -123456789 的原始字节。仍缺 `SetStencilCullCriteria`；模板/颜色清屏的部分通道掩码
+  无法用 Metal load action 表达，会明确上报而不是错误清除。
 - ✅ Sampler：M3.82 完成 builder、object、getter 和真实的
   `MTLSamplerState`；M3.83 完成 sampler pool、`BindSeparateSampler(s)` 与
   参数缓冲区/直连绑定两条路径。M3.84 已把真实 shader 的 `[[id(k)]]` 顺序
