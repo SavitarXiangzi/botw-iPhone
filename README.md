@@ -302,6 +302,7 @@ padding 里的 0，变成黑色。CI 现在设置
 `nvnTextureFlushTexels`，改成棕/钢蓝/橙/天蓝后再画。三次回读都正确才算通过，
 失败码 `16409`（初始路径）、`16410`（WriteTexels）、`16411`（FlushTexels）；
 run 41090664172 的 portable job 124183374680、iOS job 124183554875 均通过。
+设备状态与帧计数器回归（失败码 `16436`）由 run 41193853309 的 portable job 124515942326 与 iOS job 124516016377 覆盖，两个 job 均通过。
 它不替代真机，但比“编过了”强一档。
 
 > 为什么不用 XCTest：本仓库先试过 unit-test bundle，`xcodebuild test` 在 runner 上

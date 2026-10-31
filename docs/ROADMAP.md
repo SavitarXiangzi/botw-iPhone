@@ -6030,7 +6030,8 @@ git diff --check
 ```
 
 本地已通过（513 procs / 466 implemented / 477 measured + 25 inferred）。
-本批 CI 结果在推送后补记。
+推送后 CI run `41193853309` 的 `portable`（job 124515942326）与 `ios`
+（job 124516016377）两个 job 均成功，模拟器里 `16436` 全部通过。
 
 ### 7. 仍然没有闭环的部分
 
