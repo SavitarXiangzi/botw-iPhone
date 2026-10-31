@@ -6468,8 +6468,10 @@ git diff --check
 ```
 
 本机（Windows，无 Metal 运行时）已通过类型检查与全部便携门禁：
-**514 procs / 484 implemented / 477 measured + 29 inferred**；
-`16442` 的实际 Metal 执行仍要等 macOS CI 的 iOS Simulator job。
+**514 procs / 484 implemented / 477 measured + 29 inferred**。
+CI run `41206775765`（run 159）的 `portable` job `124553344841` 与 `ios`
+job `124553437656` 均成功；iOS job 的 “Run the replay-layer self-test in
+the simulator” 步骤通过，说明 `16442` 在模拟器里实际返回 0。
 
 ### 4. 仍然没有闭环的部分
 
