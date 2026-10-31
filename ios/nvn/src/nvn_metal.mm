@@ -87,6 +87,7 @@
 #include "nvn_metal.h"
 #include "nvn_pool.h"
 #include "nvn_sampler.h"
+#include "nvn_state.h"
 #include "nvn_shader.h"
 #include "nvn_texlayout.h"
 #include "nvn_texture.h"
@@ -310,6 +311,40 @@ struct CmdBuf {
     bool hasViewport = false;
     MTLScissorRect scissor = {};
     bool hasScissor = false;
+    /* M4 fixed-function state.  The guest's setters write these exact bit
+     * layouts into its own 4/8/10-byte objects; a bind copies the decoded
+     * fields here so a later pipeline can be built from the state that was
+     * current at the draw, not from whatever the guest reused later. */
+    nvngfx_blend_state blendState = {};
+    nvngfx_color_state colorState = {};
+    nvngfx_channel_mask_state channelState = {};
+    nvngfx_multisample_state multisampleState = {};
+    nvngfx_polygon_state polygonState = {};
+    nvngfx_depth_stencil_state depthState = {};
+    bool hasBlendState = false;
+    bool hasColorState = false;
+    bool hasChannelState = false;
+    bool hasMultisampleState = false;
+    bool hasPolygonState = false;
+    bool hasDepthState = false;
+    float blendColor[4] = {0, 0, 0, 0};
+    bool hasBlendColor = false;
+    float alphaRef = 0.0f;
+    bool hasAlphaRef = false;
+    uint32_t renderEnable = 1;
+    bool hasRenderEnable = false;
+    float coverageTable[16] = {};
+    bool hasCoverageTable = false;
+    double depthNear = 0.0, depthFar = 1.0;
+    /* Compute / transform-feedback and image bindings are recorded for the
+     * compute path; the render path does not consume them yet. */
+    uint64_t storage[6][NVNGFX_MAX_UBO_SLOTS] = {};
+    uint64_t storageSize[6][NVNGFX_MAX_UBO_SLOTS] = {};
+    uint64_t image[6][NVNGFX_MAX_TEXTURE_SLOTS] = {};
+    uint64_t tfBuffer[16] = {};
+    uint64_t tfSize[16] = {};
+    uint32_t viewportSwizzle[4] = {};
+    bool hasViewportSwizzle = false;
 };
 
 /* Builder specs are gathered in a side table keyed by the guest's builder
@@ -2480,6 +2515,313 @@ void vstream_get_divisor(nvngfx_ctx*, uint64_t* x) {
     x[0] = w ? w[1] : 0u;
 }
 
+
+/* ------------------------------------------------------------------ */
+/* fixed-function state objects (M4)                                   */
+/* ------------------------------------------------------------------ */
+
+/* State objects live in the guest's own 4/8/10-byte storage.  These helpers
+ * are the only place that crosses between those bytes and the portable
+ * nvngfx_*_state structs; the setters below never keep an address-keyed
+ * side table, so a guest memcpy of a state object cannot go stale. */
+bool read_blend(uint64_t a, nvngfx_blend_state* s) {
+    const unsigned long long* w = guest_ptr<const unsigned long long>(a);
+    if (!w) return false;
+    nvngfx_blend_unpack(s, *w);
+    return true;
+}
+void write_blend(uint64_t a, const nvngfx_blend_state* s) {
+    unsigned long long* w = guest_ptr<unsigned long long>(a);
+    if (w) *w = nvngfx_blend_pack(s);
+}
+bool read_color(uint64_t a, nvngfx_color_state* s) {
+    const unsigned* w = guest_ptr<const unsigned>(a);
+    if (!w) return false;
+    nvngfx_color_unpack(s, *w);
+    return true;
+}
+void write_color(uint64_t a, const nvngfx_color_state* s) {
+    unsigned* w = guest_ptr<unsigned>(a);
+    if (w) *w = nvngfx_color_pack(s);
+}
+bool read_channel(uint64_t a, nvngfx_channel_mask_state* s) {
+    const unsigned* w = guest_ptr<const unsigned>(a);
+    if (!w) return false;
+    nvngfx_channel_mask_unpack(s, *w);
+    return true;
+}
+void write_channel(uint64_t a, const nvngfx_channel_mask_state* s) {
+    unsigned* w = guest_ptr<unsigned>(a);
+    if (w) *w = nvngfx_channel_mask_pack(s);
+}
+bool read_multisample(uint64_t a, nvngfx_multisample_state* s) {
+    const unsigned char* w = guest_ptr<const unsigned char>(a);
+    if (!w) return false;
+    nvngfx_multisample_unpack(s, w);
+    return true;
+}
+void write_multisample(uint64_t a, const nvngfx_multisample_state* s) {
+    unsigned char* w = guest_ptr<unsigned char>(a);
+    if (w) nvngfx_multisample_pack(s, w);
+}
+bool read_polygon(uint64_t a, nvngfx_polygon_state* s) {
+    const unsigned* w = guest_ptr<const unsigned>(a);
+    if (!w) return false;
+    nvngfx_polygon_unpack(s, *w);
+    return true;
+}
+void write_polygon(uint64_t a, const nvngfx_polygon_state* s) {
+    unsigned* w = guest_ptr<unsigned>(a);
+    if (w) *w = nvngfx_polygon_pack(s);
+}
+bool read_depth(uint64_t a, nvngfx_depth_stencil_state* s) {
+    const unsigned long long* w = guest_ptr<const unsigned long long>(a);
+    if (!w) return false;
+    nvngfx_depth_stencil_unpack(s, *w);
+    return true;
+}
+void write_depth(uint64_t a, const nvngfx_depth_stencil_state* s) {
+    unsigned long long* w = guest_ptr<unsigned long long>(a);
+    if (w) *w = nvngfx_depth_stencil_pack(s);
+}
+
+/* nvnBlendStateSetDefaults / Target / Func / Equation */
+void blend_set_defaults(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_blend_state s;
+    nvngfx_blend_defaults(&s);
+    write_blend(x[0], &s);
+}
+void blend_set_target(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_blend_state s;
+    if (!read_blend(x[0], &s)) return;
+    s.target = static_cast<unsigned>(x[1]);
+    write_blend(x[0], &s);
+}
+void blend_set_func(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_blend_state s;
+    if (!read_blend(x[0], &s)) return;
+    s.src_rgb = static_cast<unsigned>(x[1]);
+    s.dst_rgb = static_cast<unsigned>(x[2]);
+    s.src_a = static_cast<unsigned>(x[3]);
+    s.dst_a = static_cast<unsigned>(x[4]);
+    write_blend(x[0], &s);
+}
+void blend_set_equation(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_blend_state s;
+    if (!read_blend(x[0], &s)) return;
+    s.eq_rgb = static_cast<unsigned>(x[1]);
+    s.eq_a = static_cast<unsigned>(x[2]);
+    write_blend(x[0], &s);
+}
+
+/* nvnColorStateSetDefaults / BlendEnable / LogicOp / AlphaTest */
+void color_set_defaults(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_color_state s;
+    nvngfx_color_defaults(&s);
+    write_color(x[0], &s);
+}
+void color_set_blend_enable(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_color_state s;
+    if (!read_color(x[0], &s)) return;
+    const unsigned i = static_cast<unsigned>(x[1]);
+    if (i >= 8) { log_once("nvnColorStateSetBlendEnable.target", i); return; }
+    const unsigned mask = 1u << i;
+    if (x[2] & 0xFFu) s.blend_en |= mask; else s.blend_en &= ~mask;
+    write_color(x[0], &s);
+}
+void color_set_logic_op(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_color_state s;
+    if (!read_color(x[0], &s)) return;
+    s.logic_op = static_cast<unsigned>(x[1]);
+    write_color(x[0], &s);
+}
+void color_set_alpha_test(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_color_state s;
+    if (!read_color(x[0], &s)) return;
+    s.alpha_func = static_cast<unsigned>(x[1]);
+    write_color(x[0], &s);
+}
+
+/* nvnChannelMaskStateSetDefaults / SetChannelMask */
+void channel_set_defaults(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_channel_mask_state s;
+    nvngfx_channel_mask_defaults(&s);
+    write_channel(x[0], &s);
+}
+void channel_set_mask(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_channel_mask_state s;
+    if (!read_channel(x[0], &s)) return;
+    const unsigned i = static_cast<unsigned>(x[1]);
+    if (i >= 8) { log_once("nvnChannelMaskStateSetChannelMask.target", i); return; }
+    const unsigned nib = ((x[2] & 0xFFu) ? 1u : 0u) |
+                         ((x[3] & 0xFFu) ? 2u : 0u) |
+                         ((x[4] & 0xFFu) ? 4u : 0u) |
+                         ((x[5] & 0xFFu) ? 8u : 0u);
+    const unsigned sh = 4u * i;
+    s.mask = (s.mask & ~(0xFu << sh)) | (nib << sh);
+    write_channel(x[0], &s);
+}
+
+/* nvnMultisampleStateSet*: ten one-byte fields in declaration order. */
+void multisample_set_defaults(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_multisample_state s;
+    nvngfx_multisample_defaults(&s);
+    write_multisample(x[0], &s);
+}
+void multisample_set_enable(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_multisample_state s;
+    if (!read_multisample(x[0], &s)) return;
+    s.enable = static_cast<unsigned char>(x[1] & 0xFFu);
+    write_multisample(x[0], &s);
+}
+void multisample_set_samples(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_multisample_state s;
+    if (!read_multisample(x[0], &s)) return;
+    s.samples = static_cast<unsigned char>(x[1] & 0xFFu);
+    write_multisample(x[0], &s);
+}
+void multisample_set_a2c(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_multisample_state s;
+    if (!read_multisample(x[0], &s)) return;
+    s.a2c = static_cast<unsigned char>(x[1] & 0xFFu);
+    write_multisample(x[0], &s);
+}
+void multisample_set_dither(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_multisample_state s;
+    if (!read_multisample(x[0], &s)) return;
+    s.a2c_dither = static_cast<unsigned char>(x[1] & 0xFFu);
+    write_multisample(x[0], &s);
+}
+void multisample_set_raster_samples(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_multisample_state s;
+    if (!read_multisample(x[0], &s)) return;
+    s.raster_samples = static_cast<unsigned char>(x[1] & 0xFFu);
+    write_multisample(x[0], &s);
+}
+void multisample_set_cov_mod(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_multisample_state s;
+    if (!read_multisample(x[0], &s)) return;
+    s.cov_mod = static_cast<unsigned char>(x[1] & 0xFFu);
+    write_multisample(x[0], &s);
+}
+void multisample_set_cov2color_en(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_multisample_state s;
+    if (!read_multisample(x[0], &s)) return;
+    s.cov2color_en = static_cast<unsigned char>(x[1] & 0xFFu);
+    write_multisample(x[0], &s);
+}
+void multisample_set_cov2color_out(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_multisample_state s;
+    if (!read_multisample(x[0], &s)) return;
+    s.cov2color_out = static_cast<unsigned char>(x[1] & 0xFFu);
+    write_multisample(x[0], &s);
+}
+void multisample_set_sl_enable(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_multisample_state s;
+    if (!read_multisample(x[0], &s)) return;
+    s.sl_en = static_cast<unsigned char>(x[1] & 0xFFu);
+    write_multisample(x[0], &s);
+}
+void multisample_set_sl_grid(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_multisample_state s;
+    if (!read_multisample(x[0], &s)) return;
+    s.sl_grid = static_cast<unsigned char>(x[1] & 0xFFu);
+    write_multisample(x[0], &s);
+}
+void multisample_set_sample_locations(nvngfx_ctx*, uint64_t* x) {
+    /* The locations are not part of the 10-byte bindable state.  Recording
+     * them would require a side table keyed by a guest address that the
+     * guest may immediately copy; report once instead of pretending. */
+    log_once("nvnMultisampleStateSetSampleLocations.ignored",
+             static_cast<unsigned>(x[2]));
+}
+
+/* nvnPolygonStateSetDefaults / CullFace / FrontFace / Mode / OffsetEnables */
+void polygon_set_defaults(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_polygon_state s;
+    nvngfx_polygon_defaults(&s);
+    write_polygon(x[0], &s);
+}
+void polygon_set_cull(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_polygon_state s;
+    if (!read_polygon(x[0], &s)) return;
+    s.cull = static_cast<unsigned>(x[1]);
+    write_polygon(x[0], &s);
+}
+void polygon_set_front(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_polygon_state s;
+    if (!read_polygon(x[0], &s)) return;
+    s.front = static_cast<unsigned>(x[1]);
+    write_polygon(x[0], &s);
+}
+void polygon_set_mode(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_polygon_state s;
+    if (!read_polygon(x[0], &s)) return;
+    s.mode = static_cast<unsigned>(x[1]);
+    write_polygon(x[0], &s);
+}
+void polygon_set_offset(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_polygon_state s;
+    if (!read_polygon(x[0], &s)) return;
+    s.offset_en = static_cast<unsigned>(x[1]);
+    write_polygon(x[0], &s);
+}
+
+/* nvnDepthStencilStateSet* */
+void depth_set_defaults(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_depth_stencil_state s;
+    nvngfx_depth_stencil_defaults(&s);
+    write_depth(x[0], &s);
+}
+void depth_set_test(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_depth_stencil_state s;
+    if (!read_depth(x[0], &s)) return;
+    s.dt = (x[1] & 0xFFu) ? 1u : 0u;
+    write_depth(x[0], &s);
+}
+void depth_set_write(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_depth_stencil_state s;
+    if (!read_depth(x[0], &s)) return;
+    s.dw = (x[1] & 0xFFu) ? 1u : 0u;
+    write_depth(x[0], &s);
+}
+void depth_set_func(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_depth_stencil_state s;
+    if (!read_depth(x[0], &s)) return;
+    s.df = static_cast<unsigned>(x[1]);
+    write_depth(x[0], &s);
+}
+void depth_set_stencil_test(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_depth_stencil_state s;
+    if (!read_depth(x[0], &s)) return;
+    s.st = (x[1] & 0xFFu) ? 1u : 0u;
+    write_depth(x[0], &s);
+}
+void depth_set_stencil_func(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_depth_stencil_state s;
+    if (!read_depth(x[0], &s)) return;
+    const unsigned face = static_cast<unsigned>(x[1]);
+    if (face & 1u) s.sf_f = static_cast<unsigned>(x[2]);
+    if (face & 2u) s.sf_b = static_cast<unsigned>(x[2]);
+    write_depth(x[0], &s);
+}
+void depth_set_stencil_op(nvngfx_ctx*, uint64_t* x) {
+    nvngfx_depth_stencil_state s;
+    if (!read_depth(x[0], &s)) return;
+    const unsigned face = static_cast<unsigned>(x[1]);
+    if (face & 1u) {
+        s.fail_f = static_cast<unsigned>(x[2]);
+        s.zfail_f = static_cast<unsigned>(x[3]);
+        s.zpass_f = static_cast<unsigned>(x[4]);
+    }
+    if (face & 2u) {
+        s.fail_b = static_cast<unsigned>(x[2]);
+        s.zfail_b = static_cast<unsigned>(x[3]);
+        s.zpass_b = static_cast<unsigned>(x[4]);
+    }
+    write_depth(x[0], &s);
+}
+
 /* nvnCommandBufferBindVertexAttribState(NVNcommandBuffer*, int,
  *                                      const NVNvertexAttribState*)
  *
@@ -2570,6 +2912,12 @@ bool ensure_encoder(Ctx* c, CmdBuf* b) {
         b->enc = [b->cb renderCommandEncoderWithDescriptor:rpd];
         if (b->enc && b->hasViewport) [b->enc setViewport:b->viewport];
         if (b->enc && b->hasScissor) [b->enc setScissorRect:b->scissor];
+        if (b->enc && b->hasBlendColor) {
+            [b->enc setBlendColorRed:b->blendColor[0]
+                                green:b->blendColor[1]
+                                 blue:b->blendColor[2]
+                                alpha:b->blendColor[3]];
+        }
     }
     b->pendingClear = false;
     return b->enc != nil;
@@ -2590,6 +2938,28 @@ void cmdbuf_begin_recording(nvngfx_ctx* ctx, uint64_t* x) {
     b->argbuf[0] = b->argbuf[1] = nil;
     b->hasViewport = false;
     b->hasScissor = false;
+    b->hasBlendState = b->hasColorState = b->hasChannelState = false;
+    b->hasMultisampleState = b->hasPolygonState = b->hasDepthState = false;
+    b->hasBlendColor = false;
+    b->hasAlphaRef = false;
+    b->hasRenderEnable = false;
+    b->hasCoverageTable = false;
+    b->hasViewportSwizzle = false;
+    b->depthNear = 0.0;
+    b->depthFar = 1.0;
+    for (unsigned si = 0; si < 6; ++si) {
+        for (unsigned i = 0; i < NVNGFX_MAX_UBO_SLOTS; ++i) {
+            b->storage[si][i] = 0;
+            b->storageSize[si][i] = 0;
+        }
+        for (unsigned i = 0; i < NVNGFX_MAX_TEXTURE_SLOTS; ++i)
+            b->image[si][i] = 0;
+    }
+    for (unsigned i = 0; i < 16; ++i) {
+        b->tfBuffer[i] = 0;
+        b->tfSize[i] = 0;
+    }
+    for (unsigned i = 0; i < 4; ++i) b->viewportSwizzle[i] = 0;
 }
 
 /* nvnCommandBufferEndRecording(NVNcommandBuffer*) -> NVNcommandHandle
@@ -2664,6 +3034,157 @@ void cmdbuf_clear_color(nvngfx_ctx* ctx, uint64_t* x) {
 
 /* NVNshaderStage from nxnative's nvn.h: VERTEX=0, FRAGMENT=1, GEOMETRY=2,
  * TESS_CONTROL=3, TESS_EVALUATION=4, COMPUTE=5. */
+
+
+/* A raw 0..5 NVNshaderStage for tables that are recorded but not consumed by
+ * the two live render stages yet.  Keep this separate from stage_index():
+ * accepting compute here must not make the render path think it can use it. */
+int record_stage_index(uint64_t stage) {
+    return stage < 6 ? static_cast<int>(stage) : -1;
+}
+
+/* Fixed-function state binds.  Snapshot at call time: the guest reuses these
+ * objects, and a pipeline built from them must see the values at the draw,
+ * not the final values after recording. */
+void cmdbuf_bind_blend_state(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    if (!b || !read_blend(x[1], &b->blendState)) return;
+    b->hasBlendState = true;
+    b->pso = nil;
+}
+void cmdbuf_bind_color_state(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    if (!b || !read_color(x[1], &b->colorState)) return;
+    b->hasColorState = true;
+    b->pso = nil;
+}
+void cmdbuf_bind_channel_state(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    if (!b || !read_channel(x[1], &b->channelState)) return;
+    b->hasChannelState = true;
+    b->pso = nil;
+}
+void cmdbuf_bind_multisample_state(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    if (!b || !read_multisample(x[1], &b->multisampleState)) return;
+    b->hasMultisampleState = true;
+    b->pso = nil;
+}
+void cmdbuf_bind_polygon_state(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    if (!b || !read_polygon(x[1], &b->polygonState)) return;
+    b->hasPolygonState = true;
+    b->pso = nil;
+}
+void cmdbuf_bind_depth_state(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    if (!b || !read_depth(x[1], &b->depthState)) return;
+    b->hasDepthState = true;
+    b->pso = nil;
+}
+
+/* nvnCommandBufferBindCoverageModulationTable(NVNcommandBuffer*, const float*) */
+void cmdbuf_bind_coverage_table(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    const float* t = guest_ptr<const float>(x[1]);
+    if (!b || !t) return;
+    for (unsigned i = 0; i < 16; ++i) b->coverageTable[i] = t[i];
+    b->hasCoverageTable = true;
+    b->pso = nil;
+}
+
+/* nvnCommandBufferBindImage(s): recorded, but Metal image blocks / UAVs are
+ * not wired into the argument buffer yet.  The handle is still kept so the
+ * compute path can use it without another guest call. */
+void cmdbuf_bind_image(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    if (!b) return;
+    const int si = record_stage_index(x[1]);
+    const unsigned slot = static_cast<unsigned>(x[2]);
+    if (si < 0 || slot >= NVNGFX_MAX_TEXTURE_SLOTS) {
+        log_once("nvnCommandBufferBindImage.slot", static_cast<unsigned>(x[2]));
+        return;
+    }
+    b->image[si][slot] = x[3];
+    log_once("nvnCommandBufferBindImage.unsupported", static_cast<unsigned>(x[1]));
+}
+void cmdbuf_bind_images(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    if (!b) return;
+    const int si = record_stage_index(x[1]);
+    const int first = static_cast<int>(x[2]);
+    const int n = static_cast<int>(x[3]);
+    const uint64_t* hs = guest_ptr<const uint64_t>(x[4]);
+    if (si < 0 || first < 0 || n < 0 || first + n > NVNGFX_MAX_TEXTURE_SLOTS ||
+        (n > 0 && !hs)) {
+        log_once("nvnCommandBufferBindImages.range", static_cast<unsigned>(n));
+        return;
+    }
+    for (int i = 0; i < n; ++i) b->image[si][first + i] = hs[i];
+    log_once("nvnCommandBufferBindImages.unsupported", static_cast<unsigned>(x[1]));
+}
+
+/* nvnCommandBufferBindStorageBuffer(s): recorded for compute. */
+void cmdbuf_bind_storage_buffer(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    if (!b) return;
+    const int si = record_stage_index(x[1]);
+    const unsigned slot = static_cast<unsigned>(x[2]);
+    if (si < 0 || slot >= NVNGFX_MAX_UBO_SLOTS) {
+        log_once("nvnCommandBufferBindStorageBuffer.slot", static_cast<unsigned>(x[2]));
+        return;
+    }
+    b->storage[si][slot] = x[3];
+    b->storageSize[si][slot] = x[4];
+    log_once("nvnCommandBufferBindStorageBuffer.unsupported", static_cast<unsigned>(x[1]));
+}
+void cmdbuf_bind_storage_buffers(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    if (!b) return;
+    const int si = record_stage_index(x[1]);
+    const int first = static_cast<int>(x[2]);
+    const int n = static_cast<int>(x[3]);
+    const uint64_t* rg = guest_ptr<const uint64_t>(x[4]);
+    if (si < 0 || first < 0 || n < 0 || first + n > NVNGFX_MAX_UBO_SLOTS ||
+        (n > 0 && !rg)) {
+        log_once("nvnCommandBufferBindStorageBuffers.range", static_cast<unsigned>(n));
+        return;
+    }
+    for (int i = 0; i < n; ++i) {
+        b->storage[si][first + i] = rg[2 * i];
+        b->storageSize[si][first + i] = rg[2 * i + 1];
+    }
+    log_once("nvnCommandBufferBindStorageBuffers.unsupported", static_cast<unsigned>(x[1]));
+}
+
+/* nvnCommandBufferBindTransformFeedbackBuffer(s): recorded for the later
+ * transform-feedback path. */
+void cmdbuf_bind_tf_buffer(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    const int slot = static_cast<int>(x[1]);
+    if (!b || slot < 0 || slot >= 16) {
+        log_once("nvnCommandBufferBindTransformFeedbackBuffer.slot",
+                 static_cast<unsigned>(x[1]));
+        return;
+    }
+    b->tfBuffer[slot] = x[2];
+    b->tfSize[slot] = x[3];
+}
+void cmdbuf_bind_tf_buffers(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    const int first = static_cast<int>(x[1]);
+    const int n = static_cast<int>(x[2]);
+    const uint64_t* rg = guest_ptr<const uint64_t>(x[3]);
+    if (!b || first < 0 || n < 0 || first + n > 16 || (n > 0 && !rg)) {
+        log_once("nvnCommandBufferBindTransformFeedbackBuffers.range",
+                 static_cast<unsigned>(n));
+        return;
+    }
+    for (int i = 0; i < n; ++i) {
+        b->tfBuffer[first + i] = rg[2 * i];
+        b->tfSize[first + i] = rg[2 * i + 1];
+    }
+}
 
 /* nvnCommandBufferBindUniformBuffer(NVNcommandBuffer*, NVNshaderStage,
  *                                  int index, NVNbufferAddress, size_t) */
@@ -3431,7 +3952,8 @@ void cmdbuf_set_viewport(nvngfx_ctx* ctx, uint64_t* x) {
     b->viewport = {static_cast<double>(static_cast<int>(x[1])),
                    static_cast<double>(static_cast<int>(x[2])),
                    static_cast<double>(static_cast<int>(x[3])),
-                   static_cast<double>(static_cast<int>(x[4])), 0.0, 1.0};
+                   static_cast<double>(static_cast<int>(x[4])),
+                   b->depthNear, b->depthFar};
     b->hasViewport = true;
     if (b->enc) [b->enc setViewport:b->viewport];
 }
@@ -3447,6 +3969,170 @@ void cmdbuf_set_scissor(nvngfx_ctx* ctx, uint64_t* x) {
                   static_cast<NSUInteger>(static_cast<int>(x[4]))};
     b->hasScissor = true;
     if (b->enc) [b->enc setScissorRect:b->scissor];
+}
+
+
+/* ------------------------------------------------------------------ */
+/* remaining M4 command-buffer state                                   */
+/* ------------------------------------------------------------------ */
+
+/* nvnCommandBufferClearColori / ClearColorui.
+ *
+ * Metal's load-action clear takes doubles, not integer components.  Applying
+ * an integer clear through that path would depend on the attachment's pixel
+ * format and would quietly reinterpret the bits.  These two calls therefore
+ * record that a clear happened and report once; the float entry point above
+ * remains the implemented clear. */
+void cmdbuf_clear_color_i(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    if (!b) return;
+    log_once("nvnCommandBufferClearColori.unsupported", static_cast<unsigned>(x[1]));
+}
+void cmdbuf_clear_color_ui(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    if (!b) return;
+    log_once("nvnCommandBufferClearColorui.unsupported", static_cast<unsigned>(x[1]));
+}
+
+/* nvnCommandBufferClearDepthStencil(cb, float depth, uint32_t depthMask,
+ *                                  int stencil, int stencilMask)
+ * The current pass has no depth attachment, so a clear cannot be encoded. */
+void cmdbuf_clear_depth_stencil(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    if (!b) return;
+    nvngfx_args* a = reinterpret_cast<nvngfx_args*>(x);
+    log_once("nvnCommandBufferClearDepthStencil.unsupported",
+             static_cast<unsigned>(nvngfx_arg_f32(a, 0) * 1000.0f));
+    (void)x[1]; (void)x[2]; (void)x[3];
+}
+
+/* nvnCommandBufferClearBuffer(cb, address, size, uint32_t value) */
+void cmdbuf_clear_buffer(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    if (!b) return;
+    log_once("nvnCommandBufferClearBuffer.unsupported", static_cast<unsigned>(x[3]));
+}
+
+/* nvnCommandBufferClearTexture{,i,ui}: the texture clear path is not wired
+ * to a Metal blit yet.  Keep the call visible instead of silently dropping. */
+void cmdbuf_clear_texture(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    if (!b) return;
+    log_once("nvnCommandBufferClearTexture.unsupported", static_cast<unsigned>(x[1] != 0));
+}
+void cmdbuf_clear_texture_i(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    if (!b) return;
+    log_once("nvnCommandBufferClearTexturei.unsupported", static_cast<unsigned>(x[1] != 0));
+}
+void cmdbuf_clear_texture_ui(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    if (!b) return;
+    log_once("nvnCommandBufferClearTextureui.unsupported", static_cast<unsigned>(x[1] != 0));
+}
+
+/* nvnCommandBufferSetAlphaRef(cb, float) */
+void cmdbuf_set_alpha_ref(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    if (!b) return;
+    nvngfx_args* a = reinterpret_cast<nvngfx_args*>(x);
+    b->alphaRef = nvngfx_arg_f32(a, 0);
+    b->hasAlphaRef = true;
+    log_once("nvnCommandBufferSetAlphaRef.unconsumed",
+             static_cast<unsigned>(b->alphaRef * 1000.0f));
+}
+
+/* nvnCommandBufferSetBlendColor(cb, const float rgba[4]) */
+void cmdbuf_set_blend_color(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    const float* rgba = guest_ptr<const float>(x[1]);
+    if (!b || !rgba) return;
+    for (unsigned i = 0; i < 4; ++i) b->blendColor[i] = rgba[i];
+    b->hasBlendColor = true;
+    if (b->enc) {
+        [b->enc setBlendColorRed:b->blendColor[0]
+                            green:b->blendColor[1]
+                             blue:b->blendColor[2]
+                            alpha:b->blendColor[3]];
+    }
+}
+
+/* nvnCommandBufferSetDepthRange(cb, float near, float far) */
+void cmdbuf_set_depth_range(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    if (!b) return;
+    nvngfx_args* a = reinterpret_cast<nvngfx_args*>(x);
+    b->depthNear = static_cast<double>(nvngfx_arg_f32(a, 0));
+    b->depthFar = static_cast<double>(nvngfx_arg_f32(a, 1));
+    if (b->hasViewport) {
+        b->viewport.znear = b->depthNear;
+        b->viewport.zfar = b->depthFar;
+        if (b->enc) [b->enc setViewport:b->viewport];
+    }
+}
+
+/* nvnCommandBufferSetRenderEnable(cb, uint32_t) */
+void cmdbuf_set_render_enable(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    if (!b) return;
+    b->renderEnable = static_cast<uint32_t>(x[1]);
+    b->hasRenderEnable = true;
+    log_once("nvnCommandBufferSetRenderEnable.recorded", b->renderEnable);
+}
+
+/* nvnCommandBufferSetScissors(cb, int first, int count, const int* rects)
+ * NVNrectangle is four int32 fields.  The current pass has one scissor, so
+ * the first rectangle is applied and a multi-rect call is reported. */
+void cmdbuf_set_scissors(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    const int first = static_cast<int>(x[1]);
+    const int n = static_cast<int>(x[2]);
+    const int* r = guest_ptr<const int>(x[3]);
+    if (!b || !r || n <= 0) return;
+    if (first != 0 || n > 1) {
+        log_once("nvnCommandBufferSetScissors.multi",
+                 static_cast<unsigned>(first) * 32u + static_cast<unsigned>(n));
+    }
+    const int rx = r[0], ry = r[1], rw = r[2], rh = r[3];
+    b->scissor = {static_cast<NSUInteger>(rx < 0 ? 0 : rx),
+                  static_cast<NSUInteger>(ry < 0 ? 0 : ry),
+                  static_cast<NSUInteger>(rw < 0 ? 0 : rw),
+                  static_cast<NSUInteger>(rh < 0 ? 0 : rh)};
+    b->hasScissor = true;
+    if (b->enc) [b->enc setScissorRect:b->scissor];
+}
+
+/* nvnCommandBufferSetViewports(cb, int first, int count, const float* v)
+ * Each NVNviewport is four floats (x, y, w, h).  Apply the first one and
+ * report a multi-viewport call; the render path has one viewport. */
+void cmdbuf_set_viewports(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    const int first = static_cast<int>(x[1]);
+    const int n = static_cast<int>(x[2]);
+    const float* v = guest_ptr<const float>(x[3]);
+    if (!b || !v || n <= 0) return;
+    if (first != 0 || n > 1) {
+        log_once("nvnCommandBufferSetViewports.multi",
+                 static_cast<unsigned>(first) * 32u + static_cast<unsigned>(n));
+    }
+    b->viewport = {static_cast<double>(v[0]), static_cast<double>(v[1]),
+                   static_cast<double>(v[2]), static_cast<double>(v[3]),
+                   b->depthNear, b->depthFar};
+    b->hasViewport = true;
+    if (b->enc) [b->enc setViewport:b->viewport];
+}
+
+/* nvnCommandBufferSetViewportSwizzles(cb, int first, int count,
+ *                                     const NVNviewportSwizzle*)
+ * Metal has no per-viewport axis swizzle; record the first one and report. */
+void cmdbuf_set_viewport_swizzles(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    const int n = static_cast<int>(x[2]);
+    const unsigned* v = guest_ptr<const unsigned>(x[3]);
+    if (!b || !v || n <= 0) return;
+    for (unsigned i = 0; i < 4; ++i) b->viewportSwizzle[i] = v[i];
+    b->hasViewportSwizzle = true;
+    log_once("nvnCommandBufferSetViewportSwizzles.unsupported", b->viewportSwizzle[0]);
 }
 
 /* ------------------------------------------------------------------ */
@@ -3661,6 +4347,69 @@ const Binding kBindings[] = {
     BIND("nvnVertexStreamStateSetDivisor", vstream_set_divisor),
     BIND("nvnVertexStreamStateGetStride", vstream_get_stride),
     BIND("nvnVertexStreamStateGetDivisor", vstream_get_divisor),
+
+    BIND("nvnBlendStateSetDefaults", blend_set_defaults),
+    BIND("nvnBlendStateSetBlendTarget", blend_set_target),
+    BIND("nvnBlendStateSetBlendFunc", blend_set_func),
+    BIND("nvnBlendStateSetBlendEquation", blend_set_equation),
+    BIND("nvnColorStateSetDefaults", color_set_defaults),
+    BIND("nvnColorStateSetBlendEnable", color_set_blend_enable),
+    BIND("nvnColorStateSetLogicOp", color_set_logic_op),
+    BIND("nvnColorStateSetAlphaTest", color_set_alpha_test),
+    BIND("nvnChannelMaskStateSetDefaults", channel_set_defaults),
+    BIND("nvnChannelMaskStateSetChannelMask", channel_set_mask),
+    BIND("nvnMultisampleStateSetDefaults", multisample_set_defaults),
+    BIND("nvnMultisampleStateSetMultisampleEnable", multisample_set_enable),
+    BIND("nvnMultisampleStateSetSamples", multisample_set_samples),
+    BIND("nvnMultisampleStateSetAlphaToCoverageEnable", multisample_set_a2c),
+    BIND("nvnMultisampleStateSetAlphaToCoverageDither", multisample_set_dither),
+    BIND("nvnMultisampleStateSetRasterSamples", multisample_set_raster_samples),
+    BIND("nvnMultisampleStateSetCoverageModulationMode", multisample_set_cov_mod),
+    BIND("nvnMultisampleStateSetCoverageToColorEnable", multisample_set_cov2color_en),
+    BIND("nvnMultisampleStateSetCoverageToColorOutput", multisample_set_cov2color_out),
+    BIND("nvnMultisampleStateSetSampleLocationsEnable", multisample_set_sl_enable),
+    BIND("nvnMultisampleStateSetSampleLocationsGridEnable", multisample_set_sl_grid),
+    BIND("nvnMultisampleStateSetSampleLocations", multisample_set_sample_locations),
+    BIND("nvnPolygonStateSetDefaults", polygon_set_defaults),
+    BIND("nvnPolygonStateSetCullFace", polygon_set_cull),
+    BIND("nvnPolygonStateSetFrontFace", polygon_set_front),
+    BIND("nvnPolygonStateSetPolygonMode", polygon_set_mode),
+    BIND("nvnPolygonStateSetPolygonOffsetEnables", polygon_set_offset),
+    BIND("nvnDepthStencilStateSetDefaults", depth_set_defaults),
+    BIND("nvnDepthStencilStateSetDepthTestEnable", depth_set_test),
+    BIND("nvnDepthStencilStateSetDepthWriteEnable", depth_set_write),
+    BIND("nvnDepthStencilStateSetDepthFunc", depth_set_func),
+    BIND("nvnDepthStencilStateSetStencilTestEnable", depth_set_stencil_test),
+    BIND("nvnDepthStencilStateSetStencilFunc", depth_set_stencil_func),
+    BIND("nvnDepthStencilStateSetStencilOp", depth_set_stencil_op),
+
+    BIND("nvnCommandBufferBindBlendState", cmdbuf_bind_blend_state),
+    BIND("nvnCommandBufferBindColorState", cmdbuf_bind_color_state),
+    BIND("nvnCommandBufferBindChannelMaskState", cmdbuf_bind_channel_state),
+    BIND("nvnCommandBufferBindMultisampleState", cmdbuf_bind_multisample_state),
+    BIND("nvnCommandBufferBindPolygonState", cmdbuf_bind_polygon_state),
+    BIND("nvnCommandBufferBindDepthStencilState", cmdbuf_bind_depth_state),
+    BIND("nvnCommandBufferBindCoverageModulationTable", cmdbuf_bind_coverage_table),
+    BIND("nvnCommandBufferBindStorageBuffer", cmdbuf_bind_storage_buffer),
+    BIND("nvnCommandBufferBindStorageBuffers", cmdbuf_bind_storage_buffers),
+    BIND("nvnCommandBufferBindImage", cmdbuf_bind_image),
+    BIND("nvnCommandBufferBindImages", cmdbuf_bind_images),
+    BIND("nvnCommandBufferBindTransformFeedbackBuffer", cmdbuf_bind_tf_buffer),
+    BIND("nvnCommandBufferBindTransformFeedbackBuffers", cmdbuf_bind_tf_buffers),
+    BIND("nvnCommandBufferClearColori", cmdbuf_clear_color_i),
+    BIND("nvnCommandBufferClearColorui", cmdbuf_clear_color_ui),
+    BIND("nvnCommandBufferClearDepthStencil", cmdbuf_clear_depth_stencil),
+    BIND("nvnCommandBufferClearBuffer", cmdbuf_clear_buffer),
+    BIND("nvnCommandBufferClearTexture", cmdbuf_clear_texture),
+    BIND("nvnCommandBufferClearTexturei", cmdbuf_clear_texture_i),
+    BIND("nvnCommandBufferClearTextureui", cmdbuf_clear_texture_ui),
+    BIND("nvnCommandBufferSetAlphaRef", cmdbuf_set_alpha_ref),
+    BIND("nvnCommandBufferSetBlendColor", cmdbuf_set_blend_color),
+    BIND("nvnCommandBufferSetDepthRange", cmdbuf_set_depth_range),
+    BIND("nvnCommandBufferSetRenderEnable", cmdbuf_set_render_enable),
+    BIND("nvnCommandBufferSetScissors", cmdbuf_set_scissors),
+    BIND("nvnCommandBufferSetViewports", cmdbuf_set_viewports),
+    BIND("nvnCommandBufferSetViewportSwizzles", cmdbuf_set_viewport_swizzles),
 
     BIND("nvnQueuePresentTexture", queue_present_texture),
 };

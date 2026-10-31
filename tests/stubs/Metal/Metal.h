@@ -387,6 +387,7 @@ destinationBytesPerImage:(NSUInteger)bpi;
             indexBufferOffset:(NSUInteger)offset;
 - (void)setViewport:(MTLViewport)viewport;
 - (void)setScissorRect:(MTLScissorRect)rect;
+- (void)setBlendColorRed:(float)red green:(float)green blue:(float)blue alpha:(float)alpha;
 - (void)setRenderPipelineState:(id<MTLRenderPipelineState>)state;
 - (void)setVertexBuffer:(id<MTLBuffer>)buffer
                  offset:(NSUInteger)offset

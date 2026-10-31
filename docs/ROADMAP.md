@@ -3943,3 +3943,177 @@ RESULT: PASS
 | harness 侧 `nvnCommandBufferBind*` 仍是 no-op | 进 `NVN_MISS`、不产生记录；回放层还原管线还缺这些状态 |
 | 段满 236 次只镜像到宿主帧表 | guest 命令内存里没有这些记录，真机语义下应触发 memory callback 扩容 |
 | 去重加速默认关闭（`BOTW_FAST_DEDUP=1` 才开） | 未默认启用，避免未验证路径影响回归 |
+
+## M4 固定功能状态对象与命令句柄（进行中）
+
+M3.96 的严格门禁已经把真实的 guest draw 打到 701 draw / 301 present（660 s），
+随后一次 700 s 复跑给出 529 draw / 228 present、api_entries=98。这些数字只证明
+"游戏确实在提交绘制"。要让回放层画对，还缺两样当时完全不存在的东西：
+
+* **固定功能状态**：blend / color / channel mask / multisample / polygon /
+  depth-stencil 六类状态对象，以及 viewport、scissor、深度范围、清屏参数；
+* **命令句柄**：`nvnCommandBufferEndRecording` 的返回值，以及
+  `nvnCommandBufferCallCommands` 要展开的私有命令段。
+
+这一轮把这两块从空实现变成"回放层可以直接消费的记录"，iOS 侧同步落地了状态对象
+的可移植打包，Metal 入口从 134 增到 195（+61）。
+
+### 1. 状态 setter 与 bind 从 `_nvn_miss` 里捞出来
+
+上一轮 700 s 复跑的日志把"落到空实现"的入口按次数排了序：
+
+```text
+nvnVertexAttribStateSetDefaults              15944
+nvnSamplerCompare                            14041
+nvnVertexAttribStateSetFormat                12704
+nvnVertexAttribStateSetStreamIndex           12704
+nvnVertexStreamStateSetDefaults              10813
+nvnChannelMaskStateSetChannelMask             8824
+nvnColorStateSetBlendEnable                   8592
+nvnBlendStateSetBlendTarget                   8592
+nvnBlendStateSetBlendFunc                     8592
+nvnBlendStateSetBlendEquation                 8592
+```
+
+同一份日志里 `nvnCommandBufferBindBlendState` 被调用 **7231 次**，一条记录都没
+产生。这一轮补的是六类状态对象的全部 setter、6 个 `Bind*State`，以及
+viewport / scissor / 深度范围 / 混合色 / 清屏的记录入口；它们分别写进
+`OP_BIND_STATE` / `OP_SET_VIEWPORT` / `OP_SET_SCISSOR` / `OP_CLEAR_COLOR` /
+`OP_CLEAR_DS` / `OP_SET_DEPTH_RANGE` / `OP_SET_BLEND_COLOR`。
+
+### 2. 状态对象就地打包，不建地址侧表
+
+NVN 的状态对象本身就是 guest 内存里的一个小 blob：`nvn*StateSet*` 往里写位域，
+`nvnCommandBufferBind*State` 只是把指针交给命令流。所以记录层按 D2R
+`dm/gfx/nvn/nvn_obj.h` 的实测布局，就地读、就地写：
+
+| 对象 | 大小 | 位域 |
+|---|---:|---|
+| Blend | 8 B | `target:3, src_rgb:7, dst_rgb:7, src_a:7, dst_a:7, eq_rgb:3, eq_a:3` |
+| Color | 4 B | `blend_en:8, logic_op:4, alpha_func:4` |
+| ChannelMask | 4 B | 每个 target 4 个写使能位 |
+| Multisample | 10 B | `enable, samples, a2c, a2c_dither, raster_samples, cov_mod, cov2color_en, cov2color_out, sl_en, sl_grid`（一字节一个字段） |
+| Polygon | 4 B | `cull:2, front:1, mode:2, offset_en:3` |
+| DepthStencil | 8 B | `dt:1, dw:1, df:4, st:1` + 六个 4 位 stencil 域 |
+
+bind 当刻就把 4 / 8 / 10 字节快照写进记录。这一点不能省：游戏会复用同一个状态
+对象，若按"记录末尾再读指针"的做法，前面所有 draw 都会看到最后一次 `Set*` 之后
+的值，回放出来就是错的。
+
+### 3. depth 与 polygon 的 kind 写反了
+
+旧记录层把两个 bind 的类型编号对调：
+
+```text
+BindDepthStencilState  kind=4 / 4 B    （4 B 是 polygon）
+BindPolygonState       kind=5 / 8 B    （8 B 是 depth-stencil）
+```
+
+现在 `kind 4 = polygon (4 B)`、`kind 5 = depthStencil (8 B)`。`m3_verify.py`
+的严格检查按同一张表校验快照长度，写错一位就判失败——这条错误是被门禁而不是被
+肉眼发现的。
+
+### 4. 命令句柄是真的句柄
+
+```text
+nvnCommandBufferEndRecording(cb) -> NVNcommandHandle
+```
+
+M3.96 之前这个入口返回 void，游戏存下来的"句柄"永远是 0。现在：
+
+* 句柄是 guest 内存里一块 0x40 字节零页地址（1 MiB arena，16384 个），满足
+  "唯一且可解引用"；arena 用完时 `HANDLE_FAIL` 计数，不静默返回 0；
+* 句柄里存的是**命令体**——去掉外层 `BEGIN` / `END`，因为那两条是 command buffer
+  的边界，不是被调用的命令；
+* `CallCommands` / `CopyCommands` 在 guest 命令内存里只留一条 `OP_CALL` /
+  `OP_COPY`（这才是真机语义），展开只发生在宿主帧表里，带深度上限 6 与 `seen`
+  环检测；
+* `nvnDeviceFinalizeCommandHandle` 释放句柄。
+
+### 5. 私有命令段：`overflow=0`
+
+M3.96 里 guest 给的命令内存不够用时，我们只把记录镜像到宿主帧表，报告
+`overflow=236`。现在每个 command buffer 拿到自己的一块 0x40000 字节段（按需扩大、
+跨帧复用），游戏给的 slab 只作证据、不再往里写。游戏从不读命令内存，它看到的
+`GetCommandMemorySize/Used` 也是我们答的，所以这条替换对客体是等价的；仍然是
+**驱动侧做法**，没有重入 guest 的 memory callback（在 SVC 处理器里再跑一段 guest
+代码风险太大）。
+
+### 6. 离线测试
+
+四个 harness 单测，全部 PASS：
+
+```text
+_test_cbdraw.py     draw / 索引 / 顶点路径           PASS
+_test_m4state.py    bind/set/clear 记录              PASS
+_test_cmdhandle.py  句柄 / CallCommands / 展开       PASS
+_test_stateobj.py   6 类状态对象就地打包             PASS
+                    records=19 bind_state=6 state_write_fail=0
+```
+
+### 7. 证据：700 秒严格门禁（新代码）
+
+```text
+M3: 700.0s  frames=8398 (12 fps)  status=budget
+    objects: buffer 3974 / program 2626 / texture 450 / pool 419 / sampler 366 / cmdbuf 27
+    frame: 768 ops / 2528 bytes, cmd mem 0x1C6D8B000+0x40000
+    draw=707  overflow=0  api_entries=130
+    presents=304
+    first draw: op=13 vals=[0x701F1C88, 4, 1, 3, 0x141C22000, 0, 0, 1]
+                caller=0x41D2BA6C main+0x1D2BA6C cb=0x701F1C88 frame#8
+    state: BIND_UNIFORM 150 / BIND_STATE 50 / CALL 17 / SET_SCISSOR 15 /
+           SET_VIEWPORT 15 / SET_DEPTH_RANGE 15 / SET_RT 6 /
+           SET_BLEND_COLOR 5 / CLEAR_COLOR 3 / BIND_VATTR 2 / DRAW_IDX 2
+    command handles: calls=5165 copies=0 submits=304 expanded=210807 miss=0
+    first viewport (x,y,w,h) = (0, 0, 1920, 1080)
+RESULT: PASS
+```
+
+与 M3.96 的 660 s 门禁（701 draw / 301 present / `overflow` 236）相比，draw 与
+present 同量级，但三件事变了：
+
+* `overflow` 从 236 变成 **0**；
+* 命令句柄被 `CallCommands` 调用 **5165 次**，展开 **210807** 条记录，
+  `CALL_MISS` = **0**（句柄查不到的次数）；
+* `m3_verify.py` 对每条状态记录解码后**一条不合法都没有**（有的话会打印
+  "M4 状态记录有 N 处不合法"）。这条检查包括 kind ∈ 0..5 与快照长度
+  8/4/4/10/4/8 的逐项校验。
+
+门禁本身仍只跑 700 s（`status=budget`），不是"加载完成后稳定运行"的证明。
+
+### 8. iOS 侧：可移植状态层 + Metal 入口 195/513
+
+新增 `ios/nvn/include/nvn_state.h` 与 `src/nvn_state.c`：
+
+* 六类状态的**位域布局、默认值与 pack / unpack**，与 D2R `nvn_obj.h` 逐字段一致；
+* **不翻译 NVN 枚举**：字段按 guest 写入的原值保存，由 Metal 层决定认不认得；
+* `tests/nvn_state_test.cpp` 用真实位模式断言默认值、打包与往返，不依赖 Metal 或
+  Apple SDK。
+
+`ios/nvn/src/nvn_metal.mm`：
+
+* `CmdBuf` 增加固定功能状态快照字段，`BeginRecording` 重置；
+* 六类状态 setter 与 6 个 `Bind*State` 全部落地，bind 时快照并置 `pso = nil`；
+* 补 `BindCoverageModulationTable` / `BindStorageBuffer(s)` / `BindImage(s)` /
+  `BindTransformFeedbackBuffer(s)`、`ClearColori/ui` / `ClearDepthStencil` /
+  `ClearBuffer` / `ClearTexture{i,ui}`、`SetAlphaRef` / `SetBlendColor` /
+  `SetDepthRange` / `SetRenderEnable` / `SetScissors` / `SetViewports` /
+  `SetViewportSwizzles`；
+* 映射不到 Metal 的路径用 `log_once()` 明确上报，**没有静默 no-op**。
+
+覆盖从 **134/513** 提升到 **195/513（38.0%）**，CommandBuffer 域从 23/144 到
+50/144。门禁：`verify_ios: ok (metal bindings: 195/513)`、
+`syntax_check_metal: ok (clang++.exe)`、
+`build_abi_test: all tests passed`。
+
+### 还没有的（M4 的真实缺口）
+
+| 缺口 | 后果 |
+|---|---|
+| iOS 侧 `cmdbuf_end_recording` 仍在 EndRecording 里直接 commit 并返回 handle 0 | 客体拿不到可提交的句柄，回放层没有命令流可重放 |
+| iOS 侧未实现 `nvnCommandBufferCallCommands` / `nvnQueueSubmitCommands` | harness 记录得出来，回放层展不开 |
+| 固定功能状态只记录 / 快照，没有写进 `MTLRenderPipelineDescriptor` | 混合、深度测试、剔除、写掩码都不生效 |
+| `ClearColori/ui` / `ClearDepthStencil` / `ClearBuffer` / `ClearTexture*` 只 `log_once` | 整数清屏与纹理清屏仍是占位；`ClearColor`（float）有真路径 |
+| storage buffer / image / transform feedback 只记录句柄 | 计算与 UAV 路径未接线 |
+| harness 的 `nvnSamplerCompare` 只比较部分已实现字段，`SamplerBuilder` 缺 wrap / compare / border setter | 采样器状态不完整 |
+| 没有真机运行 | 不能声称画面，任何"能玩"的说法都不成立 |
