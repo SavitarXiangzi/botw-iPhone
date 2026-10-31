@@ -4715,28 +4715,47 @@ build_abi_test: all tests passed
 ### 3. direct binding 契约
 
 ```text
-NVN storage buffer slot r -> MSL [[buffer(16 + r)]]
-NVN image slot r          -> MSL [[texture(r)]]
+NVN uniform buffer slot r  -> MSL [[buffer(r)]]          r = 0..15
+NVN storage buffer slot r  -> MSL [[buffer(16 + r)]]     r = 0..14
+NVN image slot r           -> MSL [[texture(r)]]         r = 0..15
+NVN sampled texture slot r -> MSL [[texture(16 + r)]]    r = 0..14
+NVN sampler slot r         -> MSL [[sampler(r)]]         r = 0..15
 ```
 
-* `begin_compute_dispatch()` 先落地 pending clears，再结束 render pass，然后建
-  `MTLComputeCommandEncoder`，按 compute stage（5）绑定 storage buffer / image；
+* Metal 每个阶段只有 31 个 buffer / texture 参数（索引 0..30）和 16 个
+  sampler；NVN 自己允许 32 个槽，所以 direct 表必须切分。越界绑定在记录时
+  明确拒绝并 `log_once`，不会等到真机 Metal 校验才失败；
+* compute 使用独立的 `cuUbo` / `cuTex` / `cuSepTex` / `cuSepSamp` 表，
+  一次 dispatch 不会覆盖下一条 draw 的图形阶段资源；
+* `begin_compute_dispatch()` 先落地 pending clears，再结束 render pass；
+  `prepare_compute_textures()` 在创建 compute encoder 之前对 sampled texture
+  调用 `tex_upload()`（解块 / BCn 解码走 blit），失败则整次 dispatch 不编码；
+* `BindTexture` 的组合句柄同时提供纹理和 sampler；`BindSeparateTexture` /
+  `BindSeparateSampler` 进入独立表。组合绑定的 sampler 槽位与纹理槽位相同，
+  分离绑定按各自槽位解析；
 * direct dispatch 的三个参数是 threadgroup 数，乘以侧车里的线程组大小；
 * indirect dispatch 把 guest 地址映射到 pool 的 `MTLBuffer`，交给
   `dispatchThreadgroupsWithIndirectBuffer:...` 由 GPU 读取 `{x, y, z}`，CPU
   不提前读参数，因此同一 command buffer 里前一个 kernel 写出的组数可见；
-* dispatch 后把绑定的 image 标记为已写入，避免后续采样从 guest 原始纹理存储
-  重传并覆盖 compute 结果。
+* dispatch 后只把 image 表的槽位标记为已写入，避免后续采样从 guest 原始纹理
+  存储重传并覆盖 compute 结果；sampled texture 不会被误标为写目标。
 
 ### 4. 模拟器自测
 
 * compute-only 程序 + `// nvngfx-threadgroup 16 1 1`；
-* storage buffer 0 为源（`src[0] = 1000`），buffer 1 为 direct 输出，buffer 1
-  重新绑定为 indirect 输出；indirect 参数 `{1, 16, 1}`；
+* uniform buffer 0 提供 `base = 500`；storage buffer 0 为源
+  （`src[0] = 1000`），buffer 1 为 direct 输出，随后重新绑定为 indirect 输出；
+  indirect 参数 `{1, 16, 1}`；
+* sampled texture 是 guest pool 中 2×2 RGBA8 的全红纹理，绑定到
+  `[[texture(16)]]`；sampler pool 槽位 9 绑定到 `[[sampler(0)]]`；
+* direct dispatch 使用组合纹理句柄（同时带 sampler）；indirect dispatch 先清掉
+  组合槽，再走分离纹理 + 分离 sampler，两条路径都真实执行；
 * 16×16 RGBA8 image 同时由 kernel 写入；
-* direct 与 indirect 各 dispatch 一次，回读 256 个 storage word
-  （`1000 + x + y`）与 image 的 `(0,0)` / `(15,15)` 像素；
-* 期望像素约为 `(0, 0, 191, 255)` 与 `(255, 255, 191, 255)`。
+* 回读 256 个 storage word（`500 + 1000 + x + y`）与 image 的 `(0,0)` /
+  `(15,15)` 像素；红色通道来自 sampled texel，期望像素约为
+  `(255, 0, 191, 255)` 与 `(255, 255, 191, 255)`；
+* 额外断言 sampled texture 处于 `uploaded` 且没有被 image 写回逻辑标成
+  `rendered`。
 
 ### 5. 覆盖与仍然缺的
 
@@ -4750,10 +4769,9 @@ build_abi_test: all tests passed
 
 仍未支持：
 
-* compute 的 sampled texture / sampler / uniform buffer 绑定（`cmdbuf_bind_texture()` /
-  `bind_sampler()` / `bind_uniform_buffer()` 仍拒绝 stage 5）；
 * mixed graphics + compute 的 `nvnProgramSetShaders`；
 * 离线 manifest 的 compute 条目与真实标题 compute shader 翻译（`gen_blobs.py`
   仍只有 `vs` / `ps`）；
 * compute image 写回 guest 存储 / CPU 回读的完整一致性；
+* texture view 与 compute 的 bindless / 参数缓冲区路径；
 * 没有真机像素验证，不能声称画面正确。

@@ -510,7 +510,7 @@ guest storage，再调用 `nvnTextureFlushTexels` 改成棕/钢蓝/橙/天蓝并
   blit `fillBuffer` 只能重复单字节，而 NVN 的 value 是 32 位字。kernel 在同一个
   `MTLCommandBuffer` 内写入已注册 memory pool 的 span，支持任意 32 位模式，地址和长度
   要求 4 字节对齐；模拟器用 0xA1B2C3D4 回读 8 个 word。仍缺
-  `SetStencilCullCriteria`；guest `DispatchCompute` / `DispatchComputeIndirect` 已支持 compute-only 程序的 direct-binding 路径（storage buffer 为 `[[buffer(16 + slot)]]`，image 为 `[[texture(slot)]]`，线程组大小来自 MSL 侧车 `// nvngfx-threadgroup X Y Z`，indirect 参数由 GPU 从 guest pool 读取），但仍缺 compute 的 sampled texture / sampler / uniform buffer、compute image 写回 guest 存储 / CPU 回读、混合 graphics+compute 程序与真实标题 compute blob；颜色清屏的部分通道掩码已改为
+  `SetStencilCullCriteria`；guest `DispatchCompute` / `DispatchComputeIndirect` 已支持 compute-only 程序的 direct-binding 路径（uniform 为 `[[buffer(slot)]]`、storage buffer 为 `[[buffer(16 + slot)]]`、image 为 `[[texture(slot)]]`、sampled texture 为 `[[texture(16 + slot)]]`、sampler 为 `[[sampler(slot)]]`；组合与分离纹理 / sampler 句柄都解析，sampled texture 在 compute encoder 打开前解块上传；受 Metal 每阶段 31 个 buffer / texture 参数限制，storage 与 sampled texture 各 15 槽，uniform / image / sampler 各 16 槽，越界绑定明确拒绝；线程组大小来自 MSL 侧车 `// nvngfx-threadgroup X Y Z`，indirect 参数由 GPU 从 guest pool 读取），但仍缺 compute image 写回 guest 存储 / CPU 回读、混合 graphics+compute 程序与真实标题 compute blob；颜色清屏的部分通道掩码已改为
   Load + 全屏三角形（管线写掩码选通道），模拟器验证 RGBA8 的 R/G 合并清屏与
   RGBA8Uint 的 R/G 掩码清屏保留 B/A。`ClearTexture` / `ClearTexturei` /
   `ClearTextureui` 已支持 2D / 2D array / cube / cube array / 2D MSAA 颜色纹理的
@@ -640,7 +640,7 @@ constexpr int kEnumsVerified = 0;
 | 浮点参数 | `nvngfx_args.f[8]` 已扩展，float 在低 32 位 | 本仓库外 guest 调用端仍需实现 s/d 寄存器桥 |
 | 采样器资源 | builder/object、sampler pool 与 `MTLSamplerState` 已建，句柄可解析 | `[[id(k)]]`、c1、packed slot、bindless 与顶点参数缓冲区已接；真实标题 shader 仍缺离线翻译链 |
 | 同步/fence | 未实现 | 长时间跑可能撕裂 |
-| compute | compute-only 程序的 direct / indirect dispatch 已接（storage buffer / image 直连绑定）；sampled texture / sampler / uniform 与真实标题 blob 未接 | 后处理仍不可用 |
+| compute | compute-only 程序的 direct / indirect dispatch 已接（uniform / storage buffer / image / sampled texture / sampler 直连绑定，组合与分离句柄；sampled texture 先上传）；真实标题 blob 与 image 写回 guest 未接 | 后处理仍不可用 |
 | 多线程 | 单队列 | 与真机行为有差异 |
 
 `ios/project.yml` 的跨目录引用（`../core/src`）、`buildPhase: none`、

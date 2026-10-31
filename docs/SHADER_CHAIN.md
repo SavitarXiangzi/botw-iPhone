@@ -323,7 +323,7 @@ packed slot 写进 blob，尚未接（M3.85 的自检暴露了这一点）。
 | 整作 19,592 个 shader 全量构建 | 未做；只验证了 1 个 pack 的 5,102 个 key 中的 2 个 |
 | 编译期校验（MSL 语法） | 未做；Windows 没有 Metal 前端，MSL 只在 CI 的 macOS 上才能编 |
 | 真机 / 模拟器上跑真实 shader | 未做。自检用的是内置 MSL 和自写合成 bundle（十条 draw：`[[vertex_id]]`、顶点属性、16 位索引的 `DrawElements`、`BindUniformBuffer` 参数缓冲区、texture pool + sampler pool 采样、只通过 `[[id(0)]]` 读 c1 常量段、bindless 句柄表、顶点阶段参数缓冲区、从 guest 池解块上传的 2x2 纹理、从离线 bundle 按 guest key 取 MSL；另加一条 sampler 状态创建/比较路径） |
-| compute / geometry shader | 后端已有 host 自测 MSL 的 compute-only direct / indirect dispatch 路径；`extract` 仍跳过 cs，geometry 未做 |
+| compute / geometry shader | 后端已有 host 自测 MSL 的 compute-only direct / indirect dispatch 路径（uniform / storage buffer、image、sampled texture、sampler，组合与分离句柄）；`extract` 仍跳过 cs，geometry 仍跳过 |
 | 运行时按 key 取 MSL | **已接线**（M3.78，见 §5.1） |
 | 顶点描述符 | **已接**（M3.79） |
 | argument buffer（UBO / 纹理 / sampler / c1） | UBO 已接（M3.81）；texture/sampler 条目按固定 8 字节 ABI 写入（M3.83）；真实 shader 的 `[[id(k)]]` 布局侧车已接（M3.84）；c1 已接（M3.85），但 bindless / 顶点参数缓冲区仍未解 |

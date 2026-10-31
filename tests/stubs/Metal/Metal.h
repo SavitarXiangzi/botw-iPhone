@@ -507,6 +507,7 @@ destinationBytesPerImage:(NSUInteger)bpi;
           length:(NSUInteger)length
          atIndex:(NSUInteger)index;
 - (void)setTexture:(id<MTLTexture>)texture atIndex:(NSUInteger)index;
+- (void)setSamplerState:(id<MTLSamplerState>)sampler atIndex:(NSUInteger)index;
 - (void)dispatchThreadgroups:(MTLSize)threadgroups
       threadsPerThreadgroup:(MTLSize)threadsPerThreadgroup;
 - (void)dispatchThreadgroupsWithIndirectBuffer:(id<MTLBuffer>)indirectBuffer

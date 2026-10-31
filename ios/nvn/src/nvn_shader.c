@@ -39,19 +39,31 @@ static const char* const kVs =
 /* The compute self-test: one dispatch fills a 16x16 uint buffer and a 16x16
  * RGBA8 image.  The comment is the threadgroup-size sidecar the backend reads;
  * it is deliberately machine-readable and lives in the MSL so a translated
- * compute blob can carry the same information later. */
+ * compute blob can carry the same information later.
+ *
+ * The bindings pin the whole direct compute contract: uniform buffer 0 at
+ * [[buffer(0)]], storage buffers 0/1 at [[buffer(16/17)]], the write image at
+ * [[texture(0)]], the sampled texture at [[texture(16)]] and its sampler at
+ * [[sampler(0)]].  The uniform contributes an offset and the sampled texel
+ * becomes the image's red channel, so a wrong table shows up in the readback
+ * instead of passing as an unbound-but-unused argument. */
 static const char* const kCs =
     "#include <metal_stdlib>\n"
     "using namespace metal;\n"
     "// nvngfx-threadgroup 16 1 1\n"
+    "struct NvngfxComputeUniforms { uint base; uint pad0; uint pad1; uint pad2; };\n"
     "kernel void nvngfx_main_cs(device const uint* src [[buffer(16)]],\n"
     "                           device uint* dst [[buffer(17)]],\n"
+    "                           constant NvngfxComputeUniforms& u [[buffer(0)]],\n"
     "                           texture2d<float, access::write> image [[texture(0)]],\n"
+    "                           texture2d<float> sampled [[texture(16)]],\n"
+    "                           sampler samp [[sampler(0)]],\n"
     "                           uint2 gid [[thread_position_in_grid]]) {\n"
     "    if (gid.x >= 16 || gid.y >= 16) return;\n"
-    "    dst[gid.y * 16 + gid.x] = src[0] + gid.x + gid.y;\n"
-    "    image.write(float4(float(gid.x) / 15.0,\n"
-    "                       float(gid.y) / 15.0, 0.75, 1.0), gid);\n"
+    "    const float4 texel =\n"
+    "        sampled.sample(samp, float2(0.25, 0.25), level(0.0));\n"
+    "    dst[gid.y * 16 + gid.x] = src[0] + u.base + gid.x + gid.y;\n"
+    "    image.write(float4(texel.r, float(gid.y) / 15.0, 0.75, 1.0), gid);\n"
     "}\n";
 
 static const char* const kFs =

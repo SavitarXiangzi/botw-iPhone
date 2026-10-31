@@ -19,9 +19,13 @@
  *           per-level/slice attachment passes, flushed even without a draw
  *         ClearBuffer -> host compute kernel over a pool span
  *         guest DispatchCompute / DispatchComputeIndirect -> compute-only
- *           program, direct [[buffer(16 + r)]] storage buffers and
- *           [[texture(r)]] images, threadgroup size from an MSL sidecar;
- *           indirect group counts are read by the GPU from a pool span
+ *           program with direct bindings: uniform buffers [[buffer(r)]],
+ *           storage buffers [[buffer(16 + r)]], images [[texture(r)]],
+ *           sampled textures [[texture(16 + r)]] and samplers [[sampler(r)]];
+ *           combined and separate texture/sampler handles are both resolved,
+ *           sampled textures are uploaded before the compute encoder opens,
+ *           the threadgroup size comes from an MSL sidecar, and indirect
+ *           group counts are read by the GPU from a pool span
  *         texture objects, built from the values nvnTextureBuilderSet* was
  *           given (no guest struct offsets are read)
  *         program objects; the pipeline cache is keyed by every colour
@@ -44,8 +48,8 @@
  *         ClearColor, ClearTexture full-region-mask-uint-cube-mip, depth /
  *         stencil / partial-stencil and MRT clears), a
  *         buffer-fill compute probe, direct and indirect guest compute
- *         dispatch probes (storage words and RGBA8 pixels read back), a
- *         bindless table probe, and a vertex-stage
+ *         dispatch probes (uniform offset, sampled texel and RGBA8 pixels
+ *         read back), a bindless table probe, and a vertex-stage
  *         argument-buffer draw whose shifted pixels are read back.  The ninth
  *         builds a block-linear texture in a guest memory pool and proves that
  *         the sampled pixels came from that storage, not from a host-side
@@ -53,9 +57,9 @@
  *         <app>/shaders and reads back orange.  The eleventh uploads a
  *         two-layer 2D array and reads red from layer 0 and yellow from layer 1.
  *         A sampler state object is also created, compared and read back.
- *         texture views / compute sampled textures, samplers, uniform
- *         buffers, mixed graphics+compute programs, translated compute
- *         blobs / sync-fence
+ *         texture views / mixed graphics+compute programs, translated
+ *         compute blobs / sync-fence, and compute image writeback to guest
+ *         storage
  *         BC6H/BC7 and signed BCn (unsigned BC1-BC5 decode to RGBA8)
  *
  * Argument ABI: measured, not guessed
@@ -309,6 +313,29 @@ struct TexView16 {
 };
 static_assert(sizeof(TexView16) == 16, "NVNtextureView measured as 16 bytes");
 
+/* NVN numbers its stages vertex 0 ... compute 5.  nvngfx_stage is a
+ * compact 0/1/2 vocabulary for the shader blob table, so the guest value
+ * is named separately and never confused with it. */
+constexpr uint64_t kNvnStageCompute = 5;
+/* Metal argument tables hold 31 entries (indices 0..30) per stage and 16
+ * samplers.  NVN itself allows 32 slots, so a compute direct binding has to
+ * split the tables:
+ *
+ *   uniform buffer  slot r -> [[buffer(r)]]          r = 0..15
+ *   storage buffer  slot r -> [[buffer(16 + r)]]     r = 0..14
+ *   image           slot r -> [[texture(r)]]         r = 0..15
+ *   sampled texture slot r -> [[texture(16 + r)]]    r = 0..14
+ *   sampler         slot r -> [[sampler(r)]]         r = 0..15
+ *
+ * Index 31 is not an argument; Metal rejects it on a real device.  Bindings
+ * outside these ranges are dropped and reported once instead of producing a
+ * validation failure later. */
+constexpr unsigned kComputeImageSlots = 16;
+constexpr unsigned kComputeSampledSlots = 15;
+constexpr unsigned kComputeSamplerSlots = 16;
+constexpr unsigned kComputeUniformSlots = 16;
+constexpr unsigned kComputeStorageSlots = 15;
+
 struct CmdBuf {
     bool recording = false;
     unsigned draws = 0;
@@ -458,6 +485,14 @@ struct CmdBuf {
     uint64_t storage[6][NVNGFX_MAX_UBO_SLOTS] = {};
     uint64_t storageSize[6][NVNGFX_MAX_UBO_SLOTS] = {};
     uint64_t image[6][NVNGFX_MAX_TEXTURE_SLOTS] = {};
+    /* Compute bindings live in their own tables: stage 5 and the graphics
+     * stages may hold different objects at one index, and a dispatch between
+     * two draws must not disturb the render tables. */
+    uint64_t cuUbo[NVNGFX_MAX_UBO_SLOTS] = {};
+    uint64_t cuUboSize[NVNGFX_MAX_UBO_SLOTS] = {};
+    uint64_t cuTex[kComputeSampledSlots] = {};
+    uint64_t cuSepTex[kComputeSampledSlots] = {};
+    uint64_t cuSepSamp[kComputeSamplerSlots] = {};
     uint64_t tfBuffer[16] = {};
     uint64_t tfSize[16] = {};
     uint32_t viewportSwizzle[4] = {};
@@ -1880,14 +1915,25 @@ int stage_index(uint64_t stage) {
 }
 
 /* nvnCommandBufferBindTexture(cb, stage, slot, handle) and the plural form.
- * Vertex and pixel bindings are kept apart; any other stage is reported as
- * ignored instead of silently landing in a table nothing reads. */
+ * Vertex and pixel bindings are kept apart; compute gets its own combined-
+ * texture table (cuTex) so a dispatch between two draws cannot move either
+ * render stage's arguments.  Any other stage is reported as ignored instead
+ * of silently landing in a table nothing reads. */
 void cmdbuf_bind_texture(nvngfx_ctx*, uint64_t* x) {
     CmdBuf* b = find<CmdBuf>(x[0]);
     if (!b) return;
+    const unsigned stage = static_cast<unsigned>(x[1]);
+    const unsigned slot = static_cast<unsigned>(x[2]);
+    if (stage == kNvnStageCompute) {
+        if (slot >= kComputeSampledSlots) {
+            log_once("nvnCommandBufferBindTexture.computeSlot", slot);
+            return;
+        }
+        b->cuTex[slot] = x[3];
+        return;
+    }
     const int si = stage_index(x[1]);
     if (si < 0) { log_once("nvnCommandBufferBindTexture.stage", static_cast<unsigned>(x[1])); return; }
-    const unsigned slot = static_cast<unsigned>(x[2]);
     if (slot >= NVNGFX_MAX_TEXTURE_SLOTS) { log_once("nvnCommandBufferBindTexture.slot", slot); return; }
     b->texHandle[si][slot] = x[3];
     b->argbuf[si] = nil;
@@ -1895,12 +1941,21 @@ void cmdbuf_bind_texture(nvngfx_ctx*, uint64_t* x) {
 void cmdbuf_bind_textures(nvngfx_ctx*, uint64_t* x) {
     CmdBuf* b = find<CmdBuf>(x[0]);
     if (!b) return;
-    const int si = stage_index(x[1]);
-    if (si < 0) { log_once("nvnCommandBufferBindTextures.stage", static_cast<unsigned>(x[1])); return; }
+    const unsigned stage = static_cast<unsigned>(x[1]);
     const unsigned first = static_cast<unsigned>(x[2]);
     const unsigned n = static_cast<unsigned>(x[3]);
     const uint64_t* handles = guest_ptr<const uint64_t>(x[4]);
-    if (!handles) return;
+    if (!handles && n) return;
+    if (stage == kNvnStageCompute) {
+        if (first > kComputeSampledSlots || n > kComputeSampledSlots - first) {
+            log_once("nvnCommandBufferBindTextures.computeRange", n);
+            return;
+        }
+        for (unsigned i = 0; i < n; ++i) b->cuTex[first + i] = handles[i];
+        return;
+    }
+    const int si = stage_index(x[1]);
+    if (si < 0) { log_once("nvnCommandBufferBindTextures.stage", static_cast<unsigned>(x[1])); return; }
     for (unsigned i = 0; i < n; ++i) {
         const unsigned slot = first + i;
         if (slot >= NVNGFX_MAX_TEXTURE_SLOTS) { log_once("nvnCommandBufferBindTextures.slot", slot); break; }
@@ -1911,9 +1966,18 @@ void cmdbuf_bind_textures(nvngfx_ctx*, uint64_t* x) {
 void cmdbuf_bind_separate_texture(nvngfx_ctx*, uint64_t* x) {
     CmdBuf* b = find<CmdBuf>(x[0]);
     if (!b) return;
+    const unsigned stage = static_cast<unsigned>(x[1]);
+    const unsigned slot = static_cast<unsigned>(x[2]);
+    if (stage == kNvnStageCompute) {
+        if (slot >= kComputeSampledSlots) {
+            log_once("nvnCommandBufferBindSeparateTexture.computeSlot", slot);
+            return;
+        }
+        b->cuSepTex[slot] = x[3];
+        return;
+    }
     const int si = stage_index(x[1]);
     if (si < 0) { log_once("nvnCommandBufferBindSeparateTexture.stage", static_cast<unsigned>(x[1])); return; }
-    const unsigned slot = static_cast<unsigned>(x[2]);
     if (slot >= NVNGFX_MAX_TEXTURE_SLOTS) { log_once("nvnCommandBufferBindSeparateTexture.slot", slot); return; }
     b->sepTexHandle[si][slot] = x[3];
     b->argbuf[si] = nil;
@@ -1921,12 +1985,21 @@ void cmdbuf_bind_separate_texture(nvngfx_ctx*, uint64_t* x) {
 void cmdbuf_bind_separate_textures(nvngfx_ctx*, uint64_t* x) {
     CmdBuf* b = find<CmdBuf>(x[0]);
     if (!b) return;
-    const int si = stage_index(x[1]);
-    if (si < 0) { log_once("nvnCommandBufferBindSeparateTextures.stage", static_cast<unsigned>(x[1])); return; }
+    const unsigned stage = static_cast<unsigned>(x[1]);
     const unsigned first = static_cast<unsigned>(x[2]);
     const unsigned n = static_cast<unsigned>(x[3]);
     const uint64_t* handles = guest_ptr<const uint64_t>(x[4]);
-    if (!handles) return;
+    if (!handles && n) return;
+    if (stage == kNvnStageCompute) {
+        if (first > kComputeSampledSlots || n > kComputeSampledSlots - first) {
+            log_once("nvnCommandBufferBindSeparateTextures.computeRange", n);
+            return;
+        }
+        for (unsigned i = 0; i < n; ++i) b->cuSepTex[first + i] = handles[i];
+        return;
+    }
+    const int si = stage_index(x[1]);
+    if (si < 0) { log_once("nvnCommandBufferBindSeparateTextures.stage", static_cast<unsigned>(x[1])); return; }
     for (unsigned i = 0; i < n; ++i) {
         const unsigned slot = first + i;
         if (slot >= NVNGFX_MAX_TEXTURE_SLOTS) { log_once("nvnCommandBufferBindSeparateTextures.slot", slot); break; }
@@ -1937,9 +2010,18 @@ void cmdbuf_bind_separate_textures(nvngfx_ctx*, uint64_t* x) {
 void cmdbuf_bind_separate_sampler(nvngfx_ctx*, uint64_t* x) {
     CmdBuf* b = find<CmdBuf>(x[0]);
     if (!b) return;
+    const unsigned stage = static_cast<unsigned>(x[1]);
+    const unsigned slot = static_cast<unsigned>(x[2]);
+    if (stage == kNvnStageCompute) {
+        if (slot >= kComputeSamplerSlots) {
+            log_once("nvnCommandBufferBindSeparateSampler.computeSlot", slot);
+            return;
+        }
+        b->cuSepSamp[slot] = x[3];
+        return;
+    }
     const int si = stage_index(x[1]);
     if (si < 0) { log_once("nvnCommandBufferBindSeparateSampler.stage", static_cast<unsigned>(x[1])); return; }
-    const unsigned slot = static_cast<unsigned>(x[2]);
     if (slot >= NVNGFX_MAX_SAMPLER_SLOTS) { log_once("nvnCommandBufferBindSeparateSampler.slot", slot); return; }
     b->sepSampHandle[si][slot] = x[3];
     b->argbuf[si] = nil;
@@ -1947,12 +2029,21 @@ void cmdbuf_bind_separate_sampler(nvngfx_ctx*, uint64_t* x) {
 void cmdbuf_bind_separate_samplers(nvngfx_ctx*, uint64_t* x) {
     CmdBuf* b = find<CmdBuf>(x[0]);
     if (!b) return;
-    const int si = stage_index(x[1]);
-    if (si < 0) { log_once("nvnCommandBufferBindSeparateSamplers.stage", static_cast<unsigned>(x[1])); return; }
+    const unsigned stage = static_cast<unsigned>(x[1]);
     const unsigned first = static_cast<unsigned>(x[2]);
     const unsigned n = static_cast<unsigned>(x[3]);
     const uint64_t* handles = guest_ptr<const uint64_t>(x[4]);
-    if (!handles) return;
+    if (!handles && n) return;
+    if (stage == kNvnStageCompute) {
+        if (first > kComputeSamplerSlots || n > kComputeSamplerSlots - first) {
+            log_once("nvnCommandBufferBindSeparateSamplers.computeRange", n);
+            return;
+        }
+        for (unsigned i = 0; i < n; ++i) b->cuSepSamp[first + i] = handles[i];
+        return;
+    }
+    const int si = stage_index(x[1]);
+    if (si < 0) { log_once("nvnCommandBufferBindSeparateSamplers.stage", static_cast<unsigned>(x[1])); return; }
     for (unsigned i = 0; i < n; ++i) {
         const unsigned slot = first + i;
         if (slot >= NVNGFX_MAX_SAMPLER_SLOTS) { log_once("nvnCommandBufferBindSeparateSamplers.slot", slot); break; }
@@ -2621,11 +2712,12 @@ bool pool_span(uint64_t addr, size_t len, id<MTLBuffer>* buf, size_t* off) {
 bool flush_pending_clears(Ctx* c, CmdBuf* b);
 void end_encoder(CmdBuf* b);
 
-/* Compiles a compute-only Program.  The direct-binding contract is the same
- * one the self-test uses: storage buffer slot r is [[buffer(16 + r)]] and
- * image slot r is [[texture(r)]].  The threadgroup size is read from the
- * nvngfx-threadgroup comment because Metal does not expose it through the
- * pipeline. */
+/* Compiles a compute-only Program.  The direct-binding contract is the table
+ * split documented next to kComputeImageSlots: uniform r at [[buffer(r)]],
+ * storage r at [[buffer(16 + r)]], image r at [[texture(r)]], sampled texture
+ * r at [[texture(16 + r)]] and sampler r at [[sampler(r)]].  The threadgroup
+ * size is read from the nvngfx-threadgroup comment because Metal does not
+ * expose it through the pipeline. */
 id<MTLComputePipelineState> compute_pipeline(Ctx* c, Program* p,
                                              const char** why) {
     if (!p) {
@@ -2695,12 +2787,56 @@ id<MTLComputePipelineState> compute_pipeline(Ctx* c, Program* p,
     }
 }
 
-/* Direct compute bindings always live in NVN stage 5's tables.  Extra buffer
- * or texture indices are harmless: Metal ignores an argument the kernel does
- * not declare. */
+/* Forward declaration: the upload helper is defined next to the draw path,
+ * but a compute dispatch must prepare its sampled textures before it opens a
+ * compute encoder. */
+bool tex_upload(Ctx* c, CmdBuf* b, Tex* t);
+
+/* Uploads every sampled texture a compute dispatch can read.  This runs
+ * before the compute encoder exists because tex_upload() emits a blit; a
+ * texture whose upload fails drops the dispatch instead of sampling stale
+ * host memory.  Images are write targets and are deliberately not uploaded
+ * here. */
+bool prepare_compute_textures(Ctx* c, CmdBuf* b) {
+    if (!b || !b->cb) return false;
+    for (unsigned slot = 0; slot < kComputeSampledSlots; ++slot) {
+        const uint64_t handle =
+            b->cuTex[slot] ? b->cuTex[slot] : b->cuSepTex[slot];
+        if (!handle) continue;
+        Tex* t = const_cast<Tex*>(bound_texture(b, handle));
+        if (!t || !t->mtl) {
+            log_once("nvnCommandBufferDispatchCompute.sampledTexture", slot);
+            return false;
+        }
+        if (!tex_upload(c, b, t)) {
+            log_once("nvnCommandBufferDispatchCompute.textureUpload", slot);
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Direct compute bindings always live in NVN stage 5's tables.  Extra buffer,
+ * texture or sampler indices are harmless: Metal ignores an argument the
+ * kernel does not declare.  The index split is documented next to
+ * kComputeImageSlots. */
 bool bind_compute_resources(CmdBuf* b, id<MTLComputeCommandEncoder> enc) {
     if (!b || !enc) return false;
-    for (unsigned slot = 0; slot < NVNGFX_MAX_UBO_SLOTS; ++slot) {
+    for (unsigned slot = 0; slot < kComputeUniformSlots; ++slot) {
+        const uint64_t addr = b->cuUbo[slot];
+        if (!addr) continue;
+        const size_t len = static_cast<size_t>(
+            b->cuUboSize[slot] ? b->cuUboSize[slot] : 1u);
+        id<MTLBuffer> buf = nil;
+        size_t off = 0;
+        if (!pool_span(addr, len, &buf, &off)) {
+            log_once("nvnCommandBufferDispatchCompute.uniformBuffer", slot);
+            return false;
+        }
+        [enc setBuffer:buf offset:static_cast<NSUInteger>(off)
+               atIndex:static_cast<NSUInteger>(slot)];
+    }
+    for (unsigned slot = 0; slot < kComputeStorageSlots; ++slot) {
         const uint64_t addr = b->storage[5][slot];
         if (!addr) continue;
         const size_t len = static_cast<size_t>(
@@ -2712,9 +2848,9 @@ bool bind_compute_resources(CmdBuf* b, id<MTLComputeCommandEncoder> enc) {
             return false;
         }
         [enc setBuffer:buf offset:static_cast<NSUInteger>(off)
-               atIndex:static_cast<NSUInteger>(16u + slot)];
+               atIndex:static_cast<NSUInteger>(kComputeUniformSlots + slot)];
     }
-    for (unsigned slot = 0; slot < NVNGFX_MAX_TEXTURE_SLOTS; ++slot) {
+    for (unsigned slot = 0; slot < kComputeImageSlots; ++slot) {
         const uint64_t handle = b->image[5][slot];
         if (!handle) continue;
         const Tex* t = bound_texture(b, handle);
@@ -2724,14 +2860,40 @@ bool bind_compute_resources(CmdBuf* b, id<MTLComputeCommandEncoder> enc) {
         }
         [enc setTexture:t->mtl atIndex:static_cast<NSUInteger>(slot)];
     }
+    for (unsigned slot = 0; slot < kComputeSampledSlots; ++slot) {
+        const uint64_t handle =
+            b->cuTex[slot] ? b->cuTex[slot] : b->cuSepTex[slot];
+        if (!handle) continue;
+        const Tex* t = bound_texture(b, handle);
+        if (!t || !t->mtl || !t->uploaded) {
+            log_once("nvnCommandBufferDispatchCompute.sampledTexture", slot);
+            return false;
+        }
+        [enc setTexture:t->mtl
+                atIndex:static_cast<NSUInteger>(kComputeImageSlots + slot)];
+    }
+    for (unsigned slot = 0; slot < kComputeSamplerSlots; ++slot) {
+        const uint64_t combined =
+            slot < kComputeSampledSlots ? b->cuTex[slot] : 0;
+        const uint64_t handle = combined ? combined : b->cuSepSamp[slot];
+        if (!handle) continue;
+        const PooledSampler* s = bound_sampler(b, handle);
+        if (!s || !s->mtl) {
+            log_once("nvnCommandBufferDispatchCompute.sampler", slot);
+            return false;
+        }
+        [enc setSamplerState:s->mtl atIndex:static_cast<NSUInteger>(slot)];
+    }
     return true;
 }
 
 /* A dispatch writes images through Metal, so a later draw must not overwrite
- * those pixels from the guest's original texture storage. */
+ * those pixels from the guest's original texture storage.  Only the image
+ * table is marked: a sampled texture is read-only unless it was also bound as
+ * an image. */
 void mark_compute_image_writes(CmdBuf* b) {
     if (!b) return;
-    for (unsigned slot = 0; slot < NVNGFX_MAX_TEXTURE_SLOTS; ++slot) {
+    for (unsigned slot = 0; slot < kComputeImageSlots; ++slot) {
         const uint64_t handle = b->image[5][slot];
         if (!handle) continue;
         Tex* t = const_cast<Tex*>(bound_texture(b, handle));
@@ -2769,6 +2931,9 @@ bool begin_compute_dispatch(Ctx* c, CmdBuf* b,
                      why ? why : "unknown");
         return false;
     }
+    /* Uploads emit blits, so they must run while the render pass is closed
+     * and before the compute encoder is opened. */
+    if (!prepare_compute_textures(c, b)) return false;
     id<MTLComputeCommandEncoder> enc = [b->cb computeCommandEncoder];
     if (!enc) {
         log_once("nvnCommandBufferDispatchCompute.encoder", 1);
@@ -4538,7 +4703,8 @@ void cmdbuf_bind_image(nvngfx_ctx*, uint64_t* x) {
     if (!b) return;
     const int si = record_stage_index(x[1]);
     const unsigned slot = static_cast<unsigned>(x[2]);
-    if (si < 0 || slot >= NVNGFX_MAX_TEXTURE_SLOTS) {
+    if (si < 0 || slot >= NVNGFX_MAX_TEXTURE_SLOTS ||
+        (si == kNvnStageCompute && slot >= kComputeImageSlots)) {
         log_once("nvnCommandBufferBindImage.slot", static_cast<unsigned>(x[2]));
         return;
     }
@@ -4552,6 +4718,7 @@ void cmdbuf_bind_images(nvngfx_ctx*, uint64_t* x) {
     const int n = static_cast<int>(x[3]);
     const uint64_t* hs = guest_ptr<const uint64_t>(x[4]);
     if (si < 0 || first < 0 || n < 0 || first + n > NVNGFX_MAX_TEXTURE_SLOTS ||
+        (si == kNvnStageCompute && first + n > static_cast<int>(kComputeImageSlots)) ||
         (n > 0 && !hs)) {
         log_once("nvnCommandBufferBindImages.range", static_cast<unsigned>(n));
         return;
@@ -4566,7 +4733,8 @@ void cmdbuf_bind_storage_buffer(nvngfx_ctx*, uint64_t* x) {
     if (!b) return;
     const int si = record_stage_index(x[1]);
     const unsigned slot = static_cast<unsigned>(x[2]);
-    if (si < 0 || slot >= NVNGFX_MAX_UBO_SLOTS) {
+    if (si < 0 || slot >= NVNGFX_MAX_UBO_SLOTS ||
+        (si == kNvnStageCompute && slot >= kComputeStorageSlots)) {
         log_once("nvnCommandBufferBindStorageBuffer.slot", static_cast<unsigned>(x[2]));
         return;
     }
@@ -4581,6 +4749,7 @@ void cmdbuf_bind_storage_buffers(nvngfx_ctx*, uint64_t* x) {
     const int n = static_cast<int>(x[3]);
     const uint64_t* rg = guest_ptr<const uint64_t>(x[4]);
     if (si < 0 || first < 0 || n < 0 || first + n > NVNGFX_MAX_UBO_SLOTS ||
+        (si == kNvnStageCompute && first + n > static_cast<int>(kComputeStorageSlots)) ||
         (n > 0 && !rg)) {
         log_once("nvnCommandBufferBindStorageBuffers.range", static_cast<unsigned>(n));
         return;
@@ -4621,12 +4790,24 @@ void cmdbuf_bind_tf_buffers(nvngfx_ctx*, uint64_t* x) {
 }
 
 /* nvnCommandBufferBindUniformBuffer(NVNcommandBuffer*, NVNshaderStage,
- *                                  int index, NVNbufferAddress, size_t) */
+ *                                  int index, NVNbufferAddress, size_t)
+ * Compute has its own table: a dispatch between two draws must not move the
+ * graphics stages' arguments. */
 void cmdbuf_bind_uniform_buffer(nvngfx_ctx*, uint64_t* x) {
     CmdBuf* b = find_or_add<CmdBuf>(x[0]);
     if (!b) return;
     const unsigned stage = static_cast<unsigned>(x[1]);
     const int index = static_cast<int>(x[2]);
+    if (stage == kNvnStageCompute) {
+        if (index < 0 || index >= static_cast<int>(kComputeUniformSlots)) {
+            log_once("nvnCommandBufferBindUniformBuffer.computeIndex",
+                     static_cast<unsigned>(index));
+            return;
+        }
+        b->cuUbo[index] = x[3];
+        b->cuUboSize[index] = x[4];
+        return;
+    }
     if (stage_index(x[1]) < 0) {
         log_once("nvnCommandBufferBindUniformBuffer.stage", stage);
         return;
@@ -11049,18 +11230,28 @@ extern "C" int nvngfx_metal_selftest(void) {
         }
 
         {
-            /* --- Compute dispatches: storage buffer and image ------------
-             * The host self-test kernel reads storage buffer 0, writes
-             * storage buffer 1 and a 16x16 RGBA8 image, then runs a second
-             * time through an indirect group-count buffer.  The threadgroup
-             * size (16x1x1) travels in the kernel's nvngfx-threadgroup
-             * sidecar; NVN's group counts (1x16x1) travel separately. */
+            /* --- Compute dispatches: buffers, textures and image --------
+             * The host self-test kernel reads uniform buffer 0, storage
+             * buffer 0 and a sampled 2x2 texture, writes storage buffer 1 and
+             * a 16x16 RGBA8 image, then runs a second time through an indirect
+             * group-count buffer.  The threadgroup size (16x1x1) travels in
+             * the kernel's nvngfx-threadgroup sidecar; NVN's group counts
+             * (1x16x1) travel separately.
+             *
+             * The direct dispatch binds a combined texture handle (texture +
+             * sampler).  The indirect dispatch clears it and uses the separate
+             * texture / separate sampler entry points instead, so both halves
+             * of the compute binding contract are exercised. */
             const uint64_t kProgCompute = 0x9A00;
             const uint64_t kCbCompute = 0x9B00;
+            const uint64_t kTexComputeSampled = 0x9C00;
             const unsigned kComputeSrc = 8192;
             const unsigned kComputeDst = 9216;
             const unsigned kComputeIndirectDst = 10240;
             const unsigned kComputeIndirectArgs = 11264;
+            const unsigned kComputeUniform = 11520;
+            const unsigned kComputeSampleOffset = 11648;
+            const uint32_t kComputeUniformBase = 500;
             const size_t kComputeBytes = 16 * 16 * sizeof(uint32_t);
             unsigned char* const vpoolCompute =
                 poolRaw2 ? reinterpret_cast<unsigned char*>(
@@ -11099,6 +11290,63 @@ extern "C" int nvngfx_metal_selftest(void) {
             x[0] = kTexPool; x[1] = 14; x[2] = kTexCompute; x[3] = 0;
             tex_pool_register_image(ctx, x);
 
+            /* A 2x2 RGBA8 texture whose storage lives in kCubePool, the same
+             * guest page the storage buffers use.  tex_upload() must deswizzle
+             * it before the compute encoder opens.  All four texels are red so
+             * the sampled value is visible as the image's red channel. */
+            {
+                alignas(16) unsigned char computeSampleBuilder[0x80] = {};
+                const uint64_t kComputeSampleBuilder =
+                    reinterpret_cast<uint64_t>(computeSampleBuilder);
+                x[0] = kComputeSampleBuilder;
+                tex_builder_set_defaults(ctx, x);
+                x[0] = kComputeSampleBuilder; x[1] = 0;
+                tex_builder_set_target(ctx, x);
+                x[0] = kComputeSampleBuilder; x[1] = 0x25;
+                tex_builder_set_format(ctx, x);
+                x[0] = kComputeSampleBuilder; x[1] = 2; x[2] = 2;
+                tex_builder_set_size2d(ctx, x);
+                x[0] = kComputeSampleBuilder; x[1] = 1;
+                tex_builder_set_levels(ctx, x);
+                x[0] = kComputeSampleBuilder; x[1] = 1;
+                tex_builder_set_samples(ctx, x);
+                x[0] = kComputeSampleBuilder; x[1] = kCubePool;
+                x[2] = kComputeSampleOffset;
+                tex_builder_set_storage(ctx, x);
+                x[0] = kTexComputeSampled; x[1] = kComputeSampleBuilder;
+                tex_initialize(ctx, x);
+
+                nvngfx_texdesc sdesc;
+                nvngfx_texdesc_defaults(&sdesc);
+                sdesc.target = 0;
+                sdesc.format = 0x25;
+                sdesc.width = 2;
+                sdesc.height = 2;
+                sdesc.levels = 1;
+                sdesc.samples = 1;
+                sdesc.pool = kCubePool;
+                sdesc.offset = kComputeSampleOffset;
+                const unsigned char red[16] = {
+                    255, 0, 0, 255, 255, 0, 0, 255,
+                    255, 0, 0, 255, 255, 0, 0, 255};
+                nvngfx_texlayout sl = {};
+                if (x[0] != 1 ||
+                    nvngfx_tex_layout(&sdesc, &sl) != 0 ||
+                    sl.size > 12288u - kComputeSampleOffset ||
+                    nvngfx_tex_swizzle(&sdesc, 0, 0, red, 8,
+                                       vpoolCompute + kComputeSampleOffset) != 0) {
+                    std::fprintf(stderr,
+                                 "[selftest] compute: sampled texture setup "
+                                 "failed (size=%llu)\n",
+                                 static_cast<unsigned long long>(sl.size));
+                    rc = 16420;
+                    goto done;
+                }
+            }
+            x[0] = kTexPool; x[1] = 15; x[2] = kTexComputeSampled;
+            x[3] = 0;
+            tex_pool_register_texture(ctx, x);
+
             uint32_t* const src = reinterpret_cast<uint32_t*>(
                 vpoolCompute + kComputeSrc);
             uint32_t* const dst = reinterpret_cast<uint32_t*>(
@@ -11114,6 +11362,12 @@ extern "C" int nvngfx_metal_selftest(void) {
             indirect[0] = 1;
             indirect[1] = 16;
             indirect[2] = 1;
+            uint32_t* const cuUniform = reinterpret_cast<uint32_t*>(
+                vpoolCompute + kComputeUniform);
+            cuUniform[0] = kComputeUniformBase;
+            cuUniform[1] = 0;
+            cuUniform[2] = 0;
+            cuUniform[3] = 0;
             const uint64_t srcAddr =
                 reinterpret_cast<uint64_t>(vpoolCompute + kComputeSrc);
             const uint64_t dstAddr =
@@ -11122,6 +11376,8 @@ extern "C" int nvngfx_metal_selftest(void) {
                 vpoolCompute + kComputeIndirectDst);
             const uint64_t indirectAddr = reinterpret_cast<uint64_t>(
                 vpoolCompute + kComputeIndirectArgs);
+            const uint64_t cuUniformAddr = reinterpret_cast<uint64_t>(
+                vpoolCompute + kComputeUniform);
 
             {
                 struct { uint64_t data; uint64_t control; } sd[1];
@@ -11145,6 +11401,8 @@ extern "C" int nvngfx_metal_selftest(void) {
             cmdbuf_begin_recording(ctx, x);
             x[0] = kCbCompute; x[1] = kTexPool;
             cmdbuf_set_texture_pool(ctx, x);
+            x[0] = kCbCompute; x[1] = kSampPool;
+            cmdbuf_set_sampler_pool(ctx, x);
             x[0] = kCbCompute; x[1] = 5; x[2] = 0; x[3] = srcAddr;
             x[4] = kComputeBytes;
             cmdbuf_bind_storage_buffer(ctx, x);
@@ -11157,11 +11415,33 @@ extern "C" int nvngfx_metal_selftest(void) {
             x[0] = kCbCompute; x[1] = 5; x[2] = 0;
             x[3] = computeImageHandle;
             cmdbuf_bind_image(ctx, x);
+            x[0] = kCbCompute; x[1] = 5; x[2] = 0;
+            x[3] = cuUniformAddr; x[4] = 16;
+            cmdbuf_bind_uniform_buffer(ctx, x);
+            x[0] = 0; x[1] = 15; x[2] = 9;
+            dev_get_texture_handle(ctx, x);
+            const uint64_t computeCombinedHandle = x[0];
+            x[0] = kCbCompute; x[1] = 5; x[2] = 0;
+            x[3] = computeCombinedHandle;
+            cmdbuf_bind_texture(ctx, x);
             x[0] = kCbCompute; x[1] = kProgCompute; x[2] = 0x20;
             cmdbuf_bind_program(ctx, x);
             x[0] = kCbCompute; x[1] = 1; x[2] = 16; x[3] = 1;
             cmdbuf_dispatch_compute(ctx, x);
 
+            /* Combined -> separate: clear the combined entry so the second
+             * dispatch can only see the separate texture and sampler. */
+            x[0] = kCbCompute; x[1] = 5; x[2] = 0; x[3] = 0;
+            cmdbuf_bind_texture(ctx, x);
+            x[0] = kCbCompute; x[1] = 5; x[2] = 0;
+            x[3] = computeCombinedHandle;
+            cmdbuf_bind_separate_texture(ctx, x);
+            x[0] = 0; x[1] = 9;
+            dev_get_separate_sampler_handle(ctx, x);
+            const uint64_t computeSeparateSampler = x[0];
+            x[0] = kCbCompute; x[1] = 5; x[2] = 0;
+            x[3] = computeSeparateSampler;
+            cmdbuf_bind_separate_sampler(ctx, x);
             x[0] = kCbCompute; x[1] = 5; x[2] = 1;
             x[3] = indirectDstAddr; x[4] = kComputeBytes;
             cmdbuf_bind_storage_buffer(ctx, x);
@@ -11189,7 +11469,8 @@ extern "C" int nvngfx_metal_selftest(void) {
             }
             for (unsigned y = 0; y < 16; ++y) {
                 for (unsigned x = 0; x < 16; ++x) {
-                    const uint32_t want = 1000u + x + y;
+                    const uint32_t want =
+                        kComputeUniformBase + 1000u + x + y;
                     const uint32_t i = y * 16u + x;
                     if (dst[i] != want || indirectDst[i] != want) {
                         std::fprintf(stderr,
@@ -11202,7 +11483,7 @@ extern "C" int nvngfx_metal_selftest(void) {
                 }
             }
             {
-                const int want00[4] = {0, 0, 191, 255};
+                const int want00[4] = {255, 0, 191, 255};
                 const int want15[4] = {255, 255, 191, 255};
                 unsigned char px[4] = {0, 0, 0, 0};
                 if (!read_pixel_at(dev, c->queue, computeTex->mtl, 16, 0, 0, px) ||
@@ -11225,9 +11506,24 @@ extern "C" int nvngfx_metal_selftest(void) {
                     goto done;
                 }
             }
+            {
+                Tex* const sampled = find<Tex>(kTexComputeSampled);
+                if (!sampled || !sampled->uploaded || sampled->rendered) {
+                    std::fprintf(stderr,
+                                 "[selftest] compute: sampled texture state "
+                                 "uploaded=%d rendered=%d\n",
+                                 sampled ? sampled->uploaded : -1,
+                                 sampled ? sampled->rendered : -1);
+                    rc = 16420;
+                    goto done;
+                }
+            }
             std::fprintf(stderr,
-                         "[selftest] compute: direct and indirect dispatches "
-                         "wrote 256 storage words and a 16x16 image\n");
+                         "[selftest] compute: direct/combined and "
+                         "indirect/separate dispatches wrote 256 storage "
+                         "words, sampled a 2x2 texture and filled a 16x16 "
+                         "image (uniform base %u)\n",
+                         kComputeUniformBase);
         }
 
         {
@@ -11346,6 +11642,7 @@ extern "C" int nvngfx_metal_selftest(void) {
         g_tex_specs.erase(0x8C00);
         forget<Program>(0x9A00);
         forget<CmdBuf>(0x9B00);
+        forget<Tex>(0x9C00);
         forget<Tex>(kTexCompute);
         g_tex_specs.erase(kTexComputeBuilder);
         forget<CmdBuf>(0x9300);

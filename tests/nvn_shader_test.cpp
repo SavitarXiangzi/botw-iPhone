@@ -66,6 +66,14 @@ int main() {
     CHECK(cs != nullptr &&
           std::strstr(cs, "nvngfx-threadgroup 16 1 1") != nullptr);
     CHECK(cs != nullptr && std::strstr(cs, "[[texture(0)]]") != nullptr);
+    /* The compute fixture also pins the direct-binding contract: uniform
+     * buffer 0, sampled texture 0 at texture(16) and its sampler at
+     * sampler(0).  A table split that drifts from the backend would otherwise
+     * only show up as a validation failure on a device. */
+    CHECK(cs != nullptr && std::strstr(cs, "[[buffer(0)]]") != nullptr);
+    CHECK(cs != nullptr && std::strstr(cs, "[[texture(16)]]") != nullptr);
+    CHECK(cs != nullptr && std::strstr(cs, "[[sampler(0)]]") != nullptr);
+    CHECK(cs != nullptr && std::strstr(cs, "level(0.0)") != nullptr);
 
     /* The comment is the only place NVN's compute threadgroup size can live:
      * Metal chooses the launch size at dispatch time.  Pin both the valid
