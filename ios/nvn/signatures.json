@@ -1,7 +1,7 @@
 {
  "source": "seedds/nxnative dm/gfx/nvn/nvn_protos.h, MIT License (Copyright (c) 2026 seedds)",
  "note": "NVN entry-point shapes only: return type and parameter types. The header itself is not redistributed.",
- "count": 470,
+ "count": 477,
  "max_arity": 8,
  "procs": [
   {
@@ -236,6 +236,14 @@
    "arity": 1
   },
   {
+   "name": "nvnBufferGetMemoryPool",
+   "ret": "NVNmemoryPool*",
+   "params": [
+    "const NVNbuffer*"
+   ],
+   "arity": 1
+  },
+  {
    "name": "nvnBufferGetSize",
    "ret": "size_t",
    "params": [
@@ -261,6 +269,14 @@
     "size_t"
    ],
    "arity": 3
+  },
+  {
+   "name": "nvnBufferMap",
+   "ret": "void*",
+   "params": [
+    "const NVNbuffer*"
+   ],
+   "arity": 1
   },
   {
    "name": "nvnBufferSetDebugLabel",
@@ -2358,6 +2374,14 @@
    "arity": 3
   },
   {
+   "name": "nvnMemoryPoolMap",
+   "ret": "void*",
+   "params": [
+    "const NVNmemoryPool*"
+   ],
+   "arity": 1
+  },
+  {
    "name": "nvnMemoryPoolMapVirtual",
    "ret": "NVNboolean",
    "params": [
@@ -3274,6 +3298,14 @@
    "arity": 1
   },
   {
+   "name": "nvnSamplerPoolGetMemoryPool",
+   "ret": "const NVNmemoryPool*",
+   "params": [
+    "const NVNsamplerPool*"
+   ],
+   "arity": 1
+  },
+  {
    "name": "nvnSamplerPoolGetSize",
    "ret": "int",
    "params": [
@@ -3432,6 +3464,14 @@
   {
    "name": "nvnTextureBuilderGetMemoryPool",
    "ret": "NVNmemoryPool",
+   "params": [
+    "const NVNtextureBuilder*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnTextureBuilderGetPackagedTextureData",
+   "ret": "const void*",
    "params": [
     "const NVNtextureBuilder*"
    ],
@@ -3800,6 +3840,14 @@
    "arity": 1
   },
   {
+   "name": "nvnTextureGetMemoryPool",
+   "ret": "NVNmemoryPool",
+   "params": [
+    "const NVNtexture*"
+   ],
+   "arity": 1
+  },
+  {
    "name": "nvnTextureGetSamples",
    "ret": "int",
    "params": [
@@ -3923,6 +3971,14 @@
   {
    "name": "nvnTexturePoolGetMemoryOffset",
    "ret": "ptrdiff_t",
+   "params": [
+    "const NVNtexturePool*"
+   ],
+   "arity": 1
+  },
+  {
+   "name": "nvnTexturePoolGetMemoryPool",
+   "ret": "const NVNmemoryPool*",
    "params": [
     "const NVNtexturePool*"
    ],

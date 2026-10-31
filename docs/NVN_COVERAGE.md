@@ -7,8 +7,8 @@
 `nvn*` 字符串（运行时按名解析，所以名字本身就暴露了完整接口面）。
 
 - 接口总数：**513**
-- Metal 后端已实现：**209**（40.7%）
-- 仍未实现：**304**
+- Metal 后端已实现：**241**（47.0%）
+- 仍未实现：**272**
 
 > 只有出现在 `ios/nvn/implemented_metal.txt` 里、且确实在
 > `ios/nvn/src/nvn_metal.mm` 中定义过的名字才算“已实现”。
@@ -18,7 +18,7 @@
 
 | 域 | 已实现 | 总数 | 进度 |
 |---|---:|---:|---|
-| CommandBuffer | 64 | 144 | `####      ` |
+| CommandBuffer | 67 | 144 | `#####     ` |
 | Texture | 4 | 45 | `#         ` |
 | TextureBuilder | 14 | 43 | `###       ` |
 | Device | 7 | 27 | `###       ` |
@@ -31,13 +31,13 @@
 | DepthStencilState | 7 | 13 | `#####     ` |
 | Window | 6 | 12 | `#####     ` |
 | WindowBuilder | 5 | 12 | `####      ` |
-| Buffer | 0 | 11 | `          ` |
-| MemoryPool | 3 | 10 | `###       ` |
+| Buffer | 11 | 11 | `##########` |
+| MemoryPool | 9 | 10 | `######### ` |
 | PolygonState | 5 | 9 | `######    ` |
-| MemoryPoolBuilder | 3 | 8 | `####      ` |
+| MemoryPoolBuilder | 8 | 8 | `##########` |
 | SamplerPool | 7 | 8 | `######### ` |
 | TexturePool | 7 | 8 | `######### ` |
-| BufferBuilder | 0 | 7 | `          ` |
+| BufferBuilder | 7 | 7 | `##########` |
 | ColorState | 4 | 7 | `######    ` |
 | Event | 0 | 7 | `          ` |
 | Program | 3 | 7 | `####      ` |
@@ -72,29 +72,29 @@
 
 - [ ] `nvnBootstrapLoader`
 
-### Buffer (0/11)
+### Buffer (11/11)
 
-- [ ] `nvnBufferFinalize`
-- [ ] `nvnBufferFlushMappedRange`
-- [ ] `nvnBufferGetAddress`
-- [ ] `nvnBufferGetDebugID`
-- [ ] `nvnBufferGetMemoryOffset`
-- [ ] `nvnBufferGetMemoryPool`
-- [ ] `nvnBufferGetSize`
-- [ ] `nvnBufferInitialize`
-- [ ] `nvnBufferInvalidateMappedRange`
-- [ ] `nvnBufferMap`
-- [ ] `nvnBufferSetDebugLabel`
+- [x] `nvnBufferFinalize`
+- [x] `nvnBufferFlushMappedRange`
+- [x] `nvnBufferGetAddress`
+- [x] `nvnBufferGetDebugID`
+- [x] `nvnBufferGetMemoryOffset`
+- [x] `nvnBufferGetMemoryPool`
+- [x] `nvnBufferGetSize`
+- [x] `nvnBufferInitialize`
+- [x] `nvnBufferInvalidateMappedRange`
+- [x] `nvnBufferMap`
+- [x] `nvnBufferSetDebugLabel`
 
-### BufferBuilder (0/7)
+### BufferBuilder (7/7)
 
-- [ ] `nvnBufferBuilderGetDevice`
-- [ ] `nvnBufferBuilderGetMemoryOffset`
-- [ ] `nvnBufferBuilderGetMemoryPool`
-- [ ] `nvnBufferBuilderGetSize`
-- [ ] `nvnBufferBuilderSetDefaults`
-- [ ] `nvnBufferBuilderSetDevice`
-- [ ] `nvnBufferBuilderSetStorage`
+- [x] `nvnBufferBuilderGetDevice`
+- [x] `nvnBufferBuilderGetMemoryOffset`
+- [x] `nvnBufferBuilderGetMemoryPool`
+- [x] `nvnBufferBuilderGetSize`
+- [x] `nvnBufferBuilderSetDefaults`
+- [x] `nvnBufferBuilderSetDevice`
+- [x] `nvnBufferBuilderSetStorage`
 
 ### ChannelMaskState (2/3)
 
@@ -112,11 +112,11 @@
 - [x] `nvnColorStateSetDefaults`
 - [x] `nvnColorStateSetLogicOp`
 
-### CommandBuffer (64/144)
+### CommandBuffer (67/144)
 
 - [ ] `nvnCommandBufferAddCommandMemory`
 - [ ] `nvnCommandBufferAddControlMemory`
-- [ ] `nvnCommandBufferBarrier`
+- [x] `nvnCommandBufferBarrier`
 - [x] `nvnCommandBufferBeginRecording`
 - [ ] `nvnCommandBufferBeginTransformFeedback`
 - [x] `nvnCommandBufferBindBlendState`
@@ -154,7 +154,7 @@
 - [x] `nvnCommandBufferClearTexture`
 - [x] `nvnCommandBufferClearTexturei`
 - [x] `nvnCommandBufferClearTextureui`
-- [ ] `nvnCommandBufferCopyBufferToBuffer`
+- [x] `nvnCommandBufferCopyBufferToBuffer`
 - [ ] `nvnCommandBufferCopyBufferToTexture`
 - [ ] `nvnCommandBufferCopyCommands`
 - [ ] `nvnCommandBufferCopyTextureToBuffer`
@@ -255,7 +255,7 @@
 - [ ] `nvnCommandBufferSignalEvent`
 - [ ] `nvnCommandBufferTiledDownsample`
 - [ ] `nvnCommandBufferTiledDownsampleTextureView`
-- [ ] `nvnCommandBufferUpdateUniformBuffer`
+- [x] `nvnCommandBufferUpdateUniformBuffer`
 - [ ] `nvnCommandBufferWaitEvent`
 - [ ] `nvnCommandBufferWaitSync`
 
@@ -321,27 +321,27 @@
 - [ ] `nvnEventInitialize`
 - [ ] `nvnEventSignal`
 
-### MemoryPool (3/10)
+### MemoryPool (9/10)
 
 - [x] `nvnMemoryPoolFinalize`
-- [ ] `nvnMemoryPoolFlushMappedRange`
-- [ ] `nvnMemoryPoolGetBufferAddress`
-- [ ] `nvnMemoryPoolGetFlags`
+- [x] `nvnMemoryPoolFlushMappedRange`
+- [x] `nvnMemoryPoolGetBufferAddress`
+- [x] `nvnMemoryPoolGetFlags`
 - [x] `nvnMemoryPoolGetSize`
 - [x] `nvnMemoryPoolInitialize`
-- [ ] `nvnMemoryPoolInvalidateMappedRange`
-- [ ] `nvnMemoryPoolMap`
+- [x] `nvnMemoryPoolInvalidateMappedRange`
+- [x] `nvnMemoryPoolMap`
 - [ ] `nvnMemoryPoolMapVirtual`
-- [ ] `nvnMemoryPoolSetDebugLabel`
+- [x] `nvnMemoryPoolSetDebugLabel`
 
-### MemoryPoolBuilder (3/8)
+### MemoryPoolBuilder (8/8)
 
-- [ ] `nvnMemoryPoolBuilderGetDevice`
-- [ ] `nvnMemoryPoolBuilderGetFlags`
-- [ ] `nvnMemoryPoolBuilderGetMemory`
-- [ ] `nvnMemoryPoolBuilderGetSize`
+- [x] `nvnMemoryPoolBuilderGetDevice`
+- [x] `nvnMemoryPoolBuilderGetFlags`
+- [x] `nvnMemoryPoolBuilderGetMemory`
+- [x] `nvnMemoryPoolBuilderGetSize`
 - [x] `nvnMemoryPoolBuilderSetDefaults`
-- [ ] `nvnMemoryPoolBuilderSetDevice`
+- [x] `nvnMemoryPoolBuilderSetDevice`
 - [x] `nvnMemoryPoolBuilderSetFlags`
 - [x] `nvnMemoryPoolBuilderSetStorage`
 

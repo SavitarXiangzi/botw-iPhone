@@ -485,6 +485,11 @@ typedef void (^MTLDeallocator)(void* pointer, NSUInteger length);
 destinationBytesPerImage:(NSUInteger)bpi;
 - (void)copyFromBuffer:(id<MTLBuffer>)src
           sourceOffset:(NSUInteger)srcOffset
+              toBuffer:(id<MTLBuffer>)dst
+     destinationOffset:(NSUInteger)dstOffset
+                  size:(NSUInteger)size;
+- (void)copyFromBuffer:(id<MTLBuffer>)src
+          sourceOffset:(NSUInteger)srcOffset
      sourceBytesPerRow:(NSUInteger)bpr
    sourceBytesPerImage:(NSUInteger)bpi
             sourceSize:(MTLSize)size
@@ -659,6 +664,9 @@ destinationBytesPerImage:(NSUInteger)bpi;
                                    length:(NSUInteger)length
                                   options:(MTLResourceOptions)options
                               deallocator:(MTLDeallocator)deallocator;
+- (id<MTLBuffer>)newBufferWithBytes:(const void*)pointer
+                             length:(NSUInteger)length
+                            options:(MTLResourceOptions)options;
 - (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length
                             options:(MTLResourceOptions)options;
 - (id<MTLLibrary>)newLibraryWithSource:(NSString*)source

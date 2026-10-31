@@ -37,6 +37,9 @@
  *         vertex input: NVNvertexAttribState / NVNvertexStreamState decoded
  *           from the guest's own bytes -> MTLVertexDescriptor, and the
  *           stream's guest address -> the MTLBuffer of the pool that holds it
+ *         NVN buffer objects and memory-pool address/map queries, plus
+ *           UpdateUniformBuffer (record-time CPU snapshot -> GPU blit) and
+ *           CopyBufferToBuffer in the same Metal command buffer
  *         present (blit fast path, cleared-drawable fallback)
  *
  *   TODO  a guest draw still stops at "noPipeline" whenever the offline blob
@@ -51,7 +54,8 @@
  *         buffer-fill compute probe, direct and indirect guest compute
  *         dispatch probes (uniform offset, sampled texel and RGBA8 pixels
  *         read back), seven instanced / base-vertex / indirect draw phases
- *         (including a zero-instance no-op), a bindless table probe, and a
+ *         (including a zero-instance no-op), a buffer / UpdateUniformBuffer /
+ *         CopyBufferToBuffer probe, a bindless table probe, and a
  *         vertex-stage
  *         argument-buffer draw whose shifted pixels are read back.  The ninth
  *         builds a block-linear texture in a guest memory pool and proves that
@@ -250,7 +254,28 @@ struct Pool {
     void* storage = nullptr;
     size_t size = 0;
     uint32_t flags = 0;
+    std::string label;
     id<MTLBuffer> buffer = nil;
+};
+
+/* An NVN buffer is a view of [pool.storage + offset, + size).  The guest owns
+ * the object bytes; this side table only records the fields a builder handed
+ * us, so nvnBufferGetAddress/Map can answer without guessing object offsets. */
+struct NvnBufferSpec {
+    uint64_t device = 0;
+    uint64_t pool = 0;
+    ptrdiff_t offset = 0;
+    size_t size = 0;
+    bool hasStorage = false;
+};
+
+struct NvnBuffer {
+    uint64_t device = 0;
+    uint64_t pool = 0;
+    ptrdiff_t offset = 0;
+    size_t size = 0;
+    uint64_t debugId = 0;
+    std::string label;
 };
 
 struct Tex {
@@ -515,6 +540,7 @@ struct WinSpec {
 };
 
 struct PoolSpec {
+    uint64_t device = 0;
     void* storage = nullptr;
     size_t size = 0;
     uint32_t flags = 0;
@@ -589,6 +615,8 @@ void forget(uint64_t guest) {
 
 std::unordered_map<uint64_t, WinSpec> g_win_specs;
 std::unordered_map<uint64_t, PoolSpec> g_pool_specs;
+std::unordered_map<uint64_t, NvnBufferSpec> g_buffer_specs;
+uint64_t g_next_buffer_debug_id = 0x10000;
 std::unordered_map<uint64_t, int> g_device_flags;
 /* Builder state, keyed by the guest builder address.  The guest owns the
  * struct and its layout is unverified, but that does not matter: every
@@ -861,6 +889,12 @@ void win_finalize(nvngfx_ctx*, uint64_t* x) { forget<Win>(x[0]); }
 /* nvnMemoryPoolBuilderSetDefaults(NVNmemoryPoolBuilder*) */
 void pool_builder_set_defaults(nvngfx_ctx*, uint64_t* x) {
     if (x[0]) (void)guest_write(x[0], 0x30);
+    g_pool_specs[x[0]] = PoolSpec{};
+}
+
+/* nvnMemoryPoolBuilderSetDevice(NVNmemoryPoolBuilder*, NVNdevice*) */
+void pool_builder_set_device(nvngfx_ctx*, uint64_t* x) {
+    g_pool_specs[x[0]].device = x[1];
 }
 
 /* nvnMemoryPoolBuilderSetStorage(NVNmemoryPoolBuilder*, void*, size_t) */
@@ -873,6 +907,30 @@ void pool_builder_set_storage(nvngfx_ctx*, uint64_t* x) {
 /* nvnMemoryPoolBuilderSetFlags(NVNmemoryPoolBuilder*, int) */
 void pool_builder_set_flags(nvngfx_ctx*, uint64_t* x) {
     g_pool_specs[x[0]].flags = static_cast<uint32_t>(x[1]);
+}
+
+/* Builder getters return what the setters recorded; they do not read the
+ * guest-owned builder struct. */
+void pool_builder_get_device(nvngfx_ctx*, uint64_t* x) {
+    auto it = g_pool_specs.find(x[0]);
+    x[0] = it == g_pool_specs.end() ? 0 : it->second.device;
+}
+
+void pool_builder_get_memory(nvngfx_ctx*, uint64_t* x) {
+    auto it = g_pool_specs.find(x[0]);
+    x[0] = it == g_pool_specs.end()
+               ? 0
+               : reinterpret_cast<uint64_t>(it->second.storage);
+}
+
+void pool_builder_get_size(nvngfx_ctx*, uint64_t* x) {
+    auto it = g_pool_specs.find(x[0]);
+    x[0] = it == g_pool_specs.end() ? 0 : it->second.size;
+}
+
+void pool_builder_get_flags(nvngfx_ctx*, uint64_t* x) {
+    auto it = g_pool_specs.find(x[0]);
+    x[0] = it == g_pool_specs.end() ? 0 : it->second.flags;
 }
 
 /* nvnMemoryPoolInitialize(NVNmemoryPool*, const NVNmemoryPoolBuilder*) -> NVNboolean */
@@ -921,6 +979,165 @@ void pool_finalize(nvngfx_ctx*, uint64_t* x) { forget<Pool>(x[0]); }
 void pool_get_size(nvngfx_ctx*, uint64_t* x) {
     Pool* p = find<Pool>(x[0]);
     x[0] = p ? static_cast<uint64_t>(p->size) : 0;
+}
+
+/* nvnMemoryPoolGetBufferAddress / GetFlags / Map.  The pool wraps the
+ * guest's own storage with a zero-copy MTLBuffer, so the CPU pointer is also
+ * the address the guest binds. */
+void pool_get_buffer_address(nvngfx_ctx*, uint64_t* x) {
+    Pool* p = find<Pool>(x[0]);
+    x[0] = p ? reinterpret_cast<uint64_t>(p->storage) : 0;
+}
+
+void pool_get_flags(nvngfx_ctx*, uint64_t* x) {
+    Pool* p = find<Pool>(x[0]);
+    x[0] = p ? p->flags : 0;
+}
+
+void pool_map(nvngfx_ctx*, uint64_t* x) {
+    Pool* p = find<Pool>(x[0]);
+    x[0] = p ? reinterpret_cast<uint64_t>(p->storage) : 0;
+}
+
+/* Mapped range maintenance is a coherency hint.  Unified shared storage is
+ * already coherent on both sides, so both calls are valid no-ops. */
+void pool_flush_mapped_range(nvngfx_ctx*, uint64_t* x) { (void)x; }
+void pool_invalidate_mapped_range(nvngfx_ctx*, uint64_t* x) { (void)x; }
+
+void pool_set_debug_label(nvngfx_ctx*, uint64_t* x) {
+    Pool* p = find<Pool>(x[0]);
+    if (!p) return;
+    const char* label = guest_ptr<const char>(x[1]);
+    p->label = label ? label : "";
+}
+
+/* ------------------------------------------------------------------ */
+/* buffers                                                             */
+/* ------------------------------------------------------------------ */
+
+void buffer_builder_set_defaults(nvngfx_ctx*, uint64_t* x) {
+    g_buffer_specs[x[0]] = NvnBufferSpec{};
+}
+
+void buffer_builder_set_device(nvngfx_ctx*, uint64_t* x) {
+    g_buffer_specs[x[0]].device = x[1];
+}
+
+/* nvnBufferBuilderSetStorage(NVNbufferBuilder*, NVNmemoryPool*, ptrdiff_t,
+ * size_t).  The offset is relative to the pool's storage. */
+void buffer_builder_set_storage(nvngfx_ctx*, uint64_t* x) {
+    NvnBufferSpec& s = g_buffer_specs[x[0]];
+    s.pool = x[1];
+    s.offset = static_cast<ptrdiff_t>(x[2]);
+    s.size = static_cast<size_t>(x[3]);
+    s.hasStorage = true;
+}
+
+void buffer_builder_get_device(nvngfx_ctx*, uint64_t* x) {
+    auto it = g_buffer_specs.find(x[0]);
+    x[0] = it == g_buffer_specs.end() ? 0 : it->second.device;
+}
+
+void buffer_builder_get_memory_pool(nvngfx_ctx*, uint64_t* x) {
+    auto it = g_buffer_specs.find(x[0]);
+    x[0] = it == g_buffer_specs.end() ? 0 : it->second.pool;
+}
+
+void buffer_builder_get_memory_offset(nvngfx_ctx*, uint64_t* x) {
+    auto it = g_buffer_specs.find(x[0]);
+    x[0] = it == g_buffer_specs.end()
+               ? 0
+               : static_cast<uint64_t>(it->second.offset);
+}
+
+void buffer_builder_get_size(nvngfx_ctx*, uint64_t* x) {
+    auto it = g_buffer_specs.find(x[0]);
+    x[0] = it == g_buffer_specs.end() ? 0 : it->second.size;
+}
+
+/* nvnBufferInitialize(NVNbuffer*, const NVNbufferBuilder*) -> NVNboolean */
+void buffer_initialize(nvngfx_ctx*, uint64_t* x) {
+    auto it = g_buffer_specs.find(x[1]);
+    if (it == g_buffer_specs.end() || !it->second.hasStorage) {
+        log_once_str("nvnBufferInitialize", "builder has no storage");
+        x[0] = 0;
+        return;
+    }
+    const NvnBufferSpec& spec = it->second;
+    Pool* pool = find<Pool>(spec.pool);
+    if (!pool || !pool->storage) {
+        log_once_str("nvnBufferInitialize", "memory pool is not initialized");
+        x[0] = 0;
+        return;
+    }
+    if (spec.offset < 0) {
+        log_once_str("nvnBufferInitialize", "negative pool offset");
+        x[0] = 0;
+        return;
+    }
+    const uint64_t off = static_cast<uint64_t>(spec.offset);
+    if (off > pool->size || spec.size > pool->size - off) {
+        log_once_str("nvnBufferInitialize", "range runs past the pool");
+        x[0] = 0;
+        return;
+    }
+    NvnBuffer* b = find_or_add<NvnBuffer>(x[0]);
+    b->device = spec.device;
+    b->pool = spec.pool;
+    b->offset = spec.offset;
+    b->size = spec.size;
+    b->debugId = ++g_next_buffer_debug_id;
+    x[0] = 1;
+}
+
+void buffer_finalize(nvngfx_ctx*, uint64_t* x) { forget<NvnBuffer>(x[0]); }
+
+void buffer_get_address(nvngfx_ctx*, uint64_t* x) {
+    NvnBuffer* b = find<NvnBuffer>(x[0]);
+    Pool* p = b ? find<Pool>(b->pool) : nullptr;
+    x[0] = b && p && p->storage
+               ? reinterpret_cast<uint64_t>(p->storage) +
+                     static_cast<uint64_t>(b->offset)
+               : 0;
+}
+
+void buffer_get_memory_pool(nvngfx_ctx*, uint64_t* x) {
+    NvnBuffer* b = find<NvnBuffer>(x[0]);
+    x[0] = b ? b->pool : 0;
+}
+
+void buffer_get_memory_offset(nvngfx_ctx*, uint64_t* x) {
+    NvnBuffer* b = find<NvnBuffer>(x[0]);
+    x[0] = b ? static_cast<uint64_t>(b->offset) : 0;
+}
+
+void buffer_get_size(nvngfx_ctx*, uint64_t* x) {
+    NvnBuffer* b = find<NvnBuffer>(x[0]);
+    x[0] = b ? b->size : 0;
+}
+
+void buffer_get_debug_id(nvngfx_ctx*, uint64_t* x) {
+    NvnBuffer* b = find<NvnBuffer>(x[0]);
+    x[0] = b ? b->debugId : 0;
+}
+
+void buffer_map(nvngfx_ctx*, uint64_t* x) {
+    NvnBuffer* b = find<NvnBuffer>(x[0]);
+    Pool* p = b ? find<Pool>(b->pool) : nullptr;
+    x[0] = b && p && p->storage
+               ? reinterpret_cast<uint64_t>(p->storage) +
+                     static_cast<uint64_t>(b->offset)
+               : 0;
+}
+
+void buffer_flush_mapped_range(nvngfx_ctx*, uint64_t* x) { (void)x; }
+void buffer_invalidate_mapped_range(nvngfx_ctx*, uint64_t* x) { (void)x; }
+
+void buffer_set_debug_label(nvngfx_ctx*, uint64_t* x) {
+    NvnBuffer* b = find<NvnBuffer>(x[0]);
+    if (!b) return;
+    const char* label = guest_ptr<const char>(x[1]);
+    b->label = label ? label : "";
 }
 
 /* ------------------------------------------------------------------ */
@@ -3003,6 +3220,143 @@ void cmdbuf_dispatch_compute_indirect(nvngfx_ctx* ctx, uint64_t* x) {
             static_cast<NSUInteger>(p->computeThreadgroup[2]))];
     [enc endEncoding];
     mark_compute_image_writes(b);
+}
+
+/* Resource copies need a blit encoder, and a blit cannot coexist with a
+ * render or compute encoder.  Pending clears are materialised first so the
+ * recorded order is preserved; the next draw opens a fresh pass with
+ * loadAction Load. */
+id<MTLBlitCommandEncoder> begin_resource_blit(Ctx* c, CmdBuf* b,
+                                              const char* tag) {
+    if (!c || !b || !b->recording || !b->cb) {
+        log_once_str(tag, "command buffer is not recording");
+        return nil;
+    }
+    if (!flush_pending_clears(c, b)) {
+        log_once_str(tag, "pending clear could not be materialised");
+        return nil;
+    }
+    end_encoder(b);
+    b->argbuf[0] = b->argbuf[1] = nil;
+    id<MTLBlitCommandEncoder> blit = [b->cb blitCommandEncoder];
+    if (!blit) log_once_str(tag, "Metal returned no blit encoder");
+    return blit;
+}
+
+/* nvnCommandBufferCopyBufferToBuffer(cb, src, dst, size, flags).
+ * Both addresses must name a span in one registered pool.  The blit is
+ * encoded in order, so an earlier compute dispatch's writes are visible to
+ * the copy and the copy's writes are visible to a later draw or dispatch. */
+void cmdbuf_copy_buffer_to_buffer(nvngfx_ctx* ctx, uint64_t* x) {
+    Ctx* c = ctx_of(ctx);
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    const size_t n = static_cast<size_t>(x[3]);
+    if (n == 0) return;
+    if ((n & 3u) != 0) {
+        log_once_str("nvnCommandBufferCopyBufferToBuffer.alignment",
+                     "size is not a multiple of four bytes");
+        return;
+    }
+    id<MTLBuffer> src = nil;
+    id<MTLBuffer> dst = nil;
+    size_t srcOff = 0;
+    size_t dstOff = 0;
+    if (!pool_span(x[1], n, &src, &srcOff) ||
+        !pool_span(x[2], n, &dst, &dstOff)) {
+        log_once_str("nvnCommandBufferCopyBufferToBuffer.range",
+                     "source or destination is not in a registered pool");
+        return;
+    }
+    if (((srcOff | dstOff) & 3u) != 0) {
+        log_once_str("nvnCommandBufferCopyBufferToBuffer.alignment",
+                     "source or destination offset is not four-byte aligned");
+        return;
+    }
+    id<MTLBlitCommandEncoder> blit =
+        begin_resource_blit(c, b, "nvnCommandBufferCopyBufferToBuffer.encoder");
+    if (!blit) return;
+    [blit copyFromBuffer:src
+            sourceOffset:static_cast<NSUInteger>(srcOff)
+                toBuffer:dst
+       destinationOffset:static_cast<NSUInteger>(dstOff)
+                    size:static_cast<NSUInteger>(n)];
+    [blit endEncoding];
+}
+
+/* nvnCommandBufferUpdateUniformBuffer(cb, buf, bufsz, offset, size, data).
+ * NVN snapshots the CPU bytes at recording time; the copy itself must execute
+ * at submit time.  Stage the bytes into a shared MTLBuffer and blit them into
+ * the guest pool, rather than copying directly into guest memory here. */
+void cmdbuf_update_uniform_buffer(nvngfx_ctx* ctx, uint64_t* x) {
+    Ctx* c = ctx_of(ctx);
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    const ptrdiff_t rel = static_cast<ptrdiff_t>(x[3]);
+    const size_t n = static_cast<size_t>(x[4]);
+    if (n == 0) return;
+    if (rel < 0) {
+        log_once_str("nvnCommandBufferUpdateUniformBuffer.offset",
+                     "negative destination offset");
+        return;
+    }
+    if ((n & 3u) != 0) {
+        log_once_str("nvnCommandBufferUpdateUniformBuffer.alignment",
+                     "size is not a multiple of four bytes");
+        return;
+    }
+    if (x[1] > UINT64_MAX - static_cast<uint64_t>(rel)) {
+        log_once_str("nvnCommandBufferUpdateUniformBuffer.offset",
+                     "destination address overflows");
+        return;
+    }
+    const uint64_t dstAddr = x[1] + static_cast<uint64_t>(rel);
+    id<MTLBuffer> dst = nil;
+    size_t dstOff = 0;
+    if (!pool_span(dstAddr, n, &dst, &dstOff) || (dstOff & 3u) != 0) {
+        log_once_str("nvnCommandBufferUpdateUniformBuffer.range",
+                     "destination is not an aligned span in a registered pool");
+        return;
+    }
+    if (!guest_range(x[5], n)) {
+        log_once_str("nvnCommandBufferUpdateUniformBuffer.source",
+                     "source pointer is not guest memory");
+        return;
+    }
+    if (!c || !c->ready) {
+        log_once_str("nvnCommandBufferUpdateUniformBuffer.device",
+                     "Metal device is not ready");
+        return;
+    }
+    id<MTLBuffer> staging =
+        [c->device newBufferWithBytes:guest_ptr<const void>(x[5])
+                               length:n
+                              options:MTLResourceStorageModeShared];
+    if (!staging) {
+        log_once_str("nvnCommandBufferUpdateUniformBuffer.staging",
+                     "staging buffer allocation failed");
+        return;
+    }
+    id<MTLBlitCommandEncoder> blit = begin_resource_blit(
+        c, b, "nvnCommandBufferUpdateUniformBuffer.encoder");
+    if (!blit) return;
+    [blit copyFromBuffer:staging
+            sourceOffset:0
+                toBuffer:dst
+       destinationOffset:static_cast<NSUInteger>(dstOff)
+                    size:static_cast<NSUInteger>(n)];
+    [blit endEncoding];
+}
+
+/* nvnCommandBufferBarrier(cb, bits).  All work here is encoded into one Metal
+ * command buffer, and Metal inserts the resource hazards for its own draws,
+ * dispatches and blits.  A host-side barrier is therefore already satisfied;
+ * record the call so the guest's command stream stays aligned. */
+void cmdbuf_barrier(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    if (!b || !b->recording) {
+        log_once_str("nvnCommandBufferBarrier", "command buffer is not recording");
+        return;
+    }
+    (void)x[1];
 }
 
 /* Binds one MTLBuffer per stream that a bound attribute reads.
@@ -6612,9 +6966,39 @@ const Binding kBindings[] = {
     BIND("nvnMemoryPoolBuilderSetDefaults", pool_builder_set_defaults),
     BIND("nvnMemoryPoolBuilderSetStorage", pool_builder_set_storage),
     BIND("nvnMemoryPoolBuilderSetFlags", pool_builder_set_flags),
+    BIND("nvnMemoryPoolBuilderSetDevice", pool_builder_set_device),
+    BIND("nvnMemoryPoolBuilderGetDevice", pool_builder_get_device),
+    BIND("nvnMemoryPoolBuilderGetMemory", pool_builder_get_memory),
+    BIND("nvnMemoryPoolBuilderGetSize", pool_builder_get_size),
+    BIND("nvnMemoryPoolBuilderGetFlags", pool_builder_get_flags),
     BIND("nvnMemoryPoolInitialize", pool_initialize),
     BIND("nvnMemoryPoolFinalize", pool_finalize),
     BIND("nvnMemoryPoolGetSize", pool_get_size),
+    BIND("nvnMemoryPoolGetBufferAddress", pool_get_buffer_address),
+    BIND("nvnMemoryPoolGetFlags", pool_get_flags),
+    BIND("nvnMemoryPoolMap", pool_map),
+    BIND("nvnMemoryPoolFlushMappedRange", pool_flush_mapped_range),
+    BIND("nvnMemoryPoolInvalidateMappedRange", pool_invalidate_mapped_range),
+    BIND("nvnMemoryPoolSetDebugLabel", pool_set_debug_label),
+
+    BIND("nvnBufferBuilderSetDefaults", buffer_builder_set_defaults),
+    BIND("nvnBufferBuilderSetDevice", buffer_builder_set_device),
+    BIND("nvnBufferBuilderSetStorage", buffer_builder_set_storage),
+    BIND("nvnBufferBuilderGetDevice", buffer_builder_get_device),
+    BIND("nvnBufferBuilderGetMemoryPool", buffer_builder_get_memory_pool),
+    BIND("nvnBufferBuilderGetMemoryOffset", buffer_builder_get_memory_offset),
+    BIND("nvnBufferBuilderGetSize", buffer_builder_get_size),
+    BIND("nvnBufferInitialize", buffer_initialize),
+    BIND("nvnBufferFinalize", buffer_finalize),
+    BIND("nvnBufferGetAddress", buffer_get_address),
+    BIND("nvnBufferGetMemoryPool", buffer_get_memory_pool),
+    BIND("nvnBufferGetMemoryOffset", buffer_get_memory_offset),
+    BIND("nvnBufferGetSize", buffer_get_size),
+    BIND("nvnBufferGetDebugID", buffer_get_debug_id),
+    BIND("nvnBufferMap", buffer_map),
+    BIND("nvnBufferFlushMappedRange", buffer_flush_mapped_range),
+    BIND("nvnBufferInvalidateMappedRange", buffer_invalidate_mapped_range),
+    BIND("nvnBufferSetDebugLabel", buffer_set_debug_label),
 
     BIND("nvnTextureBuilderSetDefaults", tex_builder_set_defaults),
     BIND("nvnTextureBuilderSetTarget", tex_builder_set_target),
@@ -6787,6 +7171,9 @@ const Binding kBindings[] = {
     BIND("nvnCommandBufferBindImages", cmdbuf_bind_images),
     BIND("nvnCommandBufferBindTransformFeedbackBuffer", cmdbuf_bind_tf_buffer),
     BIND("nvnCommandBufferBindTransformFeedbackBuffers", cmdbuf_bind_tf_buffers),
+    BIND("nvnCommandBufferCopyBufferToBuffer", cmdbuf_copy_buffer_to_buffer),
+    BIND("nvnCommandBufferUpdateUniformBuffer", cmdbuf_update_uniform_buffer),
+    BIND("nvnCommandBufferBarrier", cmdbuf_barrier),
     BIND("nvnCommandBufferClearColori", cmdbuf_clear_color_i),
     BIND("nvnCommandBufferClearColorui", cmdbuf_clear_color_ui),
     BIND("nvnCommandBufferClearDepthStencil", cmdbuf_clear_depth_stencil),
@@ -11762,6 +12149,335 @@ extern "C" int nvngfx_metal_selftest(void) {
                          "words, sampled a 2x2 texture and filled a 16x16 "
                          "image (uniform base %u)\n",
                          kComputeUniformBase);
+        }
+
+        {
+            /* --- Buffer objects and in-command resource updates ----------
+             * The compute kernel from the previous block is reused.  A real
+             * NVN buffer is built over the second pool and every getter must
+             * agree with that pool; then UpdateUniformBuffer snapshots CPU
+             * bytes and CopyBufferToBuffer copies another 16-byte uniform
+             * record on the GPU.  Two dispatches read those destinations and
+             * write distinct 256-word storage buffers, so either the wrong
+             * address or a later CPU overwrite changes the readback. */
+            const uint64_t kProgCopy = 0x9A00;
+            const uint64_t kCbCopy = 0x9B00;
+            const unsigned kCopySrcStorage = 8192;
+            const unsigned kCopyUpdate = 12544;
+            const unsigned kCopySrc = 12800;
+            const unsigned kCopyDst = 13056;
+            const unsigned kCopyOutA = 13312;
+            const unsigned kCopyOutB = 14336;
+            const unsigned kCopyUniformBytes = 16;
+            const size_t kCopyOutBytes = 16 * 16 * sizeof(uint32_t);
+            unsigned char* const vpoolCopy =
+                poolRaw2 ? reinterpret_cast<unsigned char*>(
+                               (reinterpret_cast<uintptr_t>(poolRaw2) + 16383u) &
+                               ~static_cast<uintptr_t>(16383u))
+                         : nullptr;
+            if (!vpoolCopy) {
+                std::fprintf(stderr,
+                             "[selftest] copies: the second pool is missing\n");
+                rc = 16424;
+                goto done;
+            }
+
+            alignas(16) unsigned char copyPoolBuilder[0x40] = {};
+            alignas(16) unsigned char copyBufferBuilder[0x40] = {};
+            alignas(16) unsigned char copyBufferObject[0x30] = {};
+            const uint64_t kCopyPoolBuilder =
+                reinterpret_cast<uint64_t>(copyPoolBuilder);
+            const uint64_t kCopyBufferBuilder =
+                reinterpret_cast<uint64_t>(copyBufferBuilder);
+            const uint64_t kCopyBuffer =
+                reinterpret_cast<uint64_t>(copyBufferObject);
+
+            x[0] = kCopyPoolBuilder;
+            pool_builder_set_defaults(ctx, x);
+            x[0] = kCopyPoolBuilder; x[1] = 0xB070;
+            pool_builder_set_device(ctx, x);
+            x[0] = kCopyPoolBuilder;
+            x[1] = reinterpret_cast<uint64_t>(vpoolCopy);
+            x[2] = 16384;
+            pool_builder_set_storage(ctx, x);
+            x[0] = kCopyPoolBuilder; x[1] = 7;
+            pool_builder_set_flags(ctx, x);
+            x[0] = kCopyPoolBuilder;
+            pool_builder_get_device(ctx, x);
+            const uint64_t copyBuilderDevice = x[0];
+            x[0] = kCopyPoolBuilder;
+            pool_builder_get_memory(ctx, x);
+            const uint64_t copyBuilderMemory = x[0];
+            x[0] = kCopyPoolBuilder;
+            pool_builder_get_size(ctx, x);
+            const uint64_t copyBuilderSize = x[0];
+            x[0] = kCopyPoolBuilder;
+            pool_builder_get_flags(ctx, x);
+            const uint64_t copyBuilderFlags = x[0];
+            if (copyBuilderDevice != 0xB070 ||
+                copyBuilderMemory != reinterpret_cast<uint64_t>(vpoolCopy) ||
+                copyBuilderSize != 16384 || copyBuilderFlags != 7) {
+                std::fprintf(stderr,
+                             "[selftest] copies: pool builder getters disagree "
+                             "(device=%llx memory=%llx size=%llu flags=%llu)\n",
+                             static_cast<unsigned long long>(copyBuilderDevice),
+                             static_cast<unsigned long long>(copyBuilderMemory),
+                             static_cast<unsigned long long>(copyBuilderSize),
+                             static_cast<unsigned long long>(copyBuilderFlags));
+                rc = 16424;
+                goto done;
+            }
+
+            x[0] = kCubePool;
+            pool_get_buffer_address(ctx, x);
+            const uint64_t poolAddress = x[0];
+            x[0] = kCubePool;
+            pool_get_size(ctx, x);
+            const uint64_t poolSize = x[0];
+            x[0] = kCubePool;
+            pool_get_flags(ctx, x);
+            const uint64_t poolFlags = x[0];
+            x[0] = kCubePool;
+            pool_map(ctx, x);
+            const uint64_t poolMapped = x[0];
+            if (poolAddress != reinterpret_cast<uint64_t>(vpoolCopy) ||
+                poolSize != 16384 || poolFlags != 0 ||
+                poolMapped != poolAddress) {
+                std::fprintf(stderr,
+                             "[selftest] copies: pool getters disagree "
+                             "(address=%llx size=%llu flags=%llu map=%llx)\n",
+                             static_cast<unsigned long long>(poolAddress),
+                             static_cast<unsigned long long>(poolSize),
+                             static_cast<unsigned long long>(poolFlags),
+                             static_cast<unsigned long long>(poolMapped));
+                rc = 16424;
+                goto done;
+            }
+
+            x[0] = kCopyBufferBuilder;
+            buffer_builder_set_defaults(ctx, x);
+            x[0] = kCopyBufferBuilder; x[1] = 0xB070;
+            buffer_builder_set_device(ctx, x);
+            x[0] = kCopyBufferBuilder;
+            x[1] = kCubePool;
+            x[2] = kCopyUpdate;
+            x[3] = kCopyUniformBytes;
+            buffer_builder_set_storage(ctx, x);
+            x[0] = kCopyBufferBuilder;
+            buffer_builder_get_device(ctx, x);
+            const uint64_t bufferBuilderDevice = x[0];
+            x[0] = kCopyBufferBuilder;
+            buffer_builder_get_memory_pool(ctx, x);
+            const uint64_t bufferBuilderPool = x[0];
+            x[0] = kCopyBufferBuilder;
+            buffer_builder_get_memory_offset(ctx, x);
+            const uint64_t bufferBuilderOffset = x[0];
+            x[0] = kCopyBufferBuilder;
+            buffer_builder_get_size(ctx, x);
+            const uint64_t bufferBuilderSize = x[0];
+            if (bufferBuilderDevice != 0xB070 ||
+                bufferBuilderPool != kCubePool ||
+                bufferBuilderOffset != kCopyUpdate ||
+                bufferBuilderSize != kCopyUniformBytes) {
+                std::fprintf(stderr,
+                             "[selftest] copies: buffer builder getters "
+                             "disagree (device=%llx pool=%llx off=%llu size=%llu)\n",
+                             static_cast<unsigned long long>(bufferBuilderDevice),
+                             static_cast<unsigned long long>(bufferBuilderPool),
+                             static_cast<unsigned long long>(bufferBuilderOffset),
+                             static_cast<unsigned long long>(bufferBuilderSize));
+                rc = 16424;
+                goto done;
+            }
+
+            x[0] = kCopyBuffer; x[1] = kCopyBufferBuilder;
+            buffer_initialize(ctx, x);
+            NvnBuffer* const copyBuffer = find<NvnBuffer>(kCopyBuffer);
+            if (x[0] != 1 || !copyBuffer) {
+                std::fprintf(stderr,
+                             "[selftest] copies: nvnBufferInitialize failed\n");
+                rc = 16424;
+                goto done;
+            }
+            x[0] = kCopyBuffer;
+            buffer_get_address(ctx, x);
+            const uint64_t copyBufferAddress = x[0];
+            x[0] = kCopyBuffer;
+            buffer_get_memory_pool(ctx, x);
+            const uint64_t copyBufferPool = x[0];
+            x[0] = kCopyBuffer;
+            buffer_get_memory_offset(ctx, x);
+            const uint64_t copyBufferOffset = x[0];
+            x[0] = kCopyBuffer;
+            buffer_get_size(ctx, x);
+            const uint64_t copyBufferSize = x[0];
+            x[0] = kCopyBuffer;
+            buffer_get_debug_id(ctx, x);
+            const uint64_t copyBufferDebugId = x[0];
+            x[0] = kCopyBuffer;
+            buffer_map(ctx, x);
+            const uint64_t copyBufferMapped = x[0];
+            const uint64_t wantBufferAddress =
+                reinterpret_cast<uint64_t>(vpoolCopy + kCopyUpdate);
+            if (copyBufferAddress != wantBufferAddress ||
+                copyBufferPool != kCubePool ||
+                copyBufferOffset != kCopyUpdate ||
+                copyBufferSize != kCopyUniformBytes ||
+                copyBufferDebugId == 0 ||
+                copyBufferMapped != wantBufferAddress) {
+                std::fprintf(stderr,
+                             "[selftest] copies: buffer getters disagree "
+                             "(address=%llx pool=%llx off=%llu size=%llu id=%llu map=%llx)\n",
+                             static_cast<unsigned long long>(copyBufferAddress),
+                             static_cast<unsigned long long>(copyBufferPool),
+                             static_cast<unsigned long long>(copyBufferOffset),
+                             static_cast<unsigned long long>(copyBufferSize),
+                             static_cast<unsigned long long>(copyBufferDebugId),
+                             static_cast<unsigned long long>(copyBufferMapped));
+                rc = 16424;
+                goto done;
+            }
+
+            uint32_t* const copySrc = reinterpret_cast<uint32_t*>(
+                vpoolCopy + kCopySrc);
+            uint32_t* const copyDst = reinterpret_cast<uint32_t*>(
+                vpoolCopy + kCopyDst);
+            uint32_t* const copyOutA = reinterpret_cast<uint32_t*>(
+                vpoolCopy + kCopyOutA);
+            uint32_t* const copyOutB = reinterpret_cast<uint32_t*>(
+                vpoolCopy + kCopyOutB);
+            uint32_t* const copyStorage = reinterpret_cast<uint32_t*>(
+                vpoolCopy + kCopySrcStorage);
+            std::memset(copySrc, 0, kCopyUniformBytes);
+            std::memset(copyDst, 0, kCopyUniformBytes);
+            std::memset(copyOutA, 0xFF, kCopyOutBytes);
+            std::memset(copyOutB, 0xFF, kCopyOutBytes);
+            copySrc[0] = 888;
+            copyStorage[0] = 1000;
+            const uint64_t copySrcAddr =
+                reinterpret_cast<uint64_t>(copySrc);
+            const uint64_t copyDstAddr =
+                reinterpret_cast<uint64_t>(copyDst);
+            const uint64_t copySrcStorageAddr =
+                reinterpret_cast<uint64_t>(copyStorage);
+            const uint64_t copyOutAAddr =
+                reinterpret_cast<uint64_t>(copyOutA);
+            const uint64_t copyOutBAddr =
+                reinterpret_cast<uint64_t>(copyOutB);
+
+            alignas(16) uint32_t updateData[4] = {777, 0, 0, 0};
+            x[0] = kCbCopy;
+            cmdbuf_begin_recording(ctx, x);
+            x[0] = kCbCopy; x[1] = kTexPool;
+            cmdbuf_set_texture_pool(ctx, x);
+            x[0] = kCbCopy; x[1] = kSampPool;
+            cmdbuf_set_sampler_pool(ctx, x);
+            x[0] = kCbCopy; x[1] = 5; x[2] = 0;
+            x[3] = copySrcStorageAddr; x[4] = kCopyOutBytes;
+            cmdbuf_bind_storage_buffer(ctx, x);
+            x[0] = kCbCopy; x[1] = 5; x[2] = 1;
+            x[3] = copyOutAAddr; x[4] = kCopyOutBytes;
+            cmdbuf_bind_storage_buffer(ctx, x);
+            x[0] = 0; x[1] = 14;
+            dev_get_image_handle(ctx, x);
+            const uint64_t copyImageHandle = x[0];
+            x[0] = kCbCopy; x[1] = 5; x[2] = 0; x[3] = copyImageHandle;
+            cmdbuf_bind_image(ctx, x);
+            x[0] = 0; x[1] = 15; x[2] = 9;
+            dev_get_texture_handle(ctx, x);
+            const uint64_t copyTextureHandle = x[0];
+            x[0] = kCbCopy; x[1] = 5; x[2] = 0; x[3] = copyTextureHandle;
+            cmdbuf_bind_texture(ctx, x);
+            x[0] = kCbCopy; x[1] = kProgCopy; x[2] = 0x20;
+            cmdbuf_bind_program(ctx, x);
+
+            x[0] = kCbCopy;
+            x[1] = copyBufferAddress;
+            x[2] = kCopyUniformBytes;
+            x[3] = 0;
+            x[4] = kCopyUniformBytes;
+            x[5] = reinterpret_cast<uint64_t>(updateData);
+            cmdbuf_update_uniform_buffer(ctx, x);
+            /* NVN's API snapshots the bytes when the command is recorded. */
+            updateData[0] = 999;
+
+            x[0] = kCbCopy; x[1] = copySrcAddr; x[2] = copyDstAddr;
+            x[3] = kCopyUniformBytes; x[4] = 0;
+            cmdbuf_copy_buffer_to_buffer(ctx, x);
+            x[0] = kCbCopy; x[1] = 0x1;
+            cmdbuf_barrier(ctx, x);
+
+            x[0] = kCbCopy; x[1] = 5; x[2] = 0;
+            x[3] = copyBufferAddress; x[4] = kCopyUniformBytes;
+            cmdbuf_bind_uniform_buffer(ctx, x);
+            x[0] = kCbCopy; x[1] = 1; x[2] = 16; x[3] = 1;
+            cmdbuf_dispatch_compute(ctx, x);
+
+            x[0] = kCbCopy; x[1] = 5; x[2] = 1;
+            x[3] = copyOutBAddr; x[4] = kCopyOutBytes;
+            cmdbuf_bind_storage_buffer(ctx, x);
+            x[0] = kCbCopy; x[1] = 5; x[2] = 0;
+            x[3] = copyDstAddr; x[4] = kCopyUniformBytes;
+            cmdbuf_bind_uniform_buffer(ctx, x);
+            x[0] = kCbCopy; x[1] = 1; x[2] = 16; x[3] = 1;
+            cmdbuf_dispatch_compute(ctx, x);
+            x[0] = kCbCopy;
+            cmdbuf_end_recording(ctx, x);
+
+            CmdBuf* const bcopy = find<CmdBuf>(kCbCopy);
+            if (!bcopy || !bcopy->last) {
+                std::fprintf(stderr,
+                             "[selftest] copies: nothing committed\n");
+                rc = 16424;
+                goto done;
+            }
+            [bcopy->last waitUntilCompleted];
+            if (bcopy->last.status == MTLCommandBufferStatusError) {
+                std::fprintf(stderr,
+                             "[selftest] copies command buffer error: %s\n",
+                             bcopy->last.error
+                                 ? [[bcopy->last.error localizedDescription] UTF8String]
+                                 : "(no description)");
+                rc = 16424;
+                goto done;
+            }
+            for (unsigned y = 0; y < 16; ++y) {
+                for (unsigned x = 0; x < 16; ++x) {
+                    const uint32_t i = y * 16u + x;
+                    const uint32_t wantA = 777u + 1000u + x + y;
+                    const uint32_t wantB = 888u + 1000u + x + y;
+                    if (copyOutA[i] != wantA || copyOutB[i] != wantB) {
+                        std::fprintf(stderr,
+                                     "[selftest] copies word (%u,%u) is "
+                                     "0x%08x / 0x%08x, want 0x%08x / 0x%08x\n",
+                                     x, y, copyOutA[i], copyOutB[i],
+                                     wantA, wantB);
+                        rc = 16424;
+                        goto done;
+                    }
+                }
+            }
+            if (reinterpret_cast<uint32_t*>(vpoolCopy + kCopyUpdate)[0] != 777 ||
+                copyDst[0] != 888) {
+                std::fprintf(stderr,
+                             "[selftest] copies landed as %u / %u, want 777 / 888\n",
+                             reinterpret_cast<uint32_t*>(vpoolCopy + kCopyUpdate)[0],
+                             copyDst[0]);
+                rc = 16424;
+                goto done;
+            }
+            x[0] = kCopyBuffer;
+            buffer_finalize(ctx, x);
+            if (find<NvnBuffer>(kCopyBuffer)) {
+                std::fprintf(stderr,
+                             "[selftest] copies: buffer finalize left the object\n");
+                rc = 16424;
+                goto done;
+            }
+            std::fprintf(stderr,
+                         "[selftest] buffers/copies: NVN buffer getters and map "
+                         "matched pool storage; UpdateUniformBuffer snapshotted "
+                         "777 and CopyBufferToBuffer supplied 888 to GPU dispatches\n");
         }
 
         {

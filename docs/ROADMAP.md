@@ -4873,3 +4873,95 @@ powershell -ExecutionPolicy Bypass -File scripts/build_abi_test.ps1
 本地已通过；iOS 模拟器的实际像素断言由 GitHub Actions 的 macOS job 执行。
 这些结果只证明**合成 MSL** 的实例化 / indirect 路径，不证明真实标题 shader、
 真实资源或真机画面已经可玩。
+
+## M4 续十三：NVN buffer 对象与命令缓冲资源更新
+
+Unity 类标题不只用“pool + 原始地址”：它还会从 `NVNbufferBuilder` 建 buffer
+对象，查地址后把地址写进 uniform / draw 参数；动态常量则常用
+`nvnCommandBufferUpdateUniformBuffer`，命令段之间也会做 buffer copy 和 barrier。
+上一轮这些入口仍全部落在日志桩，本轮补齐：
+
+* Buffer：11/11
+* BufferBuilder：7/7
+* MemoryPool：9/10
+* MemoryPoolBuilder：8/8
+* CommandBuffer：67/144
+
+Metal 覆盖从 **209/513（40.7%）** 到 **241/513（47.0%）**，未实现 272。
+
+### 1. buffer 是 pool 的视图，不是第二次分配
+
+`NvnBufferSpec` 只记录 builder 收到的 `(device, pool, offset, size)`；
+`nvnBufferInitialize` 校验 pool 存在、offset 非负且整个范围落在 pool 内，然后把
+同一组字段存进宿主侧表。`nvnBufferGetAddress` / `nvnBufferMap` 都返回
+`pool.storage + offset`，不新建 `MTLBuffer`，也不复制 guest 数据。
+
+builder 的 getter 同样回答 setter 记录的值，不读取尚未验证的 guest builder
+布局。`nvnBufferGetMemoryPool`、`nvnBufferGetMemoryOffset`、`nvnBufferGetSize`
+和 `nvnBufferGetDebugID` 都从对象表返回；`Finalize` 只移除宿主侧表项。
+`nvnBufferMap` 与 `nvnMemoryPoolMap` 之所以可以直接返回 storage，是因为 iOS
+这边 pool 本来就是 `MTLResourceStorageModeShared` 的零拷贝内存。
+
+MemoryPool 侧同时补了 `GetBufferAddress`、`GetFlags`、`Map`、
+`Get/SetDebugLabel` 与 mapped-range flush / invalidate。后两者是 coherency hint，
+统一内存下是合法空操作。`MapVirtual` 仍然未接：它不是简单查询，要求真正的
+虚拟地址映射语义，不能用 `Map` 冒充。
+
+### 2. UpdateUniformBuffer：录制时快照，提交时写入
+
+NVN 的语义是“调用时把 CPU 数据拷进命令内存，提交时再写进目标 buffer”；调用者
+在录制后可以立刻改写原数据。实现据此分两步：
+
+1. 录制时用 `newBufferWithBytes:` 把 `data` 复制到 shared staging buffer；
+2. 结束当前 render / compute encoder，开 blit encoder，把 staging 内容
+   `copyFromBuffer` 到 guest pool 的目标 span，再结束 blit。
+
+写入前会检查目标地址是否在已注册 pool、源指针是否是 guest 内存、offset 是否
+非负 / 是否溢出，以及 size、source offset、destination offset 是否 4 字节对齐。
+pending clear 会先落地，避免资源写入越过尚未物化的清屏。下一条 draw 或 dispatch
+重新打开 pass，viewport / scissor 由 `ensure_encoder()` 恢复。
+
+### 3. CopyBufferToBuffer 与 Barrier
+
+`CopyBufferToBuffer` 的两端都必须是同一个已注册 pool 内的 span，复制由
+`MTLBlitCommandEncoder` 在 GPU 上完成。因为 blit、draw 和 dispatch 都编码进
+同一个 `MTLCommandBuffer`，Metal 自己会处理资源 hazard；源 buffer 由 GPU 在
+提交时读取，前一条 compute 的写入对后一条 copy 可见。
+
+`nvnCommandBufferBarrier` 因此记录为宿主侧空操作：当前后端是单 `MTLCommandQueue`
+单 command buffer 顺序提交，Metal 已在命令之间建立依赖。它还不是通用 fence /
+event 实现；`nvnSync*`、`nvnEvent*` 与跨提交等待仍未接。
+
+仍未实现的相关入口：
+
+* `CopyBufferToTexture` / `CopyTextureToBuffer` / `CopyTextureToTexture`；
+* `nvnMemoryPoolMapVirtual`；
+* texture / buffer 的完整 CPU 回读与 compute image 写回 guest 存储；
+* 真实标题 shader 与真机画面。
+
+### 4. 模拟器自测
+
+新增一组 buffer / copy 回归，复用上一组的 16×16 compute kernel：
+
+1. 用第二个 guest pool 建 `NVNbufferBuilder` 与 `NVNbuffer`，逐一比对 device、
+   pool、offset、size、debug id 和 `Map` 返回地址；
+2. `UpdateUniformBuffer` 写入 777，随后立刻把源栈变量改成 999，证明录制时已快照；
+3. `CopyBufferToBuffer` 把另一个 16 字节 uniform 记录（888）从源 span 复制到目标；
+4. 插入 `Barrier`，再分别 dispatch：第一次读 777 的目标，第二次读 888 的目标；
+5. 回读两块 256-word storage，逐字核对 `777/888 + 1000 + x + y`，并确认两块
+   uniform 目标本身保存的也是 777 / 888。
+
+失败码为 `16424`。这一组只证明合成 compute shader、NVN buffer 查询和 Metal
+blit 的顺序路径；不是标题 buffer 内容，也不是画面正确。
+
+### 5. 门禁
+
+```text
+python scripts/syntax_check_metal.py
+python scripts/gen_nvn.py --repo .
+python scripts/gen_nvn.py --repo . --check
+python scripts/verify_ios.py
+powershell -ExecutionPolicy Bypass -File scripts/build_abi_test.ps1
+```
+
+本地已通过；新增的数据回读断言由 GitHub Actions 的 macOS `ios` job 执行。

@@ -36,7 +36,7 @@ NOTE = ("NVN entry-point shapes only: return type and parameter types. "
         "The header itself is not redistributed.")
 
 TYPEDEF = re.compile(
-    r"typedef\s+(?P<ret>[A-Za-z_][A-Za-z0-9_ ]*?)\s*\(\s*\*\s*NVNT_(?P<name>nvn[A-Za-z0-9_]+)\s*\)"
+    r"typedef\s+(?P<ret>[A-Za-z_][A-Za-z0-9_ *]*?)\s*\(\s*\*\s*NVNT_(?P<name>nvn[A-Za-z0-9_]+)\s*\)"
     r"\s*\((?P<params>[^;]*?)\)\s*;",
     re.S,
 )

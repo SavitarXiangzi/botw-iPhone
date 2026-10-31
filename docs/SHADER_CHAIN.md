@@ -292,8 +292,8 @@ packed slot 写进 blob，尚未接（M3.85 的自检暴露了这一点）。
 限制：
 
 - 纹理注册只保存客体地址；`nvnTextureFinalize` 后再采样会解析失败并丢 draw。
-- `nvnTexturePoolGetMemoryPool` / `nvnSamplerPoolGetMemoryPool` 不在
-  `signatures.json` 的 470 个形状里，未绑。
+- `nvnTexturePoolGetMemoryPool` / `nvnSamplerPoolGetMemoryPool` 已在
+  `signatures.json` 的 477 个形状里（指针返回类型此前被提取器漏掉），但后端仍未绑。
 - c1 已由 M3.85 侧车接上；bindless、image / storage buffer 仍标为
   `UNSUPPORTED`。
 - 参数缓冲区的 texture / sampler 条目要写 `gpuResourceID`。iOS 模拟器
