@@ -105,6 +105,19 @@ int nvngfx_tex_write_region(const nvngfx_texdesc* d, unsigned level,
                             int width, int height, const void* src,
                             size_t src_row, size_t src_image, void* storage);
 
+/* The inverse of nvngfx_tex_write_region: reads one rectangular region of one
+ * level/layer/slice out of the guest's block-linear (or LINEAR) storage into a
+ * linear image.  `dst_row` and `dst_image` are byte strides, with zero meaning
+ * tightly packed; a stride narrower than the tightly packed region is refused
+ * rather than truncating rows.  Same region/format/stride rules as the write
+ * path, including block alignment for compressed formats.  Returns 0, or -1
+ * for a region/format/stride this path refuses. */
+int nvngfx_tex_read_region(const nvngfx_texdesc* d, unsigned level,
+                           unsigned layer, int x, int y, int z,
+                           int width, int height, void* dst,
+                           size_t dst_row, size_t dst_image,
+                           const void* storage);
+
 #ifdef __cplusplus
 }
 #endif

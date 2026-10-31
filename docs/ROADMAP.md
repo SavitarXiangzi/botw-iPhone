@@ -6142,3 +6142,75 @@ git diff --check
 与两个 `ReadTexels` 仍未实现。标题真正用到而尚未实现的入口现在只剩
 `nvnCommandBufferCallCommands`——它需要先把“录制时立即编码”改成可重放的命令流，
 是下一堵墙。真实标题的 draw 依然为 0 条。
+
+## M4 续二十七：纹理读回（ReadTexels / ReadTexelsStrided）
+
+`WriteTexels` 早就有了，读回一直缺。这不是“再写一个拷贝循环”的问题：写路径里那段
+区域/视图/步长/层数的校验有十几处拒绝条件，抄一份给读路径就等于留一份会分叉的副本。
+所以先把两边共用的解析抽出来：
+
+```text
+tex_region_prepare(tex, view, region, buffer, row, image, strided, who, out)
+   -> Tex* / CopyRegion / level / layer0 / depth / zoff / is3d
+      / pool storage / row 与 image 的实际字节步长
+```
+
+`tex_write_texels_common` 与新的 `tex_read_texels_common` 都只做最后的一行拷贝，
+差别只在方向。日志键仍沿用 `nvnTextureWriteTexels` / `nvnTextureReadTexels`，
+所以原来的日志行为没有变。
+
+新增 `nvngfx_tex_read_region`（`ios/nvn/src/nvn_texlayout.c`）：把一个
+level/layer/slice 反解成线性图像，再把请求的矩形按 `dst_row` / `dst_image` 拷出去；
+步长比紧凑区域还窄时拒绝而不是截断行。
+
+覆盖从 **474/513（92.4%）** 到 **476/513（92.8%）**，未实现 37，Texture 达到
+**44/45**（只剩 `GetSparseTileLayout`）。
+
+### 1. 读的是 guest 存储，不是 GPU 结果
+
+这个后端的采样纹理是“首次采样时从 guest 池解块上传”的一次性副本，渲染目标则是
+私有的 `MTLTexture`。因此：
+
+* CPU 写过、packaged、或者 `WriteTexels` 写过的纹理：guest 存储就是真相，
+  `ReadTexels` 读它，和 NVN 的语义一致；
+* 被当作渲染目标用过的纹理：像素在 `MTLTexture` 里，guest 副本是旧的。这一路需要
+  一次 blit 加格式转换才能读回，**本轮没有接**，所以只打一条
+  `nvnTextureReadTexels.stale`，不把旧字节当成渲染结果交出去。
+
+这条边界写在函数注释和本文里，因为“读回成功但内容过期”是最难查的一类错误。
+
+### 2. Windows 单测
+
+`tests/nvn_texlayout_test.cpp` 新增 `test_read_region`：4x4 RGBA8 读内层 2x2、
+带 16 字节行距读（padding 必须保持 `0xEE`）、整层读回与原图逐字节比较、
+LINEAR stride 32 的行读、以及四类拒绝（空目标、步长过窄、2D 的 slice 1、
+越级 level）加一个 BC1 非整块读取。读回与写入用同一张图，所以偏移错一个 texel
+就会失败。
+
+### 3. 模拟器自测
+
+失败码 `16438`：在 `16437` 建好的 4x4 packaged 纹理上，先
+`nvnTextureWriteTexels` 写 2x2 再 `ReadTexels` 读回，逐字节比较；再用
+`ReadTexelsStrided`（`row = 16`）确认两行分别落在偏移 0 与 16。
+
+### 4. 门禁
+
+```text
+python scripts/syntax_check_metal.py
+python scripts/gen_nvn.py --repo . --check
+python scripts/extract_nvn_signatures.py --check
+python scripts/verify_ios.py
+powershell -ExecutionPolicy Bypass -File scripts/build_abi_test.ps1
+git diff --check
+```
+
+本地已通过（513 procs / 476 implemented / 477 measured + 28 inferred）。
+本批 CI 结果在推送后补记。
+
+### 5. 仍然没有闭环的部分
+
+渲染目标的 GPU 读回（blit + 格式转换）没有接；`ReadTexels` 不做脏页跟踪，读的是
+拷贝那一刻的 guest 存储；`nvnTextureGetSparseTileLayout` /
+`nvnTextureBuilderGetSparseTileLayout` 仍未实现。标题真正用到而尚未实现的入口依旧
+只有 `nvnCommandBufferCallCommands`，下一堵墙是把“录制时立即编码”改成可重放的
+命令流。真实标题的 draw 依然为 0 条。

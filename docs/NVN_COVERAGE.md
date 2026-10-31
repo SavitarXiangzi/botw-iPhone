@@ -7,8 +7,8 @@
 `nvn*` 字符串（运行时按名解析，所以名字本身就暴露了完整接口面）。
 
 - 接口总数：**513**
-- Metal 后端已实现：**474**（92.4%）
-- 仍未实现：**39**
+- Metal 后端已实现：**476**（92.8%）
+- 仍未实现：**37**
 
 > 只有出现在 `ios/nvn/implemented_metal.txt` 里、且确实在
 > `ios/nvn/src/nvn_metal.mm` 中定义过的名字才算“已实现”。
@@ -19,7 +19,7 @@
 | 域 | 已实现 | 总数 | 进度 |
 |---|---:|---:|---|
 | CommandBuffer | 117 | 144 | `########  ` |
-| Texture | 42 | 45 | `######### ` |
+| Texture | 44 | 45 | `##########` |
 | TextureBuilder | 42 | 43 | `##########` |
 | Device | 27 | 27 | `##########` |
 | SamplerBuilder | 25 | 25 | `##########` |
@@ -499,7 +499,7 @@
 - [x] `nvnSyncSetDebugLabel`
 - [x] `nvnSyncWait`
 
-### Texture (42/45)
+### Texture (44/45)
 
 - [x] `nvnTextureCompare`
 - [x] `nvnTextureFinalize`
@@ -527,8 +527,8 @@
 - [x] `nvnTextureGetZCullStorageSize`
 - [x] `nvnTextureInitialize`
 - [x] `nvnTextureInvalidateTexels`
-- [ ] `nvnTextureReadTexels`
-- [ ] `nvnTextureReadTexelsStrided`
+- [x] `nvnTextureReadTexels`
+- [x] `nvnTextureReadTexelsStrided`
 - [x] `nvnTextureSetDebugLabel`
 - [x] `nvnTextureViewCompare`
 - [x] `nvnTextureViewGetDepthStencilMode`

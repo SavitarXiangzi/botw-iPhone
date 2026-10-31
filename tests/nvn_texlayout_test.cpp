@@ -493,6 +493,90 @@ static void test_write_region() {
     }
 }
 
+/* The CPU-side half of nvnTextureReadTexels: read a sub-rectangle out of the
+ * guest's block-linear (or LINEAR) storage.  Every case is the same image the
+ * write test builds, so a wrong byte offset shows up as a wrong texel. */
+static void test_read_region() {
+    {
+        /* 4x4 RGBA8: read the inner 2x2 into a tightly packed buffer and
+         * into one with a 16-byte row stride. */
+        const nvngfx_texdesc d = make_desc(0x25, 4, 4, 1);
+        nvngfx_texlayout L;
+        CHECK(nvngfx_tex_layout(&d, &L) == 0);
+        std::vector<unsigned char> storage(static_cast<size_t>(L.size), 0);
+        std::vector<unsigned char> src(64);
+        for (size_t i = 0; i < src.size(); ++i)
+            src[i] = static_cast<unsigned char>(i * 5u + 3u);
+        CHECK(nvngfx_tex_swizzle(&d, 0, 0, src.data(), 16, storage.data()) == 0);
+
+        unsigned char tight[16] = {0};
+        CHECK(nvngfx_tex_read_region(&d, 0, 0, 1, 1, 0, 2, 2, tight, 8, 0,
+                                     storage.data()) == 0);
+        bool ok = true;
+        for (unsigned y = 0; y < 2; ++y)
+            for (unsigned x = 0; x < 2; ++x)
+                ok = ok && std::memcmp(tight + (y * 2 + x) * 4,
+                                       src.data() + ((y + 1) * 4 + x + 1) * 4,
+                                       4) == 0;
+        CHECK(ok);
+
+        unsigned char strided[32];
+        std::memset(strided, 0xEE, sizeof strided);
+        CHECK(nvngfx_tex_read_region(&d, 0, 0, 1, 1, 0, 2, 2, strided, 16, 0,
+                                     storage.data()) == 0);
+        CHECK(std::memcmp(strided, src.data() + (1 * 4 + 1) * 4, 8) == 0);
+        CHECK(std::memcmp(strided + 16, src.data() + (2 * 4 + 1) * 4, 8) == 0);
+        CHECK(strided[8] == 0xEE && strided[15] == 0xEE);
+        CHECK(strided[24] == 0xEE && strided[31] == 0xEE);
+
+        /* A whole level reads back exactly as it was swizzled. */
+        std::vector<unsigned char> whole(64, 0);
+        CHECK(nvngfx_tex_read_region(&d, 0, 0, 0, 0, 0, 4, 4, whole.data(),
+                                     16, 0, storage.data()) == 0);
+        CHECK(std::memcmp(whole.data(), src.data(), 64) == 0);
+
+        /* Refusals: no destination, a stride narrower than one row, a 2D
+         * level asked for slice 1, and a level past the descriptor. */
+        CHECK(nvngfx_tex_read_region(&d, 0, 0, 0, 0, 0, 4, 4, nullptr, 16, 0,
+                                     storage.data()) == -1);
+        CHECK(nvngfx_tex_read_region(&d, 0, 0, 0, 0, 0, 2, 2, strided, 4, 0,
+                                     storage.data()) == -1);
+        CHECK(nvngfx_tex_read_region(&d, 0, 0, 0, 0, 1, 4, 4, whole.data(), 16,
+                                     0, storage.data()) == -1);
+        CHECK(nvngfx_tex_read_region(&d, 1, 0, 0, 0, 0, 4, 4, whole.data(), 16,
+                                     0, storage.data()) == -1);
+        /* A BC1 block cannot be read half-way: 2x2 texels are not a block. */
+        const nvngfx_texdesc bc = make_desc(0x42, 8, 8, 1);
+        std::vector<unsigned char> bcStorage(static_cast<size_t>(L.size), 0);
+        unsigned char block[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+        CHECK(nvngfx_tex_read_region(&bc, 0, 0, 2, 0, 0, 2, 4, block, 8, 0,
+                                     bcStorage.data()) == -1);
+    }
+
+    {
+        /* LINEAR rows at stride 32: only the region's own bytes move. */
+        nvngfx_texdesc d = make_desc(0x25, 4, 4, 1);
+        d.flags = 0x10;
+        d.stride = 32;
+        nvngfx_texlayout L;
+        CHECK(nvngfx_tex_layout(&d, &L) == 0);
+        std::vector<unsigned char> storage(static_cast<size_t>(L.size), 0xEE);
+        for (unsigned y = 0; y < 4; ++y)
+            for (unsigned x = 0; x < 4; ++x) {
+                unsigned char* const p = storage.data() + y * 32 + x * 4;
+                p[0] = static_cast<unsigned char>(y * 16 + x * 4);
+                p[1] = 7;
+                p[2] = 9;
+                p[3] = 255;
+            }
+        unsigned char row[8] = {0};
+        CHECK(nvngfx_tex_read_region(&d, 0, 0, 0, 2, 0, 2, 1, row, 8, 0,
+                                     storage.data()) == 0);
+        CHECK(row[0] == 32 && row[1] == 7 && row[2] == 9 && row[3] == 255);
+        CHECK(row[4] == 36 && row[5] == 7 && row[6] == 9 && row[7] == 255);
+    }
+}
+
 static void test_refusals() {
     nvngfx_texdesc d = make_desc(0x25, 64, 64, 1);
     std::vector<unsigned char> a(16384), b(16384);
@@ -527,12 +611,13 @@ int main() {
     test_round_trip();
     test_linear();
     test_write_region();
+    test_read_region();
     test_refusals();
     if (g_failures) {
         std::printf("nvn_texlayout_test: %d failure(s)\n", g_failures);
         return 1;
     }
     std::printf("nvn_texlayout_test: ok (block shapes, sizes, offsets, "
-                "round trip, linear, write region, refusals)\n");
+                "round trip, linear, write region, read region, refusals)\n");
     return 0;
 }

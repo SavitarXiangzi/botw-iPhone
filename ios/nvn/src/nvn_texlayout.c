@@ -584,3 +584,63 @@ int nvngfx_tex_write_region(const nvngfx_texdesc* d, unsigned level,
     free(lin);
     return 0;
 }
+
+int nvngfx_tex_read_region(const nvngfx_texdesc* d, unsigned level,
+                           unsigned layer, int x, int y, int z,
+                           int width, int height, void* dst,
+                           size_t dst_row, size_t dst_image,
+                           const void* storage) {
+    fmt_t t;
+    unsigned row_bytes = 0, rows = 0, slices = 0;
+    unsigned xb, yb, wb, hb;
+    size_t tight_row, row, img, total;
+    unsigned char* lin;
+    const unsigned char* src;
+    unsigned i;
+
+    if (!d || !dst || !storage) return -1;
+    if (x < 0 || y < 0 || z < 0 || width <= 0 || height <= 0) return -1;
+    t = fmt_of(d->format);
+    if (!t.bpb) return -1;
+    if (nvngfx_tex_level_geometry(d, level, layer, &row_bytes, &rows, &slices,
+                                  NULL, NULL, NULL) != 0)
+        return -1;
+    if (!row_bytes || !rows || !slices) return -1;
+    if ((unsigned)z >= slices) return -1;
+    if ((unsigned)x % t.bw || (unsigned)y % t.bh ||
+        (unsigned)width % t.bw || (unsigned)height % t.bh)
+        return -1;
+
+    xb = (unsigned)x / t.bw;
+    yb = (unsigned)y / t.bh;
+    wb = (unsigned)width / t.bw;
+    hb = (unsigned)height / t.bh;
+    if (xb > row_bytes / t.bpb || wb > row_bytes / t.bpb - xb) return -1;
+    if (yb > rows || hb > rows - yb) return -1;
+
+    tight_row = (size_t)wb * t.bpb;
+    row = dst_row ? dst_row : tight_row;
+    if (row < tight_row) return -1;
+    if (hb && row > SIZE_MAX / hb) return -1;
+    img = dst_image ? dst_image : row * hb;
+    if (img < row * hb) return -1;
+
+    if (slices && rows > SIZE_MAX / row_bytes) return -1;
+    if (slices > SIZE_MAX / ((size_t)row_bytes * rows)) return -1;
+    total = (size_t)row_bytes * rows * slices;
+    lin = (unsigned char*)malloc(total ? total : 1u);
+    if (!lin) return -1;
+    if (nvngfx_tex_deswizzle(d, level, layer, storage, lin, row_bytes) != 0) {
+        free(lin);
+        return -1;
+    }
+
+    src = lin + (size_t)z * rows * row_bytes + (size_t)yb * row_bytes +
+          (size_t)xb * t.bpb;
+    for (i = 0; i < hb; ++i)
+        memcpy((unsigned char*)dst + (size_t)i * row,
+               src + (size_t)i * row_bytes, tight_row);
+
+    free(lin);
+    return 0;
+}

@@ -2307,6 +2307,173 @@ void tex_initialize(nvngfx_ctx* ctx, uint64_t* x) {
     }
 }
 
+/* Resolves everything ReadTexels and WriteTexels need before they touch
+ * bytes: the texture object, the region struct, the view's level/layer base,
+ * the pool storage and the row/image strides.
+ *
+ * The two directions are written against this one function so they cannot
+ * disagree about which bytes they address; only the final copy differs.  Every
+ * refusal carries the caller's name as the log key, which is the same key the
+ * pre-refactor WriteTexels messages used. */
+struct TexRegionCall {
+    Tex* t = nullptr;
+    CopyRegion r = {};
+    unsigned level = 0;
+    unsigned layer0 = 0;   /* first layer of a 2D array / cube */
+    unsigned depth = 1;
+    unsigned zoff = 0;
+    bool is3d = false;
+    unsigned char* storage = nullptr;
+    size_t row = 0;
+    size_t image = 0;
+};
+
+bool tex_region_prepare(uint64_t texGuest, uint64_t viewGuest,
+                        uint64_t regionGuest, uint64_t bufferGuest,
+                        uint64_t rowArg, uint64_t imgArg, bool strided,
+                        const char* who, TexRegionCall* out) {
+    if (!out) return false;
+    Tex* t = find<Tex>(texGuest);
+    if (!t || !t->desc.pool) {
+        log_once_str(who, "texture has no guest storage (or is not initialized)");
+        return false;
+    }
+    if (!guest_range(regionGuest, sizeof(CopyRegion)) ||
+        !guest_range(bufferGuest, 1)) {
+        log_once_str(who, "region or buffer pointer is not guest memory");
+        return false;
+    }
+    CopyRegion r = {};
+    std::memcpy(&r, guest_ptr<const void>(regionGuest), sizeof r);
+    if (r.xoffset < 0 || r.yoffset < 0 || r.zoffset < 0 ||
+        r.width <= 0 || r.height <= 0 || r.depth < 0) {
+        log_once_str(who, "region is empty or negative");
+        return false;
+    }
+
+    unsigned baseLevel = 0, minLayer = 0;
+    if (viewGuest) {
+        if (!guest_range(viewGuest, sizeof(TexView16))) {
+            log_once_str(who, "texture view pointer is not guest memory");
+            return false;
+        }
+        TexView16 v = {};
+        std::memcpy(&v, guest_ptr<const void>(viewGuest), sizeof v);
+        /* A view may reinterpret the pixels in another format or as another
+         * target.  The storage layout would no longer be the one this
+         * descriptor describes, so refuse instead of moving the wrong bytes;
+         * swizzle and depth-stencil mode do not move storage. */
+        if ((v.bits & 0x04u) && v.format != t->desc.format) {
+            log_once_str(who, "texture view changes the format; region refused");
+            return false;
+        }
+        if ((v.bits & 0x08u) && v.target != t->desc.target) {
+            log_once_str(who, "texture view changes the target; region refused");
+            return false;
+        }
+        if (v.bits & 0x01u) baseLevel = v.baseLevel;
+        if (v.bits & 0x02u) minLayer = v.minLayer;
+    }
+    const unsigned levels =
+        t->desc.levels ? static_cast<unsigned>(t->desc.levels) : 1u;
+    if (baseLevel >= levels) {
+        log_once_str(who, "texture view names a level past the descriptor");
+        return false;
+    }
+
+    Pool* p = find<Pool>(t->desc.pool);
+    if (!p || !p->storage || !p->size) {
+        log_once_str(who, "texture pool is not initialized");
+        return false;
+    }
+    nvngfx_texlayout L = {};
+    if (nvngfx_tex_layout(&t->desc, &L) != 0) {
+        log_once_str(who, "texture layout is unknown");
+        return false;
+    }
+    const unsigned long long off =
+        static_cast<unsigned long long>(t->desc.offset);
+    if (t->desc.offset < 0 || off > p->size || L.size > p->size - off) {
+        log_once_str(who, "texture storage is outside its pool");
+        return false;
+    }
+    unsigned char* const storage = static_cast<unsigned char*>(p->storage) + off;
+
+    unsigned bpb = 0, bw = 1, bh = 1;
+    if (!nvngfx_tex_format_block(t->desc.format, &bpb, &bw, &bh) || !bpb) {
+        log_once_str(who, "texture format has no block shape");
+        return false;
+    }
+    const unsigned wblocks = (static_cast<unsigned>(r.width) + bw - 1u) / bw;
+    const unsigned hblocks = (static_cast<unsigned>(r.height) + bh - 1u) / bh;
+    const size_t tightRow = static_cast<size_t>(wblocks) * bpb;
+    if (hblocks && tightRow > SIZE_MAX / hblocks) {
+        log_once_str(who, "region size overflows");
+        return false;
+    }
+    const size_t tightImage = tightRow * hblocks;
+
+    const int64_t rowArgS = strided ? static_cast<int64_t>(rowArg) : 0;
+    const int64_t imgArgS = strided ? static_cast<int64_t>(imgArg) : 0;
+    if (rowArgS < 0 || imgArgS < 0) {
+        log_once_str(who, "negative stride");
+        return false;
+    }
+    const size_t row = rowArgS ? static_cast<size_t>(rowArgS) : tightRow;
+    const size_t image = imgArgS ? static_cast<size_t>(imgArgS) : tightImage;
+    if (row < tightRow || image < tightImage) {
+        log_once_str(who,
+                     "stride is narrower than a tightly packed region");
+        return false;
+    }
+
+    const unsigned depth = r.depth ? static_cast<unsigned>(r.depth) : 1u;
+    const unsigned zoff = static_cast<unsigned>(r.zoffset);
+    if (zoff > 0x7FFFFFFFu - depth) {
+        log_once_str(who, "region depth overflows");
+        return false;
+    }
+    const bool is3d = t->desc.target == 2 || t->desc.rank == 3;
+    unsigned slices = 1;
+    if (is3d &&
+        nvngfx_tex_level_geometry(&t->desc, baseLevel, 0, nullptr, nullptr,
+                                  &slices, nullptr, nullptr, nullptr) != 0) {
+        log_once_str(who, "3D level geometry is unknown");
+        return false;
+    }
+    if (is3d) {
+        if (static_cast<unsigned long long>(zoff) + depth > slices) {
+            log_once_str(who, "region runs past the 3D slices");
+            return false;
+        }
+    } else if (static_cast<unsigned long long>(minLayer) + zoff + depth >
+               L.layers) {
+        log_once_str(who, "region runs past the array layers");
+        return false;
+    }
+    if (depth > 1 &&
+        image > (UINTPTR_MAX - bufferGuest) / static_cast<size_t>(depth - 1u)) {
+        log_once_str(who, "buffer range overflows");
+        return false;
+    }
+    if (p->size > UINTPTR_MAX - off) {
+        log_once_str(who, "storage address overflows");
+        return false;
+    }
+
+    out->t = t;
+    out->r = r;
+    out->level = baseLevel;
+    out->layer0 = is3d ? 0u : minLayer + zoff;
+    out->depth = depth;
+    out->zoff = zoff;
+    out->is3d = is3d;
+    out->storage = storage;
+    out->row = row;
+    out->image = image;
+    return true;
+}
+
 /* nvnTextureWriteTexels(NVNtexture*, const NVNtextureView*, const
  * NVNcopyRegion*, const void*) and its Strided variant.
  *
@@ -2317,150 +2484,23 @@ void tex_initialize(nvngfx_ctx* ctx, uint64_t* x) {
  * dirty.  The next draw's prepare_textures() re-runs tex_upload(). */
 void tex_write_texels_common(nvngfx_ctx* ctx, uint64_t* x, bool strided) {
     (void)ctx;
-    Tex* t = find<Tex>(x[0]);
-    if (!t || !t->desc.pool) {
-        log_once_str("nvnTextureWriteTexels",
-                     "texture has no guest storage (or is not initialized)");
+    TexRegionCall call;
+    if (!tex_region_prepare(x[0], x[1], x[2], x[3],
+                            strided ? x[4] : 0, strided ? x[5] : 0, strided,
+                            "nvnTextureWriteTexels", &call))
         return;
-    }
-    if (!guest_range(x[2], sizeof(CopyRegion)) || !guest_range(x[3], 1)) {
-        log_once_str("nvnTextureWriteTexels",
-                     "region or source pointer is not guest memory");
-        return;
-    }
-    CopyRegion r = {};
-    std::memcpy(&r, guest_ptr<const void>(x[2]), sizeof r);
-    if (r.xoffset < 0 || r.yoffset < 0 || r.zoffset < 0 ||
-        r.width <= 0 || r.height <= 0 || r.depth < 0) {
-        log_once_str("nvnTextureWriteTexels", "region is empty or negative");
-        return;
-    }
-
-    unsigned baseLevel = 0, minLayer = 0;
-    if (x[1]) {
-        if (!guest_range(x[1], sizeof(TexView16))) {
-            log_once_str("nvnTextureWriteTexels",
-                         "texture view pointer is not guest memory");
-            return;
-        }
-        TexView16 v = {};
-        std::memcpy(&v, guest_ptr<const void>(x[1]), sizeof v);
-        /* A view may reinterpret the pixels in another format or as another
-         * target.  The storage layout would no longer be the one this
-         * descriptor describes, so refuse instead of writing the wrong
-         * bytes; swizzle and depth-stencil mode do not move storage. */
-        if ((v.bits & 0x04u) && v.format != t->desc.format) {
-            log_once_str("nvnTextureWriteTexels",
-                         "texture view changes the format; region write refused");
-            return;
-        }
-        if ((v.bits & 0x08u) && v.target != t->desc.target) {
-            log_once_str("nvnTextureWriteTexels",
-                         "texture view changes the target; region write refused");
-            return;
-        }
-        if (v.bits & 0x01u) baseLevel = v.baseLevel;
-        if (v.bits & 0x02u) minLayer = v.minLayer;
-    }
-    const unsigned levels =
-        t->desc.levels ? static_cast<unsigned>(t->desc.levels) : 1u;
-    if (baseLevel >= levels) {
-        log_once_str("nvnTextureWriteTexels",
-                     "texture view names a level past the descriptor");
-        return;
-    }
-
-    Pool* p = find<Pool>(t->desc.pool);
-    if (!p || !p->storage || !p->size) {
-        log_once_str("nvnTextureWriteTexels", "texture pool is not initialized");
-        return;
-    }
-    nvngfx_texlayout L = {};
-    if (nvngfx_tex_layout(&t->desc, &L) != 0) {
-        log_once_str("nvnTextureWriteTexels", "texture layout is unknown");
-        return;
-    }
-    const unsigned long long off =
-        static_cast<unsigned long long>(t->desc.offset);
-    if (t->desc.offset < 0 || off > p->size || L.size > p->size - off) {
-        log_once_str("nvnTextureWriteTexels",
-                     "texture storage is outside its pool");
-        return;
-    }
-    unsigned char* const storage =
-        static_cast<unsigned char*>(p->storage) + off;
-
-    unsigned bpb = 0, bw = 1, bh = 1;
-    if (!nvngfx_tex_format_block(t->desc.format, &bpb, &bw, &bh) || !bpb) {
-        log_once_str("nvnTextureWriteTexels", "texture format has no block shape");
-        return;
-    }
-    const unsigned wblocks = (static_cast<unsigned>(r.width) + bw - 1u) / bw;
-    const unsigned hblocks = (static_cast<unsigned>(r.height) + bh - 1u) / bh;
-    const size_t tightRow = static_cast<size_t>(wblocks) * bpb;
-    if (hblocks && tightRow > SIZE_MAX / hblocks) {
-        log_once_str("nvnTextureWriteTexels", "region size overflows");
-        return;
-    }
-    const size_t tightImage = tightRow * hblocks;
-
-    const int64_t rowArg = strided ? static_cast<int64_t>(x[4]) : 0;
-    const int64_t imgArg = strided ? static_cast<int64_t>(x[5]) : 0;
-    if (rowArg < 0 || imgArg < 0) {
-        log_once_str("nvnTextureWriteTexels", "negative source stride");
-        return;
-    }
-    const size_t row = rowArg ? static_cast<size_t>(rowArg) : tightRow;
-    const size_t image = imgArg ? static_cast<size_t>(imgArg) : tightImage;
-    if (row < tightRow || image < tightImage) {
-        log_once_str("nvnTextureWriteTexels",
-                     "source stride is narrower than a tightly packed region");
-        return;
-    }
-
-    const unsigned depth = r.depth ? static_cast<unsigned>(r.depth) : 1u;
-    const unsigned zoff = static_cast<unsigned>(r.zoffset);
-    if (zoff > 0x7FFFFFFFu - depth) {
-        log_once_str("nvnTextureWriteTexels", "region depth overflows");
-        return;
-    }
-    const bool is3d = t->desc.target == 2 || t->desc.rank == 3;
-    unsigned slices = 1;
-    if (is3d &&
-        nvngfx_tex_level_geometry(&t->desc, baseLevel, 0, nullptr, nullptr,
-                                  &slices, nullptr, nullptr, nullptr) != 0) {
-        log_once_str("nvnTextureWriteTexels", "3D level geometry is unknown");
-        return;
-    }
-    if (is3d) {
-        if (static_cast<unsigned long long>(zoff) + depth > slices) {
-            log_once_str("nvnTextureWriteTexels",
-                         "region runs past the 3D slices");
-            return;
-        }
-    } else if (static_cast<unsigned long long>(minLayer) + zoff + depth >
-               L.layers) {
-        log_once_str("nvnTextureWriteTexels",
-                     "region runs past the array layers");
-        return;
-    }
-    if (depth > 1 &&
-        image > (UINTPTR_MAX - x[3]) / static_cast<size_t>(depth - 1u)) {
-        log_once_str("nvnTextureWriteTexels", "source range overflows");
-        return;
-    }
 
     bool wrote = false;
-    for (unsigned i = 0; i < depth; ++i) {
-        const unsigned layer = is3d ? 0u : minLayer + zoff + i;
-        const int z = is3d ? static_cast<int>(zoff + i) : 0;
+    for (unsigned i = 0; i < call.depth; ++i) {
+        const unsigned layer = call.is3d ? 0u : call.layer0 + i;
+        const int z = call.is3d ? static_cast<int>(call.zoff + i) : 0;
         const unsigned char* const src =
             guest_ptr<const unsigned char>(x[3]) +
-            static_cast<size_t>(i) * image;
-        if (nvngfx_tex_write_region(&t->desc, baseLevel, layer,
-                                    r.xoffset, r.yoffset, z,
-                                    r.width, r.height, src, row, image,
-                                    storage) != 0) {
+            static_cast<size_t>(i) * call.image;
+        if (nvngfx_tex_write_region(&call.t->desc, call.level, layer,
+                                    call.r.xoffset, call.r.yoffset, z,
+                                    call.r.width, call.r.height, src,
+                                    call.row, call.image, call.storage) != 0) {
             log_once_str("nvnTextureWriteTexels",
                          "region refused (level, layer, block alignment or bounds)");
             break;
@@ -2469,6 +2509,7 @@ void tex_write_texels_common(nvngfx_ctx* ctx, uint64_t* x, bool strided) {
     }
     if (!wrote) return;
 
+    Tex* t = call.t;
     t->dirty = true;
     t->uploaded = false;
     t->uploadTried = false;
@@ -2481,12 +2522,66 @@ void tex_write_texels_common(nvngfx_ctx* ctx, uint64_t* x, bool strided) {
     }
 }
 
+/* nvnTextureReadTexels / ReadTexelsStrided: the same region, copied the other
+ * way.  NVN's ground truth for a CPU-written texture is the guest storage, and
+ * that is what this reads: block-linear or LINEAR, level/layer/slice selected
+ * by the view, strides honoured exactly like the write path.
+ *
+ * The one case this cannot answer is a texture this backend has rendered: its
+ * pixels are in a private MTLTexture, and reading them back needs a blit plus
+ * format conversion that does not exist yet.  That case is reported instead of
+ * quietly returning stale pool bytes. */
+void tex_read_texels_common(nvngfx_ctx* ctx, uint64_t* x, bool strided) {
+    (void)ctx;
+    TexRegionCall call;
+    if (!tex_region_prepare(x[0], x[1], x[2], x[3],
+                            strided ? x[4] : 0, strided ? x[5] : 0, strided,
+                            "nvnTextureReadTexels", &call))
+        return;
+
+    if (call.t->rendered) {
+        log_once_str("nvnTextureReadTexels.stale",
+                     "texture has been a render target; the guest copy is stale "
+                     "(no GPU readback yet)");
+    }
+
+    bool read = false;
+    for (unsigned i = 0; i < call.depth; ++i) {
+        const unsigned layer = call.is3d ? 0u : call.layer0 + i;
+        const int z = call.is3d ? static_cast<int>(call.zoff + i) : 0;
+        unsigned char* const dst =
+            guest_ptr<unsigned char>(x[3]) +
+            static_cast<size_t>(i) * call.image;
+        if (nvngfx_tex_read_region(&call.t->desc, call.level, layer,
+                                   call.r.xoffset, call.r.yoffset, z,
+                                   call.r.width, call.r.height, dst,
+                                   call.row, call.image, call.storage) != 0) {
+            log_once_str("nvnTextureReadTexels",
+                         "region refused (level, layer, block alignment or bounds)");
+            break;
+        }
+        read = true;
+    }
+    if (read) {
+        log_once_str("nvnTextureReadTexels.ok",
+                     "region read back from guest storage");
+    }
+}
+
 void tex_write_texels(nvngfx_ctx* ctx, uint64_t* x) {
     tex_write_texels_common(ctx, x, false);
 }
 
 void tex_write_texels_strided(nvngfx_ctx* ctx, uint64_t* x) {
     tex_write_texels_common(ctx, x, true);
+}
+
+void tex_read_texels(nvngfx_ctx* ctx, uint64_t* x) {
+    tex_read_texels_common(ctx, x, false);
+}
+
+void tex_read_texels_strided(nvngfx_ctx* ctx, uint64_t* x) {
+    tex_read_texels_common(ctx, x, true);
 }
 
 /* nvnTextureFlushTexels(NVNtexture*, const NVNtextureView*,
@@ -10023,6 +10118,8 @@ const Binding kBindings[] = {
     BIND("nvnTextureGetTextureAddress", tex_get_texture_address),
     BIND("nvnTextureGetStorageSize", tex_get_storage_size),
     BIND("nvnTextureGetZCullStorageSize", tex_get_zcull_storage_size),
+    BIND("nvnTextureReadTexels", tex_read_texels),
+    BIND("nvnTextureReadTexelsStrided", tex_read_texels_strided),
     BIND("nvnTextureGetStorageClass", tex_get_storage_class),
     BIND("nvnTextureGetRawStorageClass", tex_get_raw_storage_class),
     BIND("nvnTextureGetSwizzle", tex_get_swizzle),
@@ -18352,6 +18449,44 @@ extern "C" int nvngfx_metal_selftest(void) {
                 tex_initialize(ctx, x);
                 const uint64_t pkgInit = x[0];
                 const bool pkgCopied = std::memcmp(vphys, pkg, sizeof pkg) == 0;
+
+                /* ReadTexels is the mirror of WriteTexels, so the honest test
+                 * is a round trip through both: the same 2x2 region written
+                 * then read must come back byte for byte. */
+                int rdRegion[6] = {0, 0, 0, 2, 2, 1};
+                unsigned char wsrc[8] = {0x11, 0x22, 0x33, 0x44,
+                                         0x55, 0x66, 0x77, 0x88};
+                unsigned char rdst[8] = {0};
+                x[0] = kPkgObject; x[1] = 0;
+                x[2] = reinterpret_cast<uint64_t>(rdRegion);
+                x[3] = reinterpret_cast<uint64_t>(wsrc);
+                tex_write_texels(ctx, x);
+                x[0] = kPkgObject; x[1] = 0;
+                x[2] = reinterpret_cast<uint64_t>(rdRegion);
+                x[3] = reinterpret_cast<uint64_t>(rdst);
+                tex_read_texels(ctx, x);
+                const bool readBack = std::memcmp(wsrc, rdst, sizeof wsrc) == 0;
+
+                /* The strided read must put row 0 at 0 and row 1 at 16. */
+                unsigned char rdst2[32];
+                std::memset(rdst2, 0, sizeof rdst2);
+                x[0] = kPkgObject; x[1] = 0;
+                x[2] = reinterpret_cast<uint64_t>(rdRegion);
+                x[3] = reinterpret_cast<uint64_t>(rdst2);
+                x[4] = 16; x[5] = 0;
+                tex_read_texels_strided(ctx, x);
+                const bool readStrided =
+                    std::memcmp(wsrc, rdst2, 8) == 0 &&
+                    std::memcmp(wsrc + 8, rdst2 + 16, 8) == 0;
+
+                if (!readBack || !readStrided) {
+                    std::fprintf(stderr,
+                                 "[selftest] readtexels: packed=%d strided=%d\n",
+                                 static_cast<int>(readBack),
+                                 static_cast<int>(readStrided));
+                    rc = 16438;
+                    goto done;
+                }
 
                 x[0] = kPkgBuilder2;
                 tex_builder_get_storage_class(ctx, x);

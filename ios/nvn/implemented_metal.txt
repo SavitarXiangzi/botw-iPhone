@@ -421,6 +421,8 @@ nvnTexturePoolInitialize
 nvnTexturePoolRegisterImage
 nvnTexturePoolRegisterTexture
 nvnTexturePoolSetDebugLabel
+nvnTextureReadTexels
+nvnTextureReadTexelsStrided
 nvnTextureSetDebugLabel
 nvnTextureViewCompare
 nvnTextureViewGetDepthStencilMode
