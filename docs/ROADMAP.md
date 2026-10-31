@@ -4964,4 +4964,12 @@ python scripts/verify_ios.py
 powershell -ExecutionPolicy Bypass -File scripts/build_abi_test.ps1
 ```
 
-本地已通过；新增的数据回读断言由 GitHub Actions 的 macOS `ios` job 执行。
+本地已通过；GitHub Actions run `41178632664` 的 macOS `ios` job 也已通过，模拟器输出确认：
+
+```text
+[selftest] buffers/copies: NVN buffer getters and map matched pool storage;
+UpdateUniformBuffer snapshotted 777 and CopyBufferToBuffer supplied 888 to GPU dispatches
+BOTW_SELFTEST rc=0
+```
+
+顺手修了 `extract_nvn_signatures.py` 的返回类型正则：`void*` / `NVNmemoryPool*` 这类指针返回此前被漏掉。`nvnBufferMap`、`nvnBufferGetMemoryPool`、`nvnMemoryPoolMap` 因此进入实测集合，形状计数从 470 + 4 变为 **477 + 6**。
