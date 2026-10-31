@@ -21,6 +21,7 @@ retail NSO  --rewrite_botw.py-->  patched.bin + fixups/gates/sites
 - [ ] 可执行映射（text 按 RX、data 按 RW、patch 区单独映射）
 - [x] 每线程槽布局 + key page 发布（`guest_slot.c`）
 - [x] 槽地址发布（`SLOT_BASE=abs`；`TPIDRRO_EL0` 在 EL0 只读，见 ROADMAP 续三十七）
+- [x] gate trampoline（`guest_gate_arm64.S`）：x0..x30 / sp / pc / nzcv 完整帧，CI 的 arm64 job 实测往返
 - [ ] HLE 服务层（init / fs / vi / nv / NVN bootstrap）
 - [ ] 把 NVN 调用桥到 `ios/nvn` 的 Metal 后端
 - [ ] 在 iOS 模拟器/真机执行第一条客体指令
