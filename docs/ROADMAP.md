@@ -4275,14 +4275,27 @@ Metal 不会执行深度边界测试。反转的范围会被规范化并上报�
 模拟器的深度/模板用例现在同时调用这两个入口，检查 clamp / bounds 状态，再 draw 一条
 全屏三角形，让 `setDepthClipMode:` 真正执行。
 
-### 5. 覆盖与仍然缺的
+### 5. 数组形式的深度范围
 
-覆盖从 **196/513** 提升到 **201/513（39.2%）**，未实现 312；CommandBuffer 域
-**56/144**。门禁输出：
+`nvnCommandBufferSetDepthRanges(cb, first, count, const float* ranges)` 每项是两个
+float（near, far），对应同下标的 viewport。Metal 后端只有一个 viewport，因此：
+
+* `first == 0` 时取第一项，写入与 `SetDepthRange` 相同的状态字段；
+* 多于一项时应用第一项，其余用 `log_once` 上报；
+* `first != 0` 表示只改其他 viewport，单 viewport 的深度范围保持原值，并明确上报。
+
+两个入口共用 `apply_depth_range()`，避免标量与数组路径逐渐分叉。模拟器的深度/模板
+用例现在先设 viewport，再用两个范围调用数组入口，断言 `depthNear/depthFar` 与
+`MTLViewport` 的 znear/zfar 都变成 0.2/0.8。
+
+### 6. 覆盖与仍然缺的
+
+覆盖从 **196/513** 提升到 **202/513（39.4%）**，未实现 311；CommandBuffer 域
+**57/144**。门禁输出：
 
 ```text
 syntax_check_metal: ok (clang++.exe)
-verify_ios: ok (metal bindings: 201/513)
+verify_ios: ok (metal bindings: 202/513)
 build_abi_test: all tests passed
 ```
 

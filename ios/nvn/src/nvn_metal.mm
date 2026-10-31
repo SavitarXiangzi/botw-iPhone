@@ -4623,18 +4623,52 @@ void cmdbuf_set_polygon_offset(nvngfx_ctx*, uint64_t* x) {
     b->hasPolyOffset = true;
 }
 
+/* Depth range is viewport state, and this backend owns a single Metal
+ * viewport.  Both the scalar and array NVN entry points land here so the
+ * two cannot drift apart. */
+static void apply_depth_range(CmdBuf* b, double near, double far) {
+    if (!b) return;
+    b->depthNear = near;
+    b->depthFar = far;
+    if (b->hasViewport) {
+        b->viewport.znear = near;
+        b->viewport.zfar = far;
+        if (b->enc) [b->enc setViewport:b->viewport];
+    }
+}
+
 /* nvnCommandBufferSetDepthRange(cb, float near, float far) */
 void cmdbuf_set_depth_range(nvngfx_ctx*, uint64_t* x) {
     CmdBuf* b = find_or_add<CmdBuf>(x[0]);
     if (!b) return;
     nvngfx_args* a = reinterpret_cast<nvngfx_args*>(x);
-    b->depthNear = static_cast<double>(nvngfx_arg_f32(a, 0));
-    b->depthFar = static_cast<double>(nvngfx_arg_f32(a, 1));
-    if (b->hasViewport) {
-        b->viewport.znear = b->depthNear;
-        b->viewport.zfar = b->depthFar;
-        if (b->enc) [b->enc setViewport:b->viewport];
+    apply_depth_range(b, static_cast<double>(nvngfx_arg_f32(a, 0)),
+                      static_cast<double>(nvngfx_arg_f32(a, 1)));
+}
+
+/* nvnCommandBufferSetDepthRanges(cb, int first, int count, const float* ranges)
+ *
+ * Each range is two floats (near, far) and belongs to the viewport at the
+ * same index.  There is one viewport here, so only a call that starts at
+ * index 0 can address it.  A call starting elsewhere is reported and leaves
+ * the single viewport's range untouched; a multi-range call applies its
+ * first entry and reports the rest. */
+void cmdbuf_set_depth_ranges(nvngfx_ctx*, uint64_t* x) {
+    CmdBuf* b = find_or_add<CmdBuf>(x[0]);
+    const int first = static_cast<int>(x[1]);
+    const int n = static_cast<int>(x[2]);
+    const float* r = guest_ptr<const float>(x[3]);
+    if (!b || !r || n <= 0) return;
+    if (first != 0) {
+        log_once("nvnCommandBufferSetDepthRanges.first",
+                 static_cast<unsigned>(first));
+        return;
     }
+    if (n > 1) {
+        log_once("nvnCommandBufferSetDepthRanges.multi",
+                 static_cast<unsigned>(n));
+    }
+    apply_depth_range(b, static_cast<double>(r[0]), static_cast<double>(r[1]));
 }
 
 /* nvnCommandBufferSetDepthClamp(cb, uint32_t enable) */
@@ -5014,6 +5048,7 @@ const Binding kBindings[] = {
     BIND("nvnCommandBufferSetDepthBounds", cmdbuf_set_depth_bounds),
     BIND("nvnCommandBufferSetDepthClamp", cmdbuf_set_depth_clamp),
     BIND("nvnCommandBufferSetDepthRange", cmdbuf_set_depth_range),
+    BIND("nvnCommandBufferSetDepthRanges", cmdbuf_set_depth_ranges),
     BIND("nvnCommandBufferSetRenderEnable", cmdbuf_set_render_enable),
     BIND("nvnCommandBufferSetScissors", cmdbuf_set_scissors),
     BIND("nvnCommandBufferSetStencilMask", cmdbuf_set_stencil_mask),
@@ -8433,6 +8468,19 @@ extern "C" int nvngfx_metal_selftest(void) {
                 bounds.x[1] = 1;
                 cmdbuf_set_depth_bounds(ctx, bounds.x);
             }
+            x[0] = kCbDepthClear; x[1] = 0; x[2] = 0;
+            x[3] = static_cast<uint64_t>(kSide);
+            x[4] = static_cast<uint64_t>(kSide);
+            cmdbuf_set_viewport(ctx, x);
+            {
+                /* Array form: the first range belongs to the single
+                 * viewport.  It must land in the same viewport state as
+                 * SetDepthRange, and the unused second range is reported. */
+                const float ranges[4] = {0.2f, 0.8f, 0.3f, 0.7f};
+                x[0] = kCbDepthClear; x[1] = 0; x[2] = 2;
+                x[3] = reinterpret_cast<uint64_t>(ranges);
+                cmdbuf_set_depth_ranges(ctx, x);
+            }
             x[0] = kCbDepthClear; x[1] = 0;
             x[2] = reinterpret_cast<uint64_t>(black); x[3] = 0xF;
             cmdbuf_clear_color(ctx, x);
@@ -8453,7 +8501,10 @@ extern "C" int nvngfx_metal_selftest(void) {
                 bd->depthClamp != 1 || !bd->hasDepthBounds ||
                 bd->depthBoundsEnable != 1 ||
                 bd->depthBoundsMin != 0.1f ||
-                bd->depthBoundsMax != 0.9f) {
+                bd->depthBoundsMax != 0.9f ||
+                bd->depthNear != 0.2f || bd->depthFar != 0.8f ||
+                !bd->hasViewport ||
+                bd->viewport.znear != 0.2f || bd->viewport.zfar != 0.8f) {
                 std::fprintf(stderr,
                              "[selftest] depth/stencil state mismatch\n");
                 rc = 16414;

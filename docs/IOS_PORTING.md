@@ -79,7 +79,7 @@ nvn_shader_test: ok (seam, blob table, packed slots, bindless, c1, SHA-256, shad
 nvn_vertex_test: ok (packing, 26 formats, layout id)  exit=0
 nvn_texlayout_test: ok (block shapes, sizes, offsets, round trip, linear, write region, refusals)  exit=0
 syntax_check_metal: ok (clang++.exe)
-verify_ios: ok (metal bindings: 201/513)
+verify_ios: ok (metal bindings: 202/513)
 build_abi_test: all tests passed
 ```
 
@@ -246,7 +246,7 @@ iOS 是统一内存，guest 堆本来就是宿主可读的，所以
 | DepthStencilState / PolygonState | 7/13 + 5/9 | 默认值、深度/模板/剔除/偏移 setter |
 | MultisampleState / ChannelMaskState | 12/23 + 2/3 | 默认值、采样数、coverage 相关 setter、写掩码 |
 
-上表是主要域；完整 29 个域共 **201/513**，逐项状态见 `docs/NVN_COVERAGE.md`。
+上表是主要域；完整 29 个域共 **202/513**，逐项状态见 `docs/NVN_COVERAGE.md`。
 
 **必须说清楚的六件事**，否则这张表会误导人：
 
@@ -494,7 +494,8 @@ guest storage，再调用 `nvnTextureFlushTexels` 改成棕/钢蓝/橙/天蓝并
   模板格式、采样数、顶点布局与状态哈希。`SetStencilRef` / `SetStencilMask` /
   `SetStencilValueMask` 已接入：引用值放 encoder，前后脸读/写掩码进深度模板状态缓存键。
   `ClearDepthStencil` 已转成深度/模板附件的 load action，并在 EndRecording 或换 render
-  target 前强制落地。`SetDepthClamp` 映射到 `setDepthClipMode:`；`SetDepthBounds`
+  target 前强制落地。`SetDepthClamp` 映射到 `setDepthClipMode:`；`SetDepthRange(s)` 无论标量还是数组形式
+  都落到同一个单 viewport 状态；`SetDepthBounds`
   只记录状态，Metal 没有深度边界测试，非默认范围会明确上报。仍缺
   `SetStencilCullCriteria`、MRT 和纯深度 pass；部分模板清屏掩码无法用 Metal load
   action 表达，会明确上报而不是错误清除。
