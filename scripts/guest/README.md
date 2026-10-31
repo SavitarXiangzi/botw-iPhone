@@ -20,7 +20,7 @@ retail NSO  --rewrite_botw.py-->  patched.bin + fixups/gates/sites
 - [x] 运行时 loader 的可移植部分（fixups 解析、私有复制、重定位、导入解析）
 - [ ] 可执行映射（text 按 RX、data 按 RW、patch 区单独映射）
 - [x] 每线程槽布局 + key page 发布（`guest_slot.c`）
-- [ ] `tpidrro_el0` 指向槽（需要 AArch64 汇编 + 线程切换）
+- [x] 槽地址发布（`SLOT_BASE=abs`；`TPIDRRO_EL0` 在 EL0 只读，见 ROADMAP 续三十七）
 - [ ] HLE 服务层（init / fs / vi / nv / NVN bootstrap）
 - [ ] 把 NVN 调用桥到 `ios/nvn` 的 Metal 后端
 - [ ] 在 iOS 模拟器/真机执行第一条客体指令
@@ -80,7 +80,10 @@ HLE 服务。
 
 1. `sdk_patches.py` 裁成只保留 1.6.0 SDK 的三条 `AddressRegionManager`
    补丁，并关闭 SDK-wide `MATCH_CUTS`；
-2. 新增本目录的 profile（`profiles/01007EF00011E000/`），不含任何游戏数据。
+2. 新增本目录的 profile（`profiles/01007EF00011E000/`），不含任何游戏数据；
+3. 新增 `SLOT_ABS` 模式（`DM_SLOT_ABS=1`）：key page 存槽字段的绝对地址，
+   块里不再读 `TPIDRRO_EL0`（Apple arm64 上 EL0 写它会 SIGILL）。默认关闭，
+   上游行为不变。
 
 原版权声明见 `third_party/nxnative/LICENSE`。所有 1.6.0 地址都来自本机
 重新解析，**没有**照抄 nxnative 的 1.9.0 补丁表。

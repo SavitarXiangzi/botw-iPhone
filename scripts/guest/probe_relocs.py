@@ -89,13 +89,14 @@ def read_fixups(path):
             if len(parts) != 2:
                 continue
             key, value = parts[0], parts[1].strip()
-            if key == "BUILD_ID":
+            if key in ("BUILD_ID", "SLOT_BASE"):
                 fields[key] = value
             else:
                 try:
                     fields[key] = int(value, 0)
                 except ValueError:
                     raise ProbeError("fixups: %s is not an integer: %r" % (key, value))
+    fields.setdefault("SLOT_BASE", "off")
     missing = [k for k in FIXUP_KEYS if k not in fields]
     if missing:
         raise ProbeError("fixups: missing %s" % ", ".join(missing))
@@ -297,7 +298,7 @@ def describe(path, fx_path, as_json=False):
         return 0 if not problems else 1
 
     print("image      %s" % path)
-    print("build id   %s" % fx["BUILD_ID"])
+    print("build id   %s  slot base %s" % (fx["BUILD_ID"], fx["SLOT_BASE"]))
     print("size       %#x  (text ends %#x, data %#x, key page %#x+%#x, patch %#x)"
           % (len(data), fx["TEXT_END"], fx["DATA_OFF"], fx["KEY_PAGE_OFF"],
              fx["KEY_PAGE_SIZE"], fx["PATCH_OFF"]))

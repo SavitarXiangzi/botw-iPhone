@@ -50,6 +50,11 @@ int botw_guest_slot_init(botw_guest_slot* slot, void* memory, size_t size,
     return 0;
 }
 
+static uint64_t key_value(const botw_guest_image* img, const botw_guest_slot* slot, size_t off) {
+    if (img->slot_abs) return (uint64_t)(uintptr_t)(slot->base + off);
+    return (uint64_t)off;
+}
+
 int botw_guest_slot_publish(botw_guest_image* img, botw_guest_slot* slot) {
     uint8_t* page;
     size_t page_size, entries;
@@ -74,9 +79,9 @@ int botw_guest_slot_publish(botw_guest_image* img, botw_guest_slot* slot) {
                    img->k18_idx, img->ktls_idx, img->ktlr_idx, img->kgate_idx, entries);
         return -1;
     }
-    key[img->k18_idx] = (uint64_t)slot->x18_off;
-    key[img->ktls_idx] = (uint64_t)slot->tls_off;
-    key[img->ktlr_idx] = (uint64_t)slot->tlr_off;
-    key[img->kgate_idx] = (uint64_t)slot->gate_off;
+    key[img->k18_idx] = key_value(img, slot, slot->x18_off);
+    key[img->ktls_idx] = key_value(img, slot, slot->tls_off);
+    key[img->ktlr_idx] = key_value(img, slot, slot->tlr_off);
+    key[img->kgate_idx] = key_value(img, slot, slot->gate_off);
     return 0;
 }

@@ -7058,6 +7058,10 @@ b    <site+4>
 里存的是“槽内偏移”，不是地址。镜像里的 key page 落盘时**全 0**，必须由
 loader 在跑第一条客体指令之前写进去。
 
+> **续三十七修正**：这条 `mrs tpidrro_el0` 依赖在 iOS 上不成立——EL0 写
+> `TPIDRRO_EL0` 会触发 SIGILL。改写器已改为 `SLOT_BASE=abs`：key page 存
+> 槽字段的绝对地址，块里不再读系统寄存器。
+
 ### 2. 槽布局
 
 | 字段 | key page 索引 | 槽内偏移 | 用途 |
@@ -7103,4 +7107,87 @@ powershell -ExecutionPolicy Bypass -File scripts/build_abi_test.ps1
 
 guest_image_test 现在同时链接 `guest_image.c` 和 `guest_slot.c`，CI 的
 portable job 用 clang 再跑一遍。
+
+## M4 续三十七：TPIDRRO_EL0 在 iOS 上不可写，改用绝对地址槽
+
+### 1. 问题
+
+续三十六 里记录的 gate / x18 块都以 `mrs xN, tpidrro_el0` 取线程槽基址。
+ARM 架构规定 `TPIDRRO_EL0` **在 EL0 只读**，Darwin 还把它用于自己的线程数据。
+换句话说：这条路径在 iOS 上不是“还没接线”，而是**根本接不上**——读到的是系统
+的值，加完 key 偏移后 `blr` 会跳到野地址。
+
+### 2. 证据（实测，不是推断）
+
+在 GitHub 的 `macos-15`（arm64）runner 上开了临时分支，跑同一段程序，用三个
+job 把三种可能行为分别断言，谁成功就是哪种：
+
+| job | 断言 | 结果 |
+|---|---|---|
+| `probe-sigill` | `msr tpidrro_el0, x` 触发 SIGILL | **成功** |
+| `probe-changed` | 写入生效，读回等于写入值 | 失败 |
+| `probe-ignored` | 不报信号但值不变 | 失败 |
+
+结论：Apple arm64 上 EL0 写 `TPIDRRO_EL0` 直接 SIGILL。临时分支用完即删，
+复现方法记在本节（三个 job + 一段 20 行 C）。
+
+### 3. 修复：`SLOT_BASE=abs`
+
+改写器新增模式（`rewrite_botw.py` 设 `DM_SLOT_ABS=1`）：key page 里不再放
+“槽内偏移”，而是放**槽字段的绝对地址**；块里删掉 `mrs` 和 `add`。
+
+```text
+改前（0x28 字节）                     改后（0x20 字节）
+stp  x29, x30, [sp, #-16]!           stp  x29, x30, [sp, #-16]!
+mrs  x30, tpidrro_el0                adrp x30, #key_page
+adrp x29, #key_page                  ldr  x30, [x30, #0x18]
+ldr  x29, [x29, #0x18]               ldr  x30, [x30]
+add  x30, x30, x29                   ldr  x29, [sp]
+ldr  x30, [x30]                      blr  x30
+ldr  x29, [sp]                       ldp  x29, x30, [sp], #16
+blr  x30                             b    <site+4>
+ldp  x29, x30, [sp], #16
+b    <site+4>
+```
+
+代价与约束：
+
+* key page 现在保存**当前线程**的槽地址，必须在每次线程切换时重写。这正好
+  匹配既有的协作式调度器（所有客体线程跑在同一个宿主线程上），真并发需要
+  另换机制（per-thread key page 或页表隔离）；
+* 块变短，patch 区随之缩小：
+
+| 模块 | 旧 patch | 新 patch |
+|---|---:|---:|
+| main | 0xAB994 | 0x8B03C |
+| sdk | 0x7041C | 0x59DD4 |
+| subsdk0 | 0x6CCF4 | 0x571E4 |
+| rtld | 0x438 | 0x380 |
+
+* `verify_rewrite.py` 的 gate 块起点由固定 `-0x20` 改成读 `SLOT_BASE` 决定
+  `-0x18` / `-0x20`，避免把新旧两种产物混为一谈。
+
+### 4. 验证
+
+* 四个镜像里 `mrs tpidrro_el0` / `msr tpidrro_el0` 出现次数 **0**；
+* `verify_rewrite` 四个模块 `ok`（main 1,431 gates / 16,692 sites）；
+* `reloc_run` 装载结果与旧产物逐项相同（211,506 / 22,829 / 14,371 / 15 条数据
+  重定位，HLE 站点 1,414 / 16 / 6,545 / 19）；
+* `guest_image_test` 增加 `SLOT_BASE=abs` 断言：key page 里必须是
+  `slot + offset` 的绝对地址。
+
+### 5. 仍然没有证明
+
+* 没有在 ARM64 上真正执行过这些块（本机是 x86 Windows，只能编译与静态校验）；
+* gate trampoline（保存完整寄存器帧）还没写；
+* 可执行映射、HLE 表都还没做；
+* 多线程语义只在“协作式单宿主线程”前提下成立。
+
+### 6. 下一步
+
+1. 写 `_dm_gate` trampoline：`blr` 进来时把 x0..x30（x30 取自 `[sp]`）、
+   `sp`、`nzcv` 存进 `botw_guest_regs`，再调 C 分发；
+2. 用 CI 的 arm64 runner 跑一个合成 gate 块（不碰客体代码），验证 trampoline
+   的寄存器往返；
+3. 可执行映射（text RX / data RW / patch RX）。
 

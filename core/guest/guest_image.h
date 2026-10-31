@@ -41,6 +41,7 @@ typedef struct {
     size_t   key_page_size;
     size_t   patch_off;
     size_t   patch_len;
+    int      slot_abs;          /* key page holds absolute slot addresses */
     unsigned k18_idx;           /* key-page indices, from the fixups header */
     unsigned ktls_idx;
     unsigned ktlr_idx;

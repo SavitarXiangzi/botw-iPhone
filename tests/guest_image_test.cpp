@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <vector>
 
 static int g_fail = 0;
@@ -129,6 +130,14 @@ static void* resolver(void*, const char* name) {
 }
 static void* null_resolver(void*, const char*) { return nullptr; }
 
+static std::string header_with_slot_base(const char* mode) {
+    std::string h(kHeader);
+    h += "# SLOT_BASE\t";
+    h += mode;
+    h += "\n";
+    return h;
+}
+
 alignas(16) static uint8_t g_slot_memory[0x100];
 
 int main() {
@@ -170,6 +179,7 @@ int main() {
         CHECK(*(void* const*)(slot.base + 24) == handler);
         CHECK(img.k18_idx == 0 && img.ktls_idx == 1 && img.ktlr_idx == 2 && img.kgate_idx == 3);
         CHECK(botw_guest_image_key_page_size(&img) == 0x4000);
+        CHECK(img.slot_abs == 0);   // header has no SLOT_BASE line
         CHECK(botw_guest_slot_publish(&img, &slot) == 0);
         const uint64_t* key = (const uint64_t*)botw_guest_image_key_page(&img);
         CHECK(key != nullptr);
@@ -181,6 +191,25 @@ int main() {
         CHECK(std::strstr(slot.error, "aligned") != nullptr);
         CHECK(botw_guest_slot_init(&slot, g_slot_memory, sizeof g_slot_memory, nullptr) != 0);
         CHECK(std::strstr(slot.error, "handler") != nullptr);
+    }
+
+    // Apple rewrite variant: the key page holds absolute slot addresses.
+    {
+        std::string hdr = header_with_slot_base("abs");
+        botw_guest_image abs_img;
+        CHECK(botw_guest_image_open(&abs_img, file.data(), file.size(), hdr.c_str(), resolver, nullptr) == 0);
+        CHECK(abs_img.slot_abs == 1);
+        botw_guest_slot slot;
+        CHECK(botw_guest_slot_init(&slot, g_slot_memory, sizeof g_slot_memory, (void*)(uintptr_t)0x1u) == 0);
+        CHECK(botw_guest_slot_publish(&abs_img, &slot) == 0);
+        const uint64_t* key = (const uint64_t*)botw_guest_image_key_page(&abs_img);
+        CHECK(key != nullptr);
+        if (key) {
+            CHECK(key[0] == (uint64_t)(uintptr_t)g_slot_memory);
+            CHECK(key[2] == (uint64_t)(uintptr_t)(g_slot_memory + 16));
+            CHECK(key[3] == (uint64_t)(uintptr_t)(g_slot_memory + 24));
+        }
+        botw_guest_image_close(&abs_img);
     }
 
     botw_guest_image_close(&img);

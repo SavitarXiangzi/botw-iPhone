@@ -46,6 +46,16 @@ def read_header(path: Path) -> dict[str, int]:
     return hdr
 
 
+def slot_abs_mode(path: Path) -> bool:
+    """SLOT_BASE=abs drops the MRS from every block, so the gate stub sits
+    eight bytes closer to its return point."""
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.startswith("# SLOT_BASE"):
+            parts = line[1:].split("\t")
+            return len(parts) >= 2 and parts[1].strip() == "abs"
+    return False
+
+
 def branch_target(word: int, pc: int) -> int | None:
     op = word >> 26
     if op not in (0x05, 0x25):  # B, BL
@@ -66,6 +76,7 @@ def check_image(out: Path, module: str) -> int:
             fail(f"missing {p}")
 
     hdr = read_header(fixups)
+    slot_abs = slot_abs_mode(fixups)
     for key in ("PATCH_OFF", "KEY_PAGE_OFF", "KEY_PAGE_SIZE", "TEXT_END", "RO_OFF", "DATA_OFF"):
         if key not in hdr:
             fail(f"{fixups}: no {key}")
@@ -113,7 +124,9 @@ def check_image(out: Path, module: str) -> int:
                 # loop, not the head itself.  The row still proves both ends
                 # are in range; the rewriter's own spin checks cover the rest.
                 continue
-            start = stub - 0x20          # stp / mrs / adrp+add+ldr / ldr / ldr / blr
+            # stp / [mrs] / adrp+[add]+ldr / ldr / ldr / blr: the MRS (and the
+            # ADD that folds it in) disappear in SLOT_BASE=abs mode.
+            start = stub - (0x18 if slot_abs else 0x20)
             if not (patch_off <= start < patch_end):
                 fail(f"{module}: {kind} gate block {start:#x} is outside the patch area")
             word = struct.unpack_from("<I", blob, site)[0]

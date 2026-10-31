@@ -76,6 +76,9 @@ def main(argv: list[str] | None = None) -> int:
     env = os.environ.copy()
     env["DM_GAMES_DIR"] = str(PROFILES)
     env["DM_GAME"] = "01007EF00011E000"
+    # iOS: TPIDRRO_EL0 cannot be written from EL0 (SIGILL), so the key page
+    # carries absolute slot addresses and the blocks never read it.
+    env["DM_SLOT_ABS"] = "1"
 
     for m in args.modules:
         print(f"== {m} ==", flush=True)

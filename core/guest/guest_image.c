@@ -75,6 +75,21 @@ static int parse_int(const char* text, const char* key, int64_t* out) {
     return 1;
 }
 
+static int parse_token(const char* text, const char* key, char* out, size_t cap) {
+    const char* p = text ? strstr(text, key) : NULL;
+    size_t i = 0;
+    if (!p) return 0;
+    p += strlen(key);
+    while (*p == ' ' || *p == '\t' || *p == ':') ++p;
+    while (p[i] && p[i] != '\n' && p[i] != '\r' && p[i] != ' ' && p[i] != '\t') {
+        if (i + 1 >= cap) return 0;
+        out[i] = p[i];
+        ++i;
+    }
+    out[i] = '\0';
+    return i > 0;
+}
+
 static int parse_build_id(const char* text, uint8_t out[16]) {
     const char* p = text ? strstr(text, "BUILD_ID") : NULL;
     int i;
@@ -380,6 +395,14 @@ int botw_guest_image_open(botw_guest_image* img, const void* file, size_t file_l
         img->ktls_idx = parse_int(fixups_text, "KEY_KTLS_IDX", &idx) && idx >= 0 ? (unsigned)idx : 1;
         img->ktlr_idx = parse_int(fixups_text, "KEY_KTLR_IDX", &idx) && idx >= 0 ? (unsigned)idx : 2;
         img->kgate_idx = parse_int(fixups_text, "KEY_KGATE_IDX", &idx) && idx >= 0 ? (unsigned)idx : 3;
+        /* "abs" means the key page holds the address of the slot field and the
+         * rewritten blocks never read TPIDRRO_EL0 (Apple arm64 traps on an EL0
+         * write to it, so it cannot be pointed at our slot). */
+        {
+            char token[16];
+            img->slot_abs = parse_token(fixups_text, "SLOT_BASE", token, sizeof token) &&
+                            strcmp(token, "abs") == 0;
+        }
     }
     if (!read_dynamic(img, &d)) {
         botw_guest_image_close(img);
