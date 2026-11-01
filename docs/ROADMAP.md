@@ -7298,3 +7298,101 @@ FP，内联汇编的 clobber 列表里**拒绝**它（`reserved registers: FP`�
    复制而不是改权限；
 2. 把 `guest_slot` 的 key page 发布接到装载完成之后、第一个 gate 之前；
 3. 真机上跑第一条客体指令（`rtld` 的入口最干净，只有 19 个 HLE 站点）。
+## M4 续三十九：页级保护计划
+
+### 1. 为什么只能整块连续映射
+
+改写后的块用 `adrp` 拿 key page 和 patch 区的地址（偏移在改写时就固定），
+text / rodata / data 之间的引用也都是 PC 相对。也就是说：
+
+> patched.bin 必须按**原文件偏移**整块映射；把 text 塞进 `__TEXT`、data 放
+> 另一个 buffer 的“干净分节”方案会直接打乱所有 `adrp` 差值。
+
+剩下的自由度只有每页权限，而这件事恰好可以做对，因为（续三十五的实测）：
+
+* 262,837 条重定位**没有一条写在 text 上**，所以 text 复制完就可以 RX；
+* 客体唯一会写的是 key page，而且是在第一条 gate 之前由 loader 写。
+
+### 2. 区域表
+
+| 范围 | 权限 | 说明 |
+|---|---|---|
+| `[0, TEXT_END)` | RX | 代码；之后不再写 |
+| `[TEXT_END, DATA_OFF)` | R | rodata |
+| `[DATA_OFF, KEY_PAGE_OFF)` | RW | data + bss；重定位落在这里 |
+| `[KEY_PAGE_OFF, +0x4000)` | RW | key page |
+| `[.., PATCH_OFF)` | R | 0x4000 对齐留下的填充 |
+| `[PATCH_OFF, file_len)` | RX | 改写出来的 gate 块 |
+
+页大小是**参数**而不是常量：iOS / Apple 芯片 16 KiB，x86 主机 4 KiB。同一
+个模块在不同页大小下可能一个能分、一个不能分——这正是下面那个冲突。
+
+### 3. 实测：四个模块的段
+
+`reloc_run <bin> <fixups> 0x4000` 直接打印计划（真实产物，非合成）：
+
+| 模块 | 文件 | 16K 页段数 | rwx 冲突 |
+|---|---:|---:|---|
+| main | 46.0 MiB | 5 | 无 |
+| sdk | 13.2 MiB | 5 | 无 |
+| subsdk0 | 7.5 MiB | 5 | 无 |
+| rtld | 0.1 MiB | 4 | **有** |
+
+main 在 16 KiB 页下的计划：
+
+```text
+[0,        0x212c000) r-x      text + rodata 头共享的页
+[0x212c000,0x2a6c000) r--      rodata
+[0x2a6c000,0x2d6c000) rw-      data + key page
+[0x2d6c000,0x2d70000) r--      填充
+[0x2d70000,0x2dfc000) r-x      patch 区
+```
+
+`DATA_OFF=0x2a6d000` 不是 16 KiB 对齐，所以 data 从页中间开始，那一页被
+RO 和 RW 共占——取并集变成 RW，正确且无损。
+
+### 4. rtld：16 KiB 页上真的做不到
+
+rtld 只有 0x1a00 字节 text、0x2000 处 rodata、0x3000 处 data，三者全落在
+第一个 16 KiB 页里：
+
+```text
+16 KiB 页： [0, 0x4000) rwx   ← 既要能执行又要能写，W^X 下不存在
+4 KiB 页：  [0,0x2000) r-x / [0x2000,0x3000) r-- / [0x3000,0x8000) rw- / ...
+```
+
+页内复制救不了：复制一份 RW 副本会让该页的 `adrp` 目标偏移失配。可行方案只
+有两种——把这一页做成**双映射**（同一物理页同时有一个 RX 和一个 RW 视图），
+或者在装载期先 RW 写完再整体 RX（但 key page 之后还要写）。这一点被如实
+报告出来，而不是被静默降级成“能跑就行”。
+
+### 5. 实现与测试
+
+`core/guest/guest_segments.c`（纯计算，不分配、不碰系统调用）：
+
+* `botw_guest_image_map_size()`：`file_size` 向上取整到页；
+* `botw_guest_image_plan()`：逐页求并集、合并相邻同权限页，返回段数；数组不够
+  时仍然返回需要的段数（`error` 里写明 `needs N runs`）；
+* `botw_guest_image_plan_conflict()`：某页同时要 W 和 X 就返回 1。
+
+`tests/guest_image_test.cpp` 增加了用**真实 1.6.0 布局数字**（main 与 rtld）
+的断言：5 段/4 段、每段起点与权限、段首尾相接且总长等于 `map_size`、rtld 在
+16K 冲突而在 4K 不冲突、以及页大小非法 / 布局乱序 / 数组太小的三条拒绝。
+
+`reloc_run` 现在多打一段 `plan`，用真实产物跑出来就是上面那两张表。
+
+### 6. 还没有证明
+
+* 这一轮只算了权限，**没有真的 mmap / mprotect**；
+* iOS 上匿名内存 `PROT_EXEC` 需要 JIT 权限（`dynamic-codesigning`），
+  CI 是无签名构建，验不了；
+* 双映射方案还没实现，rtld 在 16 KiB 页上目前只能报冲突；
+* 仍然没有执行过一条客体指令。
+
+### 7. 下一步
+
+1. `guest_map.c`：mmap 整块 RW → 拷贝 → 按计划 mprotect → 交接给 loader
+   （需要 `botw_guest_image_open` 支持“接管调用者的 buffer”）；
+2. 在 macOS / Linux runner 上做真实映射测试：映射后写 text 必须触发
+   SIGSEGV，读 text 必须成功；
+3. rtld 的双映射（两个视图指向同一块匿名共享内存）。

@@ -73,6 +73,47 @@ size_t botw_guest_image_entry(const botw_guest_image* img);
 uint8_t* botw_guest_image_key_page(botw_guest_image* img);
 size_t botw_guest_image_key_page_size(const botw_guest_image* img);
 
+/* Protection plan for the mapping the guest will run from.
+ *
+ * Text, rodata, data, the key page and the patch area are addressed relative
+ * to each other by `adrp`, so the whole patched.bin has to be one contiguous
+ * mapping and only its page protections can differ:
+ *
+ *   [0, TEXT_END)                RX   code, never written after the copy
+ *   [TEXT_END, DATA_OFF)         R    rodata
+ *   [DATA_OFF, KEY_PAGE_OFF)     RW   data + bss; relocations land here
+ *   [KEY_PAGE_OFF, +0x4000)      RW   the key page guest_slot publishes into
+ *   [.., PATCH_OFF)              R    padding
+ *   [PATCH_OFF, file_len)        RX   rewritten gate blocks
+ *
+ * Page size is a parameter because iOS and Apple silicon use 16 KiB while
+ * x86 hosts use 4 KiB, and a page can be shared by a read-only and a writable
+ * region (then it gets the union).  When a page would need to be both
+ * writable and executable, no protection is correct: plan_conflict() says so
+ * and the caller has to split or dual-map that page.
+ *
+ * Offsets in `out` are page-aligned runs covering [0, map_size()); the runs
+ * are contiguous and in order.  Returns the number of runs the image needs.
+ * With out == NULL and cap == 0 this is a pure size query; if cap is too
+ * small the count is still returned, `out` holds a prefix, and img->error
+ * says how many were needed. */
+#define BOTW_GUEST_PROT_READ  1u
+#define BOTW_GUEST_PROT_WRITE 2u
+#define BOTW_GUEST_PROT_EXEC  4u
+
+typedef struct {
+    size_t   off;
+    size_t   len;
+    unsigned prot;
+} botw_guest_segment;
+
+size_t botw_guest_image_map_size(botw_guest_image* img, size_t page_size);
+size_t botw_guest_image_plan(botw_guest_image* img, size_t page_size,
+                             botw_guest_segment* out, size_t cap);
+/* 1 when some page needs write and execute at once, 0 when not, -1 on a bad
+ * layout or page size (img->error says which). */
+int botw_guest_image_plan_conflict(botw_guest_image* img, size_t page_size);
+
 #ifdef __cplusplus
 }
 #endif
