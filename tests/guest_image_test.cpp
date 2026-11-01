@@ -243,6 +243,84 @@ int main() {
     CHECK(botw_guest_image_open(&img, nosym.data(), nosym.size(), kHeader, resolver, nullptr) != 0);
     CHECK(std::strstr(img.error, "no symbol") != nullptr);
 
+    // --- page plan: real 1.6.0 layout numbers, no image bytes needed ---
+    // main: 46 MiB of text, rodata up to 0x2a6d000 (not 16 KiB aligned),
+    // one 16 KiB key page, then the 0x8b03c-byte patch area.
+    botw_guest_image plan;
+    std::memset(&plan, 0, sizeof plan);
+    plan.text_end = 0x2129ba4u;
+    plan.ro_off = 0x212a000u;
+    plan.data_off = 0x2a6d000u;
+    plan.key_page_off = 0x2d68000u;
+    plan.key_page_size = 0x4000u;
+    plan.patch_off = 0x2d70000u;
+    plan.file_size = 0x2dfb03cu;
+    plan.size = 0x2d68000u;
+
+    CHECK(botw_guest_image_map_size(&plan, 0x4000) == 0x2dfc000u);
+    CHECK(botw_guest_image_plan_conflict(&plan, 0x4000) == 0);
+
+    botw_guest_segment seg[8];
+    std::memset(seg, 0, sizeof seg);
+    CHECK(botw_guest_image_plan(&plan, 0x4000, seg, 8) == 5);
+    // Text and the rodata head share the 0x2128000 page, so the RX run takes
+    // the whole page; data starts mid-page and drags that page into RW.
+    CHECK(seg[0].off == 0 && seg[0].len == 0x212c000u &&
+          seg[0].prot == (BOTW_GUEST_PROT_READ | BOTW_GUEST_PROT_EXEC));
+    CHECK(seg[1].off == 0x212c000u && seg[1].len == 0x940000u &&
+          seg[1].prot == BOTW_GUEST_PROT_READ);
+    CHECK(seg[2].off == 0x2a6c000u && seg[2].len == 0x300000u &&
+          seg[2].prot == (BOTW_GUEST_PROT_READ | BOTW_GUEST_PROT_WRITE));
+    CHECK(seg[3].off == 0x2d6c000u && seg[3].len == 0x4000u &&
+          seg[3].prot == BOTW_GUEST_PROT_READ);
+    CHECK(seg[4].off == 0x2d70000u && seg[4].len == 0x8c000u &&
+          seg[4].prot == (BOTW_GUEST_PROT_READ | BOTW_GUEST_PROT_EXEC));
+    {
+        size_t at = 0;
+        for (int i = 0; i < 5; i++) {
+            CHECK(seg[i].off == at);
+            CHECK(seg[i].len % 0x4000u == 0);
+            at += seg[i].len;
+        }
+        CHECK(at == botw_guest_image_map_size(&plan, 0x4000));
+    }
+
+    // rtld is 0x1a00 bytes of text, rodata and data: at 16 KiB all three land
+    // in page 0, which would have to be writable and executable at once.
+    // At 4 KiB the same module splits cleanly, which is why the page size is
+    // a parameter and not a constant.
+    botw_guest_image tiny;
+    std::memset(&tiny, 0, sizeof tiny);
+    tiny.text_end = 0x1a00u;
+    tiny.ro_off = 0x2000u;
+    tiny.data_off = 0x3000u;
+    tiny.key_page_off = 0x4000u;
+    tiny.key_page_size = 0x4000u;
+    tiny.patch_off = 0x10000u;
+    tiny.file_size = 0x10380u;
+    tiny.size = 0x4000u;
+    CHECK(botw_guest_image_plan_conflict(&tiny, 0x4000) == 1);
+    CHECK(botw_guest_image_plan_conflict(&tiny, 0x1000) == 0);
+    std::memset(seg, 0, sizeof seg);
+    CHECK(botw_guest_image_plan(&tiny, 0x4000, seg, 8) == 4);
+    CHECK(seg[0].prot == (BOTW_GUEST_PROT_READ | BOTW_GUEST_PROT_WRITE | BOTW_GUEST_PROT_EXEC));
+    CHECK(botw_guest_image_plan(&tiny, 0x1000, seg, 8) == 5);
+
+    // Refusals: a page size that is not a real page, a layout whose ranges
+    // disagree, and an output array that cannot hold the plan.
+    CHECK(botw_guest_image_map_size(&plan, 0) == 0);
+    CHECK(std::strstr(plan.error, "power of two") != nullptr);
+    CHECK(botw_guest_image_map_size(&plan, 0x1001) == 0);
+    CHECK(botw_guest_image_map_size(&plan, 0x800) == 0);
+    {
+        botw_guest_image misordered = plan;
+        misordered.data_off = misordered.key_page_off + 0x1000u;
+        CHECK(botw_guest_image_plan(&misordered, 0x4000, seg, 8) == 0);
+        CHECK(std::strstr(misordered.error, "not usable") != nullptr);
+    }
+    CHECK(botw_guest_image_plan(&plan, 0x4000, seg, 2) == 5);
+    CHECK(std::strstr(plan.error, "needs 5 runs") != nullptr);
+
     // A bad fixups header must fail before allocating.
     CHECK(botw_guest_image_open(&img, file.data(), file.size(), "# PATCH_OFF\t0x5000\n", resolver, nullptr) != 0);
     CHECK(img.base == nullptr);
@@ -251,6 +329,6 @@ int main() {
         std::printf("guest_image_test: %d failure(s)\n", g_fail);
         return 1;
     }
-    std::printf("guest_image_test: ok (relative, abs64 base/local/import, imports, slot, refusals)\n");
+    std::printf("guest_image_test: ok (relative, abs64 base/local/import, imports, slot, page plan, refusals)\n");
     return 0;
 }

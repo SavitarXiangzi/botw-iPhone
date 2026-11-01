@@ -6,12 +6,17 @@
  * became NULL.  Real module paths are passed on the command line; nothing
  * title-derived is written by this tool.
  *
- *   reloc_run <module.patched.bin> <module.fixups.tsv>
+ *   reloc_run <module.patched.bin> <module.fixups.tsv> [page_size]
+ *
+ * It also prints the page protection plan the image would need, which is the
+ * input to the executable mapping.  The page size defaults to 16 KiB (iOS);
+ * pass 0x1000 to see how the same module looks on a 4 KiB host.
  */
 #include "guest_image.h"
 
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <string>
@@ -44,8 +49,8 @@ static bool slurp(const char* path, std::vector<unsigned char>& out) {
 }
 
 int main(int argc, char** argv) {
-    if (argc != 3) {
-        std::printf("usage: reloc_run <module.patched.bin> <module.fixups.tsv>\n");
+    if (argc < 3 || argc > 4) {
+        std::printf("usage: reloc_run <module.patched.bin> <module.fixups.tsv> [page_size]\n");
         return 2;
     }
     std::vector<unsigned char> image;
@@ -71,6 +76,27 @@ int main(int argc, char** argv) {
                 argv[1], (double)image.size() / (1024.0 * 1024.0), img.relocs, img.symbols,
                 img.hle, img.imports, g_sentinels.size(), botw_guest_image_entry(&img),
                 (long long)ms);
+    {
+        size_t page = argc == 4 ? (size_t)std::strtoull(argv[3], nullptr, 0) : (size_t)0x4000;
+        botw_guest_segment seg[16];
+        size_t n = botw_guest_image_plan(&img, page, seg, 16);
+        size_t span = botw_guest_image_map_size(&img, page);
+        if (n == 0) {
+            std::printf("reloc_run: plan page=%#zx FAIL: %s\n", page, img.error);
+        } else {
+            size_t shown = n < 16 ? n : 16;
+            std::printf("reloc_run: plan page=%#zx span=%#zx runs=%zu conflict=%d\n",
+                        page, span, n, botw_guest_image_plan_conflict(&img, page));
+            for (size_t i = 0; i < shown; i++) {
+                char prot[4];
+                prot[0] = (seg[i].prot & BOTW_GUEST_PROT_READ) ? 'r' : '-';
+                prot[1] = (seg[i].prot & BOTW_GUEST_PROT_WRITE) ? 'w' : '-';
+                prot[2] = (seg[i].prot & BOTW_GUEST_PROT_EXEC) ? 'x' : '-';
+                prot[3] = '\0';
+                std::printf("  [%#zx, %#zx) %s\n", seg[i].off, seg[i].off + seg[i].len, prot);
+            }
+        }
+    }
     botw_guest_image_close(&img);
     for (char* block : g_sentinel_blocks) delete[] block;
     g_sentinel_blocks.clear();
