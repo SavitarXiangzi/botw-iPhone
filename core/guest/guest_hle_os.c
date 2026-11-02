@@ -2018,6 +2018,8 @@ static void multiwait_notify_event(int event_index) {
     }
 }
 
+#if !defined(__aarch64__)
+/* Portable-only fallback: the AArch64 entry parks the guest thread. */
 static void* os_WaitAny(void* type) {
     botw_hle_os_multi_wait* mw;
     int index = -1;
@@ -2043,6 +2045,7 @@ static void* os_WaitAny(void* type) {
     (void)os_error(g_os, "WaitAny: would block on this host");
     return NULL;
 }
+#endif
 
 static void os_SetUserExceptionHandler(void (*handler)(void*), void* arg,
                                        size_t stack_size, void* stack) {
