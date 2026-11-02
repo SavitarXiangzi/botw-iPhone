@@ -216,6 +216,17 @@ int main() {
         /* mprotect left the key page writable, not just writable before it. */
         keys[4] = 0xfeedfaceu;
         CHECK(keys[4] == 0xfeedfaceu);
+
+        /* A key page the plan did not make writable is refused before any
+         * write: the padding page at 0xc000 is read-only. */
+        {
+            botw_guest_image saved = img;
+            img.key_page_off = 0xc000;
+            img.key_page_size = 0x1000;
+            CHECK(botw_guest_map_publish_slot(&map, &img, &slot) != 0);
+            CHECK(std::strstr(map.error, "not writable") != nullptr);
+            img = saved;
+        }
     }
 
     /* Text and the patch area are not. */
