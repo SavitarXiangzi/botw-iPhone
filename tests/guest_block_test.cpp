@@ -129,6 +129,19 @@ int main() {
 
     if (g_fail) {
         std::printf("guest_block_test: %d failure(s)\n", g_fail);
+        std::printf("  run: blocks=%lu wakes=%lu switches=%lu exits=%lu clock=%llu\n",
+                    run.blocks, run.wakes, run.switches, run.thread_exits,
+                    (unsigned long long)run.clock);
+        std::printf("  os: calls=%lu creates=%lu starts=%lu waits=%lu "
+                    "wait_blocks=%lu sleeps=%lu sleep_blocks=%lu\n",
+                    os.calls, os.thread_creates, os.thread_starts,
+                    os.thread_waits, os.wait_blocks, os.sleeps,
+                    os.sleep_blocks);
+        std::printf("  counter=%llu,%llu,%llu,%llu,%llu states=%d,%d error='%s'\n",
+                    (unsigned long long)counter[0], (unsigned long long)counter[1],
+                    (unsigned long long)counter[2], (unsigned long long)counter[3],
+                    (unsigned long long)counter[4], run.threads[0].state,
+                    run.threads[worker].state, run.error);
         return 1;
     }
     std::printf("guest_block_test: ok (wait join, timed wake, %lu blocks, %lu wakes)\n",
