@@ -28,13 +28,6 @@ BOTW_STATIC_ASSERT(sizeof(botw_guest_run_ctx) == 368, ctx_size);
 
 #if defined(__aarch64__)
 extern void botw_guest_run_enter_asm(botw_guest_run_ctx* ctx);
-#else
-/* guest_run_arm64.S emits nothing here.  init() refuses before this could be
- * called, but the symbol still has to exist for the link. */
-static void botw_guest_run_enter_asm(botw_guest_run_ctx* ctx) {
-    (void)ctx;
-}
-#endif
 
 static botw_guest_run* g_active;
 
@@ -46,6 +39,15 @@ static void run_gate(botw_guest_regs* regs) {
     run->gates++;
     if (run->gate) run->gate(run->gate_user, regs);
 }
+#else
+/* guest_run_arm64.S emits nothing here.  enter_at() refuses before this could
+ * be called, but the symbol still has to exist for the link.  It is a global
+ * rather than a static so a host build does not warn about a function that is
+ * only reachable through the AArch64 branch. */
+void botw_guest_run_enter_asm(botw_guest_run_ctx* ctx) {
+    (void)ctx;
+}
+#endif
 
 static void run_error(botw_guest_run* run, const char* fmt, ...) {
     va_list ap;
