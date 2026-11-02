@@ -123,7 +123,8 @@ jobs:
           # Entry, a real guest function on the mapped stack, and the exit
           # sentinel back into the host.  Skips itself off AArch64.
           clang++ $FLAGS $INC tests/guest_run_test.cpp \
-            core/guest/guest_run_arm64.S tests/guest_run_probe_arm64.S \
+            core/guest/guest_gate_arm64.S core/guest/guest_run_arm64.S \
+            tests/guest_run_probe_arm64.S \
             /tmp/guest_run.o /tmp/guest_gate.o /tmp/guest_image.o \
             /tmp/guest_segments.o /tmp/guest_map.o /tmp/guest_slot.o -o /tmp/guest_run_test
           /tmp/guest_run_test
@@ -252,7 +253,8 @@ jobs:
           # dispatch and the exit sentinel, all on the arm64 runner.
           xcrun clang++ -std=c++20 -Wall -Wextra -Werror -O2 -I core/guest \
             tests/guest_run_test.cpp \
-            core/guest/guest_run_arm64.S tests/guest_run_probe_arm64.S \
+            core/guest/guest_gate_arm64.S core/guest/guest_run_arm64.S \
+            tests/guest_run_probe_arm64.S \
             /tmp/guest_run.o /tmp/guest_gate_entry.o /tmp/guest_image.o \
             /tmp/guest_segments.o /tmp/guest_map.o /tmp/guest_slot.o -o /tmp/guest_run_test
           /tmp/guest_run_test
