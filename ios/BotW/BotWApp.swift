@@ -29,8 +29,14 @@ struct BotWApp: App {
                 fflush(stdout)
             }
             report("BOTW_SELFTEST start\n")
-            let rc = botw_core_selftest()
-            report("BOTW_SELFTEST rc=\(rc)\n")
+            // Two independent checks: the guest core actually enters native
+            // AArch64 code, then the Metal replay layer renders and reads back
+            // its synthetic frame.  The combined rc is what CI asserts.
+            let guestRc = botw_core_guest_selftest()
+            report("BOTW_GUEST_SELFTEST rc=\(guestRc)\n")
+            let replayRc = botw_core_selftest()
+            let rc = (guestRc == 0 && replayRc == 0) ? 0 : 1
+            report("BOTW_SELFTEST rc=\(rc) (guest=\(guestRc) replay=\(replayRc)\n")
             exit(rc == 0 ? 0 : 1)
         }
     }

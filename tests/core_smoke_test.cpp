@@ -57,6 +57,10 @@ int main() {
     botw_core_destroy(core);
     CHECK(botw_core_last_error(nullptr) != nullptr);
     CHECK(botw_core_frame(nullptr, 0.0) == -1);
+#if !defined(__aarch64__)
+    /* The app-facing guest probe is a clean no-op outside AArch64. */
+    CHECK(botw_core_guest_selftest() == -1);
+#endif
 
     if (g_failures) {
         std::printf("core_smoke_test: %d failure(s)\n", g_failures);
