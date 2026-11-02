@@ -253,7 +253,7 @@ jobs:
           xcrun clang++ -std=c++20 -Wall -Wextra -Werror -O2 -I core/guest \
             tests/guest_run_test.cpp \
             core/guest/guest_run_arm64.S tests/guest_run_probe_arm64.S \
-            /tmp/guest_run.o /tmp/guest_gate.o /tmp/guest_image.o \
+            /tmp/guest_run.o /tmp/guest_gate_entry.o /tmp/guest_image.o \
             /tmp/guest_segments.o /tmp/guest_map.o /tmp/guest_slot.o -o /tmp/guest_run_test
           /tmp/guest_run_test
           # The HLE stub returns 0 in x0 on the real arm64 target.
