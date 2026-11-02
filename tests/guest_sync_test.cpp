@@ -67,6 +67,7 @@ typedef uint32_t (*os_create7_fn)(void*, void (*)(void*), void*, void*,
 typedef void (*os_start_fn)(void*);
 typedef void (*os_init_mutex_fn)(void*, int, int);
 typedef void (*os_init_event_fn)(void*, int, int);
+typedef void (*os_init_light_event_fn)(void*, int, int);
 typedef void (*os_init_semaphore_fn)(void*, int, int);
 
 int main() {
@@ -87,6 +88,7 @@ int main() {
     os_start_fn start;
     os_init_mutex_fn init_mutex;
     os_init_event_fn init_event;
+    os_init_light_event_fn init_light;
     os_init_semaphore_fn init_semaphore;
 
     botw_hle_init(&hle);
@@ -104,19 +106,22 @@ int main() {
         &hle, "_ZN2nn2os15InitializeMutexEPNS0_9MutexTypeEbi");
     init_event = (os_init_event_fn)botw_hle_lookup(
         &hle, "_ZN2nn2os15InitializeEventEPNS0_9EventTypeEbNS0_14EventClearModeE");
+    init_light = (os_init_light_event_fn)botw_hle_lookup(
+        &hle, "_ZN2nn2os20InitializeLightEventEPNS0_14LightEventTypeEbNS0_14EventClearModeE");
     init_semaphore = (os_init_semaphore_fn)botw_hle_lookup(
         &hle, "_ZN2nn2os19InitializeSemaphoreEPNS0_13SemaphoreTypeEii");
     CHECK(create != nullptr);
     CHECK(start != nullptr);
     CHECK(init_mutex != nullptr);
     CHECK(init_event != nullptr);
+    CHECK(init_light != nullptr);
     CHECK(init_semaphore != nullptr);
 
     /* Attach clears sync objects, so initialize them afterwards.  The event
      * and light event are auto-clear; the semaphore starts empty. */
     init_mutex(mutex, 0, 0x20);
     init_event(event, 0, 1);
-    init_event(light, 0, 1);
+    init_light(light, 0, 1);
     init_semaphore(semaphore, 0, 1);
     CHECK(os.mutexes[0].used);
     CHECK(os.events[0].used);
