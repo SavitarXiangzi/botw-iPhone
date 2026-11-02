@@ -1,21 +1,25 @@
 /* nn::os HLE: threads, TLS, the virtual clock, synchronization and the
  * memory-block heap.
  *
- * The 1.6.0 main image imports 78 nn::os names.  They are not a service: they
+ * The 1.6.0 main image imports 74 nn::os names.  They are not a service: they
  * are the SDK's own operating-system layer, so a zero-return stub is not a
- * neutral answer.  This layer claims the 55 names the scheduler can answer
- * today:
+ * neutral answer.  This table has 63 entries: 62 imported names the scheduler
+ * can answer, plus FreeMemoryBlock for allocator symmetry.  Twelve imported
+ * names remain on the shared stub:
  *
  *   - the thread table (CreateThread / StartThread / WaitThread / DestroyThread,
  *     current-thread queries, names, priority and core masks);
  *   - per-thread TLS slots;
  *   - GetSystemTick / frequency / conversions;
  *   - Mutex / Event / LightEvent / Semaphore, with real blocking and wake;
+ *   - MessageQueue: FIFO send, LIFO jam, receive and peek, with blocked
+ *     senders and receivers handed their message before they are resumed;
  *   - AllocateMemoryBlock / FreeMemoryBlock / SetMemoryHeapSize.
  *
- * MessageQueue, SystemEvent and MultiWait stay on the shared stub until their
- * object layouts and ordering rules are implemented; a lock that reports
- * success without excluding anyone would be worse than an explicit stub.
+ * The twelve are SystemEvent (4), MultiWait (7), and SetUserExceptionHandler
+ * (1).  A lock that reports success without excluding anyone would be worse
+ * than an explicit stub, so these stay explicit until their ordering rules
+ * are implemented.
  *
  * Scheduling contract, stated plainly because it is not the real kernel:
  *
@@ -28,12 +32,13 @@
  *   - YieldThread requests a switch at the next gate.  It cannot switch inside
  *     a host call because the guest's return point would be lost.
  *   - SleepThread, WaitThread, LockMutex, WaitEvent, WaitLightEvent,
- *     TimedWaitLightEvent and AcquireSemaphore use AArch64 import wrappers
+ *     TimedWaitLightEvent, AcquireSemaphore, SendMessageQueue,
+ *     JamMessageQueue and ReceiveMessageQueue use AArch64 import wrappers
  *     that save the complete register frame, park the caller in BLOCKED, and
  *     restore another runnable frame.  Sleep and timed waits are woken by the
  *     virtual run clock; a live WaitThread target wakes its joiners from the
- *     thread-exit trampoline; a signal/release transfers the object exactly
- *     once before making the chosen waiter READY.
+ *     thread-exit trampoline; a signal/release/message handoff transfers the
+ *     object exactly once before making the chosen waiter READY.
  *   - DestroyThread reaps a DONE (or never-started CREATED) worker and returns
  *     its slot and stack to the run.
  *
@@ -58,11 +63,12 @@
 extern "C" {
 #endif
 
-#define BOTW_HLE_OS_COUNT 55u
+#define BOTW_HLE_OS_COUNT 63u
 #define BOTW_HLE_OS_MAX_MUTEX 128u
 #define BOTW_HLE_OS_MAX_EVENT 128u
 #define BOTW_HLE_OS_MAX_LIGHT_EVENT 128u
 #define BOTW_HLE_OS_MAX_SEMAPHORE 64u
+#define BOTW_HLE_OS_MAX_MESSAGE_QUEUE 64u
 #define BOTW_HLE_OS_TLS_SLOTS 16u
 #define BOTW_HLE_OS_NAME_MAX 64u
 #define BOTW_HLE_OS_MAIN_ID 0x100u
@@ -82,7 +88,10 @@ typedef enum {
     BOTW_HLE_OS_OP_WAIT_EVENT = 4,
     BOTW_HLE_OS_OP_WAIT_LIGHT_EVENT = 5,
     BOTW_HLE_OS_OP_TIMED_WAIT_LIGHT_EVENT = 6,
-    BOTW_HLE_OS_OP_ACQUIRE_SEMAPHORE = 7
+    BOTW_HLE_OS_OP_ACQUIRE_SEMAPHORE = 7,
+    BOTW_HLE_OS_OP_SEND_MESSAGE_QUEUE = 8,
+    BOTW_HLE_OS_OP_RECEIVE_MESSAGE_QUEUE = 9,
+    BOTW_HLE_OS_OP_JAM_MESSAGE_QUEUE = 10
 } botw_hle_os_block_op;
 
 enum {
@@ -147,6 +156,33 @@ typedef struct {
 } botw_hle_os_semaphore;
 
 typedef struct {
+    int      slot;
+    uint64_t out;               /* guest uintptr_t* to fill before wake */
+} botw_hle_os_mq_receiver;
+
+typedef struct {
+    int      slot;
+    uint64_t message;           /* pending Send/Jam payload */
+    int      jam;               /* insert at the front, not the back */
+} botw_hle_os_mq_sender;
+
+/* The guest supplies the ring storage.  Only the queue object pointer is an
+ * identity token; `buffer` is data and is read/written as the real ring. */
+typedef struct {
+    int      used;
+    int      index;
+    void*    type;
+    uint64_t* buffer;
+    size_t   capacity;
+    size_t   count;
+    size_t   offset;
+    botw_hle_os_mq_receiver receivers[BOTW_GUEST_MAX_THREADS];
+    int      receiver_count;
+    botw_hle_os_mq_sender senders[BOTW_GUEST_MAX_THREADS];
+    int      sender_count;
+} botw_hle_os_message_queue;
+
+typedef struct {
     botw_guest_run* run;
     int attached;
     botw_hle_os_thread threads[BOTW_GUEST_MAX_THREADS];
@@ -154,6 +190,7 @@ typedef struct {
     botw_hle_os_event events[BOTW_HLE_OS_MAX_EVENT];
     botw_hle_os_light_event light_events[BOTW_HLE_OS_MAX_LIGHT_EVENT];
     botw_hle_os_semaphore semaphores[BOTW_HLE_OS_MAX_SEMAPHORE];
+    botw_hle_os_message_queue message_queues[BOTW_HLE_OS_MAX_MESSAGE_QUEUE];
     uint8_t  main_type[BOTW_HLE_OS_MAIN_TYPE_BYTES];
     uint64_t next_thread_id;
     uint64_t tick;
@@ -190,6 +227,15 @@ typedef struct {
     unsigned long semaphore_acquires;
     unsigned long semaphore_blocks;
     unsigned long semaphore_releases;
+    unsigned long message_sends;
+    unsigned long message_send_blocks;
+    unsigned long message_jams;
+    unsigned long message_jam_blocks;
+    unsigned long message_receives;
+    unsigned long message_receive_blocks;
+    unsigned long message_try_sends;
+    unsigned long message_try_receives;
+    unsigned long message_peeks;
     unsigned long block_allocs;
     unsigned long block_frees;
     char     error[160];
@@ -203,7 +249,7 @@ void botw_hle_os_reset(botw_hle_os_state* state);
 /* The singleton used when register() is given NULL. */
 botw_hle_os_state* botw_hle_os_default(void);
 
-/* Registers the 55 nn::os implementations.  `state` may be NULL.  Returns 0,
+/* Registers the 63 nn::os implementations.  `state` may be NULL.  Returns 0,
  * or -1 with hle->error set. */
 int botw_hle_os_register(botw_hle_table* hle, botw_hle_os_state* state);
 

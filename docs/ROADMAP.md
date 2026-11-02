@@ -8376,3 +8376,53 @@ deadline = run->clock + span_to_ticks(ns)
 * `ThreadType`、`MutexType`、`EventType` 等对象内部布局仍未被验证；HLE
   只把它们当不透明指针；
 * 定时等待只有虚拟时钟，没有 host timer / `svcCancelSynchronization`。
+
+## M4 续五十一：MessageQueue 的 FIFO/LIFO 与阻塞交接
+
+### 1. 这一轮接了什么
+
+`nn::os` 的 8 个 MessageQueue 导入已接入：
+
+| 操作 | 语义 |
+|---|---|
+| `InitializeMessageQueue` / `FinalizeMessageQueue` | 对象指针只作 identity token；ring 使用 guest 传入的真实缓冲区 |
+| `SendMessageQueue` | 队尾 FIFO 入队；队列满时阻塞 |
+| `JamMessageQueue` | `offset -= 1` 后写入，从队头插队；队列满时阻塞，不覆盖旧消息 |
+| `ReceiveMessageQueue` | 从队头取出；空队列时阻塞 |
+| `TrySendMessageQueue` | 队列满返回 false，不阻塞 |
+| `TryReceiveMessageQueue` | 队列空返回 false，不阻塞 |
+| `TryPeekMessageQueue` | 只读队头，不消费 |
+
+阻塞的 receiver 在变成 READY 前，消息已经写入它传给 guest 的输出地址；
+阻塞的 sender 在队列腾出空间后先完成入队，再被唤醒。这样 import 包装器
+恢复执行时不需要再次进入 C 函数重试。
+
+### 2. 与 Atmosphere 的语义核对
+
+对照 `libstratosphere/source/os/os_message_queue.cpp` 和
+`impl/os_message_queue_helper.hpp`，修正了两个容易误实现的地方：
+
+* `Jam` 是 LIFO 插队，不是覆盖最旧消息；
+* `TryPeek` 不改变 ring 的 `count` / `offset`。
+
+### 3. 测试与计数口径
+
+* `tests/guest_hle_os_test.cpp` 在 Windows 和 Apple arm64 上覆盖 FIFO、
+  `TryPeek`、`TrySend`、`TryReceive` 和 portable `Jam` 顺序。
+* 新增 `tests/guest_message_queue_probe_arm64.S` +
+  `tests/guest_message_queue_test.cpp`，在 AArch64 上验证：
+  * 阻塞 receiver 的直接消息交接；
+  * 队列满时阻塞 sender，receive 后按 FIFO 接纳；
+  * 阻塞 Jam 在空间释放后插到队头；
+  * 计数为 9 次 block、9 次 wake、3 次线程退出。
+* `BOTW_HLE_OS_COUNT` 是注册表条目数，不等于标题导入覆盖率。当前 63 个
+  条目中 62 个是 1.6.0 的 `nn::os` 导入，另有一个 `FreeMemoryBlock`；
+  标题实际导入 74 个，仍缺 12 个：SystemEvent 4、MultiWait 7、
+  `SetUserExceptionHandler` 1。
+
+### 4. 仍然不成立
+
+* 多个同时阻塞的 `Jam` sender 目前按 waiter 表顺序接纳，尚未证明与
+  Horizon 内核的先入先出/优先级顺序完全一致；
+* ring 缓冲区由宿主直接解引用，尚未改成显式 guest-memory 访问器；
+* 没有抢占；真实标题线程与 `main.patched.bin` 入口仍未调用。

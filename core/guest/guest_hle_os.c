@@ -1,5 +1,6 @@
 #include "guest_hle_os.h"
 
+#include <limits.h>
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -17,6 +18,9 @@ extern void botw_hle_os_guest_wait_event(void);
 extern void botw_hle_os_guest_wait_light_event(void);
 extern void botw_hle_os_guest_timed_wait_light_event(void);
 extern void botw_hle_os_guest_acquire_semaphore(void);
+extern void botw_hle_os_guest_send_message_queue(void);
+extern void botw_hle_os_guest_receive_message_queue(void);
+extern void botw_hle_os_guest_jam_message_queue(void);
 #endif
 
 /* The implementations are registered under their Itanium-mangled names,
@@ -120,6 +124,7 @@ void botw_hle_os_attach_run(botw_hle_os_state* state, botw_guest_run* run) {
     memset(state->events, 0, sizeof state->events);
     memset(state->light_events, 0, sizeof state->light_events);
     memset(state->semaphores, 0, sizeof state->semaphores);
+    memset(state->message_queues, 0, sizeof state->message_queues);
     for (i = 1; i < (int)BOTW_GUEST_MAX_THREADS; i++) {
         memset(&state->threads[i], 0, sizeof state->threads[i]);
     }
@@ -1203,6 +1208,323 @@ static void os_ReleaseSemaphore_n(void* type, int count) {
     os_ReleaseSemaphore_count(type, count);
 }
 
+/* ------------------------------------------------------------------ */
+/* MessageQueue                                                       */
+/* ------------------------------------------------------------------ */
+
+/* The ring itself is the guest's buffer.  The queue object remains an opaque
+ * identity token, but the messages must be visible to the guest, so they are
+ * copied through the real storage the caller supplied to Initialize.  A
+ * blocked receiver is handed its value (and a blocked sender has its pending
+ * value inserted) before it is made READY: the import wrapper resumes after
+ * the call and never re-enters this C function. */
+
+static botw_hle_os_message_queue* mq_find(const void* type, int* out_index) {
+    int i;
+    if (!g_os || !type) return NULL;
+    for (i = 0; i < (int)BOTW_HLE_OS_MAX_MESSAGE_QUEUE; i++) {
+        if (g_os->message_queues[i].used && g_os->message_queues[i].type == type) {
+            if (out_index) *out_index = i;
+            return &g_os->message_queues[i];
+        }
+    }
+    return NULL;
+}
+
+static int mq_receiver_index(const botw_hle_os_message_queue* q, int slot) {
+    int i;
+    for (i = 0; i < q->receiver_count; i++) {
+        if (q->receivers[i].slot == slot) return i;
+    }
+    return -1;
+}
+
+static int mq_sender_index(const botw_hle_os_message_queue* q, int slot) {
+    int i;
+    for (i = 0; i < q->sender_count; i++) {
+        if (q->senders[i].slot == slot) return i;
+    }
+    return -1;
+}
+
+static void mq_receiver_remove_at(botw_hle_os_message_queue* q, int pos) {
+    int i;
+    if (pos < 0 || pos >= q->receiver_count) return;
+    for (i = pos + 1; i < q->receiver_count; i++) {
+        q->receivers[i - 1] = q->receivers[i];
+    }
+    q->receiver_count--;
+}
+
+static void mq_sender_remove_at(botw_hle_os_message_queue* q, int pos) {
+    int i;
+    if (pos < 0 || pos >= q->sender_count) return;
+    for (i = pos + 1; i < q->sender_count; i++) {
+        q->senders[i - 1] = q->senders[i];
+    }
+    q->sender_count--;
+}
+
+static int mq_receiver_add(botw_hle_os_message_queue* q, int slot, uint64_t out) {
+    int pos = mq_receiver_index(q, slot);
+    if (pos >= 0) {
+        q->receivers[pos].out = out;
+        return 1;
+    }
+    if (q->receiver_count >= (int)BOTW_GUEST_MAX_THREADS) {
+        (void)os_error(g_os, "MessageQueue: receiver waiter list is full");
+        return 0;
+    }
+    q->receivers[q->receiver_count].slot = slot;
+    q->receivers[q->receiver_count].out = out;
+    q->receiver_count++;
+    return 1;
+}
+
+static int mq_sender_add(botw_hle_os_message_queue* q, int slot,
+                         uint64_t message, int jam) {
+    int pos = mq_sender_index(q, slot);
+    if (pos >= 0) {
+        q->senders[pos].message = message;
+        q->senders[pos].jam = jam;
+        return 1;
+    }
+    if (q->sender_count >= (int)BOTW_GUEST_MAX_THREADS) {
+        (void)os_error(g_os, "MessageQueue: sender waiter list is full");
+        return 0;
+    }
+    q->senders[q->sender_count].slot = slot;
+    q->senders[q->sender_count].message = message;
+    q->senders[q->sender_count].jam = jam;
+    q->sender_count++;
+    return 1;
+}
+
+static void mq_compact_waiters(botw_hle_os_message_queue* q) {
+    int i = 0;
+    while (i < q->receiver_count) {
+        if (thread_waiting_on(q->receivers[i].slot,
+                              BOTW_GUEST_WAIT_MESSAGE_QUEUE_RECEIVE,
+                              q->index)) {
+            i++;
+        } else {
+            mq_receiver_remove_at(q, i);
+        }
+    }
+    i = 0;
+    while (i < q->sender_count) {
+        if (thread_waiting_on(q->senders[i].slot,
+                              BOTW_GUEST_WAIT_MESSAGE_QUEUE_SEND,
+                              q->index)) {
+            i++;
+        } else {
+            mq_sender_remove_at(q, i);
+        }
+    }
+}
+
+static int mq_insert(botw_hle_os_message_queue* q, uint64_t message, int jam) {
+    size_t ind;
+    if (!q || q->count >= q->capacity) return 0;
+    if (jam) {
+        ind = (q->offset + q->capacity - 1u) % q->capacity;
+        q->offset = ind;
+    } else {
+        ind = (q->offset + q->count) % q->capacity;
+    }
+    q->buffer[ind] = message;
+    q->count++;
+    return 1;
+}
+
+static int mq_remove(botw_hle_os_message_queue* q, uint64_t* out) {
+    if (!q || q->count == 0) return 0;
+    *out = q->buffer[q->offset];
+    q->offset = (q->offset + 1u) % q->capacity;
+    q->count--;
+    return 1;
+}
+
+static int mq_fill_senders(botw_hle_os_message_queue* q) {
+    int admitted = 0;
+    while (q->count < q->capacity && q->sender_count > 0) {
+        botw_hle_os_mq_sender sender = q->senders[0];
+        if (!thread_waiting_on(sender.slot, BOTW_GUEST_WAIT_MESSAGE_QUEUE_SEND,
+                               q->index)) {
+            mq_sender_remove_at(q, 0);
+            continue;
+        }
+        if (!mq_insert(q, sender.message, sender.jam)) break;
+        mq_sender_remove_at(q, 0);
+        (void)wake_sync_waiter(sender.slot, 0, 0);
+        admitted++;
+    }
+    return admitted;
+}
+
+static int mq_deliver_receivers(botw_hle_os_message_queue* q) {
+    int delivered = 0;
+    while (q->count > 0 && q->receiver_count > 0) {
+        botw_hle_os_mq_receiver receiver = q->receivers[0];
+        uint64_t message;
+        if (!thread_waiting_on(receiver.slot, BOTW_GUEST_WAIT_MESSAGE_QUEUE_RECEIVE,
+                               q->index)) {
+            mq_receiver_remove_at(q, 0);
+            continue;
+        }
+        if (!mq_remove(q, &message)) break;
+        mq_receiver_remove_at(q, 0);
+        if (receiver.out) *(uint64_t*)(uintptr_t)receiver.out = message;
+        (void)wake_sync_waiter(receiver.slot, 0, 0);
+        delivered++;
+    }
+    return delivered;
+}
+
+/* Admit blocked senders into freed slots, hand queued messages to blocked
+ * receivers, and repeat if one step makes the other possible. */
+static void mq_service(botw_hle_os_message_queue* q) {
+    int progress;
+    do {
+        progress = mq_fill_senders(q);
+        progress += mq_deliver_receivers(q);
+    } while (progress > 0);
+}
+
+static int mq_try_insert(botw_hle_os_message_queue* q, uint64_t message, int jam) {
+    if (!mq_insert(q, message, jam)) return 0;
+    mq_service(q);
+    return 1;
+}
+
+static int mq_try_remove(botw_hle_os_message_queue* q, uint64_t* out) {
+    if (!mq_remove(q, out)) return 0;
+    mq_service(q);
+    return 1;
+}
+
+static botw_hle_os_message_queue* mq_create(void* type, uint64_t* buffer,
+                                           size_t capacity, int* out_index) {
+    botw_hle_os_message_queue* q;
+    int existing = -1;
+    int i;
+    if (!g_os) return NULL;
+    if (!type) {
+        (void)os_error(g_os, "InitializeMessageQueue: null MessageQueueType");
+        return NULL;
+    }
+    if (!buffer) {
+        (void)os_error(g_os, "InitializeMessageQueue: null message buffer");
+        return NULL;
+    }
+    if (capacity == 0) {
+        (void)os_error(g_os, "InitializeMessageQueue: capacity must be positive");
+        return NULL;
+    }
+    if (capacity > (size_t)INT_MAX) {
+        (void)os_error(g_os, "InitializeMessageQueue: capacity %zu is too large",
+                       capacity);
+        return NULL;
+    }
+    q = mq_find(type, &existing);
+    if (q) {
+        mq_compact_waiters(q);
+        if (q->receiver_count != 0 || q->sender_count != 0) {
+            (void)os_error(g_os, "InitializeMessageQueue: object still has waiters");
+            return NULL;
+        }
+        memset(q, 0, sizeof *q);
+        q->index = existing;
+        if (out_index) *out_index = existing;
+    } else {
+        for (i = 0; i < (int)BOTW_HLE_OS_MAX_MESSAGE_QUEUE; i++) {
+            if (!g_os->message_queues[i].used) break;
+        }
+        if (i == (int)BOTW_HLE_OS_MAX_MESSAGE_QUEUE) {
+            (void)os_error(g_os, "InitializeMessageQueue: queue table is full");
+            return NULL;
+        }
+        q = &g_os->message_queues[i];
+        memset(q, 0, sizeof *q);
+        q->index = i;
+        if (out_index) *out_index = i;
+    }
+    q->used = 1;
+    q->type = type;
+    q->buffer = buffer;
+    q->capacity = capacity;
+    return q;
+}
+
+static botw_hle_os_message_queue* mq_begin(const char* op, const void* type,
+                                           int* out_index) {
+    botw_hle_os_message_queue* q;
+    if (!g_os) return NULL;
+    g_os->calls++;
+    q = mq_find(type, out_index);
+    if (!q) {
+        (void)os_error(g_os, "%s: MessageQueueType was not initialized", op);
+    }
+    return q;
+}
+
+static void os_InitializeMessageQueue(void* type, size_t* buffer, size_t capacity) {
+    if (!g_os) return;
+    g_os->calls++;
+    (void)mq_create(type, (uint64_t*)(uintptr_t)buffer, capacity, NULL);
+}
+
+static void os_FinalizeMessageQueue(void* type) {
+    botw_hle_os_message_queue* q;
+    if (!g_os) return;
+    g_os->calls++;
+    q = mq_find(type, NULL);
+    if (!q) return;
+    mq_compact_waiters(q);
+    if (q->receiver_count != 0 || q->sender_count != 0) {
+        (void)os_error(g_os, "FinalizeMessageQueue: object still has waiters");
+        return;
+    }
+    memset(q, 0, sizeof *q);
+}
+
+static int os_TrySendMessageQueue(void* type, size_t message) {
+    botw_hle_os_message_queue* q;
+    if (!g_os) return 0;
+    q = mq_begin("TrySendMessageQueue", type, NULL);
+    if (!q) return 0;
+    g_os->message_try_sends++;
+    return mq_try_insert(q, (uint64_t)message, 0);
+}
+
+static int os_TryReceiveMessageQueue(size_t* out, void* type) {
+    botw_hle_os_message_queue* q;
+    if (!g_os) return 0;
+    q = mq_begin("TryReceiveMessageQueue", type, NULL);
+    if (!q) return 0;
+    g_os->message_try_receives++;
+    if (!out) {
+        (void)os_error(g_os, "TryReceiveMessageQueue: null output pointer");
+        return 0;
+    }
+    return mq_try_remove(q, (uint64_t*)(uintptr_t)out);
+}
+
+static int os_TryPeekMessageQueue(size_t* out, const void* type) {
+    botw_hle_os_message_queue* q;
+    if (!g_os) return 0;
+    q = mq_begin("TryPeekMessageQueue", type, NULL);
+    if (!q) return 0;
+    g_os->message_peeks++;
+    if (!out) {
+        (void)os_error(g_os, "TryPeekMessageQueue: null output pointer");
+        return 0;
+    }
+    if (q->count == 0) return 0;
+    *(uint64_t*)(uintptr_t)out = q->buffer[q->offset];
+    return 1;
+}
+
 /* Called from the scheduler's timed-wake path.  The thread is still BLOCKED,
  * so its saved frame is the one the import wrapper will restore. */
 static void os_sync_timeout(void* user, int thread_slot, int wait_kind,
@@ -1267,6 +1589,37 @@ static void os_AcquireSemaphore_portable(void* type) {
     if (!s) return;
     if (!semaphore_acquire_now(s)) {
         (void)os_error(g_os, "AcquireSemaphore: would block on this host");
+    }
+}
+
+static void os_SendMessageQueue(void* type, size_t message) {
+    botw_hle_os_message_queue* q = mq_begin("SendMessageQueue", type, NULL);
+    if (!q) return;
+    g_os->message_sends++;
+    if (!mq_try_insert(q, (uint64_t)message, 0)) {
+        (void)os_error(g_os, "SendMessageQueue: would block on this host");
+    }
+}
+
+static void os_JamMessageQueue(void* type, size_t message) {
+    botw_hle_os_message_queue* q = mq_begin("JamMessageQueue", type, NULL);
+    if (!q) return;
+    g_os->message_jams++;
+    if (!mq_try_insert(q, (uint64_t)message, 1)) {
+        (void)os_error(g_os, "JamMessageQueue: would block on this host");
+    }
+}
+
+static void os_ReceiveMessageQueue(size_t* out, void* type) {
+    botw_hle_os_message_queue* q = mq_begin("ReceiveMessageQueue", type, NULL);
+    if (!q) return;
+    g_os->message_receives++;
+    if (!out) {
+        (void)os_error(g_os, "ReceiveMessageQueue: null output pointer");
+        return;
+    }
+    if (!mq_try_remove(q, (uint64_t*)(uintptr_t)out)) {
+        (void)os_error(g_os, "ReceiveMessageQueue: would block on this host");
     }
 }
 #endif
@@ -1483,6 +1836,79 @@ int botw_hle_os_blocking_call(botw_guest_regs* frame, unsigned op,
         *next_resume = next;
         return BOTW_HLE_OS_SWITCHED;
     }
+    case BOTW_HLE_OS_OP_SEND_MESSAGE_QUEUE:
+    case BOTW_HLE_OS_OP_JAM_MESSAGE_QUEUE: {
+        botw_hle_os_message_queue* q;
+        int index = -1;
+        int jam = op == BOTW_HLE_OS_OP_JAM_MESSAGE_QUEUE;
+        q = mq_begin(jam ? "JamMessageQueue" : "SendMessageQueue",
+                     (void*)(uintptr_t)arg0, &index);
+        if (!q) return BOTW_HLE_OS_RETURN;
+        if (jam) g_os->message_jams++;
+        else g_os->message_sends++;
+        if (mq_try_insert(q, arg1, jam)) return BOTW_HLE_OS_RETURN;
+        if (!run) {
+            (void)os_error(g_os, "%s: no guest run is attached",
+                           jam ? "JamMessageQueue" : "SendMessageQueue");
+            return BOTW_HLE_OS_RETURN;
+        }
+        if (!botw_guest_run_is_executing(run)) {
+            (void)os_error(g_os, "%s: would block without an executing run",
+                           jam ? "JamMessageQueue" : "SendMessageQueue");
+            return BOTW_HLE_OS_RETURN;
+        }
+        cur = current_slot(g_os);
+        if (!mq_sender_add(q, cur, arg1, jam)) return BOTW_HLE_OS_RETURN;
+        next = botw_guest_run_block_and_switch(run, frame,
+                                               BOTW_GUEST_WAIT_MESSAGE_QUEUE_SEND,
+                                               (uint64_t)(unsigned)index,
+                                               BOTW_GUEST_NO_DEADLINE);
+        if (!next) {
+            int pos = mq_sender_index(q, cur);
+            mq_sender_remove_at(q, pos);
+            return BOTW_HLE_OS_STOPPED;
+        }
+        if (jam) g_os->message_jam_blocks++;
+        else g_os->message_send_blocks++;
+        *next_resume = next;
+        return BOTW_HLE_OS_SWITCHED;
+    }
+    case BOTW_HLE_OS_OP_RECEIVE_MESSAGE_QUEUE: {
+        botw_hle_os_message_queue* q;
+        int index = -1;
+        q = mq_begin("ReceiveMessageQueue", (void*)(uintptr_t)arg1, &index);
+        if (!q) return BOTW_HLE_OS_RETURN;
+        g_os->message_receives++;
+        if (!arg0) {
+            (void)os_error(g_os, "ReceiveMessageQueue: null output pointer");
+            return BOTW_HLE_OS_RETURN;
+        }
+        if (mq_try_remove(q, (uint64_t*)(uintptr_t)arg0)) {
+            return BOTW_HLE_OS_RETURN;
+        }
+        if (!run) {
+            (void)os_error(g_os, "ReceiveMessageQueue: no guest run is attached");
+            return BOTW_HLE_OS_RETURN;
+        }
+        if (!botw_guest_run_is_executing(run)) {
+            (void)os_error(g_os, "ReceiveMessageQueue: would block without an executing run");
+            return BOTW_HLE_OS_RETURN;
+        }
+        cur = current_slot(g_os);
+        if (!mq_receiver_add(q, cur, arg0)) return BOTW_HLE_OS_RETURN;
+        next = botw_guest_run_block_and_switch(run, frame,
+                                               BOTW_GUEST_WAIT_MESSAGE_QUEUE_RECEIVE,
+                                               (uint64_t)(unsigned)index,
+                                               BOTW_GUEST_NO_DEADLINE);
+        if (!next) {
+            int pos = mq_receiver_index(q, cur);
+            mq_receiver_remove_at(q, pos);
+            return BOTW_HLE_OS_STOPPED;
+        }
+        g_os->message_receive_blocks++;
+        *next_resume = next;
+        return BOTW_HLE_OS_SWITCHED;
+    }
     case BOTW_HLE_OS_OP_ACQUIRE_SEMAPHORE: {
         botw_hle_os_semaphore* s;
         int index = -1;
@@ -1532,6 +1958,9 @@ int botw_hle_os_blocking_call(botw_guest_regs* frame, unsigned op,
 #  define OS_WAIT_LIGHT_EVENT_ENTRY ((void*)(uintptr_t)&botw_hle_os_guest_wait_light_event)
 #  define OS_TIMED_WAIT_LIGHT_EVENT_ENTRY ((void*)(uintptr_t)&botw_hle_os_guest_timed_wait_light_event)
 #  define OS_ACQUIRE_SEMAPHORE_ENTRY ((void*)(uintptr_t)&botw_hle_os_guest_acquire_semaphore)
+#  define OS_SEND_MESSAGE_QUEUE_ENTRY ((void*)(uintptr_t)&botw_hle_os_guest_send_message_queue)
+#  define OS_JAM_MESSAGE_QUEUE_ENTRY ((void*)(uintptr_t)&botw_hle_os_guest_jam_message_queue)
+#  define OS_RECEIVE_MESSAGE_QUEUE_ENTRY ((void*)(uintptr_t)&botw_hle_os_guest_receive_message_queue)
 #else
 #  define OS_SLEEP_ENTRY ((void*)(uintptr_t)&os_SleepThread)
 #  define OS_WAIT_THREAD_ENTRY ((void*)(uintptr_t)&os_WaitThread)
@@ -1540,6 +1969,9 @@ int botw_hle_os_blocking_call(botw_guest_regs* frame, unsigned op,
 #  define OS_WAIT_LIGHT_EVENT_ENTRY ((void*)(uintptr_t)&os_WaitLightEvent_portable)
 #  define OS_TIMED_WAIT_LIGHT_EVENT_ENTRY ((void*)(uintptr_t)&os_TimedWaitLightEvent_portable)
 #  define OS_ACQUIRE_SEMAPHORE_ENTRY ((void*)(uintptr_t)&os_AcquireSemaphore_portable)
+#  define OS_SEND_MESSAGE_QUEUE_ENTRY ((void*)(uintptr_t)&os_SendMessageQueue)
+#  define OS_JAM_MESSAGE_QUEUE_ENTRY ((void*)(uintptr_t)&os_JamMessageQueue)
+#  define OS_RECEIVE_MESSAGE_QUEUE_ENTRY ((void*)(uintptr_t)&os_ReceiveMessageQueue)
 #endif
 
 static const os_entry g_os_entries[BOTW_HLE_OS_COUNT] = {
@@ -1597,7 +2029,15 @@ static const os_entry g_os_entries[BOTW_HLE_OS_COUNT] = {
     { "_ZN2nn2os19TimedWaitLightEventEPNS0_14LightEventTypeENS_8TimeSpanE", OS_TIMED_WAIT_LIGHT_EVENT_ENTRY },
     { "_ZN2nn2os20InitializeLightEventEPNS0_14LightEventTypeEbNS0_14EventClearModeE", (void*)(uintptr_t)&os_InitializeLightEvent },
     { "_ZN2nn2os9LockMutexEPNS0_9MutexTypeE", OS_LOCK_MUTEX_ENTRY },
-    { "_ZN2nn2os9WaitEventEPNS0_9EventTypeE", OS_WAIT_EVENT_ENTRY }
+    { "_ZN2nn2os9WaitEventEPNS0_9EventTypeE", OS_WAIT_EVENT_ENTRY },
+    { "_ZN2nn2os20FinalizeMessageQueueEPNS0_16MessageQueueTypeE", (void*)(uintptr_t)&os_FinalizeMessageQueue },
+    { "_ZN2nn2os16SendMessageQueueEPNS0_16MessageQueueTypeEm", OS_SEND_MESSAGE_QUEUE_ENTRY },
+    { "_ZN2nn2os19TrySendMessageQueueEPNS0_16MessageQueueTypeEm", (void*)(uintptr_t)&os_TrySendMessageQueue },
+    { "_ZN2nn2os15JamMessageQueueEPNS0_16MessageQueueTypeEm", OS_JAM_MESSAGE_QUEUE_ENTRY },
+    { "_ZN2nn2os19ReceiveMessageQueueEPmPNS0_16MessageQueueTypeE", OS_RECEIVE_MESSAGE_QUEUE_ENTRY },
+    { "_ZN2nn2os22TryReceiveMessageQueueEPmPNS0_16MessageQueueTypeE", (void*)(uintptr_t)&os_TryReceiveMessageQueue },
+    { "_ZN2nn2os19TryPeekMessageQueueEPmPKNS0_16MessageQueueTypeE", (void*)(uintptr_t)&os_TryPeekMessageQueue },
+    { "_ZN2nn2os22InitializeMessageQueueEPNS0_16MessageQueueTypeEPmm", (void*)(uintptr_t)&os_InitializeMessageQueue }
 };
 
 int botw_hle_os_register(botw_hle_table* hle, botw_hle_os_state* state) {

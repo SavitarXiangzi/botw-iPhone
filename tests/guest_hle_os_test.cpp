@@ -1,16 +1,18 @@
-/* nn::os HLE: threads, TLS, virtual clock, sync objects and memory blocks.
+/* nn::os HLE: threads, TLS, virtual clock, sync objects, message queues and
+ * memory blocks.
  *
  * The registry test runs everywhere.  The run-dependent part maps real guest
  * worker stacks on POSIX hosts but never executes guest code; the actual
  * cooperative switch is covered by guest_thread_test on the arm64 runner.
  *
  * What this test proves:
- *   - all 55 names are claimed by name, not silently left on the stub;
+ *   - all 63 names are claimed by name, not silently left on the stub;
  *   - ThreadType handles map to run slots, start/ready/reap state changes in
  *     the run, and IDs are stable and distinct;
  *   - YieldThread/SleepThread set the run's switch request;
  *   - WaitThread only returns early for an already-DONE target;
- *   - TLS values are per current slot, and time/memory answers round-trip.
+ *   - TLS values are per current slot, and time/memory answers round-trip;
+ *   - MessageQueue FIFO peek/receive and LIFO jam ordering.
  */
 #include "guest_hle.h"
 #include "guest_hle_os.h"
@@ -80,6 +82,14 @@ static const char* const kOsNames[BOTW_HLE_OS_COUNT] = {
     "_ZN2nn2os20InitializeLightEventEPNS0_14LightEventTypeEbNS0_14EventClearModeE",
     "_ZN2nn2os9LockMutexEPNS0_9MutexTypeE",
     "_ZN2nn2os9WaitEventEPNS0_9EventTypeE",
+    "_ZN2nn2os22InitializeMessageQueueEPNS0_16MessageQueueTypeEPmm",
+    "_ZN2nn2os20FinalizeMessageQueueEPNS0_16MessageQueueTypeE",
+    "_ZN2nn2os16SendMessageQueueEPNS0_16MessageQueueTypeEm",
+    "_ZN2nn2os19TrySendMessageQueueEPNS0_16MessageQueueTypeEm",
+    "_ZN2nn2os15JamMessageQueueEPNS0_16MessageQueueTypeEm",
+    "_ZN2nn2os19ReceiveMessageQueueEPmPNS0_16MessageQueueTypeE",
+    "_ZN2nn2os22TryReceiveMessageQueueEPmPNS0_16MessageQueueTypeE",
+    "_ZN2nn2os19TryPeekMessageQueueEPmPKNS0_16MessageQueueTypeE",
 };
 
 static botw_hle_table g_hle;
@@ -277,6 +287,69 @@ int main() {
     CHECK(g_os.semaphore_acquires == 1);
     CHECK(g_os.semaphore_releases == 2);
 
+    /* Message queues use the caller's ring: FIFO send/receive, LIFO jam, and
+     * TryPeek without consuming.  Blocking handoff is covered by
+     * guest_message_queue_test on the AArch64 runner. */
+    uint64_t mq_obj[16] = {0};
+    size_t mq_buffer[4] = {0};
+    auto mq_init = lookup<void (*)(void*, size_t*, size_t)>(
+        "_ZN2nn2os22InitializeMessageQueueEPNS0_16MessageQueueTypeEPmm");
+    auto mq_fini = lookup<void (*)(void*)>(
+        "_ZN2nn2os20FinalizeMessageQueueEPNS0_16MessageQueueTypeE");
+    auto mq_try_send = lookup<int (*)(void*, size_t)>(
+        "_ZN2nn2os19TrySendMessageQueueEPNS0_16MessageQueueTypeEm");
+    auto mq_try_recv = lookup<int (*)(size_t*, void*)>(
+        "_ZN2nn2os22TryReceiveMessageQueueEPmPNS0_16MessageQueueTypeE");
+    auto mq_try_peek = lookup<int (*)(size_t*, const void*)>(
+        "_ZN2nn2os19TryPeekMessageQueueEPmPKNS0_16MessageQueueTypeE");
+    CHECK(mq_init != nullptr);
+    CHECK(mq_fini != nullptr);
+    CHECK(mq_try_send != nullptr);
+    CHECK(mq_try_recv != nullptr);
+    CHECK(mq_try_peek != nullptr);
+
+    mq_init(mq_obj, mq_buffer, 2);
+    CHECK(g_os.message_queues[0].used);
+    CHECK(g_os.message_queues[0].capacity == 2);
+    CHECK(mq_try_send(mq_obj, 0x11) == 1);
+    CHECK(mq_try_send(mq_obj, 0x22) == 1);
+    CHECK(mq_try_send(mq_obj, 0x33) == 0);
+    size_t mq_value = 0;
+    CHECK(mq_try_peek(&mq_value, mq_obj) == 1);
+    CHECK(mq_value == 0x11);
+    CHECK(mq_try_recv(&mq_value, mq_obj) == 1);
+    CHECK(mq_value == 0x11);
+    CHECK(mq_try_recv(&mq_value, mq_obj) == 1);
+    CHECK(mq_value == 0x22);
+    CHECK(mq_try_recv(&mq_value, mq_obj) == 0);
+    CHECK(mq_try_send(mq_obj, 0x33) == 1);
+
+#if !defined(__aarch64__)
+    /* JamMessageQueue is a blocking import on the real target, so this host
+     * only call is valid in the portable build. */
+    auto mq_jam = lookup<void (*)(void*, size_t)>(
+        "_ZN2nn2os15JamMessageQueueEPNS0_16MessageQueueTypeEm");
+    CHECK(mq_jam != nullptr);
+    mq_jam(mq_obj, 0x44);
+    CHECK(mq_try_peek(&mq_value, mq_obj) == 1);
+    CHECK(mq_value == 0x44);
+    CHECK(mq_try_recv(&mq_value, mq_obj) == 1);
+    CHECK(mq_value == 0x44);
+#endif
+
+    CHECK(mq_try_recv(&mq_value, mq_obj) == 1);
+    CHECK(mq_value == 0x33);
+    CHECK(g_os.message_queues[0].count == 0);
+    CHECK(g_os.message_queues[0].receiver_count == 0);
+    CHECK(g_os.message_queues[0].sender_count == 0);
+#if defined(__aarch64__)
+    CHECK(g_os.message_peeks == 1);
+#else
+    CHECK(g_os.message_peeks == 2);   /* the portable-only Jam check peeks too */
+#endif
+    mq_fini(mq_obj);
+    CHECK(!g_os.message_queues[0].used);
+
     /* Without a run, CreateThread must say no instead of inventing a slot. */
     uint64_t fake_type[8] = {0};
     CHECK(lookup<uint32_t (*)(void*, void (*)(void*), void*, void*, size_t, int)>(
@@ -378,7 +451,7 @@ int main() {
         return 1;
     }
     std::printf("guest_hle_os_test: ok (%u nn::os names, thread table, TLS, time, "
-                "memory blocks, sync objects)\n",
+                "memory blocks, sync objects, message queues)\n",
                 BOTW_HLE_OS_COUNT);
     return 0;
 }

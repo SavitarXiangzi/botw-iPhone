@@ -97,9 +97,9 @@ typedef enum {
 } botw_guest_thread_state;
 
 /* Why a BLOCKED thread is not runnable.  Thread exit wakes THREAD waiters;
- * the scheduler's virtual clock wakes timed waiters; a sync object's signal
- * operation wakes MUTEX/EVENT/LIGHT_EVENT/SEMAPHORE waiters.  wait_arg is the
- * object index for the sync kinds and the target slot for THREAD. */
+ * the scheduler's virtual clock wakes timed waiters; a sync object's signal,
+ * release or message handoff wakes the other waiters.  wait_arg is the object
+ * index for the sync kinds and the target slot for THREAD. */
 typedef enum {
     BOTW_GUEST_WAIT_NONE = 0,
     BOTW_GUEST_WAIT_THREAD,     /* wait_arg is the target thread slot */
@@ -107,7 +107,9 @@ typedef enum {
     BOTW_GUEST_WAIT_MUTEX,      /* wait_arg is a host-side mutex index */
     BOTW_GUEST_WAIT_EVENT,      /* wait_arg is a host-side event index */
     BOTW_GUEST_WAIT_LIGHT_EVENT,/* wait_arg is a host-side light-event index */
-    BOTW_GUEST_WAIT_SEMAPHORE   /* wait_arg is a host-side semaphore index */
+    BOTW_GUEST_WAIT_SEMAPHORE,  /* wait_arg is a host-side semaphore index */
+    BOTW_GUEST_WAIT_MESSAGE_QUEUE_SEND,   /* queue index; waiting for space */
+    BOTW_GUEST_WAIT_MESSAGE_QUEUE_RECEIVE /* queue index; waiting for data */
 } botw_guest_wait_kind;
 
 /* No deadline.  Timed waits store an absolute run-clock tick instead. */

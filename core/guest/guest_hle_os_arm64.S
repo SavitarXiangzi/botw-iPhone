@@ -126,6 +126,42 @@ HLE_SYM(botw_hle_os_guest_acquire_semaphore):
 #endif
 
     .p2align 2
+    .globl HLE_SYM(botw_hle_os_guest_send_message_queue)
+#if defined(__ELF__)
+    .type HLE_SYM(botw_hle_os_guest_send_message_queue), %function
+#endif
+HLE_SYM(botw_hle_os_guest_send_message_queue):
+    mov  x9, #8                       /* BOTW_HLE_OS_OP_SEND_MESSAGE_QUEUE */
+    b    .Lblocking_common
+#if defined(__ELF__)
+    .size HLE_SYM(botw_hle_os_guest_send_message_queue), . - HLE_SYM(botw_hle_os_guest_send_message_queue)
+#endif
+
+    .p2align 2
+    .globl HLE_SYM(botw_hle_os_guest_receive_message_queue)
+#if defined(__ELF__)
+    .type HLE_SYM(botw_hle_os_guest_receive_message_queue), %function
+#endif
+HLE_SYM(botw_hle_os_guest_receive_message_queue):
+    mov  x9, #9                       /* BOTW_HLE_OS_OP_RECEIVE_MESSAGE_QUEUE */
+    b    .Lblocking_common
+#if defined(__ELF__)
+    .size HLE_SYM(botw_hle_os_guest_receive_message_queue), . - HLE_SYM(botw_hle_os_guest_receive_message_queue)
+#endif
+
+    .p2align 2
+    .globl HLE_SYM(botw_hle_os_guest_jam_message_queue)
+#if defined(__ELF__)
+    .type HLE_SYM(botw_hle_os_guest_jam_message_queue), %function
+#endif
+HLE_SYM(botw_hle_os_guest_jam_message_queue):
+    mov  x9, #10                      /* BOTW_HLE_OS_OP_JAM_MESSAGE_QUEUE */
+    b    .Lblocking_common
+#if defined(__ELF__)
+    .size HLE_SYM(botw_hle_os_guest_jam_message_queue), . - HLE_SYM(botw_hle_os_guest_jam_message_queue)
+#endif
+
+    .p2align 2
 .Lblocking_common:
     sub  sp,  sp, #FR_ALLOC
     stp  x0,  x1,  [sp, #0]
