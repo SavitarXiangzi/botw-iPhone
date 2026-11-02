@@ -4,6 +4,7 @@
 #  define _CRT_SECURE_NO_WARNINGS
 #endif
 #include "guest_hle.h"
+#include "guest_hle_nn.h"
 
 #include <ctype.h>
 #include <math.h>
@@ -226,4 +227,9 @@ void botw_hle_init(botw_hle_table* hle) {
     if (!hle) return;
     memset(hle, 0, sizeof *hle);
     register_libc(hle);
+    /* nn::oe answers questions the game polls before its first frame; the
+     * zero-return stub would answer "handheld, American English, unfocused",
+     * which is a legal answer and therefore a silent one. */
+    (void)botw_hle_nn_register(hle, NULL);
 }
+
