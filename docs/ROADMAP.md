@@ -7901,3 +7901,92 @@ guest_hle_fs_test: ok (23 nn::fs names, sandboxed paths, handles, directories, e
    一起设计，不能一条条 HLE；
 3. `nn::audio` / `nn::nfp`：SoundSystem 与 amiibo，早期可以整段替身；
 4. rtld 双映射仍未做。
+
+## M4 续四十六：guest_run —— 真的进入客体
+
+### 1. 之前缺的是什么
+
+`guest_chain_test` 证明的是「一次 **调用** 能穿过门再回来」：它 `blr` 一个门块，
+门块把控制权交给蹦床。但它没有回答另外三个问题：
+
+1. 客体的 **sp** 在哪？用什么栈？
+2. 最外层函数 `ret` 的时候回到哪？
+3. 一个跨多条指令、会调用、会写内存的客体程序，能不能连续跑？
+
+`core/guest/guest_run.{h,c}` + `guest_run_arm64.S` 就是这三件事。
+
+### 2. 进入序列（x0 = 上下文）
+
+```text
+stp x29,x30,[sp,#-16]!  ; 压宿主 fp/lr
+stp x19..x28 -> ctx     ; 保存宿主被调用者保存寄存器
+ctx.host_sp = sp
+globals = ctx           ; 之后每个寄存器都属于客体了，只能靠全局找回上下文
+x0..x30 <- ctx.x[]      ; 初始寄存器（跳过 x18：Apple 保留它）
+sp = ctx.stack_top
+x30 = 哨兵              ; 客体最外层 ret 落到这里
+br  ctx.entry
+
+哨兵:
+   ctx.exit_x0 = x0; ctx.exit_sp = sp
+   x19..x28 <- ctx; sp = ctx.host_sp
+   ldp x29,x30,[sp],#16; ret
+```
+
+由此 `botw_guest_run_enter()` 对调用者就是一个普通 C 函数调用。
+
+### 3. 栈与守卫页
+
+`botw_guest_run_init()` 用 `mmap` 映射 `可用大小 + 1 页`，把 **最低那一页**
+`mprotect` 成 `PROT_NONE`。栈向下增长，所以溢出会立刻撞在守卫页上触发
+fault，而不是安静地吃掉宿主内存。默认可用 64 KiB；真机上一个客体线程
+需要多大栈由调用方决定。
+
+### 4. 门的分发
+
+`botw_guest_run_enter()` 在进入前安装一个计数用的 dispatcher，并把它之前
+的 handler 记下来，退出时原样恢复。用户回调拿到 `botw_guest_regs*`，
+写 `regs->x[]` 就是给这次调用作答。
+
+### 5. 实测
+
+`tests/guest_run_probe_arm64.S` 是一段 **真的会被执行的 AArch64 客体程序**：
+
+```asm
+stp x29,x30,[sp,#-48]!      ; 用宿主给的客体栈建帧
+mov x19,x0 / x20,x1 / x21,x2
+loop 3 次: ldr/add/str      ; 通过内存计数
+blr x20                     ; 穿过门块 -> 蹦床 -> dispatcher
+str x0,[x19,#8]             ; 存 dispatcher 写回的答案
+ldp x29,x30,[sp],#48
+ret                         ; 落到哨兵
+```
+
+macOS arm64 runner 上的断言：
+
+* `reason == RETURNED`、`exit_sp == stack_top`（帧平衡）、`exit_x0 == 0xdead0001`；
+* 计数器 = 3、`counter[1]` = dispatcher 的返回值；
+* `gates == 1`，且 dispatcher 看到的 `x0` 是入口设的 `0x1234`；
+* 同一个 run 再进一次：计数到 6、handler 计数归零后重新计 1；
+* 结束后全局 handler 被恢复成 `nullptr`；
+* 入口越界 `enter(…, file_len)` 在**一条指令都没跑**之前就被拒绝。
+
+x86 主机上整个测试跳过（入口序列是 AArch64 汇编），但 `guest_run.c`
+仍然编译、链接，`run_init()` 会明确报「needs POSIX mmap / AArch64」。
+
+### 6. 仍然不成立
+
+* **这仍然不是《旷野之息》在跑。** 被执行的是手写的客体程序 + 手写的门块；
+  真实 `main.patched.bin` 的入口从未被调用过。
+* 没有步数预算、没有信号处理：客体死循环或跳到未映射地址会带走整个进程。
+  需要诊断时应当在子进程里跑，把信号当结论。
+* 一次只能有一个 run（宿主寄存器存在单个全局里）；不支持嵌套。
+* `x9/x10/x11` 在入口是暂存寄存器（AAPCS64 临时寄存器），`ctx.x[9..11]`
+  不会生效。
+* 没有抢占式调度：客体线程切换还没接。
+
+### 7. 下一步
+
+1. 把 `nn::os` 的线程原语接到这个 run 上（栈、切上下文、时片）；
+2. 或者先做 `nn::hid`，让输入闭环；
+3. rtld 双映射仍未做。

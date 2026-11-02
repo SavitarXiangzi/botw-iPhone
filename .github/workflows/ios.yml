@@ -72,6 +72,7 @@ jobs:
           clang -std=c11 -Wall -Wextra -Werror $INC -c core/guest/guest_gate.c -o /tmp/guest_gate.o
           clang -std=c11 -Wall -Wextra -Werror $INC -c core/guest/guest_segments.c -o /tmp/guest_segments.o
           clang -std=c11 -Wall -Wextra -Werror $INC -c core/guest/guest_map.c -o /tmp/guest_map.o
+          clang -std=c11 -Wall -Wextra -Werror $INC -c core/guest/guest_run.c -o /tmp/guest_run.o
           clang -std=c11 -Wall -Wextra -Werror $INC -c core/guest/guest_hle.c -o /tmp/guest_hle.o
           clang -std=c11 -Wall -Wextra -Werror $INC -c core/guest/guest_hle_nn.c -o /tmp/guest_hle_nn.o
           clang -std=c11 -Wall -Wextra -Werror $INC -c core/guest/guest_hle_fs.c -o /tmp/guest_hle_fs.o
@@ -119,6 +120,13 @@ jobs:
             /tmp/guest_gate.o /tmp/guest_image.o /tmp/guest_segments.o \
             /tmp/guest_map.o /tmp/guest_slot.o -o /tmp/guest_chain_test
           /tmp/guest_chain_test
+          # Entry, a real guest function on the mapped stack, and the exit
+          # sentinel back into the host.  Skips itself off AArch64.
+          clang++ $FLAGS $INC tests/guest_run_test.cpp \
+            core/guest/guest_run_arm64.S tests/guest_run_probe_arm64.S \
+            /tmp/guest_run.o /tmp/guest_gate.o /tmp/guest_image.o \
+            /tmp/guest_segments.o /tmp/guest_map.o /tmp/guest_slot.o -o /tmp/guest_run_test
+          /tmp/guest_run_test
           # HLE registry: implementations, shared stubs, full-table refusal.
           clang++ $FLAGS $INC tests/guest_hle_test.cpp $HLE -o /tmp/guest_hle_test -lm
           /tmp/guest_hle_test
@@ -224,6 +232,8 @@ jobs:
           HLE="/tmp/guest_hle.o /tmp/guest_hle_nn.o /tmp/guest_hle_fs.o"
           xcrun clang -std=c11 -Wall -Wextra -Werror -O2 -I core/guest \
             -c core/guest/guest_map.c -o /tmp/guest_map.o
+          xcrun clang -std=c11 -Wall -Wextra -Werror -O2 -I core/guest \
+            -c core/guest/guest_run.c -o /tmp/guest_run.o
           xcrun clang++ -std=c++20 -Wall -Wextra -Werror -O2 -I core/guest \
             tests/guest_map_test.cpp \
             /tmp/guest_image.o /tmp/guest_segments.o /tmp/guest_map.o /tmp/guest_slot.o \
@@ -238,6 +248,14 @@ jobs:
             /tmp/guest_gate_entry.o /tmp/guest_image.o /tmp/guest_segments.o \
             /tmp/guest_map.o /tmp/guest_slot.o -o /tmp/guest_chain_test
           /tmp/guest_chain_test
+          # A guest program entered for real: guest stack, guard page, gate
+          # dispatch and the exit sentinel, all on the arm64 runner.
+          xcrun clang++ -std=c++20 -Wall -Wextra -Werror -O2 -I core/guest \
+            tests/guest_run_test.cpp \
+            core/guest/guest_run_arm64.S tests/guest_run_probe_arm64.S \
+            /tmp/guest_run.o /tmp/guest_gate.o /tmp/guest_image.o \
+            /tmp/guest_segments.o /tmp/guest_map.o /tmp/guest_slot.o -o /tmp/guest_run_test
+          /tmp/guest_run_test
           # The HLE stub returns 0 in x0 on the real arm64 target.
           xcrun clang++ -std=c++20 -Wall -Wextra -Werror -O2 -I core/guest \
             tests/guest_hle_test.cpp $HLE -o /tmp/guest_hle_test -lm
