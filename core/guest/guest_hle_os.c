@@ -365,12 +365,17 @@ static int wait_prepare(void* type, int* out_slot) {
     int cur;
     if (!g_os) return 0;
     g_os->calls++;
+    g_os->last_wait_type = (uint64_t)(uintptr_t)type;
     t = thread_by_type(g_os, type);
+    g_os->last_wait_used = t ? 1 : 0;
     if (!t || !g_os->run) {
         g_os->wait_unknown++;
         return 0;
     }
+    g_os->last_wait_slot = t->slot;
+    g_os->last_wait_state = g_os->run->threads[t->slot].state;
     cur = current_slot(g_os);
+    g_os->last_wait_current = cur;
     if (t->slot == cur) {
         g_os->wait_self++;
         return 0;
@@ -570,8 +575,13 @@ int botw_hle_os_blocking_call(botw_guest_regs* frame, unsigned op,
 
     if (!frame || !next_resume) return BOTW_HLE_OS_STOPPED;
     *next_resume = NULL;
+    if (!g_os) {
+        frame->x[0] = 0;
+        return BOTW_HLE_OS_RETURN;
+    }
+    g_os->last_block_op = op;
+    g_os->last_block_arg = frame->x[0];
     frame->x[0] = 0;
-    if (!g_os) return BOTW_HLE_OS_RETURN;
     run = g_os->run;
 
     switch (op) {

@@ -55,9 +55,11 @@ BLOCK_SYM(botw_guest_block_main_entry):
     blr  x20                    /* BLOCKED until the worker returns */
     mov  x9, #1
     str  x9, [x19, #8]
+    str  x24, [x19, #56]        /* counter[7]: x24 after WaitThread */
 
     blr  x22                    /* tick before sleep */
     str  x0, [x19, #24]
+    str  x24, [x19, #64]        /* counter[8]: x24 after GetSystemTick */
     mov  x0, x24
     blr  x21                    /* BLOCKED until the virtual deadline */
     blr  x22                    /* tick after sleep */
