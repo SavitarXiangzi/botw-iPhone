@@ -203,7 +203,7 @@ int main() {
         alignas(64) unsigned char slot_mem[BOTW_GUEST_SLOT_MIN * 2];
         botw_guest_slot slot;
         uint64_t handler = 0;
-        const uint64_t* keys = (const uint64_t*)((const unsigned char*)map.base + kKeyOff);
+        uint64_t* keys = (uint64_t*)(void*)((unsigned char*)map.base + kKeyOff);
         CHECK(botw_guest_slot_init(&slot, slot_mem, sizeof slot_mem,
                                    (void*)(uintptr_t)0x12345678u) == 0);
         CHECK(botw_guest_map_publish_slot(&map, &img, &slot) == 0);
