@@ -37,6 +37,20 @@
 | `nn::lm::Initialize` / `Finalize` | 日志库依赖 `lm` 服务，无 IPC 时构造失败 |
 | `OsResourceManager` 构造 | 依赖 `svcGetInfo(12/13)` 的地址空间基址/大小 |
 
+## nn::os 直调 HLE 的调度边界
+
+`nn::os::YieldThread` / `SleepThread` / `WaitThread` 是**重定位到宿主 C 函数**
+的直调导入，不是 gate。宿主函数返回时，客体还在原来的指令流上；因此
+`guest_hle_os.c` 只能置 `botw_guest_run_yield()` 的 `switch_requested`，
+真正的帧切换发生在下一个 gate。`SleepThread` 目前记录 deadline 后同样只
+请求让出，`WaitThread` 对活目标也只请求让出一次；不要把这三者当成真正的
+阻塞/唤醒。
+
+要越过这个边界，需要在 gate 分发处按 `gates.tsv` 的返回点识别等待原语，
+或在导入外包一层汇编入口，在 C 函数返回前保存客体帧并把当前线程置
+`BLOCKED`。在这之前，同步对象（mutex/event/semaphore/queue）不应假装
+自己已经互斥或已经唤醒。
+
 ## 已知技术债
 
 * **页别名**：Fiber 真正跑起来时需要（复制 + 回写，或自建页表）。当前是“假装成功”。

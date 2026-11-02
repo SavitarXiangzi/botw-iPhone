@@ -255,6 +255,11 @@ int botw_guest_run_thread_create(botw_guest_run* run, const void* entry,
         run_error(run, "run_init() has not mapped a guest stack");
         return -1;
     }
+    if (stack_bytes > BOTW_GUEST_THREAD_STACK_MAX) {
+        run_error(run, "thread stack of %zu bytes exceeds the %u-byte limit",
+                  stack_bytes, (unsigned)BOTW_GUEST_THREAD_STACK_MAX);
+        return -1;
+    }
     for (i = 1; i < BOTW_GUEST_MAX_THREADS; i++) {
         if (run->threads[i].state == BOTW_GUEST_THREAD_FREE) break;
     }
@@ -307,6 +312,29 @@ int botw_guest_run_thread_start(botw_guest_run* run, int id) {
         return -1;
     }
     run->threads[id].state = BOTW_GUEST_THREAD_READY;
+    return 0;
+}
+
+int botw_guest_run_thread_reap(botw_guest_run* run, int id) {
+    botw_guest_thread* t;
+
+    if (!run || id <= 0 || id >= BOTW_GUEST_MAX_THREADS) {
+        if (run) run_error(run, "thread id %d cannot be reaped", id);
+        return -1;
+    }
+    t = &run->threads[id];
+    if (t->state != BOTW_GUEST_THREAD_DONE &&
+        t->state != BOTW_GUEST_THREAD_CREATED &&
+        t->state != BOTW_GUEST_THREAD_FREE) {
+        run_error(run, "thread %d is still live (state %d)", id, t->state);
+        return -1;
+    }
+#if !defined(_WIN32)
+    if (t->stack && t->stack != run->stack && t->stack_bytes) {
+        munmap(t->stack, t->stack_bytes);
+    }
+#endif
+    memset(t, 0, sizeof *t);
     return 0;
 }
 

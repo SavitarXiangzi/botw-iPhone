@@ -27,7 +27,8 @@ retail NSO  --rewrite_botw.py-->  patched.bin + fixups/gates/sites
 - [x] 页级保护计划（`guest_segments.c`）：真实四模块 5/5/5/4 段；rtld 在 16 KiB 页上 rwx 冲突，如实报告
 - [x] `guest_run`：独立客体栈 + 守卫页 + 入口/退出哨兵；合成客体在 macOS arm64 CI 真正执行
 - [x] 协作式客体线程（`guest_thread_test`）：独立栈、272 字节帧保存/恢复、轮转切换、线程退出；三线程在 arm64 CI 通过
-- [ ] `nn::os` 线程/同步原语接到线程表（CreateThread / StartThread / ExitThread / WaitSynchronization）
+- [x] `nn::os` 线程表 / TLS / 虚拟时钟 / 内存块（33/78；CreateThread / StartThread / WaitThread / DestroyThread）
+- [ ] `nn::os` 同步原语（mutex / event / light event / semaphore / message queue / multi-wait）与真正的 BLOCKED 唤醒
 - [ ] HLE 服务层（init / fs / vi / nv / NVN bootstrap）
 - [ ] 把 NVN 调用桥到 `ios/nvn` 的 Metal 后端
 - [ ] 在 iOS 模拟器/真机执行第一条客体指令
@@ -43,7 +44,7 @@ python scripts/guest/rewrite_botw.py --nso-dir <ExeFS/update> --out build/guest
 python scripts/guest/verify_rewrite.py build/guest main
 python scripts/guest/probe_relocs.py build/guest/main.patched.bin --fixups build/guest/main.fixups.tsv
 # 有 MSVC 时：把真实镜像完整装载一遍（只读，不执行客体代码）
-cl /std:c++20 /I core\guest scripts/guest/reloc_run.cpp core/guest/guest_image.c core/guest/guest_slot.c core/guest/guest_segments.c core/guest/guest_hle.c core/guest/guest_hle_nn.c core/guest/guest_hle_fs.c /Fe:build\reloc_run.exe
+cl /std:c++20 /I core\guest scripts/guest/reloc_run.cpp core/guest/guest_image.c core/guest/guest_slot.c core/guest/guest_segments.c core/guest/guest_run.c core/guest/guest_hle.c core/guest/guest_hle_nn.c core/guest/guest_hle_fs.c core/guest/guest_hle_os.c /Fe:build\reloc_run.exe
 build\reloc_run.exe build/guest/main.patched.bin build/guest/main.fixups.tsv
 # --slot: 把合成槽发布进真实镜像的 key page 并核对四个索引（不执行客体代码）
 build\reloc_run.exe build/guest/main.patched.bin build/guest/main.fixups.tsv 0x4000 --slot

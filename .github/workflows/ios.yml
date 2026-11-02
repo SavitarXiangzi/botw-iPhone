@@ -76,7 +76,9 @@ jobs:
           clang -std=c11 -Wall -Wextra -Werror $INC -c core/guest/guest_hle.c -o /tmp/guest_hle.o
           clang -std=c11 -Wall -Wextra -Werror $INC -c core/guest/guest_hle_nn.c -o /tmp/guest_hle_nn.o
           clang -std=c11 -Wall -Wextra -Werror $INC -c core/guest/guest_hle_fs.c -o /tmp/guest_hle_fs.o
-          HLE="/tmp/guest_hle.o /tmp/guest_hle_nn.o /tmp/guest_hle_fs.o"
+          clang -std=c11 -Wall -Wextra -Werror $INC -c core/guest/guest_hle_os.c -o /tmp/guest_hle_os.o
+          HLE="/tmp/guest_hle.o /tmp/guest_hle_nn.o /tmp/guest_hle_fs.o /tmp/guest_hle_os.o /tmp/guest_run.o /tmp/guest_gate.o"
+          HLE_OS="/tmp/guest_hle.o /tmp/guest_hle_nn.o /tmp/guest_hle_fs.o /tmp/guest_hle_os.o"
           LIB="/tmp/guest_image.o ios/nvn/src/nvn_dispatch.cpp ios/nvn/src/nvn_null.cpp core/src/botw_core.cpp /tmp/nvn_texture.o /tmp/nvn_shader.o /tmp/nvn_shader_key.o /tmp/nvn_shader_bundle.o /tmp/nvn_shader_blobs.o /tmp/nvn_vertex.o /tmp/nvn_sampler.o /tmp/nvn_pool.o /tmp/nvn_texlayout.o /tmp/nvn_bcn.o /tmp/nvn_pipeline.o /tmp/nvn_state.o"
           clang++ $FLAGS $INC tests/nvn_abi_test.cpp      $LIB -o /tmp/nvn_abi_test
           clang++ $FLAGS $INC tests/core_smoke_test.cpp   $LIB -o /tmp/core_smoke_test
@@ -135,7 +137,7 @@ jobs:
             core/guest/guest_gate_arm64.S core/guest/guest_run_arm64.S \
             tests/guest_thread_probe_arm64.S \
             /tmp/guest_run.o /tmp/guest_gate.o /tmp/guest_image.o \
-            /tmp/guest_segments.o /tmp/guest_map.o /tmp/guest_slot.o -o /tmp/guest_thread_test
+            /tmp/guest_segments.o /tmp/guest_map.o /tmp/guest_slot.o $HLE_OS -o /tmp/guest_thread_test
           /tmp/guest_thread_test
           # HLE registry: implementations, shared stubs, full-table refusal.
           clang++ $FLAGS $INC tests/guest_hle_test.cpp $HLE -o /tmp/guest_hle_test -lm
@@ -145,7 +147,9 @@ jobs:
           /tmp/guest_hle_nn_test
           # nn::fs: a real directory tree under the sandbox root.
           clang++ $FLAGS $INC tests/guest_hle_fs_test.cpp $HLE -o /tmp/guest_hle_fs_test -lm
+          clang++ $FLAGS $INC tests/guest_hle_os_test.cpp $HLE -o /tmp/guest_hle_os_test -lm
           /tmp/guest_hle_fs_test
+          /tmp/guest_hle_os_test
           # Host-only loader probe: built everywhere, needs a real image to run.
           clang++ $FLAGS $INC scripts/guest/reloc_run.cpp /tmp/guest_image.o /tmp/guest_slot.o /tmp/guest_segments.o $HLE -o /tmp/reloc_run -lm
           if /tmp/reloc_run; then
@@ -243,7 +247,10 @@ jobs:
             -c core/guest/guest_hle_nn.c -o /tmp/guest_hle_nn.o
           xcrun clang -std=c11 -Wall -Wextra -Werror -O2 -I core/guest \
             -c core/guest/guest_hle_fs.c -o /tmp/guest_hle_fs.o
-          HLE="/tmp/guest_hle.o /tmp/guest_hle_nn.o /tmp/guest_hle_fs.o"
+          xcrun clang -std=c11 -Wall -Wextra -Werror -O2 -I core/guest \
+            -c core/guest/guest_hle_os.c -o /tmp/guest_hle_os.o
+          HLE="/tmp/guest_hle.o /tmp/guest_hle_nn.o /tmp/guest_hle_fs.o /tmp/guest_hle_os.o /tmp/guest_run.o /tmp/guest_gate_entry.o core/guest/guest_run_arm64.S"
+          HLE_OS="/tmp/guest_hle.o /tmp/guest_hle_nn.o /tmp/guest_hle_fs.o /tmp/guest_hle_os.o"
           xcrun clang -std=c11 -Wall -Wextra -Werror -O2 -I core/guest \
             -c core/guest/guest_map.c -o /tmp/guest_map.o
           xcrun clang -std=c11 -Wall -Wextra -Werror -O2 -I core/guest \
@@ -271,15 +278,15 @@ jobs:
             /tmp/guest_run.o /tmp/guest_gate_entry.o /tmp/guest_image.o \
             /tmp/guest_segments.o /tmp/guest_map.o /tmp/guest_slot.o -o /tmp/guest_run_test
           /tmp/guest_run_test
-          # Three guest threads, each on its own mapped stack, yielding at a
-          # real gate block.  This is the scheduler, not a host thread pool:
+          # Three guest threads, each on its own mapped stack.  Every thread
+          # calls the nn::os::YieldThread HLE import before a real gate block;
           # the arm64 runner must see the round-robin order and the exits.
           xcrun clang++ -std=c++20 -Wall -Wextra -Werror -O2 -I core/guest \
             tests/guest_thread_test.cpp \
             core/guest/guest_gate_arm64.S core/guest/guest_run_arm64.S \
             tests/guest_thread_probe_arm64.S \
             /tmp/guest_run.o /tmp/guest_gate_entry.o /tmp/guest_image.o \
-            /tmp/guest_segments.o /tmp/guest_map.o /tmp/guest_slot.o -o /tmp/guest_thread_test
+            /tmp/guest_segments.o /tmp/guest_map.o /tmp/guest_slot.o $HLE_OS -o /tmp/guest_thread_test
           /tmp/guest_thread_test
           # The HLE stub returns 0 in x0 on the real arm64 target.
           xcrun clang++ -std=c++20 -Wall -Wextra -Werror -O2 -I core/guest \
@@ -290,7 +297,10 @@ jobs:
           /tmp/guest_hle_nn_test
           xcrun clang++ -std=c++20 -Wall -Wextra -Werror -O2 -I core/guest \
             tests/guest_hle_fs_test.cpp $HLE -o /tmp/guest_hle_fs_test -lm
+          xcrun clang++ -std=c++20 -Wall -Wextra -Werror -O2 -I core/guest \
+            tests/guest_hle_os_test.cpp $HLE -o /tmp/guest_hle_os_test -lm
           /tmp/guest_hle_fs_test
+          /tmp/guest_hle_os_test
 
       - name: Verify generated project parses
         working-directory: ios

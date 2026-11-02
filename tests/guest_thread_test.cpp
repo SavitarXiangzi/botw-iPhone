@@ -1,9 +1,10 @@
 /* Cooperative guest threads: two extra threads, three stacks, one scheduler.
  *
  * The image and gate block are synthetic, but the code that runs is real
- * AArch64: each thread calls the gate block, the host callback yields, and
- * the trampoline resumes a different thread's saved frame on its own stack.
- * The thread bodies are the same assembly probe called three times.
+ * AArch64.  Each thread calls the nn::os::YieldThread HLE import, then the
+ * gate block; the yield request is honoured at the gate and the trampoline
+ * resumes a different thread's saved frame on its own stack.  The thread
+ * bodies are the same assembly probe called three times.
  *
  * On x86 the whole test skips: the entry and switch sequences are AArch64.
  */
@@ -25,6 +26,9 @@ int main() {
 }
 
 #else
+
+#include "guest_hle.h"
+#include "guest_hle_os.h"
 
 #include <unistd.h>
 
@@ -92,19 +96,21 @@ struct probe_args {
     uint64_t  id;
     uint64_t  iterations;
     void*     block;
+    void*     yield_fn;     /* nn::os::YieldThread import */
 };
 
 struct gate_ctx {
-    botw_guest_run* run;
     std::vector<uint64_t>* ids;
     unsigned long* calls;
 };
+
+typedef uint32_t (*os_create7_fn)(void*, void (*)(void*), void*, void*, size_t, int, int);
+typedef void (*os_start_fn)(void*);
 
 static void gate_cb(void* user, botw_guest_regs* regs) {
     gate_ctx* c = (gate_ctx*)user;
     c->ids->push_back(regs->x[0]);
     (*c->calls)++;
-    botw_guest_run_yield(c->run);
 }
 
 static bool inside(const botw_guest_thread& t, uint64_t sp) {
@@ -124,6 +130,10 @@ int main() {
     uint64_t main_counter[3] = {0, 0, 0};
     uint64_t a_counter[3] = {0, 0, 0};
     uint64_t b_counter[3] = {0, 0, 0};
+    uint64_t type_a[64] = {0};
+    uint64_t type_b[64] = {0};
+    botw_hle_table hle;
+    botw_hle_os_state os;
     std::vector<uint64_t> ids;
     unsigned long calls = 0;
     int a, b, i;
@@ -153,31 +163,45 @@ int main() {
     CHECK(botw_guest_run_thread_start(&run, 0) == -1);
     CHECK(botw_guest_run_thread_create(&run, nullptr, 0, 0) == -1);
 
-    probe_args a_args = { a_counter, 1, 2, block };
-    probe_args b_args = { b_counter, 2, 2, block };
-    a = botw_guest_run_thread_create(&run,
-            (const void*)&botw_guest_thread_probe_entry,
-            (uint64_t)(uintptr_t)&a_args, 0x8000);
-    b = botw_guest_run_thread_create(&run,
-            (const void*)&botw_guest_thread_probe_entry,
-            (uint64_t)(uintptr_t)&b_args, 0x8000);
-    CHECK(a == 1);
-    CHECK(b == 2);
+    botw_hle_init(&hle);
+    CHECK(hle.error[0] == '\0');
+    botw_hle_os_reset(&os);
+    CHECK(botw_hle_os_register(&hle, &os) == 0);
+    botw_hle_os_attach_run(&os, &run);
+    void* yield_fn = botw_hle_lookup(&hle, "_ZN2nn2os11YieldThreadEv");
+    CHECK(yield_fn != nullptr);
+
+    probe_args a_args = { a_counter, 1, 2, block, yield_fn };
+    probe_args b_args = { b_counter, 2, 2, block, yield_fn };
+    os_create7_fn create = (os_create7_fn)botw_hle_lookup(
+        &hle, "_ZN2nn2os12CreateThreadEPNS0_10ThreadTypeEPFvPvES3_S3_mii");
+    os_start_fn start = (os_start_fn)botw_hle_lookup(
+        &hle, "_ZN2nn2os11StartThreadEPNS0_10ThreadTypeE");
+    CHECK(create != nullptr);
+    CHECK(start != nullptr);
+    CHECK(create(type_a, &botw_guest_thread_probe_entry, &a_args, nullptr, 0x8000, 0x20, 0) == 0);
+    CHECK(create(type_b, &botw_guest_thread_probe_entry, &b_args, nullptr, 0x8000, 0x20, 0) == 0);
+    CHECK(os.thread_creates == 2);
+    CHECK(os.threads[1].used);
+    CHECK(os.threads[2].used);
+    a = 1;
+    b = 2;
     CHECK(run.thread_count == 3);
     CHECK(run.threads[a].state == BOTW_GUEST_THREAD_CREATED);
     CHECK(run.threads[b].state == BOTW_GUEST_THREAD_CREATED);
     CHECK(run.threads[a].stack != run.threads[b].stack);
     CHECK(run.threads[a].stack != run.stack);
     CHECK(run.threads[a].guard_bytes == page);
-    CHECK(botw_guest_run_thread_start(&run, a) == 0);
-    CHECK(botw_guest_run_thread_start(&run, b) == 0);
+    start(type_a);
+    start(type_b);
+    CHECK(os.thread_starts == 2);
     CHECK(run.threads[a].state == BOTW_GUEST_THREAD_READY);
     CHECK(run.threads[b].state == BOTW_GUEST_THREAD_READY);
 
-    gate_ctx gc = { &run, &ids, &calls };
+    gate_ctx gc = { &ids, &calls };
     botw_guest_run_set_gate(&run, gate_cb, &gc);
 
-    probe_args main_args = { main_counter, 0, 4, block };
+    probe_args main_args = { main_counter, 0, 4, block, yield_fn };
     run.args[0] = (uint64_t)(uintptr_t)&main_args;
     CHECK(botw_guest_run_enter_at(&run, (const void*)&botw_guest_thread_probe_entry) == 0);
 
@@ -198,6 +222,7 @@ int main() {
     CHECK(run.threads[0].yields == 4);
     CHECK(run.threads[a].yields == 2);
     CHECK(run.threads[b].yields == 2);
+    CHECK(os.yields == 8);
     CHECK(run.current == -1);
 
     const uint64_t expected[8] = {0, 1, 2, 0, 1, 2, 0, 0};
@@ -214,6 +239,7 @@ int main() {
     CHECK(b_counter[2] % 16 == 0);
 
     CHECK(botw_guest_gate_get_handler() == nullptr);
+    botw_hle_os_attach_run(&os, nullptr);
 
     botw_guest_run_close(&run);
     CHECK(run.stack == nullptr);

@@ -8108,3 +8108,71 @@ x86 的 portable job 仍会编译 C 调度器、汇编两份 `.S`（Apple 目标
 2. 在 gate 上做时间片：连续运行超过 N 个 gate 或 N 次 tick 就强制
    `switch_requested`，给“不主动 yield”的线程留出轮转机会；
 3. 之后才是 `nn::hid` 输入闭环与真实 `main` 的入口调用。
+
+## M4 续四十八：nn::os 线程层
+
+### 1. 这一轮接了什么
+
+`core/guest/guest_hle_os.{h,c}` 接管 1.6.0 `main` 的 33 个 `nn::os` 导入：
+
+| 组 | 入口 |
+|---|---|
+| 线程 | `CreateThread` ×2、`StartThread`、`WaitThread`、`DestroyThread` |
+| 查询 | `GetCurrentThread`、`GetThreadId`、名称两套、优先级、核掩码、栈信息、fiber、host argc/argv |
+| 调度 | `YieldThread`、`SleepThread` |
+| TLS | `AllocateTlsSlot`、`FreeTlsSlot`、`GetTlsValue`、`SetTlsValue` |
+| 时间 | `GetSystemTick`、`GetSystemTickFrequency`、`ConvertToTick`、`ConvertToTimeSpan` |
+| 内存 | `AllocateMemoryBlock`、`FreeMemoryBlock`、`SetMemoryHeapSize` |
+
+`ThreadType*` 只作为不透明的 guest 句柄；HLE 不往游戏自己的对象里写字段。
+主线程没有这样的对象，因此 `GetCurrentThread()` 返回 state 内一块 0x200
+字节的 identity token。
+
+`CreateThread` 用 `botw_guest_run_thread_create()` 分配私有客体栈（含
+`PROT_NONE` 守卫页）。游戏传入的 `stack` 指针和大小被记录在状态里，但
+**没有拿来当执行栈**：宿主需要自己拥有并证明守卫页，当前也不具备把任意
+guest 堆指针安全改成栈映射的页表。`DestroyThread` 走新增的
+`botw_guest_run_thread_reap()`，允许回收 DONE 或从未启动的 CREATED 线程。
+
+### 2. 调度语义仍然受“导入是直调”限制
+
+改写器把 `svc` 和自旋回边变成 gate，但 `nn::os::*` 是被重定位到宿主 C
+函数的**直调**导入。因此：
+
+```
+guest: blr <YieldThread>
+host:  os_YieldThread() -> botw_guest_run_yield(); return
+guest: 继续执行到下一个 gate
+gate:  run_gate() 保存当前帧，轮转，恢复另一个帧
+```
+
+`YieldThread` 的语义因此是“请求在下一个 gate 让出”，不是立刻切走。
+`SleepThread(ns)` 目前也只记录 `last_sleep_ns`/`sleep_deadline` 并发出同样
+的请求；活目标的 `WaitThread` 同样只请求一次 gate 切换。这样不会假装
+`BLOCKED` 已经可用，也不会在宿主 C 调用栈里强行恢复另一条客体帧。
+
+真正的阻塞需要下一步把 gate 回调改成按 `gates.tsv` 的返回点分派，并在
+那里把当前线程置 `BLOCKED`、唤醒等待者；或者给线程导入加一层汇编
+wrapper，在 C 调用返回前保存客体帧。两者都还没有做。
+
+### 3. 测试
+
+* `tests/guest_hle_os_test.cpp`：33 个名字逐个查表；ThreadType 到 run
+  槽位的映射、StartThread 状态、Yield/Sleep 的 switch request、活/已完成
+  目标的 WaitThread、DestroyThread 的回收、TLS、时间换算、页对齐内存块。
+  Windows 上跳过 run 段（无 POSIX mmap），Linux/macOS 上执行映射与回收。
+* `tests/guest_thread_test.cpp`：三条真实 AArch64 客体线程在 gate 前调用
+  `nn::os::YieldThread` HLE 导入；gate 回调不再主动 yield。预期仍是
+  `0,1,2,0,1,2,0,0` 八次 gate、九次切换、两次线程退出。
+* `tests/guest_thread_probe_arm64.S`：新增 `+32` 的 yield 函数指针参数，
+  `x23` 保存并在调用前后保持。
+
+### 4. 仍然不成立
+
+* 78 个 `nn::os` 里还有 45 个在共享 stub 上：mutex、event、light event、
+  semaphore、message queue、system event、multi-wait。
+* 没有 `BLOCKED` 唤醒路径，没有超时；`SleepThread` 不是睡眠。
+* 没有真实标题线程：`main.patched.bin` 的入口仍未调用。
+* 线程栈不使用游戏传入的栈；`ThreadType` 内部布局未被验证。
+* 仍无抢占：纯计算且没有 gate/自旋回边的长循环仍会饿死其他线程。
+* 仍无步数预算/信号处理：客体跳到未映射地址会带走整个进程。

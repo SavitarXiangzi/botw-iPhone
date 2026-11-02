@@ -77,6 +77,7 @@ typedef struct {
  * running.
  */
 #define BOTW_GUEST_MAX_THREADS 32
+#define BOTW_GUEST_THREAD_STACK_MAX (8u * 1024u * 1024u)
 
 typedef enum {
     BOTW_GUEST_THREAD_FREE = 0,
@@ -154,6 +155,12 @@ int botw_guest_run_thread_create(botw_guest_run* run, const void* entry,
 
 /* Makes a CREATED thread runnable.  Returns 0, or -1 with error set. */
 int botw_guest_run_thread_start(botw_guest_run* run, int id);
+
+
+/* Frees a DONE or never-started CREATED worker's stack and returns its slot
+ * to FREE.  Thread 0 and live threads are refused.  DestroyThread HLE uses
+ * this, so a reaped slot can be reused without waiting for run_close(). */
+int botw_guest_run_thread_reap(botw_guest_run* run, int id);
 
 /* Asks the scheduler to switch at the end of the current gate callback.  It
  * is a no-op outside an active run.  HLE primitives call this to implement a
