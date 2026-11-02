@@ -7564,3 +7564,67 @@ gate 块都是 AArch64 指令。
 1. 用真实 main 做 map + publish（不执行），核对 key page 与段计划；
 2. 先做 rtld 的双映射，或从 main 的 HLE 表开始；
 3. 把 NVN 调用桥到 `ios/nvn` 的 Metal 后端。
+
+## M4 续四十二：真实模块的 key page 发布
+
+### 1. `reloc_run --slot`
+
+`reloc_run` 原来只证明“真实镜像能完成重定位”，现在多一个 `--slot`：
+
+```text
+reloc_run <bin> <fixups> [page_size] [--slot]
+```
+
+它用 malloc-backed 的真实镜像（不是可执行映射）初始化一个合成槽，调用
+`botw_guest_slot_publish()`，然后逐个核对 key page 的 K18 / KTLS / KTLR /
+KGATE 是否等于该槽字段的绝对地址。镜像不执行，槽只活到核对结束。
+
+页保护路径仍由 `guest_map_test` 和 `guest_chain_test` 在真实 mmap 上覆盖；
+这里验证的是**真实模块的索引、布局和地址写对**。
+
+### 2. 四个模块的实测
+
+`reloc_run ... 0x4000 --slot`（Windows x86_64，1.6.0 ABS 改写产物）：
+
+| 模块 | 大小 | 重定位 | HLE | 入口 | 16K 段数 | 冲突 | key page |
+|---|---:|---:|---:|---:|---:|---:|---|
+| main | 46.0 MiB | 211,506 | 1,414 | 0x30 | 5 | 无 | ok |
+| sdk | 13.2 MiB | 22,829 | 16 | 0x30 | 5 | 无 | ok |
+| subsdk0 | 7.5 MiB | 14,371 | 6,545 | 0x30 | 5 | 无 | ok |
+| rtld | 0.1 MiB | 15 | 19 | 0x100 | 4 | **有** | ok |
+
+四个模块的槽索引都是 `k18=0 ktls=1 ktlr=2 kgate=3`，`SLOT_BASE=abs`，
+`x18_off=0`，`gate_off=0x18`；key page 的四个值都等于对应字段地址。
+
+### 3. rtld 的冲突不只是 16 KiB 的问题
+
+rtld 的布局是：
+
+```text
+text  [0,       0x1a00)  rx
+ro    [0x2000,  0x3000)  r
+data  [0x3000,  0x4000)  rw
+```
+
+在 **4 KiB** 页下，这三段已经全部落在第一个页里，计划仍然是
+`[0, 0x4000) rwx`。所以 rtld 不是“换 4K 页就能过”，而是必须双映射：
+
+* 一个 RX 视图供取指；
+* 一个 RW 视图供重定位、数据写入；
+* 两个视图必须别名同一批物理页，`adrp` 的相对偏移才不变。
+
+macOS/iOS 上可以用同一份 `MAP_SHARED` 后备对象映射两次（或者
+`mremap`/`VM_PROT` 等价手段）；这需要真实实现和测试，当前没有做。
+
+### 4. 还没有证明
+
+* 真实模块还没有经过 `mmap` + `mprotect`（CI 没有游戏文件，本机没有 POSIX mmap）；
+* 没有执行任何客体指令；
+* rtld 双映射未实现；
+* HLE 表仍未实现。
+
+### 5. 下一步
+
+1. 实现 rtld 的双映射（最小真实模块，19 个 HLE）；
+2. 或者先做 main 的 458 个 HLE 名字表；
+3. 把 NVN 调用桥到 `ios/nvn` 的 Metal 后端。

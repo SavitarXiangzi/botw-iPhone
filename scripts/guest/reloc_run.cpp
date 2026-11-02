@@ -6,15 +6,20 @@
  * became NULL.  Real module paths are passed on the command line; nothing
  * title-derived is written by this tool.
  *
- *   reloc_run <module.patched.bin> <module.fixups.tsv> [page_size]
+ *   reloc_run <module.patched.bin> <module.fixups.tsv> [page_size] [--slot]
  *
  * It also prints the page protection plan the image would need, which is the
  * input to the executable mapping.  The page size defaults to 16 KiB (iOS);
- * pass 0x1000 to see how the same module looks on a 4 KiB host.
+ * pass 0x1000 to see how the same module looks on a 4 KiB host.  `--slot`
+ * publishes a synthetic thread slot into the image's key page and checks the
+ * four entries; the image is malloc-backed here, so this validates the real
+ * module's indices and addresses, not the mapping protections.
  */
 #include "guest_image.h"
+#include "guest_slot.h"
 
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -48,10 +53,63 @@ static bool slurp(const char* path, std::vector<unsigned char>& out) {
     return (bool)in;
 }
 
+/* Publishes a synthetic slot into the real image's key page.  The slot lives
+ * on this stack frame only long enough to verify the four entries; nothing
+ * executes the image. */
+static int publish_slot(botw_guest_image* img) {
+    alignas(64) unsigned char slot_mem[BOTW_GUEST_SLOT_MIN * 2];
+    botw_guest_slot slot;
+    const uint64_t* key;
+    int ok = 1;
+
+    if (botw_guest_slot_init(&slot, slot_mem, sizeof slot_mem,
+                             (void*)(uintptr_t)0x12345678u) != 0) {
+        std::printf("reloc_run: slot init failed: %s\n", slot.error);
+        return 1;
+    }
+    if (botw_guest_slot_publish(img, &slot) != 0) {
+        std::printf("reloc_run: slot publish failed: %s\n",
+                    slot.error[0] ? slot.error : "unknown");
+        return 1;
+    }
+    key = (const uint64_t*)(const void*)botw_guest_image_key_page(img);
+    if (!key) {
+        std::printf("reloc_run: key page unavailable after publish\n");
+        return 1;
+    }
+    std::printf("reloc_run: slot k18=%u ktls=%u ktlr=%u kgate=%u abs=%d "
+                "x18_off=%#zx gate_off=%#zx\n",
+                img->k18_idx, img->ktls_idx, img->ktlr_idx, img->kgate_idx,
+                img->slot_abs, slot.x18_off, slot.gate_off);
+    ok &= key[img->k18_idx] == (uint64_t)(uintptr_t)(slot.base + slot.x18_off);
+    ok &= key[img->ktls_idx] == (uint64_t)(uintptr_t)(slot.base + slot.tls_off);
+    ok &= key[img->ktlr_idx] == (uint64_t)(uintptr_t)(slot.base + slot.tlr_off);
+    ok &= key[img->kgate_idx] == (uint64_t)(uintptr_t)(slot.base + slot.gate_off);
+    std::printf("reloc_run: key page %s\n",
+                ok ? "ok (4 absolute field addresses)" : "MISMATCH");
+    return ok ? 0 : 1;
+}
+
 int main(int argc, char** argv) {
-    if (argc < 3 || argc > 4) {
-        std::printf("usage: reloc_run <module.patched.bin> <module.fixups.tsv> [page_size]\n");
+    size_t page = 0x4000;
+    int want_slot = 0;
+    if (argc < 3) {
+        std::printf("usage: reloc_run <module.patched.bin> <module.fixups.tsv> "
+                    "[page_size] [--slot]\n");
         return 2;
+    }
+    for (int i = 3; i < argc; i++) {
+        if (std::strcmp(argv[i], "--slot") == 0) {
+            want_slot = 1;
+        } else {
+            char* end = nullptr;
+            unsigned long long v = std::strtoull(argv[i], &end, 0);
+            if (!end || *end != '\0' || v < 0x1000) {
+                std::printf("reloc_run: bad page size '%s'\n", argv[i]);
+                return 2;
+            }
+            page = (size_t)v;
+        }
     }
     std::vector<unsigned char> image;
     std::vector<unsigned char> fixups;
@@ -77,7 +135,6 @@ int main(int argc, char** argv) {
                 img.hle, img.imports, g_sentinels.size(), botw_guest_image_entry(&img),
                 (long long)ms);
     {
-        size_t page = argc == 4 ? (size_t)std::strtoull(argv[3], nullptr, 0) : (size_t)0x4000;
         botw_guest_segment seg[16];
         size_t n = botw_guest_image_plan(&img, page, seg, 16);
         size_t span = botw_guest_image_map_size(&img, page);
@@ -96,6 +153,12 @@ int main(int argc, char** argv) {
                 std::printf("  [%#zx, %#zx) %s\n", seg[i].off, seg[i].off + seg[i].len, prot);
             }
         }
+    }
+    if (want_slot && publish_slot(&img) != 0) {
+        botw_guest_image_close(&img);
+        for (char* block : g_sentinel_blocks) delete[] block;
+        g_sentinel_blocks.clear();
+        return 1;
     }
     botw_guest_image_close(&img);
     for (char* block : g_sentinel_blocks) delete[] block;
