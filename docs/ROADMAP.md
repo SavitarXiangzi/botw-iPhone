@@ -8544,13 +8544,18 @@ Horizon 多等待仲裁器。
 2. `botw_core_selftest()`（Metal 回放与像素回读）；
 3. 合并两个返回值，写 `BOTW_SELFTEST rc=0 (guest=0 replay=0)` 后退出。
 
-macOS arm64 CI run `41408120422` 的 `portable` 与 `ios` 两个 job 均 success，
+macOS arm64 CI run `41409268996` 的 `portable` 与 `ios` 两个 job 均 success，
 模拟器中的自检报告为：
 
 ```text
+botw_guest_selftest: ok (reason=1 words=5457424f/54574350/11f sp=10077fff0 exit_x0=5457424f)
 BOTW_GUEST_SELFTEST rc=0
 BOTW_SELFTEST rc=0 (guest=0 replay=0)
 ```
+
+`reason=1` 是 `BOTW_GUEST_EXIT_RETURNED`；三个参数块字分别是魔数 `0x5457424f`、
+派生值 `0x54574350`、异或值 `0x11f`，`sp=0x10077fff0` 等于 `stack_top - 16`，
+`exit_x0` 与魔数一致。
 
 ### 3. 仍然不成立
 

@@ -65,7 +65,7 @@ docs/           路线图、HLE 边界、NVN 覆盖表、iOS 移植手册、着�
 | M4.1 | 1.6.0 客体 AOT 改写（x18 / TLS / SVC / spin） | 🟡 四模块改写并结构校验通过；portable loader / 页级映射 / key page / gate trampoline / HLE 注册表（libc / nn::oe / nn::fs 沙箱 / nn::os 线程层）已接，合成客体可在 macOS arm64 CI 真跑；真实 `main.patched.bin` 入口尚未调用 |
 | M4.2 | 客体线程调度（协作式：独立栈 / 帧切换 / yield / block / exit） | 🟡 三线程合成测试在 macOS arm64 CI 通过（8 gate / 9 次切换 / 2 次退出）；新增阻塞探针 `guest_block_test`：主线程在 worker 运行前 `WaitThread`，由 worker 退出唤醒，再 `SleepThread(5ms)` 由虚拟时钟 deadline 唤醒（macOS arm64 CI 通过：`guest_block_test: ok (wait join, timed wake, 2 blocks, 2 wakes)`）；无抢占，真实标题线程未接 |
 | M4.3 | `nn::os` 线程 / TLS / 虚拟时钟 / 同步 / 内存块 HLE | 🟡 74/74 个标题导入已接管（78 个注册表项含 4 个 helper）：`CreateThread` 两种重载、`StartThread`、`WaitThread`、`DestroyThread`、线程名/优先级/核掩码、16 个 TLS 槽、`GetSystemTick`、页对齐内存块，以及 Mutex / Event / LightEvent / Semaphore / MessageQueue / SystemEvent / MultiWait 的初始化、非阻塞尝试、信号与 finalize；`SleepThread`、活目标 `WaitThread`、`LockMutex`、`WaitEvent`、`WaitLightEvent`、`TimedWaitLightEvent`、`AcquireSemaphore`、阻塞式 MessageQueue 与 SystemEvent / `WaitAny` 经 AArch64 导入包装器保存完整客体帧并真正进入 `BLOCKED`：mutex 解锁按所有权移交唤醒一个 waiter，event/light event 按 manual/auto-clear 唤醒，semaphore 释放按 permit 交接，timed wait 由 run 的虚拟时钟超时并从对象 waiter 表移除，`WaitAny` 返回 link 顺序中的第一个有信号 holder 且不消费 Event；`SetUserExceptionHandler` 只保存 handler / arg / stack 配置，尚未派发用户异常 |
-| M4.4 | iOS App 内执行客体代码 | 🟡 内置 AArch64 探针经 `botw_guest_run` 在 iOS 模拟器真实进入/返回（独立 guest 栈、x30 哨兵、返回值捕获）；run 41408120422 的自检为 `BOTW_SELFTEST rc=0 (guest=0 replay=0)`。真实 `main.patched.bin` 入口仍未接 |
+| M4.4 | iOS App 内执行客体代码 | 🟡 内置 AArch64 探针经 `botw_guest_run` 在 iOS 模拟器真实进入/返回（独立 guest 栈、x30 哨兵、返回值捕获）；run 41409268996 的探针输出为 `botw_guest_selftest: ok (reason=1 words=5457424f/54574350/11f sp=10077fff0 exit_x0=5457424f)`。真实 `main.patched.bin` 入口仍未接 |
 | M5 | 音频（nn::audio → AVAudioEngine）、输入 | ⬜ |
 | M6 | 真机性能与内存（6 GB 机型起步） | ⬜ |
 
@@ -153,7 +153,7 @@ docs/           路线图、HLE 边界、NVN 覆盖表、iOS 移植手册、着�
 * MultiWait 7 个标题导入：holder 按 link 顺序保存，`WaitAny` 返回第一个有信号的
   Event holder，但**不消费** auto-clear 信号；
 * `SetUserExceptionHandler` 只保存 handler / arg / stack 配置，尚未派发用户异常。
-* iOS App 新增 `botw_core_guest_selftest()` 与内置 AArch64 探针：`botw_guest_run` 创建独立客体栈、以 x30 哨兵进入探针、捕获返回值和栈指针后回到宿主；模拟器自检与 Metal 回放自检合并为 `BOTW_SELFTEST rc=0`（run 41408120422）。
+* iOS App 新增 `botw_core_guest_selftest()` 与内置 AArch64 探针：`botw_guest_run` 创建独立客体栈、以 x30 哨兵进入探针、捕获返回值和栈指针后回到宿主；模拟器自检与 Metal 回放自检合并为 `BOTW_SELFTEST rc=0`（run 41409268996）。
 
 ### 阻塞导入：`SleepThread` / `WaitThread`
 

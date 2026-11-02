@@ -33,7 +33,7 @@ retail NSO  --rewrite_botw.py-->  patched.bin + fixups/gates/sites
 - [x] `nn::os` 同步原语（mutex / event / light event / semaphore / message queue / system event / multi-wait）
 - [ ] HLE 服务层（init / fs / vi / nv / NVN bootstrap）
 - [ ] 把 NVN 调用桥到 `ios/nvn` 的 Metal 后端
-- [x] 在 iOS 模拟器执行第一条客体指令（内置探针，run 41408120422；真实标题入口仍未接）
+- [x] 在 iOS 模拟器执行第一条客体指令（内置探针，run 41409268996；真实标题入口仍未接）
 
 ## 用法
 
