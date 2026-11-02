@@ -145,6 +145,13 @@ int main() {
                     run.threads[worker].wait_kind,
                     (unsigned long long)run.threads[worker].wait_arg,
                     run.error);
+        std::printf("  detail: last_sleep_ns=%lld deadline=%llu tick=%llu "
+                    "worker_type=%p thread1_type=%p main_type=%p current=%d\n",
+                    (long long)os.last_sleep_ns,
+                    (unsigned long long)os.sleep_deadline,
+                    (unsigned long long)os.tick,
+                    (void*)worker_type, os.threads[1].type,
+                    (void*)os.main_type, run.current);
     }
 
     botw_hle_os_attach_run(&os, nullptr);
