@@ -67,6 +67,40 @@ typedef struct {
     uint64_t stack_top;  /* 360 : initial guest sp */
 } botw_guest_run_ctx;
 
+/* Cooperatively scheduled guest threads.
+ *
+ * A thread owns a guest stack and one saved register frame.  The frame is
+ * captured when the thread yields at a gate and restored when the scheduler
+ * comes back to it.  Thread 0 is the entry thread created by run_init()/enter;
+ * created threads start in CREATED and only become eligible when start() is
+ * called.  The table is fixed-size: no allocation happens while the guest is
+ * running.
+ */
+#define BOTW_GUEST_MAX_THREADS 32
+
+typedef enum {
+    BOTW_GUEST_THREAD_FREE = 0,
+    BOTW_GUEST_THREAD_CREATED,  /* stack and frame exist, not started */
+    BOTW_GUEST_THREAD_READY,    /* runnable, waiting for a time slice */
+    BOTW_GUEST_THREAD_RUNNING,
+    BOTW_GUEST_THREAD_BLOCKED,  /* reserved for a wait primitive */
+    BOTW_GUEST_THREAD_DONE
+} botw_guest_thread_state;
+
+typedef struct {
+    int      state;             /* botw_guest_thread_state */
+    int      has_frame;         /* frame holds a resumable gate snapshot */
+    uint64_t entry;             /* guest entry address */
+    uint64_t arg;               /* passed in x0 */
+    uint8_t* stack;             /* whole mapping, guard page included */
+    size_t   stack_bytes;
+    size_t   guard_bytes;
+    uint64_t stack_top;
+    botw_guest_regs frame;      /* valid when has_frame is set */
+    unsigned long yields;       /* explicit yields observed from this thread */
+    unsigned long generation;   /* run generation that created this thread */
+} botw_guest_thread;
+
 typedef struct {
     const uint8_t* image_base;   /* for the bounds check in enter() */
     size_t   image_size;
@@ -83,6 +117,13 @@ typedef struct {
     botw_guest_run_gate_fn gate;
     void*    gate_user;
     botw_guest_run_ctx ctx;
+    botw_guest_thread threads[BOTW_GUEST_MAX_THREADS];
+    int      thread_count;       /* high-water mark, informational */
+    int      current;            /* running thread, -1 when idle */
+    int      switch_requested;   /* set by botw_guest_run_yield() */
+    unsigned long switches;      /* context switches, self-yields excluded */
+    unsigned long thread_exits;  /* created threads that returned */
+    unsigned long generation;    /* bumped after each completed run */
     char     error[160];
 } botw_guest_run;
 
@@ -103,6 +144,29 @@ int botw_guest_run_enter(botw_guest_run* run, size_t entry_off);
 
 /* Same, for code that is not part of the image (tests, a JIT arena). */
 int botw_guest_run_enter_at(botw_guest_run* run, const void* entry);
+
+/* Allocates a guest stack (with a guard page) and a CREATED thread.  `entry`
+ * is a guest code address; `arg` is placed in x0.  Returns the thread index
+ * (>= 1), or -1 with error set.  Thread 0 is the entry thread and is not
+ * created through this API. */
+int botw_guest_run_thread_create(botw_guest_run* run, const void* entry,
+                                 uint64_t arg, size_t stack_bytes);
+
+/* Makes a CREATED thread runnable.  Returns 0, or -1 with error set. */
+int botw_guest_run_thread_start(botw_guest_run* run, int id);
+
+/* Asks the scheduler to switch at the end of the current gate callback.  It
+ * is a no-op outside an active run.  HLE primitives call this to implement a
+ * yield; a guest cannot observe it until the gate returns. */
+void botw_guest_run_yield(botw_guest_run* run);
+
+/* Index of the running thread, or -1. */
+int botw_guest_run_current(const botw_guest_run* run);
+
+/* Called by the thread-exit trampoline, not by normal host code.  Marks the
+ * current thread DONE and returns the next frame to restore, or NULL when
+ * the run has no runnable thread left. */
+botw_guest_regs* botw_guest_thread_exit_frame(void);
 
 #ifdef __cplusplus
 }

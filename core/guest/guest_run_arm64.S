@@ -86,6 +86,15 @@ RUN_SYM(botw_guest_run_enter_asm):
     br   x11
 
 1:  /* The guest returned to the sentinel. */
+    b    RUN_SYM(botw_guest_run_finish_asm)
+#if defined(__ELF__)
+    .size RUN_SYM(botw_guest_run_enter_asm), . - RUN_SYM(botw_guest_run_enter_asm)
+#endif
+
+/* Restore the host after either the sentinel or the last guest thread exits.
+ * x0 is the guest's return value, sp is the guest's stack pointer. */
+    .p2align 2
+RUN_SYM(botw_guest_run_finish_asm):
     adrp x9,  RUN_SYM(botw_guest_run_globals)@PAGE
     add  x9,  x9, RUN_SYM(botw_guest_run_globals)@PAGEOFF
     ldr  x9,  [x9]
@@ -103,7 +112,73 @@ RUN_SYM(botw_guest_run_enter_asm):
     ldp  x29, x30, [sp], #16
     ret
 #if defined(__ELF__)
-    .size RUN_SYM(botw_guest_run_enter_asm), . - RUN_SYM(botw_guest_run_enter_asm)
+    .size RUN_SYM(botw_guest_run_finish_asm), . - RUN_SYM(botw_guest_run_finish_asm)
+#endif
+
+/* A created thread starts here with x0=arg, x19=guest entry, x20=exit stub.
+ * It has a normal guest stack and a synthetic frame whose pc pointed here.
+ * Set a clean frame pointer and the real LR, then enter the guest. */
+    .p2align 2
+    .globl RUN_SYM(botw_guest_thread_start_asm)
+#if defined(__ELF__)
+    .type RUN_SYM(botw_guest_thread_start_asm), %function
+#endif
+RUN_SYM(botw_guest_thread_start_asm):
+    mov  x29, xzr
+    mov  x30, x20
+    br   x19
+#if defined(__ELF__)
+    .size RUN_SYM(botw_guest_thread_start_asm), . - RUN_SYM(botw_guest_thread_start_asm)
+#endif
+
+/* A guest thread returned to the exit stub.  Ask the scheduler for the next
+ * frame; NULL means the run is over and the host must be restored. */
+    .p2align 2
+    .globl RUN_SYM(botw_guest_thread_exit_asm)
+#if defined(__ELF__)
+    .type RUN_SYM(botw_guest_thread_exit_asm), %function
+#endif
+RUN_SYM(botw_guest_thread_exit_asm):
+    bl   RUN_SYM(botw_guest_thread_exit_frame)
+    cbz  x0, 2f
+    b    RUN_SYM(botw_guest_resume_frame)
+2:  mov  x0, xzr
+    b    RUN_SYM(botw_guest_run_finish_asm)
+#if defined(__ELF__)
+    .size RUN_SYM(botw_guest_thread_exit_asm), . - RUN_SYM(botw_guest_thread_exit_asm)
+#endif
+
+/* Restore a saved gate frame and return into its block's ldp.  The frame
+ * lives in a thread struct, not on the stack being abandoned, so sp may move
+ * before the remaining loads.  x18 is never loaded: it is reserved by Apple. */
+    .p2align 2
+RUN_SYM(botw_guest_resume_frame):
+    mov  x9,  x0
+    ldr  x16, [x9, #248]               /* frame->sp */
+    sub  x16, x16, #16
+    ldr  x11, [x9, #232]               /* frame->x[29] */
+    ldr  x12, [x9, #240]               /* frame->x[30] */
+    stp  x11, x12, [x16]               /* the block's ldp slot */
+    mov  sp,  x16
+    ldp  x0,  x1,  [x9, #0]
+    ldp  x2,  x3,  [x9, #16]
+    ldp  x4,  x5,  [x9, #32]
+    ldp  x6,  x7,  [x9, #48]
+    ldr  x8,       [x9, #64]
+    ldp  x10, x11, [x9, #80]
+    ldp  x12, x13, [x9, #96]
+    ldp  x14, x15, [x9, #112]
+    ldp  x16, x17, [x9, #128]
+    ldp  x19, x20, [x9, #152]
+    ldp  x21, x22, [x9, #168]
+    ldp  x23, x24, [x9, #184]
+    ldp  x25, x26, [x9, #200]
+    ldp  x27, x28, [x9, #216]
+    ldr  x30,      [x9, #256]
+    ldr  x9,       [x9, #72]           /* x9 last: it was the base */
+    ret
+#if defined(__ELF__)
+    .size RUN_SYM(botw_guest_resume_frame), . - RUN_SYM(botw_guest_resume_frame)
 #endif
 
 #endif /* __aarch64__ */
