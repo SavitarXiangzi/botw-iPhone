@@ -36,7 +36,7 @@ struct BotWApp: App {
             report("BOTW_GUEST_SELFTEST rc=\(guestRc)\n")
             let replayRc = botw_core_selftest()
             let rc = (guestRc == 0 && replayRc == 0) ? 0 : 1
-            report("BOTW_SELFTEST rc=\(rc) (guest=\(guestRc) replay=\(replayRc)\n")
+            report("BOTW_SELFTEST rc=\(rc) (guest=\(guestRc) replay=\(replayRc))\n")
             exit(rc == 0 ? 0 : 1)
         }
     }

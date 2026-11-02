@@ -8519,3 +8519,42 @@ Horizon 多等待仲裁器。
 * 没有抢占、步数预算或宿主 timer；长计算循环仍可能饿死其他客体线程；
 * 用户异常只保存配置，不派发；
 * 真实标题线程和 `main.patched.bin` 入口仍未调用，以上结果全部来自合成客体探针。
+
+## M4 续五十三：iOS App 内执行第一条客体指令
+
+### 1. 这一轮接了什么
+
+`botw_core_guest_selftest()` 不再只检查注册表，而是真正调用
+`botw_guest_run_init()` / `botw_guest_run_enter_at()`：
+
+* `ios/BotW/guest_app_probe_arm64.S` 是一段随 App 一起编译的 AArch64 探针；
+* 探针压入自己的 x29/x30，读取 `x0` 传入的参数块，写入三个派生值；
+* 它把压栈后的 sp 写回参数块，证明执行发生在 `botw_guest_run` 的独立客体栈上；
+* 探针把 `"BOTW"` 魔数放进 x0 后 `ret`，落到 run 安装的退出哨兵；
+* 宿主检查 `reason == RETURNED`、三个内存字、sp == `stack_top - 16` 和 `exit_x0`。
+
+探针不是标题镜像，也不调用 HLE；它只验证 App→guest_run→AArch64→退出哨兵这条
+链路。HLE 调用仍由 `guest_system_event_test` / `guest_sync_test` 等独立测试覆盖。
+
+### 2. App 自检
+
+`BotWApp` 的 `BOTW_SELFTEST=1` 路径现在依次执行：
+
+1. `botw_core_guest_selftest()`；
+2. `botw_core_selftest()`（Metal 回放与像素回读）；
+3. 合并两个返回值，写 `BOTW_SELFTEST rc=0 (guest=0 replay=0)` 后退出。
+
+macOS arm64 CI run `41408120422` 的 `portable` 与 `ios` 两个 job 均 success，
+模拟器中的自检报告为：
+
+```text
+BOTW_GUEST_SELFTEST rc=0
+BOTW_SELFTEST rc=0 (guest=0 replay=0)
+```
+
+### 3. 仍然不成立
+
+* 探针是编译进 App 的合成代码，不是 `main.patched.bin`；
+* 探针没有经过 HLE gate/import，也没有创建客体线程；
+* iOS 真机 arm64e 的函数指针签名（PAC）路径尚未验证；模拟器是 arm64；
+* 真实标题镜像装载、服务层和第一条 `main` 指令仍是后续工作。
