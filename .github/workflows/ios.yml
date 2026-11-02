@@ -521,7 +521,7 @@ jobs:
                 done
             exit 1
           fi
-          echo "replay-layer self-test: draws encoded, pixels read back, rc=0"
+          echo "in-app self-tests (guest, mapped image, replay): rc=0"
 
       # Debug on purpose: nvn_metal.mm refuses an NDEBUG build while the NVN
       # enum values are unverified, so a Release build here would always fail.

@@ -12,6 +12,9 @@
 
 #if defined(__aarch64__)
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <libkern/OSCacheControl.h>
+#endif
 extern "C" void botw_app_guest_probe(void*);
 extern "C" void botw_app_guest_map_probe(uint64_t* out, void* block, uint64_t value);
 #endif
@@ -223,8 +226,14 @@ extern "C" int botw_core_guest_image_selftest(void) {
     }
 
     block = static_cast<unsigned char*>(map.base) + kPatchOff;
+#if defined(__APPLE__)
+    /* __builtin___clear_cache emits a call to ___clear_cache, which the iOS
+     * device libSystem does not export.  This is the supported spelling. */
+    sys_icache_invalidate(block, kBlockLen);
+#else
     __builtin___clear_cache(static_cast<char*>(block),
                             static_cast<char*>(block) + kBlockLen);
+#endif
 
     if (botw_guest_run_init(&run, map.base, img.size, 0x8000) != 0) {
         set_image_report("FAIL run init: %s", run.error);

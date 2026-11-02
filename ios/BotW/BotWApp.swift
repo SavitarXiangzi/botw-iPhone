@@ -20,10 +20,14 @@ struct BotWApp: App {
             // distinguishable from the hook never running.
             let dir = FileManager.default.urls(for: .documentDirectory,
                                                in: .userDomainMask).first
+            // Keep the whole transcript: replacing the file on every call
+            // would leave only the final rc line and lose the diagnostics.
+            var transcript = ""
             func report(_ text: String) {
+                transcript += text
                 if let dir = dir {
-                    try? text.write(to: dir.appendingPathComponent("selftest.txt"),
-                                    atomically: true, encoding: .utf8)
+                    try? transcript.write(to: dir.appendingPathComponent("selftest.txt"),
+                                          atomically: true, encoding: .utf8)
                 }
                 print(text, terminator: "")
                 fflush(stdout)
