@@ -34,9 +34,14 @@ struct BotWApp: App {
             // its synthetic frame.  The combined rc is what CI asserts.
             let guestRc = botw_core_guest_selftest()
             report("BOTW_GUEST_SELFTEST rc=\(guestRc)\n")
+            // The loader chain needs executable anonymous memory, which is a
+            // separate permission question from entering built-in code.
+            let imageRc = botw_core_guest_image_selftest()
+            let imageDetail = String(cString: botw_core_guest_image_selftest_report())
+            report("BOTW_GUEST_IMAGE_SELFTEST rc=\(imageRc) \(imageDetail)\n")
             let replayRc = botw_core_selftest()
-            let rc = (guestRc == 0 && replayRc == 0) ? 0 : 1
-            report("BOTW_SELFTEST rc=\(rc) (guest=\(guestRc) replay=\(replayRc))\n")
+            let rc = (guestRc == 0 && imageRc == 0 && replayRc == 0) ? 0 : 1
+            report("BOTW_SELFTEST rc=\(rc) (guest=\(guestRc) image=\(imageRc) replay=\(replayRc))\n")
             exit(rc == 0 ? 0 : 1)
         }
     }

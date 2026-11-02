@@ -51,4 +51,45 @@ APP_SYM(botw_app_guest_probe):
     .size APP_SYM(botw_app_guest_probe), . - APP_SYM(botw_app_guest_probe)
 #endif
 
+
+/*
+ * botw_app_guest_map_probe -- run one rewritten gate block from a mapped
+ * synthetic image.  This is the app-side counterpart of tests/guest_run_probe:
+ * it uses the guest stack, calls the patch-area block, stores the dispatcher's
+ * answer, and returns through botw_guest_run's exit sentinel.
+ *
+ *   void botw_app_guest_map_probe(uint64_t out[4], void* block, uint64_t value);
+ */
+    .p2align 2
+    .globl APP_SYM(botw_app_guest_map_probe)
+#if defined(__ELF__)
+    .type APP_SYM(botw_app_guest_map_probe), %function
 #endif
+APP_SYM(botw_app_guest_map_probe):
+    stp  x29, x30, [sp, #-64]!
+    mov  x29, sp
+    stp  x19, x20, [sp, #16]
+    stp  x21, x22, [sp, #32]
+
+    mov  x19, x0                    /* out */
+    mov  x20, x1                    /* gate block in the mapped patch area */
+    mov  x21, x2                    /* value the dispatcher must observe */
+    add  x9, x21, #1
+    str  x9, [x19, #0]
+    str  x21, [x19, #24]
+
+    mov  x0, x21
+    blr  x20                        /* key page -> trampoline -> HLE gate */
+    str  x0, [x19, #8]
+    mov  x9, sp
+    str  x9, [x19, #16]             /* probe frame sp, above the block's pair */
+
+    ldp  x21, x22, [sp, #32]
+    ldp  x19, x20, [sp, #16]
+    ldp  x29, x30, [sp], #64
+    ret
+#if defined(__ELF__)
+    .size APP_SYM(botw_app_guest_map_probe), . - APP_SYM(botw_app_guest_map_probe)
+#endif
+
+#endif /* __aarch64__ */
