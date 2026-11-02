@@ -8211,6 +8211,11 @@ int botw_hle_os_blocking_call(botw_guest_regs* frame, unsigned op,
 | `BOTW_HLE_OS_SWITCHED` (1) | C 侧已推进调度器，恢复 `next_resume` |
 | `BOTW_HLE_OS_STOPPED` (2) | 死锁，调用 `botw_guest_run_finish_asm` 结束 run |
 
+`x0` 同时是导入参数和返回值槽。C 侧必须先把参数复制出来，再写回零返回值；
+第一版先清零后分派，结果 `SleepThread` 永远收到 0 ns、`WaitThread` 永远
+收到空 `ThreadType*`，两条路径都退化成“立即返回”。`guest_block_test`
+的失败计数把这个错误直接暴露出来。
+
 恢复路径必须区分两种帧：
 
 * gate 帧：保存于 gate 边界，恢复后要回到改写块末尾的

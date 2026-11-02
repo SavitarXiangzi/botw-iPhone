@@ -48,18 +48,14 @@ BLOCK_SYM(botw_guest_block_main_entry):
     ldr  x22, [x0, #24]         /* GetSystemTick */
     ldr  x23, [x0, #32]         /* worker ThreadType* */
     ldr  x24, [x0, #40]         /* sleep nanoseconds */
-    str  x23, [x19, #40]        /* counter[5]: the pointer the guest will pass */
-    str  x24, [x19, #48]        /* counter[6]: the span the guest will pass */
 
     mov  x0, x23
     blr  x20                    /* BLOCKED until the worker returns */
     mov  x9, #1
     str  x9, [x19, #8]
-    str  x24, [x19, #56]        /* counter[7]: x24 after WaitThread */
 
     blr  x22                    /* tick before sleep */
     str  x0, [x19, #24]
-    str  x24, [x19, #64]        /* counter[8]: x24 after GetSystemTick */
     mov  x0, x24
     blr  x21                    /* BLOCKED until the virtual deadline */
     blr  x22                    /* tick after sleep */

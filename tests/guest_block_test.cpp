@@ -52,7 +52,7 @@ int main() {
     botw_hle_os_state os;
     botw_guest_run run;
     uint64_t worker_type[64] = {0};
-    uint64_t counter[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+    uint64_t counter[5] = {0, 0, 0, 0, 0};
     const int64_t sleep_ns = 5000000;
     block_probe_args args;
     os_create7_fn create;
@@ -137,11 +137,6 @@ int main() {
                     os.sleep_blocks);
         std::printf("  wait rejects: self=%lu done=%lu unknown=%lu\n",
                     os.wait_self, os.wait_done, os.wait_unknown);
-        std::printf("  last wait: type=%p current=%d slot=%d state=%d used=%d "
-                    "last block: op=%u arg=%llu\n",
-                    (void*)(uintptr_t)os.last_wait_type, os.last_wait_current,
-                    os.last_wait_slot, os.last_wait_state, os.last_wait_used,
-                    os.last_block_op, (unsigned long long)os.last_block_arg);
         std::printf("  counter=%llu,%llu,%llu,%llu,%llu states=%d,%d "
                     "waits=%d/%llu,%d/%llu error='%s'\n",
                     (unsigned long long)counter[0], (unsigned long long)counter[1],
@@ -153,18 +148,11 @@ int main() {
                     (unsigned long long)run.threads[worker].wait_arg,
                     run.error);
         std::printf("  detail: last_sleep_ns=%lld deadline=%llu tick=%llu "
-                    "worker_type=%p thread1_type=%p main_type=%p current=%d\n",
+                    "worker_type=%p thread1_type=%p current=%d\n",
                     (long long)os.last_sleep_ns,
                     (unsigned long long)os.sleep_deadline,
                     (unsigned long long)os.tick,
-                    (void*)worker_type, os.threads[1].type,
-                    (void*)os.main_type, run.current);
-        std::printf("  guest args: wait_ptr=%p sleep_ns=%lld "
-                    "host_sleep_ns=%lld x24_after_wait=%llu x24_after_tick=%llu\n",
-                    (void*)(uintptr_t)counter[5],
-                    (long long)(int64_t)counter[6], (long long)sleep_ns,
-                    (unsigned long long)counter[7],
-                    (unsigned long long)counter[8]);
+                    (void*)worker_type, os.threads[1].type, run.current);
     }
 
     botw_hle_os_attach_run(&os, nullptr);

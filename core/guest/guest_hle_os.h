@@ -113,13 +113,6 @@ typedef struct {
     unsigned long wait_self;
     unsigned long wait_done;
     unsigned long wait_unknown;
-    uint64_t last_wait_type;
-    int      last_wait_current;
-    int      last_wait_slot;
-    int      last_wait_state;
-    int      last_wait_used;
-    unsigned last_block_op;
-    uint64_t last_block_arg;
     unsigned long thread_destroys;
     unsigned long yields;
     unsigned long sleeps;

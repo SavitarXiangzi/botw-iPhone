@@ -365,17 +365,12 @@ static int wait_prepare(void* type, int* out_slot) {
     int cur;
     if (!g_os) return 0;
     g_os->calls++;
-    g_os->last_wait_type = (uint64_t)(uintptr_t)type;
     t = thread_by_type(g_os, type);
-    g_os->last_wait_used = t ? 1 : 0;
     if (!t || !g_os->run) {
         g_os->wait_unknown++;
         return 0;
     }
-    g_os->last_wait_slot = t->slot;
-    g_os->last_wait_state = g_os->run->threads[t->slot].state;
     cur = current_slot(g_os);
-    g_os->last_wait_current = cur;
     if (t->slot == cur) {
         g_os->wait_self++;
         return 0;
@@ -572,21 +567,24 @@ int botw_hle_os_blocking_call(botw_guest_regs* frame, unsigned op,
                               const botw_guest_resume** next_resume) {
     botw_guest_run* run;
     const botw_guest_resume* next;
+    uint64_t arg0;
 
     if (!frame || !next_resume) return BOTW_HLE_OS_STOPPED;
     *next_resume = NULL;
+    /* x0 is both the import argument and the return-value slot.  Read it
+     * before replacing it, or SleepThread always sees zero nanoseconds and
+     * WaitThread always sees a null ThreadType. */
+    arg0 = frame->x[0];
     if (!g_os) {
         frame->x[0] = 0;
         return BOTW_HLE_OS_RETURN;
     }
-    g_os->last_block_op = op;
-    g_os->last_block_arg = frame->x[0];
     frame->x[0] = 0;
     run = g_os->run;
 
     switch (op) {
     case BOTW_HLE_OS_OP_SLEEP: {
-        uint64_t deadline = sleep_prepare((int64_t)frame->x[0]);
+        uint64_t deadline = sleep_prepare((int64_t)arg0);
         if (run && botw_guest_run_is_executing(run)) {
             next = botw_guest_run_block_and_switch(run, frame,
                                                    BOTW_GUEST_WAIT_SLEEP,
@@ -602,7 +600,7 @@ int botw_hle_os_blocking_call(botw_guest_regs* frame, unsigned op,
     }
     case BOTW_HLE_OS_OP_WAIT_THREAD: {
         int target = -1;
-        if (!wait_prepare((void*)(uintptr_t)frame->x[0], &target) || !run) {
+        if (!wait_prepare((void*)(uintptr_t)arg0, &target) || !run) {
             return BOTW_HLE_OS_RETURN;
         }
         if (botw_guest_run_is_executing(run)) {
