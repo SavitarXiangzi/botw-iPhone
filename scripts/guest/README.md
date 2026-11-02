@@ -25,6 +25,9 @@ retail NSO  --rewrite_botw.py-->  patched.bin + fixups/gates/sites
 - [x] 链式测试（`guest_chain_test`）：真实映射 → key page 发布 → KGATE → trampoline → gate 块 → 寄存器往返
 - [x] HLE 注册表 + libc 直通（`guest_hle.c`）：未知名字共享零返回 stub，46 个 libc 实现（含 3 个本地小包装）
 - [x] 页级保护计划（`guest_segments.c`）：真实四模块 5/5/5/4 段；rtld 在 16 KiB 页上 rwx 冲突，如实报告
+- [x] `guest_run`：独立客体栈 + 守卫页 + 入口/退出哨兵；合成客体在 macOS arm64 CI 真正执行
+- [x] 协作式客体线程（`guest_thread_test`）：独立栈、272 字节帧保存/恢复、轮转切换、线程退出；三线程在 arm64 CI 通过
+- [ ] `nn::os` 线程/同步原语接到线程表（CreateThread / StartThread / ExitThread / WaitSynchronization）
 - [ ] HLE 服务层（init / fs / vi / nv / NVN bootstrap）
 - [ ] 把 NVN 调用桥到 `ios/nvn` 的 Metal 后端
 - [ ] 在 iOS 模拟器/真机执行第一条客体指令

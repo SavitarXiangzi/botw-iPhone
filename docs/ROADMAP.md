@@ -7990,3 +7990,121 @@ x86 主机上整个测试跳过（入口序列是 AArch64 汇编），但 `guest
 1. 把 `nn::os` 的线程原语接到这个 run 上（栈、切上下文、时片）；
 2. 或者先做 `nn::hid`，让输入闭环；
 3. rtld 双映射仍未做。
+
+
+## M4 续四十七：客体线程与协作切换
+
+`guest_run` 已经能进入一个客体函数并回到宿主，但《旷野之息》启动时会创建
+14 个以上的线程；只跑一个线程不可能走到标题画面。这一轮把“一个 run”
+扩展成“一个 run 里有多条客体线程”，但仍然**不创建宿主线程**：
+
+* 所有客体线程共用宿主调用栈，轮流使用各自的客体栈；
+* 切换点只有 gate（重写器把 `svc` 和自旋回边都变成了 gate），
+  所以 HLE 回调返回后、trampoline 恢复寄存器之前，是唯一安全的切换窗口；
+* 没有 `ucontext`、没有 `setjmp`，也没有平台相关的线程 API。
+
+### 1. 线程对象与栈
+
+`core/guest/guest_run.h` 新增 `botw_guest_thread`：
+
+| 字段 | 含义 |
+|---|---|
+| `state` | `CREATED` / `READY` / `RUNNING` / `BLOCKED` / `DONE` |
+| `stack`, `stack_bytes`, `guard_bytes`, `stack_top` | 独立 `mmap` 的客体栈，底部一页 `PROT_NONE` |
+| `frame` | 该线程在 gate 处保存的 272 字节 `botw_guest_regs` |
+| `yields` | 显式让出次数，用于测试与观测 |
+| `generation` | 创建它的 run 代号，防止下一次 run 复活旧线程 |
+
+线程 0 是 `run_init()` 映射的主栈，由 `enter_at()` 启动；其余线程通过
+`botw_guest_run_thread_create()` 创建（`CREATED`），再由
+`botw_guest_run_thread_start()` 变成 `READY`。创建线程时**不会**执行客体代码，
+只准备一个合成帧。
+
+### 2. 切换：换的是 trampoline 手里的那张帧
+
+`run_gate()` 在调用 HLE 回调之后检查 `switch_requested`：
+
+1. 把当前 `regs` 整张帧拷进当前线程的 `frame`，状态改成 `READY`；
+2. 从当前线程之后开始轮转，找第一个 `READY`；
+3. 把目标线程的 `frame` 拷回 `regs`，状态改成 `RUNNING`。
+
+gate trampoline 接着按 `regs->sp` 把 `x29/x30` 写回目标线程的 gate 块，
+恢复 `x0..x28`、`sp`、`pc`，于是“返回”到另一条线程的 gate 块。整个过程
+只改寄存器帧，不碰宿主栈；被切走的线程的 C 栈帧（dispatcher 那一层）
+直接丢弃，等它下次被恢复时从 gate 块的 `ldp` 继续。
+
+`botw_guest_run_yield()` 只置一个标志，真正的切换发生在 gate 回调返回之后。
+这样 HLE 函数可以放心地改 `regs->x[0]` 作为返回值，改动会随帧一起保存。
+
+### 3. 新线程怎么开始
+
+新线程没有“原来的 gate 块”可返回，所以合成帧是：
+
+```text
+pc  = botw_guest_thread_start_asm
+sp  = stack_top
+x0  = arg
+x19 = guest entry
+x20 = botw_guest_thread_exit_asm
+```
+
+trampoline 会在 `stack_top - 16` 留出它惯用的 16 字节，然后跳到 start
+stub；start stub 做三件事：
+
+```asm
+mov x29, xzr
+mov x30, x20        ; 线程返回时落到 exit stub
+br  x19             ; 客体入口，x0 = arg
+```
+
+入口的 prologue 从 `stack_top - 16` 往下建帧，和普通 AAPCS64 函数一样。
+线程入口 `ret` 时落到 exit stub；exit stub 调
+`botw_guest_thread_exit_frame()` 把当前线程标成 `DONE` 并取下一个帧，
+没有可运行线程时跳到 `botw_guest_run_finish_asm` 恢复宿主。
+
+`botw_guest_resume_frame()` 与 gate trampoline 的恢复段是同一套寄存器语义，
+但它从一个线程结构体（而不是当前栈上的 272 字节）读帧；因此可以先把
+`sp` 切到目标栈，再继续加载其余寄存器。`x18` 仍然不加载/不写。
+
+### 4. 测试
+
+`tests/guest_thread_test.cpp` + `tests/guest_thread_probe_arm64.S` 在
+macOS arm64 runner 上跑三条**真实执行**的客体线程：
+
+| 线程 | 次数 | 行为 |
+|---|---:|---|
+| main（线程 0） | 4 | 每轮计数，调用 gate 块，gate 回调 `yield` |
+| worker A | 2 | 同上，独立栈 |
+| worker B | 2 | 同上，独立栈 |
+
+断言：
+
+* gate 看到的 id 序列是 `0,1,2,0,1,2,0,0`（8 次 gate）；
+* 三个计数器分别 4 / 2 / 2，且各自记录到的 `sp` 落在自己的栈区间内；
+* `switches == 9`（7 次 gate 轮转 + A/B 退出各一次），`thread_exits == 2`；
+* 结束后线程 0/A/B 都是 `DONE`，全局 gate handler 被恢复成 `nullptr`；
+* `run_close()` 释放三条栈。
+
+x86 的 portable job 仍会编译 C 调度器、汇编两份 `.S`（Apple 目标），
+但测试本身跳过；真正执行只在 `macos-15` arm64 job。
+
+### 5. 仍然不成立
+
+* **没有阻塞原语**：`BLOCKED` 只是预留状态，mutex / semaphore / event /
+  `svcWaitSynchronization` 还没有接到调度器；
+* **没有抢占**：线程只有走到 gate 才会让出。纯计算且没有自旋回边的长循环
+  仍会饿死其他线程；重写器覆盖了 `svc` 和自旋回边，但不覆盖所有长循环；
+* **没有 `nn::os` HLE**：`CreateThread` / `StartThread` / `ExitThread` /
+  `SleepThread` 还没有映射到这张表；当前只有测试和宿主 API 能建线程；
+* **没有真实标题线程**：执行的是合成 probe，不是 `main.patched.bin` 的
+  线程入口；
+* 线程不能 join/reap；槽位和栈保留到 `run_close()`；
+* 没有步数预算/信号处理；客体跳到未映射地址仍会带走进程。
+
+### 6. 下一步
+
+1. 把 `nn::os` 的线程/同步原语接到线程表：句柄 → 槽位，`StartThread` 置
+   `READY`，`ExitThread` 走 exit stub，`WaitSynchronization` 置 `BLOCKED`；
+2. 在 gate 上做时间片：连续运行超过 N 个 gate 或 N 次 tick 就强制
+   `switch_requested`，给“不主动 yield”的线程留出轮转机会；
+3. 之后才是 `nn::hid` 输入闭环与真实 `main` 的入口调用。
