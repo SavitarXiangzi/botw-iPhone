@@ -6,13 +6,15 @@
  * cooperative switch is covered by guest_thread_test on the arm64 runner.
  *
  * What this test proves:
- *   - all 63 names are claimed by name, not silently left on the stub;
+ *   - all 78 table entries are claimed by name; all 74 title imports are
+ *     covered, plus four helper entries;
  *   - ThreadType handles map to run slots, start/ready/reap state changes in
  *     the run, and IDs are stable and distinct;
  *   - YieldThread/SleepThread set the run's switch request;
  *   - WaitThread only returns early for an already-DONE target;
  *   - TLS values are per current slot, and time/memory answers round-trip;
- *   - MessageQueue FIFO peek/receive and LIFO jam ordering.
+ *   - MessageQueue FIFO peek/receive and LIFO jam ordering;
+ *   - SystemEvent clear modes, MultiWait link order and WaitAny selection.
  */
 #include "guest_hle.h"
 #include "guest_hle_os.h"
@@ -82,7 +84,6 @@ static const char* const kOsNames[BOTW_HLE_OS_COUNT] = {
     "_ZN2nn2os20InitializeLightEventEPNS0_14LightEventTypeEbNS0_14EventClearModeE",
     "_ZN2nn2os9LockMutexEPNS0_9MutexTypeE",
     "_ZN2nn2os9WaitEventEPNS0_9EventTypeE",
-    "_ZN2nn2os22InitializeMessageQueueEPNS0_16MessageQueueTypeEPmm",
     "_ZN2nn2os20FinalizeMessageQueueEPNS0_16MessageQueueTypeE",
     "_ZN2nn2os16SendMessageQueueEPNS0_16MessageQueueTypeEm",
     "_ZN2nn2os19TrySendMessageQueueEPNS0_16MessageQueueTypeEm",
@@ -90,6 +91,22 @@ static const char* const kOsNames[BOTW_HLE_OS_COUNT] = {
     "_ZN2nn2os19ReceiveMessageQueueEPmPNS0_16MessageQueueTypeE",
     "_ZN2nn2os22TryReceiveMessageQueueEPmPNS0_16MessageQueueTypeE",
     "_ZN2nn2os19TryPeekMessageQueueEPmPKNS0_16MessageQueueTypeE",
+    "_ZN2nn2os22InitializeMessageQueueEPNS0_16MessageQueueTypeEPmm",
+    "_ZN2nn2os21InitializeSystemEventEPNS0_15SystemEventTypeENS0_14EventClearModeE",
+    "_ZN2nn2os18DestroySystemEventEPNS0_15SystemEventTypeE",
+    "_ZN2nn2os17SignalSystemEventEPNS0_15SystemEventTypeE",
+    "_ZN2nn2os16ClearSystemEventEPNS0_15SystemEventTypeE",
+    "_ZN2nn2os15WaitSystemEventEPNS0_15SystemEventTypeE",
+    "_ZN2nn2os18TryWaitSystemEventEPNS0_15SystemEventTypeE",
+    "_ZN2nn2os20TimedWaitSystemEventEPNS0_15SystemEventTypeENS_8TimeSpanE",
+    "_ZN2nn2os19InitializeMultiWaitEPNS0_13MultiWaitTypeE",
+    "_ZN2nn2os17FinalizeMultiWaitEPNS0_13MultiWaitTypeE",
+    "_ZN2nn2os19LinkMultiWaitHolderEPNS0_13MultiWaitTypeEPNS0_19MultiWaitHolderTypeE",
+    "_ZN2nn2os21UnlinkMultiWaitHolderEPNS0_19MultiWaitHolderTypeE",
+    "_ZN2nn2os23FinalizeMultiWaitHolderEPNS0_19MultiWaitHolderTypeE",
+    "_ZN2nn2os25InitializeMultiWaitHolderEPNS0_19MultiWaitHolderTypeEPNS0_9EventTypeE",
+    "_ZN2nn2os7WaitAnyEPNS0_13MultiWaitTypeE",
+    "_ZN2nn2os23SetUserExceptionHandlerEPFvPNS0_17UserExceptionInfoEEPvmS2_",
 };
 
 static botw_hle_table g_hle;
@@ -349,6 +366,139 @@ int main() {
 #endif
     mq_fini(mq_obj);
     CHECK(!g_os.message_queues[0].used);
+
+    /* SystemEvent: auto-clear consumption, timed immediate success, and the
+     * helper clear path.  The blocking wait is covered on AArch64. */
+    uint64_t sys_obj[16] = {0};
+    uint8_t exc_stack[32] = {0};
+    auto sys_init = lookup<void (*)(void*, int)>(
+        "_ZN2nn2os21InitializeSystemEventEPNS0_15SystemEventTypeENS0_14EventClearModeE");
+    auto sys_destroy = lookup<void (*)(void*)>(
+        "_ZN2nn2os18DestroySystemEventEPNS0_15SystemEventTypeE");
+    auto sys_signal = lookup<void (*)(void*)>(
+        "_ZN2nn2os17SignalSystemEventEPNS0_15SystemEventTypeE");
+    auto sys_clear = lookup<void (*)(void*)>(
+        "_ZN2nn2os16ClearSystemEventEPNS0_15SystemEventTypeE");
+    auto sys_wait = lookup<void (*)(void*)>(
+        "_ZN2nn2os15WaitSystemEventEPNS0_15SystemEventTypeE");
+    auto sys_try = lookup<int (*)(void*)>(
+        "_ZN2nn2os18TryWaitSystemEventEPNS0_15SystemEventTypeE");
+    auto sys_timed = lookup<int (*)(void*, int64_t)>(
+        "_ZN2nn2os20TimedWaitSystemEventEPNS0_15SystemEventTypeENS_8TimeSpanE");
+    CHECK(sys_init != nullptr);
+    CHECK(sys_destroy != nullptr);
+    CHECK(sys_signal != nullptr);
+    CHECK(sys_clear != nullptr);
+    CHECK(sys_wait != nullptr);
+    CHECK(sys_try != nullptr);
+    CHECK(sys_timed != nullptr);
+
+    sys_init(sys_obj, 1);
+    CHECK(g_os.system_events[0].used);
+    CHECK(g_os.system_events[0].auto_clear == 1);
+    CHECK(sys_try(sys_obj) == 0);
+    sys_signal(sys_obj);
+    CHECK(sys_try(sys_obj) == 1);
+    CHECK(sys_try(sys_obj) == 0);
+    sys_signal(sys_obj);
+    CHECK(sys_timed(sys_obj, 0) == 1);
+    sys_signal(sys_obj);
+    sys_wait(sys_obj);
+    CHECK(sys_try(sys_obj) == 0);
+    sys_signal(sys_obj);
+    sys_clear(sys_obj);
+    CHECK(sys_try(sys_obj) == 0);
+    CHECK(g_os.system_event_waits == 7);
+    CHECK(g_os.system_event_signals == 4);
+    sys_destroy(sys_obj);
+    CHECK(!g_os.system_events[0].used);
+    CHECK(g_os.system_event_destroys == 1);
+
+    /* MultiWait observes Events without consuming them and picks the first
+     * signaled holder in link order.  Relinking moves a holder to the tail. */
+    uint64_t mw_obj[8] = {0};
+    uint64_t mw_h1[8] = {0};
+    uint64_t mw_h2[8] = {0};
+    uint64_t mw_ev1[8] = {0};
+    uint64_t mw_ev2[8] = {0};
+    auto ev_init = lookup<void (*)(void*, int, int)>(
+        "_ZN2nn2os15InitializeEventEPNS0_9EventTypeEbNS0_14EventClearModeE");
+    auto ev_signal = lookup<void (*)(void*)>(
+        "_ZN2nn2os11SignalEventEPNS0_9EventTypeE");
+    auto ev_try = lookup<int (*)(void*)>(
+        "_ZN2nn2os12TryWaitEventEPNS0_9EventTypeE");
+    auto ev_fini = lookup<void (*)(void*)>(
+        "_ZN2nn2os13FinalizeEventEPNS0_9EventTypeE");
+    auto mw_init = lookup<void (*)(void*)>(
+        "_ZN2nn2os19InitializeMultiWaitEPNS0_13MultiWaitTypeE");
+    auto mw_fini = lookup<void (*)(void*)>(
+        "_ZN2nn2os17FinalizeMultiWaitEPNS0_13MultiWaitTypeE");
+    auto mw_holder_init = lookup<void (*)(void*, void*)>(
+        "_ZN2nn2os25InitializeMultiWaitHolderEPNS0_19MultiWaitHolderTypeEPNS0_9EventTypeE");
+    auto mw_holder_fini = lookup<void (*)(void*)>(
+        "_ZN2nn2os23FinalizeMultiWaitHolderEPNS0_19MultiWaitHolderTypeE");
+    auto mw_link = lookup<void (*)(void*, void*)>(
+        "_ZN2nn2os19LinkMultiWaitHolderEPNS0_13MultiWaitTypeEPNS0_19MultiWaitHolderTypeE");
+    auto mw_unlink = lookup<void (*)(void*)>(
+        "_ZN2nn2os21UnlinkMultiWaitHolderEPNS0_19MultiWaitHolderTypeE");
+    auto mw_wait_any = lookup<void* (*)(void*)>(
+        "_ZN2nn2os7WaitAnyEPNS0_13MultiWaitTypeE");
+    CHECK(ev_init && ev_signal && ev_try && ev_fini);
+    CHECK(mw_init && mw_fini && mw_holder_init && mw_holder_fini);
+    CHECK(mw_link && mw_unlink && mw_wait_any);
+
+    ev_init(mw_ev1, 0, 1);
+    ev_init(mw_ev2, 0, 1);
+    mw_init(mw_obj);
+    CHECK(g_os.multi_waits[0].used);
+    CHECK(g_os.multi_waits[0].waiter == -1);
+    mw_holder_init(mw_h1, mw_ev1);
+    mw_holder_init(mw_h2, mw_ev2);
+    mw_link(mw_obj, mw_h1);
+    mw_link(mw_obj, mw_h2);
+    CHECK(g_os.multi_waits[0].holder_count == 2);
+    CHECK(g_os.multi_wait_links == 2);
+
+    ev_signal(mw_ev2);
+    CHECK(mw_wait_any(mw_obj) == mw_h2);
+    CHECK(ev_try(mw_ev2) == 1);           /* WaitAny did not consume it */
+    CHECK(ev_try(mw_ev1) == 0);
+    ev_signal(mw_ev1);
+    ev_signal(mw_ev2);
+    CHECK(mw_wait_any(mw_obj) == mw_h1);  /* link order wins */
+    CHECK(ev_try(mw_ev1) == 1);
+    CHECK(ev_try(mw_ev2) == 1);
+
+    mw_unlink(mw_h1);
+    mw_link(mw_obj, mw_h1);               /* h2 is now first */
+    ev_signal(mw_ev1);
+    ev_signal(mw_ev2);
+    CHECK(mw_wait_any(mw_obj) == mw_h2);
+    CHECK(ev_try(mw_ev2) == 1);
+    CHECK(ev_try(mw_ev1) == 1);
+    CHECK(g_os.multi_wait_waits == 3);
+    CHECK(g_os.multi_wait_links == 3);
+
+    mw_unlink(mw_h2);
+    mw_unlink(mw_h1);
+    mw_holder_fini(mw_h2);
+    mw_holder_fini(mw_h1);
+    mw_fini(mw_obj);
+    ev_fini(mw_ev1);
+    ev_fini(mw_ev2);
+    CHECK(!g_os.multi_waits[0].used);
+    CHECK(!g_os.multi_wait_holders[0].used);
+    CHECK(!g_os.events[0].used);
+
+    auto set_user_exception = lookup<void (*)(void (*)(void*), void*, size_t, void*)>(
+        "_ZN2nn2os23SetUserExceptionHandlerEPFvPNS0_17UserExceptionInfoEEPvmS2_");
+    CHECK(set_user_exception != nullptr);
+    set_user_exception(&dummy_entry, &g_os, sizeof exc_stack, exc_stack);
+    CHECK(g_os.user_exception_handler == &dummy_entry);
+    CHECK(g_os.user_exception_arg == &g_os);
+    CHECK(g_os.user_exception_stack_size == sizeof exc_stack);
+    CHECK(g_os.user_exception_stack == exc_stack);
+    CHECK(g_os.user_exception_sets == 1);
 
     /* Without a run, CreateThread must say no instead of inventing a slot. */
     uint64_t fake_type[8] = {0};

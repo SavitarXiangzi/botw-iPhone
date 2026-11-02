@@ -8426,3 +8426,91 @@ deadline = run->clock + span_to_ticks(ns)
   Horizon 内核的先入先出/优先级顺序完全一致；
 * ring 缓冲区由宿主直接解引用，尚未改成显式 guest-memory 访问器；
 * 没有抢占；真实标题线程与 `main.patched.bin` 入口仍未调用。
+
+## M4 续五十二：SystemEvent、MultiWait 与 nn::os 导入表收口
+
+### 1. 导入覆盖
+
+这一轮把标题实际导入的 `nn::os` 剩余 12 个入口接完：
+
+| 类别 | 标题导入 | 说明 |
+|---|---:|---|
+| SystemEvent | 4 | `WaitSystemEvent`、`TryWaitSystemEvent`、`TimedWaitSystemEvent`、`DestroySystemEvent` |
+| MultiWait | 7 | MultiWait / holder 的 initialize、finalize、link / unlink 与 `WaitAny` |
+| 用户异常 | 1 | `SetUserExceptionHandler` |
+
+注册表现在有 **78 个表项**：74 个标题导入加上 4 个 helper（SystemEvent 的 initialize /
+signal / clear，以及原有的 `FreeMemoryBlock`）。`guest_hle_os_test` 会把每个 mangled
+name 单独 lookup 一次，漏一个名字就会失败。
+
+### 2. SystemEvent
+
+SystemEvent 使用和 Event 类似的宿主固定表，guest 的 `SystemEventType*` 只作 identity
+token。clear mode 按 Atmosphere 的定义解释，**不是按 C 布尔直觉**：
+
+```cpp
+enum EventClearMode {
+    EventClearMode_ManualClear = 0,
+    EventClearMode_AutoClear   = 1,
+};
+```
+
+因此 `clear_mode != 0` 才是 auto-clear。`TryWaitSystemEvent` 立即消费 auto-clear
+信号；manual-clear 会保持置位，直到 `ClearSystemEvent`。阻塞版
+`WaitSystemEvent` / `TimedWaitSystemEvent` 走新增的 AArch64 import 包装器：
+
+1. 保存完整客体帧；
+2. 无信号时把当前线程加入该 SystemEvent 的 waiter 表并置 `BLOCKED`；
+3. signal 按 clear mode 唤醒（auto-clear 一个，manual-clear 全部）；timed wait 的 deadline 到达时由 run 的 timeout hook
+   移除 waiter，并把 `false` 写进保存帧的 `x0`。
+
+`WaitSystemEvent` 的 C++ 返回类型是 `void`，所以 `x0` 不参与 ABI；timed wait 的
+`bool` 才需要恢复前写回。
+
+### 3. MultiWait / WaitAny
+
+标题只导入了 `InitializeMultiWaitHolder(MultiWaitHolderType*, EventType*)` 这个重载，
+所以当前 holder 表只接受 Event，不接受 SystemEvent。MultiWait 保存 holder 的 link
+顺序；`Unlink` 后重新 link 会排到队尾，`WaitAny` 选择这个顺序里第一个有信号的
+holder。
+
+`WaitAny` 返回的是 **holder 指针**，不是 Event 指针，也不消费 auto-clear 信号。
+所以测试在 `WaitAny` 返回后还要对对应 Event 调一次 `TryWaitEvent`。阻塞路径在
+signal 时把 holder 指针写进等待线程的保存帧，然后才把线程置 READY。
+
+当前有一个已知语义缺口：如果同一个 auto-clear Event 同时有直接 `WaitEvent`
+waiter 和 `WaitAny` waiter，`SignalEvent` 会先把信号交给直接 waiter，`WaitAny`
+不会被同一次 signal 唤醒。标题目前没有证明会构造这个组合；不要把它当成完整的
+Horizon 多等待仲裁器。
+
+### 4. SetUserExceptionHandler
+
+只保存 handler、arg、stack、stack size 和调用计数，**不会**在 fault / SVC 异常时
+调用 handler。也没有异常栈切换、异常上下文构造、`UserExceptionInfo` 打包或
+`ThrowUserException` 语义。这一项是“导入不再落到共享 stub”，不是“用户异常可用”。
+
+### 5. 测试
+
+* `tests/guest_hle_os_test.cpp` 覆盖 78 个名字、SystemEvent auto-clear 序列、
+  MultiWait link 顺序、`WaitAny` 不消费 Event，以及 `SetUserExceptionHandler`
+  配置回读。
+* 新增 `tests/guest_system_event_probe_arm64.S` + `tests/guest_system_event_test.cpp`：
+  * worker-sys 在主线程 `WaitSystemEvent` 阻塞后 signal；
+  * 无 peer 时 `TimedWaitSystemEvent(2ms)` 由虚拟时钟推进并返回 false；
+  * Event 1 先 link，worker-mw signal 后 `WaitAny` 必须返回 holder 1；
+  * Event 2 已置位时第二次 `WaitAny` 立即返回 holder 2；
+  * 断言 13 个 guest 计数，以及 `run.blocks=3`、`wakes=3`、`switches=4`、
+    `thread_exits=2`；HLE 计数为 SystemEvent waits/blocks/signals/timeouts =
+    2/2/1/1，MultiWait waits/blocks/wakes/links = 2/1/1/2。
+* Windows x86 只编译 portable 路径并跳过 AArch64 执行；`guest_system_event_probe_arm64.S`
+  和 `guest_hle_os_arm64.S` 已用 `--target=aarch64-apple-ios17.0` 交叉汇编通过。
+  macOS arm64 runner 的执行结果不在本机产生。
+
+### 6. 仍然不成立
+
+* SystemEvent 的 inter-process / native-handle 模式未实现，也没有跨进程可读 / 可写
+  handle 的 attach / detach；
+* `WaitAny` 只支持 Event holder，不支持 SystemEvent / timer / interrupt holder；
+* 没有抢占、步数预算或宿主 timer；长计算循环仍可能饿死其他客体线程；
+* 用户异常只保存配置，不派发；
+* 真实标题线程和 `main.patched.bin` 入口仍未调用，以上结果全部来自合成客体探针。

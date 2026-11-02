@@ -54,6 +54,7 @@ try {
         @{ name = "guest_hle_nn_test"; src = "tests\guest_hle_nn_test.cpp"; obj = "build\nvn\gate\" }
         @{ name = "guest_hle_fs_test"; src = "tests\guest_hle_fs_test.cpp"; obj = "build\nvn\gate\" }
         @{ name = "guest_hle_os_test"; src = "tests\guest_hle_os_test.cpp"; obj = "build\nvn\gate\" }
+        @{ name = "guest_system_event_test"; src = "tests\guest_system_event_test.cpp"; obj = "build\nvn\gate\" }
     )
 
     foreach ($j in $jobs) {

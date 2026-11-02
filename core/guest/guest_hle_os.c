@@ -21,6 +21,9 @@ extern void botw_hle_os_guest_acquire_semaphore(void);
 extern void botw_hle_os_guest_send_message_queue(void);
 extern void botw_hle_os_guest_receive_message_queue(void);
 extern void botw_hle_os_guest_jam_message_queue(void);
+extern void botw_hle_os_guest_wait_system_event(void);
+extern void botw_hle_os_guest_timed_wait_system_event(void);
+extern void botw_hle_os_guest_wait_any(void);
 #endif
 
 /* The implementations are registered under their Itanium-mangled names,
@@ -632,6 +635,8 @@ static void waiter_compact(int* waiters, int* count, int kind, int index) {
     }
 }
 
+static void multiwait_notify_event(int event_index);
+
 static int wake_sync_waiter(int slot, int result, int write_result) {
     botw_guest_thread* t;
     if (!g_os || !g_os->run) return 0;
@@ -922,6 +927,9 @@ static void os_SignalEvent(void* type) {
         }
         e->waiter_count = 0;
     }
+    /* WaitAny observes the event but does not consume it.  Direct WaitEvent
+     * waiters above are allowed to consume an auto-clear signal first. */
+    if (e->signaled) multiwait_notify_event(index);
 }
 
 static void os_ClearEvent(void* type) {
@@ -1547,7 +1555,504 @@ static void os_sync_timeout(void* user, int thread_slot, int wait_kind,
         }
         state->light_event_timeouts++;
         if (t->has_frame) t->frame.x[0] = 0;
+    } else if (wait_kind == BOTW_GUEST_WAIT_SYSTEM_EVENT) {
+        botw_hle_os_system_event* e;
+        index = (int)wait_arg;
+        if (index >= 0 && index < (int)BOTW_HLE_OS_MAX_SYSTEM_EVENT) {
+            e = &state->system_events[index];
+            if (e->used) {
+                int pos = waiter_index(e->waiters, e->waiter_count, thread_slot);
+                waiter_remove_at(e->waiters, &e->waiter_count, pos);
+            }
+        }
+        state->system_event_timeouts++;
+        if (t->has_frame) t->frame.x[0] = 0;
     }
+}
+
+/* ------------------------------------------------------------------ */
+/* SystemEvent                                                        */
+/* ------------------------------------------------------------------ */
+
+/* The imported SystemEvent calls share one Event-like table.  A SystemEvent
+ * pointer is an identity token; the clear mode is supplied by the helper
+ * InitializeSystemEvent entry (the title imports only the four wait/destroy
+ * operations).  The signal and clear helpers are registered as well so tests
+ * and other HLE services can drive the same object without touching guest
+ * memory. */
+
+static botw_hle_os_system_event* system_event_find(const void* type,
+                                                   int* out_index) {
+    int i;
+    if (!g_os || !type) return NULL;
+    for (i = 0; i < (int)BOTW_HLE_OS_MAX_SYSTEM_EVENT; i++) {
+        if (g_os->system_events[i].used &&
+            g_os->system_events[i].type == type) {
+            if (out_index) *out_index = i;
+            return &g_os->system_events[i];
+        }
+    }
+    return NULL;
+}
+
+static botw_hle_os_system_event* system_event_create(void* type,
+                                                     int auto_clear,
+                                                     int* out_index) {
+    botw_hle_os_system_event* e;
+    int existing = -1;
+    int i;
+    if (!g_os) return NULL;
+    if (!type) {
+        (void)os_error(g_os, "InitializeSystemEvent: null SystemEventType");
+        return NULL;
+    }
+    e = system_event_find(type, &existing);
+    if (e) {
+        waiter_compact(e->waiters, &e->waiter_count,
+                       BOTW_GUEST_WAIT_SYSTEM_EVENT, existing);
+        if (e->waiter_count != 0) {
+            (void)os_error(g_os, "InitializeSystemEvent: object still has waiters");
+            return NULL;
+        }
+        memset(e, 0, sizeof *e);
+        e->used = 1;
+        e->type = type;
+        if (out_index) *out_index = existing;
+    } else {
+        for (i = 0; i < (int)BOTW_HLE_OS_MAX_SYSTEM_EVENT; i++) {
+            if (!g_os->system_events[i].used) break;
+        }
+        if (i == (int)BOTW_HLE_OS_MAX_SYSTEM_EVENT) {
+            (void)os_error(g_os, "InitializeSystemEvent: system-event table is full");
+            return NULL;
+        }
+        e = &g_os->system_events[i];
+        memset(e, 0, sizeof *e);
+        e->used = 1;
+        e->type = type;
+        if (out_index) *out_index = i;
+    }
+    e->auto_clear = auto_clear != 0;
+    return e;
+}
+
+static botw_hle_os_system_event* system_event_begin(const char* op, void* type,
+                                                    int* out_index) {
+    botw_hle_os_system_event* e;
+    if (!g_os) return NULL;
+    g_os->calls++;
+    e = system_event_find(type, out_index);
+    if (!e) {
+        (void)os_error(g_os, "%s: SystemEventType was not initialized", op);
+    }
+    return e;
+}
+
+static int system_event_consume(botw_hle_os_system_event* e) {
+    if (!e || !e->signaled) return 0;
+    if (e->auto_clear) e->signaled = 0;
+    return 1;
+}
+
+static void os_InitializeSystemEvent(void* type, int clear_mode) {
+    if (!g_os) return;
+    g_os->calls++;
+    (void)system_event_create(type, clear_mode != 0, NULL);
+}
+
+static void os_DestroySystemEvent(void* type) {
+    botw_hle_os_system_event* e;
+    int index = -1;
+    if (!g_os) return;
+    g_os->calls++;
+    e = system_event_find(type, &index);
+    if (!e) return;
+    waiter_compact(e->waiters, &e->waiter_count,
+                   BOTW_GUEST_WAIT_SYSTEM_EVENT, index);
+    if (e->waiter_count != 0) {
+        (void)os_error(g_os, "DestroySystemEvent: object still has waiters");
+        return;
+    }
+    memset(e, 0, sizeof *e);
+    g_os->system_event_destroys++;
+}
+
+static int os_TryWaitSystemEvent(void* type) {
+    botw_hle_os_system_event* e;
+    if (!g_os) return 0;
+    e = system_event_begin("TryWaitSystemEvent", type, NULL);
+    if (!e) return 0;
+    g_os->system_event_waits++;
+    return system_event_consume(e);
+}
+
+static void os_SignalSystemEvent(void* type) {
+    botw_hle_os_system_event* e;
+    int index = -1;
+    if (!g_os) return;
+    e = system_event_begin("SignalSystemEvent", type, &index);
+    if (!e) return;
+    g_os->system_event_signals++;
+    e->signaled = 1;
+    waiter_compact(e->waiters, &e->waiter_count,
+                   BOTW_GUEST_WAIT_SYSTEM_EVENT, index);
+    if (e->auto_clear) {
+        if (e->waiter_count > 0) {
+            int next = e->waiters[0];
+            waiter_remove_at(e->waiters, &e->waiter_count, 0);
+            e->signaled = 0;
+            (void)wake_sync_waiter(next, 1, 1);
+        }
+    } else {
+        int i;
+        for (i = 0; i < e->waiter_count; i++) {
+            (void)wake_sync_waiter(e->waiters[i], 1, 1);
+        }
+        e->waiter_count = 0;
+    }
+}
+
+static void os_ClearSystemEvent(void* type) {
+    botw_hle_os_system_event* e;
+    if (!g_os) return;
+    e = system_event_begin("ClearSystemEvent", type, NULL);
+    if (!e) return;
+    e->signaled = 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* MultiWait                                                          */
+/* ------------------------------------------------------------------ */
+
+static botw_hle_os_multi_wait* multi_wait_find(const void* type,
+                                               int* out_index) {
+    int i;
+    if (!g_os || !type) return NULL;
+    for (i = 0; i < (int)BOTW_HLE_OS_MAX_MULTI_WAIT; i++) {
+        if (g_os->multi_waits[i].used && g_os->multi_waits[i].type == type) {
+            if (out_index) *out_index = i;
+            return &g_os->multi_waits[i];
+        }
+    }
+    return NULL;
+}
+
+static botw_hle_os_multi_wait_holder* multi_wait_holder_find(const void* type,
+                                                              int* out_index) {
+    int i;
+    if (!g_os || !type) return NULL;
+    for (i = 0; i < (int)BOTW_HLE_OS_MAX_MULTI_WAIT_HOLDER; i++) {
+        if (g_os->multi_wait_holders[i].used &&
+            g_os->multi_wait_holders[i].type == type) {
+            if (out_index) *out_index = i;
+            return &g_os->multi_wait_holders[i];
+        }
+    }
+    return NULL;
+}
+
+static int multi_wait_holder_position(const botw_hle_os_multi_wait* mw,
+                                      int holder_index) {
+    int i;
+    for (i = 0; i < mw->holder_count; i++) {
+        if (mw->holders[i] == holder_index) return i;
+    }
+    return -1;
+}
+
+/* Return the first linked holder whose Event is currently signaled, keeping
+ * link order.  Waiting does not clear an auto-clear event; the guest normally
+ * calls TryWaitEvent on the returned holder. */
+static int multi_wait_first_signaled(int multi_wait_index) {
+    botw_hle_os_multi_wait* mw;
+    int i;
+    if (!g_os || multi_wait_index < 0 ||
+        multi_wait_index >= (int)BOTW_HLE_OS_MAX_MULTI_WAIT) return -1;
+    mw = &g_os->multi_waits[multi_wait_index];
+    for (i = 0; i < mw->holder_count; i++) {
+        int hindex = mw->holders[i];
+        botw_hle_os_multi_wait_holder* h;
+        botw_hle_os_event* e;
+        if (hindex < 0 || hindex >= (int)BOTW_HLE_OS_MAX_MULTI_WAIT_HOLDER) {
+            continue;
+        }
+        h = &g_os->multi_wait_holders[hindex];
+        if (!h->used || h->owner != multi_wait_index) continue;
+        if (h->event_index < 0 ||
+            h->event_index >= (int)BOTW_HLE_OS_MAX_EVENT) {
+            (void)os_error(g_os, "WaitAny: holder has an invalid event index");
+            continue;
+        }
+        e = &g_os->events[h->event_index];
+        if (!e->used) {
+            (void)os_error(g_os, "WaitAny: holder's EventType was finalized");
+            continue;
+        }
+        if (e->signaled) return hindex;
+    }
+    return -1;
+}
+
+static botw_hle_os_multi_wait* multi_wait_begin(const char* op, void* type,
+                                                int* out_index) {
+    botw_hle_os_multi_wait* mw;
+    if (!g_os) return NULL;
+    g_os->calls++;
+    mw = multi_wait_find(type, out_index);
+    if (!mw) (void)os_error(g_os, "%s: MultiWaitType was not initialized", op);
+    return mw;
+}
+
+static void os_InitializeMultiWait(void* type) {
+    botw_hle_os_multi_wait* mw;
+    int existing = -1;
+    int i;
+    if (!g_os) return;
+    g_os->calls++;
+    if (!type) {
+        (void)os_error(g_os, "InitializeMultiWait: null MultiWaitType");
+        return;
+    }
+    mw = multi_wait_find(type, &existing);
+    if (mw) {
+        if (mw->waiter >= 0 &&
+            !thread_waiting_on(mw->waiter, BOTW_GUEST_WAIT_MULTI_WAIT, existing)) {
+            mw->waiter = -1;
+        }
+        if (mw->holder_count != 0 || mw->waiter >= 0) {
+            (void)os_error(g_os, "InitializeMultiWait: object still has holders or a waiter");
+            return;
+        }
+        memset(mw, 0, sizeof *mw);
+        mw->used = 1;
+        mw->type = type;
+        mw->waiter = -1;
+        return;
+    }
+    for (i = 0; i < (int)BOTW_HLE_OS_MAX_MULTI_WAIT; i++) {
+        if (!g_os->multi_waits[i].used) break;
+    }
+    if (i == (int)BOTW_HLE_OS_MAX_MULTI_WAIT) {
+        (void)os_error(g_os, "InitializeMultiWait: multi-wait table is full");
+        return;
+    }
+    mw = &g_os->multi_waits[i];
+    memset(mw, 0, sizeof *mw);
+    mw->used = 1;
+    mw->type = type;
+    mw->waiter = -1;
+}
+
+static void os_FinalizeMultiWait(void* type) {
+    botw_hle_os_multi_wait* mw;
+    int index = -1;
+    if (!g_os) return;
+    g_os->calls++;
+    mw = multi_wait_find(type, &index);
+    if (!mw) return;
+    if (mw->waiter >= 0 &&
+        !thread_waiting_on(mw->waiter, BOTW_GUEST_WAIT_MULTI_WAIT, index)) {
+        mw->waiter = -1;
+    }
+    if (mw->holder_count != 0 || mw->waiter >= 0) {
+        (void)os_error(g_os, "FinalizeMultiWait: object still has holders or a waiter");
+        return;
+    }
+    memset(mw, 0, sizeof *mw);
+}
+
+static void os_InitializeMultiWaitHolder(void* type, void* event_type) {
+    botw_hle_os_multi_wait_holder* h;
+    botw_hle_os_event* e;
+    int event_index = -1;
+    int i;
+    if (!g_os) return;
+    g_os->calls++;
+    if (!type) {
+        (void)os_error(g_os, "InitializeMultiWaitHolder: null holder");
+        return;
+    }
+    h = multi_wait_holder_find(type, NULL);
+    if (h && h->owner >= 0) {
+        (void)os_error(g_os, "InitializeMultiWaitHolder: holder is still linked");
+        return;
+    }
+    e = event_find(event_type, &event_index);
+    if (!e) {
+        (void)os_error(g_os, "InitializeMultiWaitHolder: EventType was not initialized");
+        return;
+    }
+    if (!h) {
+        for (i = 0; i < (int)BOTW_HLE_OS_MAX_MULTI_WAIT_HOLDER; i++) {
+            if (!g_os->multi_wait_holders[i].used) break;
+        }
+        if (i == (int)BOTW_HLE_OS_MAX_MULTI_WAIT_HOLDER) {
+            (void)os_error(g_os, "InitializeMultiWaitHolder: holder table is full");
+            return;
+        }
+        h = &g_os->multi_wait_holders[i];
+    }
+    memset(h, 0, sizeof *h);
+    h->used = 1;
+    h->type = type;
+    h->event_index = event_index;
+    h->owner = -1;
+    h->link_pos = -1;
+}
+
+static void os_FinalizeMultiWaitHolder(void* type) {
+    botw_hle_os_multi_wait_holder* h;
+    if (!g_os) return;
+    g_os->calls++;
+    h = multi_wait_holder_find(type, NULL);
+    if (!h) return;
+    if (h->owner >= 0) {
+        (void)os_error(g_os, "FinalizeMultiWaitHolder: holder is still linked");
+        return;
+    }
+    memset(h, 0, sizeof *h);
+}
+
+static void os_LinkMultiWaitHolder(void* type, void* holder_type) {
+    botw_hle_os_multi_wait* mw;
+    botw_hle_os_multi_wait_holder* h;
+    int mw_index = -1;
+    int holder_index = -1;
+    if (!g_os) return;
+    g_os->calls++;
+    mw = multi_wait_find(type, &mw_index);
+    h = multi_wait_holder_find(holder_type, &holder_index);
+    if (!mw || !h) {
+        (void)os_error(g_os, "LinkMultiWaitHolder: object was not initialized");
+        return;
+    }
+    if (mw->waiter >= 0) {
+        (void)os_error(g_os, "LinkMultiWaitHolder: MultiWait is already waiting");
+        return;
+    }
+    if (h->owner >= 0) {
+        (void)os_error(g_os, "LinkMultiWaitHolder: holder is already linked");
+        return;
+    }
+    if (mw->holder_count >= (int)BOTW_GUEST_MAX_THREADS) {
+        (void)os_error(g_os, "LinkMultiWaitHolder: holder list is full");
+        return;
+    }
+    if (h->event_index < 0 || h->event_index >= (int)BOTW_HLE_OS_MAX_EVENT ||
+        !g_os->events[h->event_index].used) {
+        (void)os_error(g_os, "LinkMultiWaitHolder: holder's EventType is not initialized");
+        return;
+    }
+    h->owner = mw_index;
+    h->link_pos = mw->holder_count;
+    mw->holders[mw->holder_count++] = holder_index;
+    g_os->multi_wait_links++;
+}
+
+static void os_UnlinkMultiWaitHolder(void* holder_type) {
+    botw_hle_os_multi_wait_holder* h;
+    botw_hle_os_multi_wait* mw;
+    int holder_index = -1;
+    int i;
+    if (!g_os) return;
+    g_os->calls++;
+    h = multi_wait_holder_find(holder_type, &holder_index);
+    if (!h || h->owner < 0 ||
+        h->owner >= (int)BOTW_HLE_OS_MAX_MULTI_WAIT) {
+        (void)os_error(g_os, "UnlinkMultiWaitHolder: holder is not linked");
+        return;
+    }
+    mw = &g_os->multi_waits[h->owner];
+    if (!mw->used || mw->waiter >= 0) {
+        (void)os_error(g_os, "UnlinkMultiWaitHolder: MultiWait is waiting or invalid");
+        return;
+    }
+    i = multi_wait_holder_position(mw, holder_index);
+    if (i < 0) {
+        (void)os_error(g_os, "UnlinkMultiWaitHolder: holder is missing from the list");
+        return;
+    }
+    for (; i + 1 < mw->holder_count; i++) {
+        mw->holders[i] = mw->holders[i + 1];
+        g_os->multi_wait_holders[mw->holders[i]].link_pos = i;
+    }
+    mw->holder_count--;
+    h->owner = -1;
+    h->link_pos = -1;
+}
+
+static void* multi_wait_ready_result(int multi_wait_index) {
+    int hindex = multi_wait_first_signaled(multi_wait_index);
+    if (hindex < 0) return NULL;
+    return g_os->multi_wait_holders[hindex].type;
+}
+
+/* Called from Event signal after the signaled bit is set.  WaitAny observes
+ * the event without clearing it; the waiting frame receives the holder
+ * pointer before it is made READY. */
+static void multiwait_notify_event(int event_index) {
+    int i;
+    (void)event_index;
+    if (!g_os || !g_os->run) return;
+    for (i = 0; i < (int)BOTW_HLE_OS_MAX_MULTI_WAIT; i++) {
+        botw_hle_os_multi_wait* mw = &g_os->multi_waits[i];
+        int slot;
+        int hindex;
+        void* result;
+        botw_guest_thread* t;
+        if (!mw->used || mw->waiter < 0) continue;
+        if (!thread_waiting_on(mw->waiter, BOTW_GUEST_WAIT_MULTI_WAIT, i)) {
+            mw->waiter = -1;
+            continue;
+        }
+        hindex = multi_wait_first_signaled(i);
+        if (hindex < 0) continue;
+        result = g_os->multi_wait_holders[hindex].type;
+        slot = mw->waiter;
+        t = &g_os->run->threads[slot];
+        if (t->has_frame) t->frame.x[0] = (uint64_t)(uintptr_t)result;
+        if (botw_guest_run_wake(g_os->run, slot) > 0) {
+            mw->waiter = -1;
+            g_os->multi_wait_wakes++;
+        }
+    }
+}
+
+static void* os_WaitAny(void* type) {
+    botw_hle_os_multi_wait* mw;
+    int index = -1;
+    void* result;
+    if (!g_os) return NULL;
+    g_os->calls++;
+    g_os->multi_wait_waits++;
+    mw = multi_wait_find(type, &index);
+    if (!mw) {
+        (void)os_error(g_os, "WaitAny: MultiWaitType was not initialized");
+        return NULL;
+    }
+    if (mw->waiter >= 0) {
+        (void)os_error(g_os, "WaitAny: MultiWait already has a waiter");
+        return NULL;
+    }
+    if (mw->holder_count == 0) {
+        (void)os_error(g_os, "WaitAny: MultiWait has no linked holders");
+        return NULL;
+    }
+    result = multi_wait_ready_result(index);
+    if (result) return result;
+    (void)os_error(g_os, "WaitAny: would block on this host");
+    return NULL;
+}
+
+static void os_SetUserExceptionHandler(void (*handler)(void*), void* arg,
+                                       size_t stack_size, void* stack) {
+    if (!g_os) return;
+    g_os->calls++;
+    g_os->user_exception_handler = handler;
+    g_os->user_exception_arg = arg;
+    g_os->user_exception_stack_size = (uint64_t)stack_size;
+    g_os->user_exception_stack = stack;
+    g_os->user_exception_sets++;
 }
 
 /* Portable entry points.  They cannot park a guest thread without the
@@ -1568,6 +2073,27 @@ static int os_WaitEvent_portable(void* type) {
     int got = event_get_result(type);
     if (!got) (void)os_error(g_os, "WaitEvent: would block on this host");
     return got;
+}
+
+static void os_WaitSystemEvent_portable(void* type) {
+    botw_hle_os_system_event* e = system_event_begin(
+        "WaitSystemEvent", type, NULL);
+    if (!e) return;
+    g_os->system_event_waits++;
+    if (!system_event_consume(e)) {
+        (void)os_error(g_os, "WaitSystemEvent: would block on this host");
+    }
+}
+
+static int os_TimedWaitSystemEvent_portable(void* type, int64_t ns) {
+    botw_hle_os_system_event* e = system_event_begin(
+        "TimedWaitSystemEvent", type, NULL);
+    (void)ns;
+    if (!e) return 0;
+    g_os->system_event_waits++;
+    if (system_event_consume(e)) return 1;
+    (void)os_error(g_os, "TimedWaitSystemEvent: would block on this host");
+    return 0;
 }
 
 static void os_WaitLightEvent_portable(void* type) {
@@ -1836,6 +2362,129 @@ int botw_hle_os_blocking_call(botw_guest_regs* frame, unsigned op,
         *next_resume = next;
         return BOTW_HLE_OS_SWITCHED;
     }
+    case BOTW_HLE_OS_OP_WAIT_SYSTEM_EVENT: {
+        botw_hle_os_system_event* e;
+        int index = -1;
+        e = system_event_begin("WaitSystemEvent", (void*)(uintptr_t)arg0, &index);
+        if (!e) return BOTW_HLE_OS_RETURN;
+        g_os->system_event_waits++;
+        if (system_event_consume(e)) {
+            frame->x[0] = 1;
+            return BOTW_HLE_OS_RETURN;
+        }
+        if (!run) {
+            (void)os_error(g_os, "WaitSystemEvent: no guest run is attached");
+            return BOTW_HLE_OS_RETURN;
+        }
+        if (!botw_guest_run_is_executing(run)) {
+            (void)os_error(g_os, "WaitSystemEvent: would block without an executing run");
+            return BOTW_HLE_OS_RETURN;
+        }
+        cur = current_slot(g_os);
+        if (!waiter_add(e->waiters, &e->waiter_count, cur)) {
+            return BOTW_HLE_OS_RETURN;
+        }
+        next = botw_guest_run_block_and_switch(run, frame,
+                                               BOTW_GUEST_WAIT_SYSTEM_EVENT,
+                                               (uint64_t)(unsigned)index,
+                                               BOTW_GUEST_NO_DEADLINE);
+        if (!next) {
+            int pos = waiter_index(e->waiters, e->waiter_count, cur);
+            waiter_remove_at(e->waiters, &e->waiter_count, pos);
+            return BOTW_HLE_OS_STOPPED;
+        }
+        g_os->system_event_blocks++;
+        *next_resume = next;
+        return BOTW_HLE_OS_SWITCHED;
+    }
+    case BOTW_HLE_OS_OP_TIMED_WAIT_SYSTEM_EVENT: {
+        botw_hle_os_system_event* e;
+        uint64_t ticks;
+        uint64_t deadline;
+        int index = -1;
+        e = system_event_begin("TimedWaitSystemEvent",
+                               (void*)(uintptr_t)arg0, &index);
+        if (!e) return BOTW_HLE_OS_RETURN;
+        g_os->system_event_waits++;
+        if (system_event_consume(e)) {
+            frame->x[0] = 1;
+            return BOTW_HLE_OS_RETURN;
+        }
+        ticks = span_to_ticks((int64_t)arg1);
+        if (ticks == 0) {
+            g_os->system_event_timeouts++;
+            return BOTW_HLE_OS_RETURN;
+        }
+        if (!run) {
+            (void)os_error(g_os, "TimedWaitSystemEvent: no guest run is attached");
+            return BOTW_HLE_OS_RETURN;
+        }
+        if (!botw_guest_run_is_executing(run)) {
+            (void)os_error(g_os, "TimedWaitSystemEvent: would block without an executing run");
+            return BOTW_HLE_OS_RETURN;
+        }
+        cur = current_slot(g_os);
+        if (!waiter_add(e->waiters, &e->waiter_count, cur)) {
+            return BOTW_HLE_OS_RETURN;
+        }
+        deadline = botw_guest_run_clock(run);
+        if (UINT64_MAX - deadline < ticks) deadline = UINT64_MAX - 1u;
+        else deadline += ticks;
+        next = botw_guest_run_block_and_switch(run, frame,
+                                               BOTW_GUEST_WAIT_SYSTEM_EVENT,
+                                               (uint64_t)(unsigned)index,
+                                               deadline);
+        if (!next) {
+            int pos = waiter_index(e->waiters, e->waiter_count, cur);
+            waiter_remove_at(e->waiters, &e->waiter_count, pos);
+            return BOTW_HLE_OS_STOPPED;
+        }
+        g_os->system_event_blocks++;
+        *next_resume = next;
+        return BOTW_HLE_OS_SWITCHED;
+    }
+    case BOTW_HLE_OS_OP_WAIT_ANY: {
+        botw_hle_os_multi_wait* mw;
+        void* result;
+        int index = -1;
+        mw = multi_wait_begin("WaitAny", (void*)(uintptr_t)arg0, &index);
+        if (!mw) return BOTW_HLE_OS_RETURN;
+        g_os->multi_wait_waits++;
+        if (mw->holder_count == 0) {
+            (void)os_error(g_os, "WaitAny: MultiWait has no linked holders");
+            return BOTW_HLE_OS_RETURN;
+        }
+        result = multi_wait_ready_result(index);
+        if (result) {
+            frame->x[0] = (uint64_t)(uintptr_t)result;
+            return BOTW_HLE_OS_RETURN;
+        }
+        if (mw->waiter >= 0) {
+            (void)os_error(g_os, "WaitAny: MultiWait already has a waiter");
+            return BOTW_HLE_OS_RETURN;
+        }
+        if (!run) {
+            (void)os_error(g_os, "WaitAny: no guest run is attached");
+            return BOTW_HLE_OS_RETURN;
+        }
+        if (!botw_guest_run_is_executing(run)) {
+            (void)os_error(g_os, "WaitAny: would block without an executing run");
+            return BOTW_HLE_OS_RETURN;
+        }
+        cur = current_slot(g_os);
+        mw->waiter = cur;
+        next = botw_guest_run_block_and_switch(run, frame,
+                                               BOTW_GUEST_WAIT_MULTI_WAIT,
+                                               (uint64_t)(unsigned)index,
+                                               BOTW_GUEST_NO_DEADLINE);
+        if (!next) {
+            mw->waiter = -1;
+            return BOTW_HLE_OS_STOPPED;
+        }
+        g_os->multi_wait_blocks++;
+        *next_resume = next;
+        return BOTW_HLE_OS_SWITCHED;
+    }
     case BOTW_HLE_OS_OP_SEND_MESSAGE_QUEUE:
     case BOTW_HLE_OS_OP_JAM_MESSAGE_QUEUE: {
         botw_hle_os_message_queue* q;
@@ -1961,6 +2610,9 @@ int botw_hle_os_blocking_call(botw_guest_regs* frame, unsigned op,
 #  define OS_SEND_MESSAGE_QUEUE_ENTRY ((void*)(uintptr_t)&botw_hle_os_guest_send_message_queue)
 #  define OS_JAM_MESSAGE_QUEUE_ENTRY ((void*)(uintptr_t)&botw_hle_os_guest_jam_message_queue)
 #  define OS_RECEIVE_MESSAGE_QUEUE_ENTRY ((void*)(uintptr_t)&botw_hle_os_guest_receive_message_queue)
+#  define OS_WAIT_SYSTEM_EVENT_ENTRY ((void*)(uintptr_t)&botw_hle_os_guest_wait_system_event)
+#  define OS_TIMED_WAIT_SYSTEM_EVENT_ENTRY ((void*)(uintptr_t)&botw_hle_os_guest_timed_wait_system_event)
+#  define OS_WAIT_ANY_ENTRY ((void*)(uintptr_t)&botw_hle_os_guest_wait_any)
 #else
 #  define OS_SLEEP_ENTRY ((void*)(uintptr_t)&os_SleepThread)
 #  define OS_WAIT_THREAD_ENTRY ((void*)(uintptr_t)&os_WaitThread)
@@ -1972,6 +2624,9 @@ int botw_hle_os_blocking_call(botw_guest_regs* frame, unsigned op,
 #  define OS_SEND_MESSAGE_QUEUE_ENTRY ((void*)(uintptr_t)&os_SendMessageQueue)
 #  define OS_JAM_MESSAGE_QUEUE_ENTRY ((void*)(uintptr_t)&os_JamMessageQueue)
 #  define OS_RECEIVE_MESSAGE_QUEUE_ENTRY ((void*)(uintptr_t)&os_ReceiveMessageQueue)
+#  define OS_WAIT_SYSTEM_EVENT_ENTRY ((void*)(uintptr_t)&os_WaitSystemEvent_portable)
+#  define OS_TIMED_WAIT_SYSTEM_EVENT_ENTRY ((void*)(uintptr_t)&os_TimedWaitSystemEvent_portable)
+#  define OS_WAIT_ANY_ENTRY ((void*)(uintptr_t)&os_WaitAny)
 #endif
 
 static const os_entry g_os_entries[BOTW_HLE_OS_COUNT] = {
@@ -2037,7 +2692,22 @@ static const os_entry g_os_entries[BOTW_HLE_OS_COUNT] = {
     { "_ZN2nn2os19ReceiveMessageQueueEPmPNS0_16MessageQueueTypeE", OS_RECEIVE_MESSAGE_QUEUE_ENTRY },
     { "_ZN2nn2os22TryReceiveMessageQueueEPmPNS0_16MessageQueueTypeE", (void*)(uintptr_t)&os_TryReceiveMessageQueue },
     { "_ZN2nn2os19TryPeekMessageQueueEPmPKNS0_16MessageQueueTypeE", (void*)(uintptr_t)&os_TryPeekMessageQueue },
-    { "_ZN2nn2os22InitializeMessageQueueEPNS0_16MessageQueueTypeEPmm", (void*)(uintptr_t)&os_InitializeMessageQueue }
+    { "_ZN2nn2os22InitializeMessageQueueEPNS0_16MessageQueueTypeEPmm", (void*)(uintptr_t)&os_InitializeMessageQueue },
+    { "_ZN2nn2os21InitializeSystemEventEPNS0_15SystemEventTypeENS0_14EventClearModeE", (void*)(uintptr_t)&os_InitializeSystemEvent },
+    { "_ZN2nn2os18DestroySystemEventEPNS0_15SystemEventTypeE", (void*)(uintptr_t)&os_DestroySystemEvent },
+    { "_ZN2nn2os17SignalSystemEventEPNS0_15SystemEventTypeE", (void*)(uintptr_t)&os_SignalSystemEvent },
+    { "_ZN2nn2os16ClearSystemEventEPNS0_15SystemEventTypeE", (void*)(uintptr_t)&os_ClearSystemEvent },
+    { "_ZN2nn2os15WaitSystemEventEPNS0_15SystemEventTypeE", OS_WAIT_SYSTEM_EVENT_ENTRY },
+    { "_ZN2nn2os18TryWaitSystemEventEPNS0_15SystemEventTypeE", (void*)(uintptr_t)&os_TryWaitSystemEvent },
+    { "_ZN2nn2os20TimedWaitSystemEventEPNS0_15SystemEventTypeENS_8TimeSpanE", OS_TIMED_WAIT_SYSTEM_EVENT_ENTRY },
+    { "_ZN2nn2os19InitializeMultiWaitEPNS0_13MultiWaitTypeE", (void*)(uintptr_t)&os_InitializeMultiWait },
+    { "_ZN2nn2os17FinalizeMultiWaitEPNS0_13MultiWaitTypeE", (void*)(uintptr_t)&os_FinalizeMultiWait },
+    { "_ZN2nn2os19LinkMultiWaitHolderEPNS0_13MultiWaitTypeEPNS0_19MultiWaitHolderTypeE", (void*)(uintptr_t)&os_LinkMultiWaitHolder },
+    { "_ZN2nn2os21UnlinkMultiWaitHolderEPNS0_19MultiWaitHolderTypeE", (void*)(uintptr_t)&os_UnlinkMultiWaitHolder },
+    { "_ZN2nn2os23FinalizeMultiWaitHolderEPNS0_19MultiWaitHolderTypeE", (void*)(uintptr_t)&os_FinalizeMultiWaitHolder },
+    { "_ZN2nn2os25InitializeMultiWaitHolderEPNS0_19MultiWaitHolderTypeEPNS0_9EventTypeE", (void*)(uintptr_t)&os_InitializeMultiWaitHolder },
+    { "_ZN2nn2os7WaitAnyEPNS0_13MultiWaitTypeE", OS_WAIT_ANY_ENTRY },
+    { "_ZN2nn2os23SetUserExceptionHandlerEPFvPNS0_17UserExceptionInfoEEPvmS2_", (void*)(uintptr_t)&os_SetUserExceptionHandler }
 };
 
 int botw_hle_os_register(botw_hle_table* hle, botw_hle_os_state* state) {

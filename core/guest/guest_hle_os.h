@@ -63,12 +63,15 @@
 extern "C" {
 #endif
 
-#define BOTW_HLE_OS_COUNT 63u
+#define BOTW_HLE_OS_COUNT 78u
 #define BOTW_HLE_OS_MAX_MUTEX 128u
 #define BOTW_HLE_OS_MAX_EVENT 128u
 #define BOTW_HLE_OS_MAX_LIGHT_EVENT 128u
 #define BOTW_HLE_OS_MAX_SEMAPHORE 64u
 #define BOTW_HLE_OS_MAX_MESSAGE_QUEUE 64u
+#define BOTW_HLE_OS_MAX_SYSTEM_EVENT 128u
+#define BOTW_HLE_OS_MAX_MULTI_WAIT 64u
+#define BOTW_HLE_OS_MAX_MULTI_WAIT_HOLDER 128u
 #define BOTW_HLE_OS_TLS_SLOTS 16u
 #define BOTW_HLE_OS_NAME_MAX 64u
 #define BOTW_HLE_OS_MAIN_ID 0x100u
@@ -91,7 +94,10 @@ typedef enum {
     BOTW_HLE_OS_OP_ACQUIRE_SEMAPHORE = 7,
     BOTW_HLE_OS_OP_SEND_MESSAGE_QUEUE = 8,
     BOTW_HLE_OS_OP_RECEIVE_MESSAGE_QUEUE = 9,
-    BOTW_HLE_OS_OP_JAM_MESSAGE_QUEUE = 10
+    BOTW_HLE_OS_OP_JAM_MESSAGE_QUEUE = 10,
+    BOTW_HLE_OS_OP_WAIT_SYSTEM_EVENT = 11,
+    BOTW_HLE_OS_OP_TIMED_WAIT_SYSTEM_EVENT = 12,
+    BOTW_HLE_OS_OP_WAIT_ANY = 13
 } botw_hle_os_block_op;
 
 enum {
@@ -182,6 +188,36 @@ typedef struct {
     int      sender_count;
 } botw_hle_os_message_queue;
 
+/* SystemEvent is an Event-like object keyed by the guest's SystemEventType
+ * pointer.  The imported wait/try/timed-wait calls all observe this table. */
+typedef struct {
+    int      used;
+    void*    type;
+    int      signaled;
+    int      auto_clear;
+    int      waiters[BOTW_GUEST_MAX_THREADS];
+    int      waiter_count;
+} botw_hle_os_system_event;
+
+/* A MultiWaitHolder points at one EventType; the holder itself is the object
+ * WaitAny returns.  Link order is preserved because WaitAny must choose the
+ * first signaled holder in the order the guest linked them. */
+typedef struct {
+    int      used;
+    void*    type;
+    int      event_index;
+    int      owner;             /* multi-wait index, or -1 when unlinked */
+    int      link_pos;
+} botw_hle_os_multi_wait_holder;
+
+typedef struct {
+    int      used;
+    void*    type;
+    int      holders[BOTW_GUEST_MAX_THREADS];
+    int      holder_count;
+    int      waiter;            /* thread slot, or -1 */
+} botw_hle_os_multi_wait;
+
 typedef struct {
     botw_guest_run* run;
     int attached;
@@ -191,6 +227,9 @@ typedef struct {
     botw_hle_os_light_event light_events[BOTW_HLE_OS_MAX_LIGHT_EVENT];
     botw_hle_os_semaphore semaphores[BOTW_HLE_OS_MAX_SEMAPHORE];
     botw_hle_os_message_queue message_queues[BOTW_HLE_OS_MAX_MESSAGE_QUEUE];
+    botw_hle_os_system_event system_events[BOTW_HLE_OS_MAX_SYSTEM_EVENT];
+    botw_hle_os_multi_wait multi_waits[BOTW_HLE_OS_MAX_MULTI_WAIT];
+    botw_hle_os_multi_wait_holder multi_wait_holders[BOTW_HLE_OS_MAX_MULTI_WAIT_HOLDER];
     uint8_t  main_type[BOTW_HLE_OS_MAIN_TYPE_BYTES];
     uint64_t next_thread_id;
     uint64_t tick;
@@ -236,8 +275,22 @@ typedef struct {
     unsigned long message_try_sends;
     unsigned long message_try_receives;
     unsigned long message_peeks;
+    unsigned long system_event_waits;
+    unsigned long system_event_blocks;
+    unsigned long system_event_signals;
+    unsigned long system_event_timeouts;
+    unsigned long system_event_destroys;
+    unsigned long multi_wait_waits;
+    unsigned long multi_wait_blocks;
+    unsigned long multi_wait_wakes;
+    unsigned long multi_wait_links;
     unsigned long block_allocs;
     unsigned long block_frees;
+    void (*user_exception_handler)(void*);
+    void*    user_exception_arg;
+    void*    user_exception_stack;
+    uint64_t user_exception_stack_size;
+    unsigned long user_exception_sets;
     char     error[160];
 } botw_hle_os_state;
 
@@ -249,7 +302,7 @@ void botw_hle_os_reset(botw_hle_os_state* state);
 /* The singleton used when register() is given NULL. */
 botw_hle_os_state* botw_hle_os_default(void);
 
-/* Registers the 63 nn::os implementations.  `state` may be NULL.  Returns 0,
+/* Registers the 78 table entries (all 74 title imports plus four helpers).  `state` may be NULL.  Returns 0,
  * or -1 with hle->error set. */
 int botw_hle_os_register(botw_hle_table* hle, botw_hle_os_state* state);
 

@@ -479,7 +479,7 @@ const botw_guest_resume* botw_guest_run_block_and_switch(
         return NULL;
     }
     if (wait_kind <= BOTW_GUEST_WAIT_NONE ||
-        wait_kind > BOTW_GUEST_WAIT_MESSAGE_QUEUE_RECEIVE) {
+        wait_kind > BOTW_GUEST_WAIT_MULTI_WAIT) {
         run_error(run, "block requested with unknown wait kind %d", wait_kind);
         return NULL;
     }

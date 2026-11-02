@@ -109,7 +109,9 @@ typedef enum {
     BOTW_GUEST_WAIT_LIGHT_EVENT,/* wait_arg is a host-side light-event index */
     BOTW_GUEST_WAIT_SEMAPHORE,  /* wait_arg is a host-side semaphore index */
     BOTW_GUEST_WAIT_MESSAGE_QUEUE_SEND,   /* queue index; waiting for space */
-    BOTW_GUEST_WAIT_MESSAGE_QUEUE_RECEIVE /* queue index; waiting for data */
+    BOTW_GUEST_WAIT_MESSAGE_QUEUE_RECEIVE,/* queue index; waiting for data */
+    BOTW_GUEST_WAIT_SYSTEM_EVENT,        /* system-event index */
+    BOTW_GUEST_WAIT_MULTI_WAIT           /* multi-wait index */
 } botw_guest_wait_kind;
 
 /* No deadline.  Timed waits store an absolute run-clock tick instead. */

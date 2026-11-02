@@ -162,6 +162,42 @@ HLE_SYM(botw_hle_os_guest_jam_message_queue):
 #endif
 
     .p2align 2
+    .globl HLE_SYM(botw_hle_os_guest_wait_system_event)
+#if defined(__ELF__)
+    .type HLE_SYM(botw_hle_os_guest_wait_system_event), %function
+#endif
+HLE_SYM(botw_hle_os_guest_wait_system_event):
+    mov  x9, #11                      /* BOTW_HLE_OS_OP_WAIT_SYSTEM_EVENT */
+    b    .Lblocking_common
+#if defined(__ELF__)
+    .size HLE_SYM(botw_hle_os_guest_wait_system_event), . - HLE_SYM(botw_hle_os_guest_wait_system_event)
+#endif
+
+    .p2align 2
+    .globl HLE_SYM(botw_hle_os_guest_timed_wait_system_event)
+#if defined(__ELF__)
+    .type HLE_SYM(botw_hle_os_guest_timed_wait_system_event), %function
+#endif
+HLE_SYM(botw_hle_os_guest_timed_wait_system_event):
+    mov  x9, #12                      /* BOTW_HLE_OS_OP_TIMED_WAIT_SYSTEM_EVENT */
+    b    .Lblocking_common
+#if defined(__ELF__)
+    .size HLE_SYM(botw_hle_os_guest_timed_wait_system_event), . - HLE_SYM(botw_hle_os_guest_timed_wait_system_event)
+#endif
+
+    .p2align 2
+    .globl HLE_SYM(botw_hle_os_guest_wait_any)
+#if defined(__ELF__)
+    .type HLE_SYM(botw_hle_os_guest_wait_any), %function
+#endif
+HLE_SYM(botw_hle_os_guest_wait_any):
+    mov  x9, #13                      /* BOTW_HLE_OS_OP_WAIT_ANY */
+    b    .Lblocking_common
+#if defined(__ELF__)
+    .size HLE_SYM(botw_hle_os_guest_wait_any), . - HLE_SYM(botw_hle_os_guest_wait_any)
+#endif
+
+    .p2align 2
 .Lblocking_common:
     sub  sp,  sp, #FR_ALLOC
     stp  x0,  x1,  [sp, #0]
