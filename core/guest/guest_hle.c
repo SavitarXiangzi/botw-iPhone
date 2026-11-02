@@ -5,14 +5,12 @@
 #endif
 #include "guest_hle.h"
 
+#include <ctype.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#if !defined(_WIN32)
-#  include <strings.h>   /* strcasecmp / strncasecmp */
-#endif
 
 static void hle_error(botw_hle_table* hle, const char* fmt, ...) {
     va_list ap;
@@ -135,6 +133,39 @@ size_t botw_hle_implementation_count(const botw_hle_table* hle) {
     return hle ? hle->implementations : 0;
 }
 
+/* Small local wrappers for names the strict C11 headers hide on Linux
+ * (strnlen is POSIX, strcasecmp lives in <strings.h>).  They have the same
+ * signatures as the libc functions, so the guest ABI is unchanged. */
+static size_t hle_strnlen(const char* s, size_t maxlen) {
+    size_t n = 0;
+    while (n < maxlen && s[n]) n++;
+    return n;
+}
+
+static int hle_strcasecmp(const char* a, const char* b) {
+    while (*a && *b) {
+        int ca = tolower((unsigned char)*a);
+        int cb = tolower((unsigned char)*b);
+        if (ca != cb) return ca - cb;
+        a++;
+        b++;
+    }
+    return tolower((unsigned char)*a) - tolower((unsigned char)*b);
+}
+
+static int hle_strncasecmp(const char* a, const char* b, size_t n) {
+    while (n && *a && *b) {
+        int ca = tolower((unsigned char)*a);
+        int cb = tolower((unsigned char)*b);
+        if (ca != cb) return ca - cb;
+        a++;
+        b++;
+        n--;
+    }
+    if (n == 0) return 0;
+    return tolower((unsigned char)*a) - tolower((unsigned char)*b);
+}
+
 /* Functions whose argument and return registers match Apple AAPCS64.  The
  * list intentionally excludes variadic calls and anything with a struct
  * layout in its signature. */
@@ -148,7 +179,7 @@ static void register_libc(botw_hle_table* hle) {
     REG(memcmp);
     REG(memchr);
     REG(strlen);
-    REG(strnlen);
+    if (botw_hle_register(hle, "strnlen", (void*)(uintptr_t)&hle_strnlen) != 0) return;
     REG(strcmp);
     REG(strncmp);
     REG(strcpy);
@@ -186,10 +217,8 @@ static void register_libc(botw_hle_table* hle) {
     REG(truncf);
     REG(fabsf);
     REG(ldexpf);
-#if !defined(_WIN32)
-    REG(strcasecmp);
-    REG(strncasecmp);
-#endif
+    if (botw_hle_register(hle, "strcasecmp", (void*)(uintptr_t)&hle_strcasecmp) != 0) return;
+    if (botw_hle_register(hle, "strncasecmp", (void*)(uintptr_t)&hle_strncasecmp) != 0) return;
 #undef REG
 }
 
