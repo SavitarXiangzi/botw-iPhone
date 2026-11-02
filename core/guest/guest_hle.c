@@ -5,6 +5,7 @@
 #endif
 #include "guest_hle.h"
 #include "guest_hle_nn.h"
+#include "guest_hle_fs.h"
 
 #include <ctype.h>
 #include <math.h>
@@ -231,5 +232,8 @@ void botw_hle_init(botw_hle_table* hle) {
      * zero-return stub would answer "handheld, American English, unfocused",
      * which is a legal answer and therefore a silent one. */
     (void)botw_hle_nn_register(hle, NULL);
+    /* nn::fs is registered but unconfigured: the iOS shell calls
+     * botw_hle_fs_init() with the sandbox root before the guest runs. */
+    (void)botw_hle_fs_register(hle, NULL);
 }
 
