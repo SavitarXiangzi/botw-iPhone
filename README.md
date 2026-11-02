@@ -162,8 +162,10 @@ docs/           路线图、HLE 边界、NVN 覆盖表、iOS 移植手册、着�
 
 线程帧现在有两种形状：gate 帧恢复后要回到改写块的
 `ldp x29,x30,[sp],#16`，import 帧恢复后直接回到 `blr` 的下一条指令。
-`botw_guest_resume` 带 `kind`，由 `botw_guest_resume_frame` /
-`botw_guest_resume_import_frame` 分别处理，避免混用恢复路径。
+`botw_guest_resume` 带 `kind`，两条恢复路径分别在独立文件
+`core/guest/guest_resume_arm64.S` 的 `botw_guest_resume_frame` /
+`botw_guest_resume_import_frame` 中，gate 测试和 HLE 测试可以只链接自己
+需要的那一半。
 
 `guest_thread_test` 仍由三条客体线程在 gate 前调用真实的
 `nn::os::YieldThread` 导入；新增 `guest_block_test` + 真实 AArch64 探针：

@@ -8222,6 +8222,11 @@ int botw_hle_os_blocking_call(botw_guest_regs* frame, unsigned op,
 （`BOTW_GUEST_NZCV_IMPORT_FRAME`）标记 import 帧，避免把 import 帧误当成
 gate 帧恢复。线程退出 trampoline 也改成接收 `botw_guest_resume`。
 
+两条恢复路径放在独立文件 `core/guest/guest_resume_arm64.S`，不引用任何 C
+符号。这样 `guest_gate_test` / `guest_chain_test` 只链接 gate 恢复所需，
+`guest_block_test` 只链接 import 恢复所需，不会因为另一条路径缺失而出现
+链接错误。
+
 ### 3. 调度语义
 
 * `SleepThread(ns)`：`deadline = run->clock + ns * freq / 1e9`，置
