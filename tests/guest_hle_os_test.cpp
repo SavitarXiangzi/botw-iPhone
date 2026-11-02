@@ -1,11 +1,11 @@
-/* nn::os HLE: the thread table, TLS, virtual clock and memory blocks.
+/* nn::os HLE: threads, TLS, virtual clock, sync objects and memory blocks.
  *
  * The registry test runs everywhere.  The run-dependent part maps real guest
  * worker stacks on POSIX hosts but never executes guest code; the actual
  * cooperative switch is covered by guest_thread_test on the arm64 runner.
  *
  * What this test proves:
- *   - all 33 names are claimed by name, not silently left on the stub;
+ *   - all 55 names are claimed by name, not silently left on the stub;
  *   - ThreadType handles map to run slots, start/ready/reap state changes in
  *     the run, and IDs are stable and distinct;
  *   - YieldThread/SleepThread set the run's switch request;
@@ -58,6 +58,28 @@ static const char* const kOsNames[BOTW_HLE_OS_COUNT] = {
     "_ZN2nn2os20SetThreadNamePointerEPNS0_10ThreadTypeEPKc",
     "_ZN2nn2os22GetSystemTickFrequencyEv",
     "_ZN2nn2os26GetThreadAvailableCoreMaskEv",
+    "_ZN2nn2os10ClearEventEPNS0_9EventTypeE",
+    "_ZN2nn2os11SignalEventEPNS0_9EventTypeE",
+    "_ZN2nn2os11UnlockMutexEPNS0_9MutexTypeE",
+    "_ZN2nn2os12TryLockMutexEPNS0_9MutexTypeE",
+    "_ZN2nn2os12TryWaitEventEPNS0_9EventTypeE",
+    "_ZN2nn2os13FinalizeEventEPNS0_9EventTypeE",
+    "_ZN2nn2os13FinalizeMutexEPNS0_9MutexTypeE",
+    "_ZN2nn2os14WaitLightEventEPNS0_14LightEventTypeE",
+    "_ZN2nn2os15ClearLightEventEPNS0_14LightEventTypeE",
+    "_ZN2nn2os15InitializeEventEPNS0_9EventTypeEbNS0_14EventClearModeE",
+    "_ZN2nn2os15InitializeMutexEPNS0_9MutexTypeEbi",
+    "_ZN2nn2os16AcquireSemaphoreEPNS0_13SemaphoreTypeE",
+    "_ZN2nn2os16ReleaseSemaphoreEPNS0_13SemaphoreTypeE",
+    "_ZN2nn2os16ReleaseSemaphoreEPNS0_13SemaphoreTypeEi",
+    "_ZN2nn2os16SignalLightEventEPNS0_14LightEventTypeE",
+    "_ZN2nn2os17FinalizeSemaphoreEPNS0_13SemaphoreTypeE",
+    "_ZN2nn2os18FinalizeLightEventEPNS0_14LightEventTypeE",
+    "_ZN2nn2os19InitializeSemaphoreEPNS0_13SemaphoreTypeEii",
+    "_ZN2nn2os19TimedWaitLightEventEPNS0_14LightEventTypeENS_8TimeSpanE",
+    "_ZN2nn2os20InitializeLightEventEPNS0_14LightEventTypeEbNS0_14EventClearModeE",
+    "_ZN2nn2os9LockMutexEPNS0_9MutexTypeE",
+    "_ZN2nn2os9WaitEventEPNS0_9EventTypeE",
 };
 
 static botw_hle_table g_hle;
@@ -167,6 +189,94 @@ int main() {
     CHECK(g_os.block_allocs == 1);
     CHECK(g_os.block_frees == 1);
 
+    /* Mutexes are keyed by the guest object pointer.  Recursive locks count
+     * depth; a non-recursive second lock fails without touching the object. */
+    uint64_t mutex_obj[8] = {0};
+    uint64_t recursive_obj[8] = {0};
+    lookup<void (*)(void*, int, int)>("_ZN2nn2os15InitializeMutexEPNS0_9MutexTypeEbi")(
+        mutex_obj, 0, 0x20);
+    CHECK(g_os.mutexes[0].used);
+    CHECK(g_os.mutexes[0].owner == -1);
+    CHECK(lookup<int (*)(void*)>("_ZN2nn2os12TryLockMutexEPNS0_9MutexTypeE")(mutex_obj) == 1);
+    CHECK(lookup<int (*)(void*)>("_ZN2nn2os12TryLockMutexEPNS0_9MutexTypeE")(mutex_obj) == 0);
+    lookup<void (*)(void*)>("_ZN2nn2os11UnlockMutexEPNS0_9MutexTypeE")(mutex_obj);
+    CHECK(g_os.mutexes[0].owner == -1);
+    lookup<void (*)(void*)>("_ZN2nn2os13FinalizeMutexEPNS0_9MutexTypeE")(mutex_obj);
+    CHECK(!g_os.mutexes[0].used);
+
+    lookup<void (*)(void*, int, int)>("_ZN2nn2os15InitializeMutexEPNS0_9MutexTypeEbi")(
+        recursive_obj, 1, 0x20);
+    CHECK(lookup<int (*)(void*)>("_ZN2nn2os12TryLockMutexEPNS0_9MutexTypeE")(recursive_obj) == 1);
+    CHECK(lookup<int (*)(void*)>("_ZN2nn2os12TryLockMutexEPNS0_9MutexTypeE")(recursive_obj) == 1);
+    CHECK(g_os.mutexes[0].depth == 2);
+    lookup<void (*)(void*)>("_ZN2nn2os11UnlockMutexEPNS0_9MutexTypeE")(recursive_obj);
+    CHECK(g_os.mutexes[0].depth == 1);
+    lookup<void (*)(void*)>("_ZN2nn2os11UnlockMutexEPNS0_9MutexTypeE")(recursive_obj);
+    CHECK(g_os.mutexes[0].owner == -1);
+    lookup<void (*)(void*)>("_ZN2nn2os13FinalizeMutexEPNS0_9MutexTypeE")(recursive_obj);
+
+    /* Manual-clear events stay signaled; auto-clear events consume one wait. */
+    uint64_t event_obj[8] = {0};
+    uint64_t auto_event_obj[8] = {0};
+    lookup<void (*)(void*, int, int)>(
+        "_ZN2nn2os15InitializeEventEPNS0_9EventTypeEbNS0_14EventClearModeE")(event_obj, 0, 0);
+    CHECK(lookup<int (*)(void*)>("_ZN2nn2os12TryWaitEventEPNS0_9EventTypeE")(event_obj) == 0);
+    lookup<void (*)(void*)>("_ZN2nn2os11SignalEventEPNS0_9EventTypeE")(event_obj);
+    CHECK(lookup<int (*)(void*)>("_ZN2nn2os12TryWaitEventEPNS0_9EventTypeE")(event_obj) == 1);
+    CHECK(lookup<int (*)(void*)>("_ZN2nn2os12TryWaitEventEPNS0_9EventTypeE")(event_obj) == 1);
+    lookup<void (*)(void*)>("_ZN2nn2os10ClearEventEPNS0_9EventTypeE")(event_obj);
+    CHECK(lookup<int (*)(void*)>("_ZN2nn2os12TryWaitEventEPNS0_9EventTypeE")(event_obj) == 0);
+    lookup<void (*)(void*)>("_ZN2nn2os13FinalizeEventEPNS0_9EventTypeE")(event_obj);
+    CHECK(!g_os.events[0].used);
+
+    lookup<void (*)(void*, int, int)>(
+        "_ZN2nn2os15InitializeEventEPNS0_9EventTypeEbNS0_14EventClearModeE")(auto_event_obj, 1, 1);
+    CHECK(lookup<int (*)(void*)>("_ZN2nn2os12TryWaitEventEPNS0_9EventTypeE")(auto_event_obj) == 1);
+    CHECK(lookup<int (*)(void*)>("_ZN2nn2os12TryWaitEventEPNS0_9EventTypeE")(auto_event_obj) == 0);
+    lookup<void (*)(void*)>("_ZN2nn2os11SignalEventEPNS0_9EventTypeE")(auto_event_obj);
+    CHECK(lookup<int (*)(void*)>("_ZN2nn2os12TryWaitEventEPNS0_9EventTypeE")(auto_event_obj) == 1);
+    CHECK(lookup<int (*)(void*)>("_ZN2nn2os12TryWaitEventEPNS0_9EventTypeE")(auto_event_obj) == 0);
+    lookup<void (*)(void*)>("_ZN2nn2os13FinalizeEventEPNS0_9EventTypeE")(auto_event_obj);
+
+    /* Light events use the same clear modes and a timed wait returns bool. */
+    uint64_t light_obj[8] = {0};
+    lookup<void (*)(void*, int, int)>(
+        "_ZN2nn2os20InitializeLightEventEPNS0_14LightEventTypeEbNS0_14EventClearModeE")(
+        light_obj, 1, 1);
+    CHECK(lookup<int (*)(void*, int64_t)>(
+              "_ZN2nn2os19TimedWaitLightEventEPNS0_14LightEventTypeENS_8TimeSpanE")(
+              light_obj, 0) == 1);
+    CHECK(lookup<int (*)(void*, int64_t)>(
+              "_ZN2nn2os19TimedWaitLightEventEPNS0_14LightEventTypeENS_8TimeSpanE")(
+              light_obj, 0) == 0);
+    lookup<void (*)(void*)>("_ZN2nn2os16SignalLightEventEPNS0_14LightEventTypeE")(light_obj);
+    lookup<void (*)(void*)>("_ZN2nn2os14WaitLightEventEPNS0_14LightEventTypeE")(light_obj);
+    CHECK(lookup<int (*)(void*, int64_t)>(
+              "_ZN2nn2os19TimedWaitLightEventEPNS0_14LightEventTypeENS_8TimeSpanE")(
+              light_obj, 0) == 0);
+    lookup<void (*)(void*)>("_ZN2nn2os15ClearLightEventEPNS0_14LightEventTypeE")(light_obj);
+    lookup<void (*)(void*)>("_ZN2nn2os18FinalizeLightEventEPNS0_14LightEventTypeE")(light_obj);
+    CHECK(!g_os.light_events[0].used);
+
+    /* Semaphore counts obey the maximum and hand permits back on release. */
+    uint64_t sem_obj[8] = {0};
+    lookup<void (*)(void*, int, int)>(
+        "_ZN2nn2os19InitializeSemaphoreEPNS0_13SemaphoreTypeEii")(sem_obj, 1, 2);
+    CHECK(g_os.semaphores[0].count == 1);
+    lookup<void (*)(void*)>("_ZN2nn2os16AcquireSemaphoreEPNS0_13SemaphoreTypeE")(sem_obj);
+    CHECK(g_os.semaphores[0].count == 0);
+    lookup<void (*)(void*)>("_ZN2nn2os16ReleaseSemaphoreEPNS0_13SemaphoreTypeE")(sem_obj);
+    CHECK(g_os.semaphores[0].count == 1);
+    lookup<void (*)(void*, int)>("_ZN2nn2os16ReleaseSemaphoreEPNS0_13SemaphoreTypeEi")(sem_obj, 1);
+    CHECK(g_os.semaphores[0].count == 2);
+    lookup<void (*)(void*)>("_ZN2nn2os17FinalizeSemaphoreEPNS0_13SemaphoreTypeE")(sem_obj);
+    CHECK(!g_os.semaphores[0].used);
+    CHECK(g_os.mutex_locks == 3);
+    CHECK(g_os.event_signals == 2);
+    CHECK(g_os.light_event_signals == 1);
+    CHECK(g_os.semaphore_acquires == 1);
+    CHECK(g_os.semaphore_releases == 2);
+
     /* Without a run, CreateThread must say no instead of inventing a slot. */
     uint64_t fake_type[8] = {0};
     CHECK(lookup<uint32_t (*)(void*, void (*)(void*), void*, void*, size_t, int)>(
@@ -267,7 +377,8 @@ int main() {
         std::printf("guest_hle_os_test: %d failure(s)\n", g_fail);
         return 1;
     }
-    std::printf("guest_hle_os_test: ok (%u nn::os names, thread table, TLS, time, memory blocks)\n",
+    std::printf("guest_hle_os_test: ok (%u nn::os names, thread table, TLS, time, "
+                "memory blocks, sync objects)\n",
                 BOTW_HLE_OS_COUNT);
     return 0;
 }

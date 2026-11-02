@@ -66,6 +66,66 @@ HLE_SYM(botw_hle_os_guest_wait_thread):
 #endif
 
     .p2align 2
+    .globl HLE_SYM(botw_hle_os_guest_lock_mutex)
+#if defined(__ELF__)
+    .type HLE_SYM(botw_hle_os_guest_lock_mutex), %function
+#endif
+HLE_SYM(botw_hle_os_guest_lock_mutex):
+    mov  x9, #3                       /* BOTW_HLE_OS_OP_LOCK_MUTEX */
+    b    .Lblocking_common
+#if defined(__ELF__)
+    .size HLE_SYM(botw_hle_os_guest_lock_mutex), . - HLE_SYM(botw_hle_os_guest_lock_mutex)
+#endif
+
+    .p2align 2
+    .globl HLE_SYM(botw_hle_os_guest_wait_event)
+#if defined(__ELF__)
+    .type HLE_SYM(botw_hle_os_guest_wait_event), %function
+#endif
+HLE_SYM(botw_hle_os_guest_wait_event):
+    mov  x9, #4                       /* BOTW_HLE_OS_OP_WAIT_EVENT */
+    b    .Lblocking_common
+#if defined(__ELF__)
+    .size HLE_SYM(botw_hle_os_guest_wait_event), . - HLE_SYM(botw_hle_os_guest_wait_event)
+#endif
+
+    .p2align 2
+    .globl HLE_SYM(botw_hle_os_guest_wait_light_event)
+#if defined(__ELF__)
+    .type HLE_SYM(botw_hle_os_guest_wait_light_event), %function
+#endif
+HLE_SYM(botw_hle_os_guest_wait_light_event):
+    mov  x9, #5                       /* BOTW_HLE_OS_OP_WAIT_LIGHT_EVENT */
+    b    .Lblocking_common
+#if defined(__ELF__)
+    .size HLE_SYM(botw_hle_os_guest_wait_light_event), . - HLE_SYM(botw_hle_os_guest_wait_light_event)
+#endif
+
+    .p2align 2
+    .globl HLE_SYM(botw_hle_os_guest_timed_wait_light_event)
+#if defined(__ELF__)
+    .type HLE_SYM(botw_hle_os_guest_timed_wait_light_event), %function
+#endif
+HLE_SYM(botw_hle_os_guest_timed_wait_light_event):
+    mov  x9, #6                       /* BOTW_HLE_OS_OP_TIMED_WAIT_LIGHT_EVENT */
+    b    .Lblocking_common
+#if defined(__ELF__)
+    .size HLE_SYM(botw_hle_os_guest_timed_wait_light_event), . - HLE_SYM(botw_hle_os_guest_timed_wait_light_event)
+#endif
+
+    .p2align 2
+    .globl HLE_SYM(botw_hle_os_guest_acquire_semaphore)
+#if defined(__ELF__)
+    .type HLE_SYM(botw_hle_os_guest_acquire_semaphore), %function
+#endif
+HLE_SYM(botw_hle_os_guest_acquire_semaphore):
+    mov  x9, #7                       /* BOTW_HLE_OS_OP_ACQUIRE_SEMAPHORE */
+    b    .Lblocking_common
+#if defined(__ELF__)
+    .size HLE_SYM(botw_hle_os_guest_acquire_semaphore), . - HLE_SYM(botw_hle_os_guest_acquire_semaphore)
+#endif
+
+    .p2align 2
 .Lblocking_common:
     sub  sp,  sp, #FR_ALLOC
     stp  x0,  x1,  [sp, #0]

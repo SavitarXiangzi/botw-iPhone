@@ -56,9 +56,19 @@ gate。
 import 帧直接 `br x30`。`botw_guest_resume` 用 `kind` 区分，两条 trampoline
 不能混用。
 
-在这条包装器之外，同步对象（mutex / event / light event / semaphore /
-message queue / system event / multi-wait）仍不应假装自己已经互斥或已经
-唤醒——它们还在共享 stub 上。
+同一套包装器和 `botw_hle_os_blocking_call()` 现在也服务 `LockMutex`、
+`WaitEvent`、`WaitLightEvent`、`TimedWaitLightEvent` 和
+`AcquireSemaphore`。同步对象按 guest 指针索引宿主固定表，HLE 不读写游戏
+对象内部：mutex 保存 owner/depth，event 与 light event 保存 signal 状态和
+manual/auto-clear 模式，semaphore 保存 count/maximum 和 waiter 队列。
+解锁/释放/signal 先把对象状态交给确切的 waiter，再调用
+`botw_guest_run_wake()`；这样不会出现“被唤醒但对象仍不可用”的丢唤醒。
+`TimedWaitLightEvent` 到期时由 `botw_guest_run` 的 timeout hook 通知 HLE
+移除 waiter 并向保存帧写回 false。
+
+message queue / system event / multi-wait / 用户异常处理仍不应假装自己已经
+可用——它们还在共享 stub 上。`Blocking` 也只覆盖上述导入；`Try*` 路径
+（`TryLockMutex` / `TryWaitEvent`）返回真实布尔值，不进入调度器。
 
 ## 已知技术债
 

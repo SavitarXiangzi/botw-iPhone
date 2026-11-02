@@ -8274,3 +8274,105 @@ gate 帧恢复。线程退出 trampoline 也改成接收 `botw_guest_resume`。
 * 没有抢占、步数预算、信号处理；真实标题线程与 `main.patched.bin`
   入口仍未调用。
 * `ThreadType` 内部布局仍未验证，线程栈仍不使用游戏传入的栈。
+
+## M4 续五十：同步对象的真实阻塞与所有权移交
+
+### 1. 这一轮接了什么
+
+`core/guest/guest_hle_os.c` 的注册表从 33 个 `nn::os` 名字扩到 55 个，
+新增的 22 个是：
+
+| 组 | 入口 |
+|---|---|
+| Mutex | `InitializeMutex`、`FinalizeMutex`、`LockMutex`、`TryLockMutex`、`UnlockMutex` |
+| Event | `InitializeEvent`、`FinalizeEvent`、`WaitEvent`、`TryWaitEvent`、`SignalEvent`、`ClearEvent` |
+| LightEvent | `InitializeLightEvent`、`FinalizeLightEvent`、`WaitLightEvent`、`TimedWaitLightEvent`、`SignalLightEvent`、`ClearLightEvent` |
+| Semaphore | `InitializeSemaphore`、`FinalizeSemaphore`、`AcquireSemaphore`、两个 `ReleaseSemaphore` 重载 |
+
+对象内存仍只作为 identity token。宿主侧用固定表保存：
+
+* mutex：owner 线程槽、递归 depth、recursive 标志、waiter 队列；
+* event / light event：signaled、auto-clear 模式、waiter 队列；
+* semaphore：count、maximum、waiter 队列。
+
+固定表满、未初始化对象、非 owner 解锁、semaphore 超出 maximum 都会写入
+`state->error`，不会静默成功或把两个对象别名到同一个槽。
+
+### 2. 阻塞路径
+
+`guest_hle_os_arm64.S` 新增五个入口：
+`botw_hle_os_guest_lock_mutex`、`wait_event`、`wait_light_event`、
+`timed_wait_light_event`、`acquire_semaphore`。它们和已有的 sleep/wait-thread
+包装器共用同一段保存/恢复代码，操作号分别是 3–7。
+
+`botw_hle_os_blocking_call()` 的执行顺序是：
+
+1. 先从保存帧读出 `x0`（对象指针）和 `x1`（TimeSpan）；`x0` 随后被清零，
+   作为返回值槽；
+2. 能立即完成时直接返回：未占用的 mutex、signaled event/light event、
+   非空 semaphore；
+3. 否则把当前线程加入对象的 waiter 队列，置 `BLOCKED`，由
+   `botw_guest_run_block_and_switch()` 立即恢复另一条 import/gate 帧；
+4. 解锁、signal 或 release 时先从 waiter 队列取出一个/全部有效 waiter，
+   把对象状态交给它，再调用 `botw_guest_run_wake()` 置 READY。
+
+mutex 解锁不是“叫醒后再抢一次”：owner 在 `UnlockMutex` 里直接移交给
+下一个 waiter，depth 置 1。这样即使被唤醒的线程还没运行，其他线程也
+不能插队，避免丢唤醒和优先级反转式的重复阻塞。递归 mutex 的
+`TryLockMutex` 由同一 owner 增加 depth，非递归的第二次尝试返回 0。
+
+Event 的 manual-clear 在 signal 后保持 signaled 并唤醒全部 waiter；
+auto-clear 只唤醒一个 waiter 并立即清掉 signaled。LightEvent 使用相同
+规则。Semaphore 的 `ReleaseSemaphore(n)` 先把 count 加到 maximum 以内，
+再按 count 逐个把 permit 交给 waiter；每个被交接的 waiter 计入一次
+acquire，不要求它恢复后再执行一次 `TryAcquire`。
+
+### 3. 定时等待
+
+`TimedWaitLightEvent` 的 deadline 仍用 run 的确定性虚拟时钟：
+
+```
+deadline = run->clock + span_to_ticks(ns)
+```
+
+`sleep_prepare()` 之外新增了通用的 `wait_deadline` 字段，sleep、thread join
+和同步等待共用同一套 blocked 表。没有可运行线程时，调度器把 clock 推进到
+最早的 `wait_deadline`；`wake_expired()` 先调用 run 的 `timeout_fn`，让 HLE
+把该线程从 light-event 的 waiter 队列移除，并向保存帧写回 `x0 = 0`，然后
+才把线程置 READY。这样超时后对象表里不会留下“幽灵 waiter”，之后一次
+`SignalLightEvent` 也不会错误地唤醒已经超时的线程。
+
+`botw_guest_run_set_timeout()` 是新增的宿主 hook；`botw_hle_os_attach_run()`
+安装它，detach/reset 时清除。hook 只在 timeout 路径调用，不能切线程。
+
+### 4. 测试
+
+* `tests/guest_hle_os_test.cpp` 现在逐个检查 55 个 mangled name，并覆盖
+  mutex 的非递归/递归 `TryLock`、manual/auto event、timed light event
+  立即返回、semaphore count 与 finalize；Windows x86 上通过。
+* `tests/guest_sync_probe_arm64.S` + `tests/guest_sync_test.cpp` 用四个真实
+  AArch64 客体 worker：
+  * main 持有 mutex 后在 light event 上定时等待；worker-a 阻塞在 mutex；
+    main 超时后解锁并 join，验证 timed wake + mutex 所有权移交；
+  * worker-b 在 main 等待 event 时 signal，验证 auto-clear event 唤醒；
+  * worker-c 先 signal event 再阻塞在 semaphore，main 被唤醒后 release，
+    验证 permit 交接；
+  * worker-d signal 一个 untimed light event，main 再在同一对象上做一次
+    无 peer 的定时等待并超时。
+  预期计数：9 次 block、9 次 wake、12 次 switch、4 次线程退出；mutex
+  lock/unlock = 2/2，event block/signal = 2/2，light block/wait/signal/
+  timeout = 3/3/1/2，semaphore block/acquire/release = 1/1/1。
+* 本机（Windows x86）完整 `scripts/build_abi_test.ps1` 已通过；AArch64
+  探针只做了 cross-assemble 语法检查，macOS arm64 CI 已加入编译/执行步骤，
+  但本轮没有 Mac 可执行它。
+
+### 5. 仍然不成立
+
+* message queue、system event、multi-wait、`SetUserExceptionHandler` 仍在
+  共享 stub 上；
+* 没有抢占；纯计算且无 gate/自旋回边的长循环仍会饿死其他线程；
+* `YieldThread` 仍是“下一个 gate 让出”，不是立即切换；
+* 没有步数预算/信号处理；真实标题线程与 `main.patched.bin` 入口仍未调用；
+* `ThreadType`、`MutexType`、`EventType` 等对象内部布局仍未被验证；HLE
+  只把它们当不透明指针；
+* 定时等待只有虚拟时钟，没有 host timer / `svcCancelSynchronization`。

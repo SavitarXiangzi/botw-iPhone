@@ -147,6 +147,11 @@ jobs:
           # The real switch is AArch64-only; this host still compiles the test.
           clang++ $FLAGS $INC tests/guest_block_test.cpp $HLE -o /tmp/guest_block_test
           /tmp/guest_block_test
+          # Mutex / event / light-event / semaphore blocking: main times out on
+          # a light event while a worker blocks on its mutex, then later waits
+          # on an event and releases a semaphore.  AArch64-only execution.
+          clang++ $FLAGS $INC tests/guest_sync_test.cpp $HLE -o /tmp/guest_sync_test
+          /tmp/guest_sync_test
           # HLE registry: implementations, shared stubs, full-table refusal.
           clang++ $FLAGS $INC tests/guest_hle_test.cpp $HLE -o /tmp/guest_hle_test -lm
           /tmp/guest_hle_test
@@ -184,6 +189,8 @@ jobs:
             -c core/guest/guest_hle_os_arm64.S -o /tmp/guest_hle_os_arm64.o
           clang --target=aarch64-apple-ios17.0 -Wall -Wextra -Werror \
             -c tests/guest_block_probe_arm64.S -o /tmp/guest_block_probe_arm64.o
+          clang --target=aarch64-apple-ios17.0 -Wall -Wextra -Werror \
+            -c tests/guest_sync_probe_arm64.S -o /tmp/guest_sync_probe_arm64.o
 
       # nvn_metal.mm is ObjC++; this parses it against tests/stubs/ so a type
       # error in the Metal backend is caught without a mac runner.
@@ -316,6 +323,13 @@ jobs:
             tests/guest_block_probe_arm64.S \
             /tmp/guest_run.o /tmp/guest_gate_entry.o $HLE_OS -o /tmp/guest_block_test
           /tmp/guest_block_test
+          # Mutex/event/light-event/semaphore blocking on the real target.
+          xcrun clang++ -std=c++20 -Wall -Wextra -Werror -O2 -I core/guest \
+            tests/guest_sync_test.cpp \
+            core/guest/guest_run_arm64.S core/guest/guest_resume_arm64.S \
+            tests/guest_sync_probe_arm64.S \
+            /tmp/guest_run.o /tmp/guest_gate_entry.o $HLE_OS -o /tmp/guest_sync_test
+          /tmp/guest_sync_test
           # The HLE stub returns 0 in x0 on the real arm64 target.
           xcrun clang++ -std=c++20 -Wall -Wextra -Werror -O2 -I core/guest \
             tests/guest_hle_test.cpp $HLE -o /tmp/guest_hle_test -lm

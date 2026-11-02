@@ -48,6 +48,7 @@ try {
         @{ name = "guest_chain_test"; src = "tests\guest_chain_test.cpp"; obj = "build\nvn\gate\" }
         @{ name = "guest_run_test"; src = "tests\guest_run_test.cpp"; obj = "build\nvn\gate\" }
         @{ name = "guest_block_test"; src = "tests\guest_block_test.cpp"; obj = "build\nvn\gate\" }
+        @{ name = "guest_sync_test"; src = "tests\guest_sync_test.cpp"; obj = "build\nvn\gate\" }
         @{ name = "guest_thread_test"; src = "tests\guest_thread_test.cpp"; obj = "build\nvn\gate\" }
         @{ name = "guest_hle_test"; src = "tests\guest_hle_test.cpp"; obj = "build\nvn\gate\" }
         @{ name = "guest_hle_nn_test"; src = "tests\guest_hle_nn_test.cpp"; obj = "build\nvn\gate\" }

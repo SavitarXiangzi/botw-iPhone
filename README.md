@@ -64,7 +64,7 @@ docs/           路线图、HLE 边界、NVN 覆盖表、iOS 移植手册、着�
 | M4 | NVN → Metal 回放（管线/纹理/命令缓冲） | 🟡 六类固定功能状态已接入：blend / write mask / alpha-to-coverage / 深度模板格式进入 `MTLRenderPipelineDescriptor`，cull / winding / fill、`MTLDepthStencilState`、模板 ref/掩码、depth clamp 与 polygon offset 在编码器逐 draw 应用；`ClearDepthStencil` 的完整掩码通过深度/模板附件的 load action 落地，即使整段只有清屏也会提交 pass；Metal 入口 484/514。六类固定功能状态补齐 33 个入口：blend（含 advanced mode / premultiplied / overlap）、color、channel mask、multisample、polygon、depth/stencil 的 getter 按 guest 对象字节解包回读，advanced blend 的真实位布局也已按实测写入。Queue / QueueBuilder / Sync / Event 已接：19 个 builder 入口按 setter 回读，Queue 生命周期与 command/control 内存记账、submit、acquire、fence/event 等待落地；`nvnCommandBufferEndRecording` / `CallCommands` / `CopyCommands` 已接入命令句柄：经分发表进入的 90 个命令缓冲入口先记录成宿主命令段，`EndRecording` 返回唯一句柄，`QueueSubmitCommands` 再按提交顺序展开（嵌套 CALL 有环检测），`DeviceFinalizeCommandHandle` 释放句柄；`BindTexturesDeferred` 保留句柄地址，提交时才读取，避免 BOTW 的延迟纹理路径拿到录制时的空 handle。清屏颜色、视口/裁剪/深度范围、绑定数组、render-target view、拷贝区域和 `UpdateUniformBuffer` 源字节在录制时复制进段内 arena，避免 guest 复用栈后回放悬空指针；`nvnCommandBufferSignalEvent` 在 Metal completion handler 里写回事件值。深度边界测试只有记录与明确上报（Metal 无对应能力）；支持 1–8 个颜色目标（MRT），每个目标有自己的格式、混合、写掩码与清屏值，模拟器已验证双目标清屏及双颜色输出；0 颜色附件的纯深度 pass 也已打开，模拟器通过“深度写入后 EQUAL 测试”确认深度值真的落盘；ClearColor / ClearColori / ClearColorui 已共用同一条 load action 路径，R32Uint/R32Sint 清屏字节回读通过；ClearBuffer 用宿主 compute kernel 填充任意 32 位模式（4 字节对齐），0xA1B2C3D4 回读通过；guest `DispatchCompute` / `DispatchComputeIndirect` 已接上 compute-only 程序的 direct-binding 路径：uniform buffer 走 `[[buffer(slot)]]`、storage buffer 走 `[[buffer(16 + slot)]]`、image 走 `[[texture(slot)]]`、sampled texture 走 `[[texture(16 + slot)]]`、sampler 走 `[[sampler(slot)]]`；组合纹理句柄同时解析纹理与 sampler，分离纹理 / 分离 sampler 走独立表，sampled texture 在 compute encoder 打开前完成解块上传。受 Metal 每阶段 31 个 buffer / texture 参数和 16 个 sampler 限制，compute uniform 支持 16 槽、storage 15 槽、image 16 槽、sampled texture 15 槽、sampler 16 槽；越界绑定明确拒绝。线程组大小取自 MSL 侧车 `// nvngfx-threadgroup X Y Z`，indirect 的组数由 GPU 从 guest pool 读取；模拟器用 16×16 网格分别验证 direct（组合句柄）与 indirect（分离句柄）的 uniform 偏移、256 个 storage word、sampled 2×2 纹理和 RGBA8 像素。compute image 写回 guest 存储与 CPU 回读，以及真实标题 compute blob 仍未接。每个 Program 的管线缓存已扩到 16 槽 MRU，模拟器填满 16 个不同状态键并逐一回查；ClearColor 的部分通道掩码改为 Load + 全屏三角形按写掩码清除，RGBA8 的 R/G 合并清屏与 RGBA8Uint 的 R/G 掩码清屏字节回读通过；ClearTexture / ClearTexturei / ClearTextureui 共用逐 level、逐 slice 的颜色清屏：完整级别走 load action，region 或部分通道 mask 走 scissor + 全屏三角形；代码路径覆盖 2D / 2D array / cube / cube array / 2D MSAA，支持完整多 mip 清屏，显式 region 仅接受单 level 视图；模拟器回读完整、区域、mask、整数、cube 六面与 mip 1，1D / 3D / depth-stencil 明确拒绝；`ClearDepthStencil` 的 8 位模板部分掩码通过独立 depth/stencil-only pass 落地（加载旧模板、全屏三角形 + ALWAYS/REPLACE + 写掩码），完整 0xFF 仍走 load action；模拟器以 0xF0 → mask 0x0F + 0x5A → 0xFA 的 EQUAL 测试验证高低半字节；NVN buffer 对象、buffer / memory-pool 查询、UpdateUniformBuffer、CopyBufferToBuffer、Buffer↔Texture / Texture↔Texture copy 与 copy row/image stride 已接入；模拟器用两次 compute dispatch 回读 uniform 来源 777 / 888，并用 32/128 → 24/96 → tight 三组 stride 对 4×4 RGBA8 做 B2T→T2B→T2T→T2B 回读；BCn transcode 与 mirror flags 明确拒绝；CommandBuffer 的 initialize / finalize / is-recording、command/control memory 记账、memory callback 存取与 debug label / marker / group 已接，debug 组会转成 MTLCommandBuffer 的 push/pop 并在提交后检查状态；point size / line width / sample mask / primitive restart / conservative raster / subpixel bias / tiled cache / ZCull / shader scratch 记录在案（Metal 无对应能力，明确上报），rasterizer discard 真正生效——被丢弃的 draw 计数但不进 encoder；纹理侧补齐 14 个 getter（宽高深、级别、采样数、格式、target、flags、pool、offset、stride、debug id、纹理地址、storage size、swizzle），都按 guest 通过 builder 给的值回读，另加 SetDebugLabel / Finalize / InvalidateTexels；TextureBuilder 的 14 个 getter（11 个标量 + storage size/alignment + swizzle 四路）按 setter 记录回读，未设置过的 builder 返回 NVN 默认值（1×1、1 级、R/G/B/A）；NVNtextureView 的 16 字节状态对象可读写（7 个 setter、6 个 getter、字段比较），texture builder/object 新增 device、swizzle、GL 名称、depth-stencil mode 读写，`nvnTextureGetViewOffset` 按 level offset + layer × layer_size 计算，`nvnTextureCompare` 按描述符/存储身份/通道映射比较，texture / sampler descriptor pool 补齐 `GetMemoryPool`；Window / WindowBuilder 的 12 + 12 个入口补齐：builder defaults 会清空纹理列表但保留 device，texture 列表 / native window / present interval / active count 可回读，window 侧 native window / present interval / active count / crop / debug label 可读写（crop 只记录，present blit 尚未消费）；Program 侧补齐 SetDebugLabel、SetSampleShading（只记录，Metal 无独立开关）和 SetShadersExt（每 stage 0x18 字节记录转成普通 shader data），SamplerBuilderGetDevice 与 SamplerGetDebugID 也接通，Program 覆盖 6/7、Sampler 15/15、SamplerBuilder 25/25；通用 view 的 swizzle/dsmode 尚未应用到采样或渲染目标，GL 名称只是记录；Device 侧补齐 20 个入口（finalize / deferred finalize / debug domain / debug label / debug callback / walk database / fast-clear 注册 / 深度与窗口原点模式 / 中间 shader cache / 时间戳与 `GetInteger`），virtual memory pool 可以没有存储就初始化、`nvnMemoryPoolMapVirtual` 在单段连续请求时把虚拟池别名到物理池，4 个 storage class getter 与 packaged texture data/layout 读写也已接，`ReadTexels` / `ReadTexelsStrided` 按 guest 存储的块线性布局逐 level/layer/slice 读回（渲染过的纹理只报“guest 副本已过期”，没有 GPU 回读），两个 `GetSparseTileLayout` 按 64 KiB tile 报出 tiled level 数与 tile 尺寸，`DiscardColor` / `DiscardDepthStencil` 让下一次 pass 用 `MTLLoadActionDontCare` 打开对应附件，`GetMemoryCallbackData` 回读 guest 指针，`nvnCommandBufferReportCounter` / `nvnCommandBufferReportValue` / `nvnCommandBufferResetCounter` 在 Metal completion handler 里写回 guest 内存，`nvnTextureBuilderSetPackagedTextureLayout` 的首字节已接进 tile height/depth 计算，ZCull storage 明确返回 0；`GetInteger` 的 API 版本 55.15 与属性表取自 nxnative 的 1.9.0 profile，本标题（1.6.0）尚未实机确认；时间戳是宿主 `steady_clock` 的提交时刻而不是 Metal GPU 时间，samples-passed 一律写 0；Windows Unicorn 捕获侧已出现真实标题 707 draws / 304 presents（另一次 700 s 复跑 667 / 288；需 `BOTW_FAST_DEDUP=1`）；iOS app 仍未链接客体核心，`presents` 只是宿主清屏 |
 | M4.1 | 1.6.0 客体 AOT 改写（x18 / TLS / SVC / spin） | 🟡 四模块改写并结构校验通过；portable loader / 页级映射 / key page / gate trampoline / HLE 注册表（libc / nn::oe / nn::fs 沙箱 / nn::os 线程层）已接，合成客体可在 macOS arm64 CI 真跑；真实 `main.patched.bin` 入口尚未调用 |
 | M4.2 | 客体线程调度（协作式：独立栈 / 帧切换 / yield / block / exit） | 🟡 三线程合成测试在 macOS arm64 CI 通过（8 gate / 9 次切换 / 2 次退出）；新增阻塞探针 `guest_block_test`：主线程在 worker 运行前 `WaitThread`，由 worker 退出唤醒，再 `SleepThread(5ms)` 由虚拟时钟 deadline 唤醒（macOS arm64 CI 通过：`guest_block_test: ok (wait join, timed wake, 2 blocks, 2 wakes)`）；无抢占，真实标题线程未接 |
-| M4.3 | `nn::os` 线程 / TLS / 虚拟时钟 / 内存块 HLE | 🟡 33/78 个导入已接管：`CreateThread` 两种重载、`StartThread`、`WaitThread`、`DestroyThread`、线程名/优先级/核掩码、16 个 TLS 槽、`GetSystemTick` 与页对齐内存块；`SleepThread` 与活目标 `WaitThread` 现在经 AArch64 导入包装器保存完整客体帧并真正进入 `BLOCKED`：睡眠由 run 的虚拟时钟唤醒，线程退出唤醒 joiners，恢复路径区分 gate 帧与 import 帧；mutex / event / light event / semaphore / message queue / multi-wait 仍未接 |
+| M4.3 | `nn::os` 线程 / TLS / 虚拟时钟 / 同步 / 内存块 HLE | 🟡 55/78 个导入已接管：`CreateThread` 两种重载、`StartThread`、`WaitThread`、`DestroyThread`、线程名/优先级/核掩码、16 个 TLS 槽、`GetSystemTick`、页对齐内存块，以及 Mutex / Event / LightEvent / Semaphore 全套初始化、非阻塞尝试、信号与 finalize；`SleepThread`、活目标 `WaitThread`、`LockMutex`、`WaitEvent`、`WaitLightEvent`、`TimedWaitLightEvent`、`AcquireSemaphore` 经 AArch64 导入包装器保存完整客体帧并真正进入 `BLOCKED`：mutex 解锁按所有权移交唤醒一个 waiter，event/light event 按 manual/auto-clear 唤醒，semaphore 释放按 permit 交接，timed wait 由 run 的虚拟时钟超时并从对象 waiter 表移除；message queue / system event / multi-wait / 用户异常处理仍未接 |
 | M5 | 音频（nn::audio → AVAudioEngine）、输入 | ⬜ |
 | M6 | 真机性能与内存（6 GB 机型起步） | ⬜ |
 
@@ -125,7 +125,7 @@ docs/           路线图、HLE 边界、NVN 覆盖表、iOS 移植手册、着�
 
 ## M4 进展（本轮）
 
-### `nn::os` 线程层（33/78）
+### `nn::os` 线程层（55/78）
 
 新增 `core/guest/guest_hle_os.{h,c}`，把游戏自己的 `ThreadType*` 映射到
 `botw_guest_run` 的线程槽：
@@ -140,7 +140,10 @@ docs/           路线图、HLE 边界、NVN 覆盖表、iOS 移植手册、着�
   同步（每次查询前进 1 tick，`GetSystemTickFrequency` = 0x124F800），
   不接宿主时钟；
 * `AllocateMemoryBlock` 返回 0x1000 对齐的宿主内存块，`FreeMemoryBlock`
-  通过块头释放。
+  通过块头释放；
+* Mutex / Event / LightEvent / Semaphore 共 22 个入口：对象指针只作
+  identity token，宿主侧固定表保存 owner、depth、signal 状态、count 与
+  waiter 队列，不读写游戏自己的对象内存。
 
 ### 阻塞导入：`SleepThread` / `WaitThread`
 
@@ -175,11 +178,19 @@ docs/           路线图、HLE 边界、NVN 覆盖表、iOS 移植手册、着�
 5 ms。macOS arm64 CI 已通过，输出
 `guest_block_test: ok (wait join, timed wake, 2 blocks, 2 wakes)`。
 
-**仍然不成立**：`BLOCKED` 目前只服务 sleep 和 thread join；mutex / event /
-light event / semaphore / message queue / system event / multi-wait 都还是
-共享 stub。没有抢占（纯计算且没有 gate/自旋回边的长循环仍会饿死其他线程），
-没有步数预算、信号处理或真实 `main.patched.bin` 入口。也就是说，现在是一张
-可运行、可阻塞、可唤醒、可回收的协作式线程表，不是完整的 Horizon 内核。
+同步对象也走同一套 import 帧恢复：`LockMutex` 在锁已占用时把当前线程置
+`BLOCKED` 并加入对象的 waiter 队列；`UnlockMutex` 把 owner 直接交给下一个
+waiter，避免“唤醒后重新竞争”导致丢唤醒。Event / LightEvent 区分
+manual-clear 与 auto-clear；`TimedWaitLightEvent` 的超时由
+`botw_guest_run` 的 timeout hook 通知 HLE 从 waiter 队列中移除并写回 false。
+`guest_sync_test` 用四个真实 AArch64 客体 worker 验证 mutex 阻塞与所有权
+移交、event 唤醒、semaphore permit 交接和 light-event 超时。
+
+**仍然不成立**：message queue / system event / multi-wait / 用户异常处理
+仍是共享 stub；没有抢占（纯计算且没有 gate/自旋回边的长循环仍会饿死其他
+线程），没有步数预算、信号处理或真实 `main.patched.bin` 入口。也就是说，
+现在是一张可运行、可阻塞、可唤醒、可回收的协作式线程表，不是完整的
+Horizon 内核。
 
 ## M2 进展
 

@@ -77,6 +77,7 @@ static int wake_joiners(botw_guest_run* run, int target) {
             t->state = BOTW_GUEST_THREAD_READY;
             t->wait_kind = BOTW_GUEST_WAIT_NONE;
             t->wait_arg = 0;
+            t->wait_deadline = BOTW_GUEST_NO_DEADLINE;
             run->wakes++;
             woke++;
         }
@@ -84,18 +85,25 @@ static int wake_joiners(botw_guest_run* run, int target) {
     return woke;
 }
 
-/* Wake every sleeper whose absolute deadline has arrived.  The clock is
- * virtual and monotonic; this never consults the host wall clock. */
+/* Wake every timed waiter whose absolute deadline has arrived.  The clock is
+ * virtual and monotonic; this never consults the host wall clock.  A
+ * subsystem that owns the object being waited on installs timeout_fn so it
+ * can remove the waiter and write the timeout return value before the thread
+ * becomes runnable again. */
 static int wake_expired(botw_guest_run* run) {
     int i, woke = 0;
     for (i = 0; i < BOTW_GUEST_MAX_THREADS; i++) {
         botw_guest_thread* t = &run->threads[i];
         if (t->state == BOTW_GUEST_THREAD_BLOCKED &&
-            t->wait_kind == BOTW_GUEST_WAIT_SLEEP &&
-            t->wait_arg <= run->clock) {
+            t->wait_deadline != BOTW_GUEST_NO_DEADLINE &&
+            t->wait_deadline <= run->clock) {
+            if (run->timeout_fn) {
+                run->timeout_fn(run->timeout_user, i, t->wait_kind, t->wait_arg);
+            }
             t->state = BOTW_GUEST_THREAD_READY;
             t->wait_kind = BOTW_GUEST_WAIT_NONE;
             t->wait_arg = 0;
+            t->wait_deadline = BOTW_GUEST_NO_DEADLINE;
             run->wakes++;
             woke++;
         }
@@ -103,19 +111,19 @@ static int wake_expired(botw_guest_run* run) {
     return woke;
 }
 
-/* With nothing runnable, step the virtual clock to the earliest sleep
+/* With nothing runnable, step the virtual clock to the earliest timed
  * deadline.  That gives the scheduler a way out of "every thread is asleep"
- * without a host timer thread, while arbitrary event waits still deadlock
- * loudly instead of pretending to succeed. */
+ * without a host timer thread, while an untimed wait with no runnable
+ * signaller still deadlocks loudly instead of pretending to succeed. */
 static int advance_to_earliest_sleeper(botw_guest_run* run) {
     uint64_t earliest = UINT64_MAX;
     int i;
     for (i = 0; i < BOTW_GUEST_MAX_THREADS; i++) {
         const botw_guest_thread* t = &run->threads[i];
         if (t->state == BOTW_GUEST_THREAD_BLOCKED &&
-            t->wait_kind == BOTW_GUEST_WAIT_SLEEP &&
-            t->wait_arg < earliest) {
-            earliest = t->wait_arg;
+            t->wait_deadline != BOTW_GUEST_NO_DEADLINE &&
+            t->wait_deadline < earliest) {
+            earliest = t->wait_deadline;
         }
     }
     if (earliest == UINT64_MAX) return 0;
@@ -187,6 +195,7 @@ const botw_guest_resume* botw_guest_thread_exit_frame(void) {
         run->threads[cur].has_frame = 0;
         run->threads[cur].wait_kind = BOTW_GUEST_WAIT_NONE;
         run->threads[cur].wait_arg = 0;
+        run->threads[cur].wait_deadline = BOTW_GUEST_NO_DEADLINE;
         run->thread_exits++;
         (void)wake_joiners(run, cur);
     }
@@ -307,6 +316,13 @@ void botw_guest_run_set_gate(botw_guest_run* run, botw_guest_run_gate_fn fn, voi
     run->gate_user = user;
 }
 
+void botw_guest_run_set_timeout(botw_guest_run* run, botw_guest_run_timeout_fn fn,
+                                void* user) {
+    if (!run) return;
+    run->timeout_fn = fn;
+    run->timeout_user = user;
+}
+
 int botw_guest_run_enter(botw_guest_run* run, size_t entry_off) {
     if (!run) return -1;
     if (!run->image_base) {
@@ -359,6 +375,7 @@ int botw_guest_run_thread_create(botw_guest_run* run, const void* entry,
     memset(t, 0, sizeof *t);
     t->state = BOTW_GUEST_THREAD_CREATED;
     t->generation = run->generation;
+    t->wait_deadline = BOTW_GUEST_NO_DEADLINE;
     t->entry = (uint64_t)(uintptr_t)entry;
     t->arg = arg;
     t->stack = mem;
@@ -447,7 +464,7 @@ uint64_t botw_guest_run_advance_clock(botw_guest_run* run, uint64_t ticks) {
 
 const botw_guest_resume* botw_guest_run_block_and_switch(
     botw_guest_run* run, const botw_guest_regs* frame,
-    int wait_kind, uint64_t wait_arg) {
+    int wait_kind, uint64_t wait_arg, uint64_t wait_deadline) {
     botw_guest_thread* t;
     int cur, next;
 
@@ -461,7 +478,8 @@ const botw_guest_resume* botw_guest_run_block_and_switch(
         run_error(run, "block requested with no current thread");
         return NULL;
     }
-    if (wait_kind != BOTW_GUEST_WAIT_THREAD && wait_kind != BOTW_GUEST_WAIT_SLEEP) {
+    if (wait_kind <= BOTW_GUEST_WAIT_NONE ||
+        wait_kind > BOTW_GUEST_WAIT_SEMAPHORE) {
         run_error(run, "block requested with unknown wait kind %d", wait_kind);
         return NULL;
     }
@@ -481,6 +499,7 @@ const botw_guest_resume* botw_guest_run_block_and_switch(
     t->state = BOTW_GUEST_THREAD_BLOCKED;
     t->wait_kind = wait_kind;
     t->wait_arg = wait_arg;
+    t->wait_deadline = wait_deadline;
     run->blocks++;
     run->switch_requested = 0;
 
@@ -492,13 +511,28 @@ const botw_guest_resume* botw_guest_run_block_and_switch(
         next = pick_next(run, cur);
     }
     if (next < 0) {
-        run_error(run, "guest deadlock: all threads are blocked and no sleep deadline can wake one");
+        run_error(run, "guest deadlock: all threads are blocked and no timed deadline can wake one");
         return NULL;
     }
     run->current = next;
     run->threads[next].state = BOTW_GUEST_THREAD_RUNNING;
     if (next != cur) run->switches++;
     return set_resume(run, next);
+}
+
+int botw_guest_run_wake(botw_guest_run* run, int thread_slot) {
+    botw_guest_thread* t;
+    if (!run || thread_slot < 0 || thread_slot >= BOTW_GUEST_MAX_THREADS) {
+        return -1;
+    }
+    t = &run->threads[thread_slot];
+    if (t->state != BOTW_GUEST_THREAD_BLOCKED) return 0;
+    t->state = BOTW_GUEST_THREAD_READY;
+    t->wait_kind = BOTW_GUEST_WAIT_NONE;
+    t->wait_arg = 0;
+    t->wait_deadline = BOTW_GUEST_NO_DEADLINE;
+    run->wakes++;
+    return 1;
 }
 
 int botw_guest_run_current(const botw_guest_run* run) {
@@ -557,6 +591,7 @@ int botw_guest_run_enter_at(botw_guest_run* run, const void* entry) {
     run->threads[0].entry = (uint64_t)(uintptr_t)entry;
     run->threads[0].arg = run->args[0];
     memset(&run->threads[0].frame, 0, sizeof run->threads[0].frame);
+    run->threads[0].wait_deadline = BOTW_GUEST_NO_DEADLINE;
     run->current = 0;
     run->switch_requested = 0;
     run->switches = 0;

@@ -56,6 +56,13 @@ typedef enum {
  * guest; writing regs->x[] is how a call is answered. */
 typedef void (*botw_guest_run_gate_fn)(void* user, botw_guest_regs* regs);
 
+/* Called by the scheduler immediately before a timed waiter is made READY.
+ * The HLE uses it to drop the thread from its sync object's waiter list and,
+ * for TimedWaitLightEvent, to write the false result into the saved frame.
+ * It runs while the thread is still BLOCKED, and must not switch threads. */
+typedef void (*botw_guest_run_timeout_fn)(void* user, int thread_slot,
+                                          int wait_kind, uint64_t wait_arg);
+
 /* Saved host state.  The offsets are hard-coded in guest_run_arm64.S and the
  * static asserts in guest_run.c fail the build if this struct changes. */
 typedef struct {
@@ -90,12 +97,21 @@ typedef enum {
 } botw_guest_thread_state;
 
 /* Why a BLOCKED thread is not runnable.  Thread exit wakes THREAD waiters;
- * the scheduler's virtual clock wakes SLEEP waiters. */
+ * the scheduler's virtual clock wakes timed waiters; a sync object's signal
+ * operation wakes MUTEX/EVENT/LIGHT_EVENT/SEMAPHORE waiters.  wait_arg is the
+ * object index for the sync kinds and the target slot for THREAD. */
 typedef enum {
     BOTW_GUEST_WAIT_NONE = 0,
     BOTW_GUEST_WAIT_THREAD,     /* wait_arg is the target thread slot */
-    BOTW_GUEST_WAIT_SLEEP       /* wait_arg is an absolute run-clock tick */
+    BOTW_GUEST_WAIT_SLEEP,      /* deadline is an absolute run-clock tick */
+    BOTW_GUEST_WAIT_MUTEX,      /* wait_arg is a host-side mutex index */
+    BOTW_GUEST_WAIT_EVENT,      /* wait_arg is a host-side event index */
+    BOTW_GUEST_WAIT_LIGHT_EVENT,/* wait_arg is a host-side light-event index */
+    BOTW_GUEST_WAIT_SEMAPHORE   /* wait_arg is a host-side semaphore index */
 } botw_guest_wait_kind;
+
+/* No deadline.  Timed waits store an absolute run-clock tick instead. */
+#define BOTW_GUEST_NO_DEADLINE UINT64_MAX
 
 /* The two saved-frame shapes need different restore sequences.  A gate frame
  * returns through the rewritten block's `ldp x29,x30,[sp],#16`; an import
@@ -122,7 +138,8 @@ typedef struct {
     botw_guest_regs frame;      /* valid when has_frame is set */
     int      frame_kind;        /* botw_guest_frame_kind for frame */
     int      wait_kind;         /* botw_guest_wait_kind while BLOCKED */
-    uint64_t wait_arg;          /* target slot or wake tick */
+    uint64_t wait_arg;          /* target slot or sync-object index */
+    uint64_t wait_deadline;     /* absolute tick, or BOTW_GUEST_NO_DEADLINE */
     unsigned long yields;       /* explicit yields observed from this thread */
     unsigned long generation;   /* run generation that created this thread */
 } botw_guest_thread;
@@ -142,6 +159,8 @@ typedef struct {
     int      active;
     botw_guest_run_gate_fn gate;
     void*    gate_user;
+    botw_guest_run_timeout_fn timeout_fn;
+    void*    timeout_user;
     botw_guest_run_ctx ctx;
     botw_guest_thread threads[BOTW_GUEST_MAX_THREADS];
     int      thread_count;       /* high-water mark, informational */
@@ -167,6 +186,10 @@ int botw_guest_run_init(botw_guest_run* run, const void* image_base,
 void botw_guest_run_close(botw_guest_run* run);
 
 void botw_guest_run_set_gate(botw_guest_run* run, botw_guest_run_gate_fn fn, void* user);
+
+/* Installs the timed-wait cleanup hook, or clears it with fn == NULL. */
+void botw_guest_run_set_timeout(botw_guest_run* run, botw_guest_run_timeout_fn fn,
+                                void* user);
 
 /* Runs <image_base + entry_off> until the guest returns.  Returns 0 when the
  * guest got as far as executing, -1 with `error` set when it refused. */
@@ -218,7 +241,12 @@ uint64_t botw_guest_run_clock(const botw_guest_run* run);
  * than return from the host call. */
 const botw_guest_resume* botw_guest_run_block_and_switch(
     botw_guest_run* run, const botw_guest_regs* frame,
-    int wait_kind, uint64_t wait_arg);
+    int wait_kind, uint64_t wait_arg, uint64_t wait_deadline);
+
+/* Makes a BLOCKED thread runnable.  Returns 1 when it changed state, 0 when
+ * the slot was not blocked, -1 on a bad slot.  The caller has already updated
+ * the object it was waiting for (mutex owner, semaphore count, ...). */
+int botw_guest_run_wake(botw_guest_run* run, int thread_slot);
 
 /* Index of the running thread, or -1. */
 int botw_guest_run_current(const botw_guest_run* run);

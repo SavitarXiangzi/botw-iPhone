@@ -12,6 +12,11 @@
  * intentionally just symbols here. */
 extern void botw_hle_os_guest_sleep(void);
 extern void botw_hle_os_guest_wait_thread(void);
+extern void botw_hle_os_guest_lock_mutex(void);
+extern void botw_hle_os_guest_wait_event(void);
+extern void botw_hle_os_guest_wait_light_event(void);
+extern void botw_hle_os_guest_timed_wait_light_event(void);
+extern void botw_hle_os_guest_acquire_semaphore(void);
 #endif
 
 /* The implementations are registered under their Itanium-mangled names,
@@ -36,6 +41,9 @@ static botw_hle_os_state g_os_default;
 static int g_os_default_ready;
 static char g_host_arg0[] = "botw-guest";
 static char* g_host_argv[] = { g_host_arg0, NULL };
+
+static void os_sync_timeout(void* user, int thread_slot, int wait_kind,
+                            uint64_t wait_arg);
 
 static uint32_t os_error(botw_hle_os_state* state, const char* fmt, ...) {
     va_list ap;
@@ -88,6 +96,7 @@ static void init_main_thread(botw_hle_os_state* state) {
 
 void botw_hle_os_reset(botw_hle_os_state* state) {
     if (!state) return;
+    if (state->run) botw_guest_run_set_timeout(state->run, NULL, NULL);
     memset(state, 0, sizeof *state);
     init_main_thread(state);
     state->next_thread_id = BOTW_HLE_OS_MAIN_ID + 1u;
@@ -104,8 +113,13 @@ botw_hle_os_state* botw_hle_os_default(void) {
 void botw_hle_os_attach_run(botw_hle_os_state* state, botw_guest_run* run) {
     int i;
     if (!state) return;
+    if (state->run) botw_guest_run_set_timeout(state->run, NULL, NULL);
     state->run = run;
     state->attached = run != NULL;
+    memset(state->mutexes, 0, sizeof state->mutexes);
+    memset(state->events, 0, sizeof state->events);
+    memset(state->light_events, 0, sizeof state->light_events);
+    memset(state->semaphores, 0, sizeof state->semaphores);
     for (i = 1; i < (int)BOTW_GUEST_MAX_THREADS; i++) {
         memset(&state->threads[i], 0, sizeof state->threads[i]);
     }
@@ -114,6 +128,7 @@ void botw_hle_os_attach_run(botw_hle_os_state* state, botw_guest_run* run) {
     memset(state->tls_dtor, 0, sizeof state->tls_dtor);
     state->tick = 0;
     if (run) run->clock = 0;
+    if (run) botw_guest_run_set_timeout(run, os_sync_timeout, state);
     state->next_thread_id = BOTW_HLE_OS_MAIN_ID + 1u;
 }
 
@@ -556,6 +571,707 @@ static void os_FreeMemoryBlock(size_t addr, size_t size) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Mutex / Event / LightEvent / Semaphore                             */
+/* ------------------------------------------------------------------ */
+
+/* The guest's object memory is never read or written.  The pointer is only a
+ * key into these fixed tables, so an unknown layout cannot corrupt host state
+ * and a table-full condition is reported instead of aliasing two objects. */
+
+static int waiter_index(const int* waiters, int count, int slot) {
+    int i;
+    for (i = 0; i < count; i++) {
+        if (waiters[i] == slot) return i;
+    }
+    return -1;
+}
+
+static int waiter_add(int* waiters, int* count, int slot) {
+    if (waiter_index(waiters, *count, slot) >= 0) return 1;
+    if (*count >= (int)BOTW_GUEST_MAX_THREADS) {
+        (void)os_error(g_os, "sync object waiter list is full");
+        return 0;
+    }
+    waiters[(*count)++] = slot;
+    return 1;
+}
+
+static void waiter_remove_at(int* waiters, int* count, int pos) {
+    int i;
+    if (pos < 0 || pos >= *count) return;
+    for (i = pos + 1; i < *count; i++) waiters[i - 1] = waiters[i];
+    (*count)--;
+}
+
+static int thread_waiting_on(int slot, int kind, int index) {
+    const botw_guest_thread* t;
+    if (!g_os || !g_os->run) return 0;
+    if (slot < 0 || slot >= (int)BOTW_GUEST_MAX_THREADS) return 0;
+    t = &g_os->run->threads[slot];
+    return t->state == BOTW_GUEST_THREAD_BLOCKED &&
+           t->wait_kind == kind &&
+           t->wait_arg == (uint64_t)(unsigned)index;
+}
+
+/* Drop entries whose thread timed out (or whose run is gone).  Timed waits
+ * are completed by os_sync_timeout(), but compacting here also covers an HLE
+ * state that was detached while an object still had queued waiters. */
+static void waiter_compact(int* waiters, int* count, int kind, int index) {
+    int i = 0;
+    while (i < *count) {
+        if (thread_waiting_on(waiters[i], kind, index)) {
+            i++;
+        } else {
+            waiter_remove_at(waiters, count, i);
+        }
+    }
+}
+
+static int wake_sync_waiter(int slot, int result, int write_result) {
+    botw_guest_thread* t;
+    if (!g_os || !g_os->run) return 0;
+    if (slot < 0 || slot >= (int)BOTW_GUEST_MAX_THREADS) return 0;
+    t = &g_os->run->threads[slot];
+    if (write_result && t->has_frame) t->frame.x[0] = (uint64_t)(unsigned)result;
+    return botw_guest_run_wake(g_os->run, slot) > 0;
+}
+
+static botw_hle_os_mutex* mutex_find(void* type, int* out_index) {
+    int i;
+    if (!g_os || !type) return NULL;
+    for (i = 0; i < (int)BOTW_HLE_OS_MAX_MUTEX; i++) {
+        if (g_os->mutexes[i].used && g_os->mutexes[i].type == type) {
+            if (out_index) *out_index = i;
+            return &g_os->mutexes[i];
+        }
+    }
+    return NULL;
+}
+
+static botw_hle_os_mutex* mutex_create(void* type, int recursive, int* out_index) {
+    botw_hle_os_mutex* m;
+    int existing = -1;
+    int i;
+    if (!g_os) return NULL;
+    if (!type) {
+        (void)os_error(g_os, "mutex: null MutexType");
+        return NULL;
+    }
+    m = mutex_find(type, &existing);
+    if (m) {
+        waiter_compact(m->waiters, &m->waiter_count,
+                       BOTW_GUEST_WAIT_MUTEX, existing);
+        if (m->waiter_count != 0) {
+            (void)os_error(g_os, "InitializeMutex: object still has waiters");
+            return NULL;
+        }
+        memset(m, 0, sizeof *m);
+        m->used = 1;
+        m->type = type;
+        if (out_index) *out_index = existing;
+    } else {
+        for (i = 0; i < (int)BOTW_HLE_OS_MAX_MUTEX; i++) {
+            if (!g_os->mutexes[i].used) break;
+        }
+        if (i == (int)BOTW_HLE_OS_MAX_MUTEX) {
+            (void)os_error(g_os, "InitializeMutex: mutex table is full");
+            return NULL;
+        }
+        m = &g_os->mutexes[i];
+        memset(m, 0, sizeof *m);
+        m->used = 1;
+        m->type = type;
+        if (out_index) *out_index = i;
+    }
+    m->owner = -1;
+    m->depth = 0;
+    m->recursive = recursive != 0;
+    return m;
+}
+
+static botw_hle_os_mutex* mutex_begin(void* type, int* out_index) {
+    botw_hle_os_mutex* m;
+    if (!g_os) return NULL;
+    g_os->calls++;
+    m = mutex_find(type, out_index);
+    if (!m) (void)os_error(g_os, "LockMutex: MutexType was not initialized");
+    return m;
+}
+
+static int mutex_acquire_now(botw_hle_os_mutex* m, int slot) {
+    if (!m) return 0;
+    if (m->owner < 0) {
+        m->owner = slot;
+        m->depth = 1;
+        g_os->mutex_locks++;
+        return 1;
+    }
+    if (m->owner == slot && m->recursive) {
+        m->depth++;
+        g_os->mutex_locks++;
+        return 1;
+    }
+    return 0;
+}
+
+static void os_InitializeMutex(void* type, int recursive, int priority) {
+    (void)priority;
+    if (!g_os) return;
+    g_os->calls++;
+    (void)mutex_create(type, recursive, NULL);
+}
+
+static void os_FinalizeMutex(void* type) {
+    botw_hle_os_mutex* m;
+    int index = -1;
+    if (!g_os) return;
+    g_os->calls++;
+    m = mutex_find(type, &index);
+    if (!m) return;
+    waiter_compact(m->waiters, &m->waiter_count, BOTW_GUEST_WAIT_MUTEX, index);
+    if (m->waiter_count != 0) {
+        (void)os_error(g_os, "FinalizeMutex: object still has waiters");
+        return;
+    }
+    memset(m, 0, sizeof *m);
+}
+
+static int os_TryLockMutex(void* type) {
+    botw_hle_os_mutex* m;
+    int index = -1;
+    if (!g_os) return 0;
+    g_os->calls++;
+    g_os->mutex_try_locks++;
+    m = mutex_find(type, &index);
+    if (!m) {
+        (void)os_error(g_os, "TryLockMutex: MutexType was not initialized");
+        return 0;
+    }
+    return mutex_acquire_now(m, current_slot(g_os));
+}
+
+static void os_UnlockMutex(void* type) {
+    botw_hle_os_mutex* m;
+    int index = -1;
+    int cur;
+    if (!g_os) return;
+    g_os->calls++;
+    m = mutex_find(type, &index);
+    if (!m) {
+        (void)os_error(g_os, "UnlockMutex: MutexType was not initialized");
+        return;
+    }
+    cur = current_slot(g_os);
+    if (m->owner != cur) {
+        (void)os_error(g_os, "UnlockMutex: caller does not own the mutex");
+        return;
+    }
+    g_os->mutex_unlocks++;
+    if (m->depth > 1) {
+        m->depth--;
+        return;
+    }
+    m->owner = -1;
+    m->depth = 0;
+    waiter_compact(m->waiters, &m->waiter_count, BOTW_GUEST_WAIT_MUTEX, index);
+    if (m->waiter_count > 0) {
+        int next = m->waiters[0];
+        waiter_remove_at(m->waiters, &m->waiter_count, 0);
+        m->owner = next;
+        m->depth = 1;
+        g_os->mutex_locks++;
+        (void)wake_sync_waiter(next, 0, 0);
+    }
+}
+
+static botw_hle_os_event* event_find(void* type, int* out_index) {
+    int i;
+    if (!g_os || !type) return NULL;
+    for (i = 0; i < (int)BOTW_HLE_OS_MAX_EVENT; i++) {
+        if (g_os->events[i].used && g_os->events[i].type == type) {
+            if (out_index) *out_index = i;
+            return &g_os->events[i];
+        }
+    }
+    return NULL;
+}
+
+static botw_hle_os_event* event_create(void* type, int signaled, int auto_clear,
+                                       int* out_index) {
+    botw_hle_os_event* e;
+    int existing = -1;
+    int i;
+    if (!g_os) return NULL;
+    if (!type) {
+        (void)os_error(g_os, "event: null EventType");
+        return NULL;
+    }
+    e = event_find(type, &existing);
+    if (e) {
+        waiter_compact(e->waiters, &e->waiter_count,
+                       BOTW_GUEST_WAIT_EVENT, existing);
+        if (e->waiter_count != 0) {
+            (void)os_error(g_os, "InitializeEvent: object still has waiters");
+            return NULL;
+        }
+        memset(e, 0, sizeof *e);
+        e->used = 1;
+        e->type = type;
+        if (out_index) *out_index = existing;
+    } else {
+        for (i = 0; i < (int)BOTW_HLE_OS_MAX_EVENT; i++) {
+            if (!g_os->events[i].used) break;
+        }
+        if (i == (int)BOTW_HLE_OS_MAX_EVENT) {
+            (void)os_error(g_os, "InitializeEvent: event table is full");
+            return NULL;
+        }
+        e = &g_os->events[i];
+        memset(e, 0, sizeof *e);
+        e->used = 1;
+        e->type = type;
+        if (out_index) *out_index = i;
+    }
+    e->signaled = signaled != 0;
+    e->auto_clear = auto_clear != 0;
+    return e;
+}
+
+static botw_hle_os_event* event_begin(void* type, int* out_index) {
+    botw_hle_os_event* e;
+    if (!g_os) return NULL;
+    g_os->calls++;
+    e = event_find(type, out_index);
+    if (!e) (void)os_error(g_os, "WaitEvent: EventType was not initialized");
+    return e;
+}
+
+static int event_consume(botw_hle_os_event* e) {
+    if (!e || !e->signaled) return 0;
+    if (e->auto_clear) e->signaled = 0;
+    return 1;
+}
+
+static void os_InitializeEvent(void* type, int signaled, int clear_mode) {
+    if (!g_os) return;
+    g_os->calls++;
+    (void)event_create(type, signaled, clear_mode, NULL);
+}
+
+static void os_FinalizeEvent(void* type) {
+    botw_hle_os_event* e;
+    int index = -1;
+    if (!g_os) return;
+    g_os->calls++;
+    e = event_find(type, &index);
+    if (!e) return;
+    waiter_compact(e->waiters, &e->waiter_count, BOTW_GUEST_WAIT_EVENT, index);
+    if (e->waiter_count != 0) {
+        (void)os_error(g_os, "FinalizeEvent: object still has waiters");
+        return;
+    }
+    memset(e, 0, sizeof *e);
+}
+
+static int event_get_result(void* type) {
+    botw_hle_os_event* e;
+    if (!g_os) return 0;
+    g_os->calls++;
+    g_os->event_waits++;
+    e = event_find(type, NULL);
+    if (!e) {
+        (void)os_error(g_os, "WaitEvent: EventType was not initialized");
+        return 0;
+    }
+    return event_consume(e);
+}
+
+static int os_TryWaitEvent(void* type) {
+    return event_get_result(type);
+}
+
+static void os_SignalEvent(void* type) {
+    botw_hle_os_event* e;
+    int index = -1;
+    if (!g_os) return;
+    g_os->calls++;
+    e = event_find(type, &index);
+    if (!e) {
+        (void)os_error(g_os, "SignalEvent: EventType was not initialized");
+        return;
+    }
+    g_os->event_signals++;
+    e->signaled = 1;
+    waiter_compact(e->waiters, &e->waiter_count, BOTW_GUEST_WAIT_EVENT, index);
+    if (e->auto_clear) {
+        if (e->waiter_count > 0) {
+            int next = e->waiters[0];
+            waiter_remove_at(e->waiters, &e->waiter_count, 0);
+            e->signaled = 0;
+            (void)wake_sync_waiter(next, 1, 1);
+        }
+    } else {
+        int i;
+        for (i = 0; i < e->waiter_count; i++) {
+            (void)wake_sync_waiter(e->waiters[i], 1, 1);
+        }
+        e->waiter_count = 0;
+    }
+}
+
+static void os_ClearEvent(void* type) {
+    botw_hle_os_event* e;
+    if (!g_os) return;
+    g_os->calls++;
+    e = event_find(type, NULL);
+    if (!e) {
+        (void)os_error(g_os, "ClearEvent: EventType was not initialized");
+        return;
+    }
+    e->signaled = 0;
+    g_os->event_clears++;
+}
+
+static botw_hle_os_light_event* light_event_find(void* type, int* out_index) {
+    int i;
+    if (!g_os || !type) return NULL;
+    for (i = 0; i < (int)BOTW_HLE_OS_MAX_LIGHT_EVENT; i++) {
+        if (g_os->light_events[i].used && g_os->light_events[i].type == type) {
+            if (out_index) *out_index = i;
+            return &g_os->light_events[i];
+        }
+    }
+    return NULL;
+}
+
+static botw_hle_os_light_event* light_event_create(void* type, int signaled,
+                                                   int auto_clear, int* out_index) {
+    botw_hle_os_light_event* e;
+    int existing = -1;
+    int i;
+    if (!g_os) return NULL;
+    if (!type) {
+        (void)os_error(g_os, "light event: null LightEventType");
+        return NULL;
+    }
+    e = light_event_find(type, &existing);
+    if (e) {
+        waiter_compact(e->waiters, &e->waiter_count,
+                       BOTW_GUEST_WAIT_LIGHT_EVENT, existing);
+        if (e->waiter_count != 0) {
+            (void)os_error(g_os, "InitializeLightEvent: object still has waiters");
+            return NULL;
+        }
+        memset(e, 0, sizeof *e);
+        e->used = 1;
+        e->type = type;
+        if (out_index) *out_index = existing;
+    } else {
+        for (i = 0; i < (int)BOTW_HLE_OS_MAX_LIGHT_EVENT; i++) {
+            if (!g_os->light_events[i].used) break;
+        }
+        if (i == (int)BOTW_HLE_OS_MAX_LIGHT_EVENT) {
+            (void)os_error(g_os, "InitializeLightEvent: light-event table is full");
+            return NULL;
+        }
+        e = &g_os->light_events[i];
+        memset(e, 0, sizeof *e);
+        e->used = 1;
+        e->type = type;
+        if (out_index) *out_index = i;
+    }
+    e->signaled = signaled != 0;
+    e->auto_clear = auto_clear != 0;
+    return e;
+}
+
+static int light_event_consume(botw_hle_os_light_event* e) {
+    if (!e || !e->signaled) return 0;
+    if (e->auto_clear) e->signaled = 0;
+    return 1;
+}
+
+#if !defined(__aarch64__)
+static int light_event_get_result(void* type) {
+    botw_hle_os_light_event* e;
+    if (!g_os) return 0;
+    g_os->calls++;
+    g_os->light_event_waits++;
+    e = light_event_find(type, NULL);
+    if (!e) {
+        (void)os_error(g_os, "WaitLightEvent: LightEventType was not initialized");
+        return 0;
+    }
+    return light_event_consume(e);
+}
+#endif
+
+static void os_InitializeLightEvent(void* type, int signaled, int clear_mode) {
+    if (!g_os) return;
+    g_os->calls++;
+    (void)light_event_create(type, signaled, clear_mode, NULL);
+}
+
+static void os_FinalizeLightEvent(void* type) {
+    botw_hle_os_light_event* e;
+    int index = -1;
+    if (!g_os) return;
+    g_os->calls++;
+    e = light_event_find(type, &index);
+    if (!e) return;
+    waiter_compact(e->waiters, &e->waiter_count, BOTW_GUEST_WAIT_LIGHT_EVENT, index);
+    if (e->waiter_count != 0) {
+        (void)os_error(g_os, "FinalizeLightEvent: object still has waiters");
+        return;
+    }
+    memset(e, 0, sizeof *e);
+}
+
+static void os_SignalLightEvent(void* type) {
+    botw_hle_os_light_event* e;
+    int index = -1;
+    if (!g_os) return;
+    g_os->calls++;
+    e = light_event_find(type, &index);
+    if (!e) {
+        (void)os_error(g_os, "SignalLightEvent: LightEventType was not initialized");
+        return;
+    }
+    g_os->light_event_signals++;
+    e->signaled = 1;
+    waiter_compact(e->waiters, &e->waiter_count,
+                   BOTW_GUEST_WAIT_LIGHT_EVENT, index);
+    if (e->auto_clear) {
+        if (e->waiter_count > 0) {
+            int next = e->waiters[0];
+            waiter_remove_at(e->waiters, &e->waiter_count, 0);
+            e->signaled = 0;
+            (void)wake_sync_waiter(next, 1, 1);
+        }
+    } else {
+        int i;
+        for (i = 0; i < e->waiter_count; i++) {
+            (void)wake_sync_waiter(e->waiters[i], 1, 1);
+        }
+        e->waiter_count = 0;
+    }
+}
+
+static void os_ClearLightEvent(void* type) {
+    botw_hle_os_light_event* e;
+    if (!g_os) return;
+    g_os->calls++;
+    e = light_event_find(type, NULL);
+    if (!e) {
+        (void)os_error(g_os, "ClearLightEvent: LightEventType was not initialized");
+        return;
+    }
+    e->signaled = 0;
+}
+
+static botw_hle_os_semaphore* semaphore_find(void* type, int* out_index) {
+    int i;
+    if (!g_os || !type) return NULL;
+    for (i = 0; i < (int)BOTW_HLE_OS_MAX_SEMAPHORE; i++) {
+        if (g_os->semaphores[i].used && g_os->semaphores[i].type == type) {
+            if (out_index) *out_index = i;
+            return &g_os->semaphores[i];
+        }
+    }
+    return NULL;
+}
+
+static botw_hle_os_semaphore* semaphore_create(void* type, int count, int maximum,
+                                               int* out_index) {
+    botw_hle_os_semaphore* s;
+    int existing = -1;
+    int i;
+    if (!g_os) return NULL;
+    if (!type) {
+        (void)os_error(g_os, "semaphore: null SemaphoreType");
+        return NULL;
+    }
+    if (count < 0 || maximum <= 0 || count > maximum) {
+        (void)os_error(g_os, "InitializeSemaphore: invalid count %d / maximum %d",
+                       count, maximum);
+        return NULL;
+    }
+    s = semaphore_find(type, &existing);
+    if (s) {
+        waiter_compact(s->waiters, &s->waiter_count,
+                       BOTW_GUEST_WAIT_SEMAPHORE, existing);
+        if (s->waiter_count != 0) {
+            (void)os_error(g_os, "InitializeSemaphore: object still has waiters");
+            return NULL;
+        }
+        memset(s, 0, sizeof *s);
+        s->used = 1;
+        s->type = type;
+        if (out_index) *out_index = existing;
+    } else {
+        for (i = 0; i < (int)BOTW_HLE_OS_MAX_SEMAPHORE; i++) {
+            if (!g_os->semaphores[i].used) break;
+        }
+        if (i == (int)BOTW_HLE_OS_MAX_SEMAPHORE) {
+            (void)os_error(g_os, "InitializeSemaphore: semaphore table is full");
+            return NULL;
+        }
+        s = &g_os->semaphores[i];
+        memset(s, 0, sizeof *s);
+        s->used = 1;
+        s->type = type;
+        if (out_index) *out_index = i;
+    }
+    s->count = count;
+    s->maximum = maximum;
+    return s;
+}
+
+static botw_hle_os_semaphore* semaphore_begin(void* type, int* out_index) {
+    botw_hle_os_semaphore* s;
+    if (!g_os) return NULL;
+    g_os->calls++;
+    s = semaphore_find(type, out_index);
+    if (!s) (void)os_error(g_os, "AcquireSemaphore: SemaphoreType was not initialized");
+    return s;
+}
+
+static int semaphore_acquire_now(botw_hle_os_semaphore* s) {
+    if (!s || s->count <= 0) return 0;
+    s->count--;
+    g_os->semaphore_acquires++;
+    return 1;
+}
+
+static void os_InitializeSemaphore(void* type, int count, int maximum) {
+    if (!g_os) return;
+    g_os->calls++;
+    (void)semaphore_create(type, count, maximum, NULL);
+}
+
+static void os_FinalizeSemaphore(void* type) {
+    botw_hle_os_semaphore* s;
+    int index = -1;
+    if (!g_os) return;
+    g_os->calls++;
+    s = semaphore_find(type, &index);
+    if (!s) return;
+    waiter_compact(s->waiters, &s->waiter_count, BOTW_GUEST_WAIT_SEMAPHORE, index);
+    if (s->waiter_count != 0) {
+        (void)os_error(g_os, "FinalizeSemaphore: object still has waiters");
+        return;
+    }
+    memset(s, 0, sizeof *s);
+}
+
+static void os_ReleaseSemaphore_count(void* type, int count) {
+    botw_hle_os_semaphore* s;
+    int index = -1;
+    if (!g_os) return;
+    g_os->calls++;
+    s = semaphore_find(type, &index);
+    if (!s) {
+        (void)os_error(g_os, "ReleaseSemaphore: SemaphoreType was not initialized");
+        return;
+    }
+    if (count <= 0) {
+        (void)os_error(g_os, "ReleaseSemaphore: count must be positive");
+        return;
+    }
+    if (s->count > s->maximum - count) {
+        (void)os_error(g_os, "ReleaseSemaphore: count %d exceeds maximum %d",
+                       count, s->maximum);
+        return;
+    }
+    g_os->semaphore_releases++;
+    s->count += count;
+    waiter_compact(s->waiters, &s->waiter_count, BOTW_GUEST_WAIT_SEMAPHORE, index);
+    while (s->count > 0 && s->waiter_count > 0) {
+        int next = s->waiters[0];
+        waiter_remove_at(s->waiters, &s->waiter_count, 0);
+        s->count--;
+        g_os->semaphore_acquires++;
+        (void)wake_sync_waiter(next, 0, 0);
+    }
+}
+
+static void os_ReleaseSemaphore(void* type) {
+    os_ReleaseSemaphore_count(type, 1);
+}
+
+static void os_ReleaseSemaphore_n(void* type, int count) {
+    os_ReleaseSemaphore_count(type, count);
+}
+
+/* Called from the scheduler's timed-wake path.  The thread is still BLOCKED,
+ * so its saved frame is the one the import wrapper will restore. */
+static void os_sync_timeout(void* user, int thread_slot, int wait_kind,
+                            uint64_t wait_arg) {
+    botw_hle_os_state* state = (botw_hle_os_state*)user;
+    int index;
+    botw_guest_thread* t;
+    if (!state || !state->run) return;
+    if (thread_slot < 0 || thread_slot >= (int)BOTW_GUEST_MAX_THREADS) return;
+    t = &state->run->threads[thread_slot];
+    if (wait_kind == BOTW_GUEST_WAIT_LIGHT_EVENT) {
+        botw_hle_os_light_event* e;
+        index = (int)wait_arg;
+        if (index >= 0 && index < (int)BOTW_HLE_OS_MAX_LIGHT_EVENT) {
+            e = &state->light_events[index];
+            if (e->used) {
+                int pos = waiter_index(e->waiters, e->waiter_count, thread_slot);
+                waiter_remove_at(e->waiters, &e->waiter_count, pos);
+            }
+        }
+        state->light_event_timeouts++;
+        if (t->has_frame) t->frame.x[0] = 0;
+    }
+}
+
+/* Portable entry points.  They cannot park a guest thread without the
+ * AArch64 wrapper; a contended operation reports that instead of returning
+ * success without mutual exclusion. */
+#if !defined(__aarch64__)
+static void os_LockMutex(void* type) {
+    botw_hle_os_mutex* m;
+    int index = -1;
+    m = mutex_begin(type, &index);
+    if (!m) return;
+    if (!mutex_acquire_now(m, current_slot(g_os))) {
+        (void)os_error(g_os, "LockMutex: would block on this host");
+    }
+}
+
+static int os_WaitEvent_portable(void* type) {
+    int got = event_get_result(type);
+    if (!got) (void)os_error(g_os, "WaitEvent: would block on this host");
+    return got;
+}
+
+static void os_WaitLightEvent_portable(void* type) {
+    int got = light_event_get_result(type);
+    if (!got) (void)os_error(g_os, "WaitLightEvent: would block on this host");
+}
+
+static int os_TimedWaitLightEvent_portable(void* type, int64_t ns) {
+    int got = light_event_get_result(type);
+    (void)ns;
+    if (!got) (void)os_error(g_os, "TimedWaitLightEvent: would block on this host");
+    return got;
+}
+
+static void os_AcquireSemaphore_portable(void* type) {
+    botw_hle_os_semaphore* s;
+    int index = -1;
+    s = semaphore_begin(type, &index);
+    if (!s) return;
+    if (!semaphore_acquire_now(s)) {
+        (void)os_error(g_os, "AcquireSemaphore: would block on this host");
+    }
+}
+#endif
+
+/* ------------------------------------------------------------------ */
 /* Blocking imports                                                   */
 /* ------------------------------------------------------------------ */
 
@@ -568,6 +1284,8 @@ int botw_hle_os_blocking_call(botw_guest_regs* frame, unsigned op,
     botw_guest_run* run;
     const botw_guest_resume* next;
     uint64_t arg0;
+    uint64_t arg1;
+    int cur;
 
     if (!frame || !next_resume) return BOTW_HLE_OS_STOPPED;
     *next_resume = NULL;
@@ -575,6 +1293,7 @@ int botw_hle_os_blocking_call(botw_guest_regs* frame, unsigned op,
      * before replacing it, or SleepThread always sees zero nanoseconds and
      * WaitThread always sees a null ThreadType. */
     arg0 = frame->x[0];
+    arg1 = frame->x[1];
     if (!g_os) {
         frame->x[0] = 0;
         return BOTW_HLE_OS_RETURN;
@@ -588,7 +1307,7 @@ int botw_hle_os_blocking_call(botw_guest_regs* frame, unsigned op,
         if (run && botw_guest_run_is_executing(run)) {
             next = botw_guest_run_block_and_switch(run, frame,
                                                    BOTW_GUEST_WAIT_SLEEP,
-                                                   deadline);
+                                                   0, deadline);
             if (!next) return BOTW_HLE_OS_STOPPED;
             g_os->sleep_blocks++;
             sync_tick_from_run(g_os);
@@ -606,7 +1325,8 @@ int botw_hle_os_blocking_call(botw_guest_regs* frame, unsigned op,
         if (botw_guest_run_is_executing(run)) {
             next = botw_guest_run_block_and_switch(run, frame,
                                                    BOTW_GUEST_WAIT_THREAD,
-                                                   (uint64_t)(unsigned)target);
+                                                   (uint64_t)(unsigned)target,
+                                                   BOTW_GUEST_NO_DEADLINE);
             if (!next) return BOTW_HLE_OS_STOPPED;
             g_os->wait_blocks++;
             *next_resume = next;
@@ -614,6 +1334,185 @@ int botw_hle_os_blocking_call(botw_guest_regs* frame, unsigned op,
         }
         botw_guest_run_yield(run);
         return BOTW_HLE_OS_RETURN;
+    }
+    case BOTW_HLE_OS_OP_LOCK_MUTEX: {
+        botw_hle_os_mutex* m;
+        int index = -1;
+        m = mutex_begin((void*)(uintptr_t)arg0, &index);
+        if (!m) return BOTW_HLE_OS_RETURN;
+        cur = current_slot(g_os);
+        if (mutex_acquire_now(m, cur)) return BOTW_HLE_OS_RETURN;
+        if (!run) {
+            (void)os_error(g_os, "LockMutex: no guest run is attached");
+            return BOTW_HLE_OS_RETURN;
+        }
+        if (!botw_guest_run_is_executing(run)) {
+            (void)os_error(g_os, "LockMutex: would block without an executing run");
+            return BOTW_HLE_OS_RETURN;
+        }
+        if (!waiter_add(m->waiters, &m->waiter_count, cur)) {
+            return BOTW_HLE_OS_RETURN;
+        }
+        next = botw_guest_run_block_and_switch(run, frame,
+                                               BOTW_GUEST_WAIT_MUTEX,
+                                               (uint64_t)(unsigned)index,
+                                               BOTW_GUEST_NO_DEADLINE);
+        if (!next) {
+            int pos = waiter_index(m->waiters, m->waiter_count, cur);
+            waiter_remove_at(m->waiters, &m->waiter_count, pos);
+            return BOTW_HLE_OS_STOPPED;
+        }
+        g_os->mutex_blocks++;
+        *next_resume = next;
+        return BOTW_HLE_OS_SWITCHED;
+    }
+    case BOTW_HLE_OS_OP_WAIT_EVENT: {
+        botw_hle_os_event* e;
+        int index = -1;
+        e = event_begin((void*)(uintptr_t)arg0, &index);
+        if (!e) return BOTW_HLE_OS_RETURN;
+        g_os->event_waits++;
+        if (event_consume(e)) {
+            frame->x[0] = 1;
+            return BOTW_HLE_OS_RETURN;
+        }
+        if (!run) {
+            (void)os_error(g_os, "WaitEvent: no guest run is attached");
+            return BOTW_HLE_OS_RETURN;
+        }
+        if (!botw_guest_run_is_executing(run)) {
+            (void)os_error(g_os, "WaitEvent: would block without an executing run");
+            return BOTW_HLE_OS_RETURN;
+        }
+        cur = current_slot(g_os);
+        if (!waiter_add(e->waiters, &e->waiter_count, cur)) {
+            return BOTW_HLE_OS_RETURN;
+        }
+        next = botw_guest_run_block_and_switch(run, frame,
+                                               BOTW_GUEST_WAIT_EVENT,
+                                               (uint64_t)(unsigned)index,
+                                               BOTW_GUEST_NO_DEADLINE);
+        if (!next) {
+            int pos = waiter_index(e->waiters, e->waiter_count, cur);
+            waiter_remove_at(e->waiters, &e->waiter_count, pos);
+            return BOTW_HLE_OS_STOPPED;
+        }
+        g_os->event_blocks++;
+        *next_resume = next;
+        return BOTW_HLE_OS_SWITCHED;
+    }
+    case BOTW_HLE_OS_OP_WAIT_LIGHT_EVENT: {
+        botw_hle_os_light_event* e;
+        int index = -1;
+        e = light_event_find((void*)(uintptr_t)arg0, &index);
+        g_os->calls++;
+        if (!e) {
+            (void)os_error(g_os, "WaitLightEvent: LightEventType was not initialized");
+            return BOTW_HLE_OS_RETURN;
+        }
+        g_os->light_event_waits++;
+        if (light_event_consume(e)) return BOTW_HLE_OS_RETURN;
+        if (!run) {
+            (void)os_error(g_os, "WaitLightEvent: no guest run is attached");
+            return BOTW_HLE_OS_RETURN;
+        }
+        if (!botw_guest_run_is_executing(run)) {
+            (void)os_error(g_os, "WaitLightEvent: would block without an executing run");
+            return BOTW_HLE_OS_RETURN;
+        }
+        cur = current_slot(g_os);
+        if (!waiter_add(e->waiters, &e->waiter_count, cur)) {
+            return BOTW_HLE_OS_RETURN;
+        }
+        next = botw_guest_run_block_and_switch(run, frame,
+                                               BOTW_GUEST_WAIT_LIGHT_EVENT,
+                                               (uint64_t)(unsigned)index,
+                                               BOTW_GUEST_NO_DEADLINE);
+        if (!next) {
+            int pos = waiter_index(e->waiters, e->waiter_count, cur);
+            waiter_remove_at(e->waiters, &e->waiter_count, pos);
+            return BOTW_HLE_OS_STOPPED;
+        }
+        g_os->light_event_blocks++;
+        *next_resume = next;
+        return BOTW_HLE_OS_SWITCHED;
+    }
+    case BOTW_HLE_OS_OP_TIMED_WAIT_LIGHT_EVENT: {
+        botw_hle_os_light_event* e;
+        uint64_t ticks;
+        uint64_t deadline;
+        int index = -1;
+        e = light_event_find((void*)(uintptr_t)arg0, &index);
+        g_os->calls++;
+        if (!e) {
+            (void)os_error(g_os, "TimedWaitLightEvent: LightEventType was not initialized");
+            return BOTW_HLE_OS_RETURN;
+        }
+        g_os->light_event_waits++;
+        if (light_event_consume(e)) {
+            frame->x[0] = 1;
+            return BOTW_HLE_OS_RETURN;
+        }
+        ticks = span_to_ticks((int64_t)arg1);
+        if (ticks == 0) return BOTW_HLE_OS_RETURN;
+        if (!run) {
+            (void)os_error(g_os, "TimedWaitLightEvent: no guest run is attached");
+            return BOTW_HLE_OS_RETURN;
+        }
+        if (!botw_guest_run_is_executing(run)) {
+            (void)os_error(g_os, "TimedWaitLightEvent: would block without an executing run");
+            return BOTW_HLE_OS_RETURN;
+        }
+        cur = current_slot(g_os);
+        if (!waiter_add(e->waiters, &e->waiter_count, cur)) {
+            return BOTW_HLE_OS_RETURN;
+        }
+        deadline = botw_guest_run_clock(run);
+        if (UINT64_MAX - deadline < ticks) deadline = UINT64_MAX - 1u;
+        else deadline += ticks;
+        next = botw_guest_run_block_and_switch(run, frame,
+                                               BOTW_GUEST_WAIT_LIGHT_EVENT,
+                                               (uint64_t)(unsigned)index,
+                                               deadline);
+        if (!next) {
+            int pos = waiter_index(e->waiters, e->waiter_count, cur);
+            waiter_remove_at(e->waiters, &e->waiter_count, pos);
+            return BOTW_HLE_OS_STOPPED;
+        }
+        g_os->light_event_blocks++;
+        *next_resume = next;
+        return BOTW_HLE_OS_SWITCHED;
+    }
+    case BOTW_HLE_OS_OP_ACQUIRE_SEMAPHORE: {
+        botw_hle_os_semaphore* s;
+        int index = -1;
+        s = semaphore_begin((void*)(uintptr_t)arg0, &index);
+        if (!s) return BOTW_HLE_OS_RETURN;
+        if (semaphore_acquire_now(s)) return BOTW_HLE_OS_RETURN;
+        if (!run) {
+            (void)os_error(g_os, "AcquireSemaphore: no guest run is attached");
+            return BOTW_HLE_OS_RETURN;
+        }
+        if (!botw_guest_run_is_executing(run)) {
+            (void)os_error(g_os, "AcquireSemaphore: would block without an executing run");
+            return BOTW_HLE_OS_RETURN;
+        }
+        cur = current_slot(g_os);
+        if (!waiter_add(s->waiters, &s->waiter_count, cur)) {
+            return BOTW_HLE_OS_RETURN;
+        }
+        next = botw_guest_run_block_and_switch(run, frame,
+                                               BOTW_GUEST_WAIT_SEMAPHORE,
+                                               (uint64_t)(unsigned)index,
+                                               BOTW_GUEST_NO_DEADLINE);
+        if (!next) {
+            int pos = waiter_index(s->waiters, s->waiter_count, cur);
+            waiter_remove_at(s->waiters, &s->waiter_count, pos);
+            return BOTW_HLE_OS_STOPPED;
+        }
+        g_os->semaphore_blocks++;
+        *next_resume = next;
+        return BOTW_HLE_OS_SWITCHED;
     }
     default:
         (void)os_error(g_os, "blocking import %u is not implemented", op);
@@ -628,9 +1527,19 @@ int botw_hle_os_blocking_call(botw_guest_regs* frame, unsigned op,
 #if defined(__aarch64__)
 #  define OS_SLEEP_ENTRY ((void*)(uintptr_t)&botw_hle_os_guest_sleep)
 #  define OS_WAIT_THREAD_ENTRY ((void*)(uintptr_t)&botw_hle_os_guest_wait_thread)
+#  define OS_LOCK_MUTEX_ENTRY ((void*)(uintptr_t)&botw_hle_os_guest_lock_mutex)
+#  define OS_WAIT_EVENT_ENTRY ((void*)(uintptr_t)&botw_hle_os_guest_wait_event)
+#  define OS_WAIT_LIGHT_EVENT_ENTRY ((void*)(uintptr_t)&botw_hle_os_guest_wait_light_event)
+#  define OS_TIMED_WAIT_LIGHT_EVENT_ENTRY ((void*)(uintptr_t)&botw_hle_os_guest_timed_wait_light_event)
+#  define OS_ACQUIRE_SEMAPHORE_ENTRY ((void*)(uintptr_t)&botw_hle_os_guest_acquire_semaphore)
 #else
 #  define OS_SLEEP_ENTRY ((void*)(uintptr_t)&os_SleepThread)
 #  define OS_WAIT_THREAD_ENTRY ((void*)(uintptr_t)&os_WaitThread)
+#  define OS_LOCK_MUTEX_ENTRY ((void*)(uintptr_t)&os_LockMutex)
+#  define OS_WAIT_EVENT_ENTRY ((void*)(uintptr_t)&os_WaitEvent_portable)
+#  define OS_WAIT_LIGHT_EVENT_ENTRY ((void*)(uintptr_t)&os_WaitLightEvent_portable)
+#  define OS_TIMED_WAIT_LIGHT_EVENT_ENTRY ((void*)(uintptr_t)&os_TimedWaitLightEvent_portable)
+#  define OS_ACQUIRE_SEMAPHORE_ENTRY ((void*)(uintptr_t)&os_AcquireSemaphore_portable)
 #endif
 
 static const os_entry g_os_entries[BOTW_HLE_OS_COUNT] = {
@@ -666,7 +1575,29 @@ static const os_entry g_os_entries[BOTW_HLE_OS_COUNT] = {
     { "_ZN2nn2os20GetThreadNamePointerEPKNS0_10ThreadTypeE", (void*)(uintptr_t)&os_GetThreadNamePointer },
     { "_ZN2nn2os20SetThreadNamePointerEPNS0_10ThreadTypeEPKc", (void*)(uintptr_t)&os_SetThreadNamePointer },
     { "_ZN2nn2os22GetSystemTickFrequencyEv", (void*)(uintptr_t)&os_GetSystemTickFrequency },
-    { "_ZN2nn2os26GetThreadAvailableCoreMaskEv", (void*)(uintptr_t)&os_GetThreadAvailableCoreMask }
+    { "_ZN2nn2os26GetThreadAvailableCoreMaskEv", (void*)(uintptr_t)&os_GetThreadAvailableCoreMask },
+    { "_ZN2nn2os10ClearEventEPNS0_9EventTypeE", (void*)(uintptr_t)&os_ClearEvent },
+    { "_ZN2nn2os11SignalEventEPNS0_9EventTypeE", (void*)(uintptr_t)&os_SignalEvent },
+    { "_ZN2nn2os11UnlockMutexEPNS0_9MutexTypeE", (void*)(uintptr_t)&os_UnlockMutex },
+    { "_ZN2nn2os12TryLockMutexEPNS0_9MutexTypeE", (void*)(uintptr_t)&os_TryLockMutex },
+    { "_ZN2nn2os12TryWaitEventEPNS0_9EventTypeE", (void*)(uintptr_t)&os_TryWaitEvent },
+    { "_ZN2nn2os13FinalizeEventEPNS0_9EventTypeE", (void*)(uintptr_t)&os_FinalizeEvent },
+    { "_ZN2nn2os13FinalizeMutexEPNS0_9MutexTypeE", (void*)(uintptr_t)&os_FinalizeMutex },
+    { "_ZN2nn2os14WaitLightEventEPNS0_14LightEventTypeE", OS_WAIT_LIGHT_EVENT_ENTRY },
+    { "_ZN2nn2os15ClearLightEventEPNS0_14LightEventTypeE", (void*)(uintptr_t)&os_ClearLightEvent },
+    { "_ZN2nn2os15InitializeEventEPNS0_9EventTypeEbNS0_14EventClearModeE", (void*)(uintptr_t)&os_InitializeEvent },
+    { "_ZN2nn2os15InitializeMutexEPNS0_9MutexTypeEbi", (void*)(uintptr_t)&os_InitializeMutex },
+    { "_ZN2nn2os16AcquireSemaphoreEPNS0_13SemaphoreTypeE", OS_ACQUIRE_SEMAPHORE_ENTRY },
+    { "_ZN2nn2os16ReleaseSemaphoreEPNS0_13SemaphoreTypeE", (void*)(uintptr_t)&os_ReleaseSemaphore },
+    { "_ZN2nn2os16ReleaseSemaphoreEPNS0_13SemaphoreTypeEi", (void*)(uintptr_t)&os_ReleaseSemaphore_n },
+    { "_ZN2nn2os16SignalLightEventEPNS0_14LightEventTypeE", (void*)(uintptr_t)&os_SignalLightEvent },
+    { "_ZN2nn2os17FinalizeSemaphoreEPNS0_13SemaphoreTypeE", (void*)(uintptr_t)&os_FinalizeSemaphore },
+    { "_ZN2nn2os18FinalizeLightEventEPNS0_14LightEventTypeE", (void*)(uintptr_t)&os_FinalizeLightEvent },
+    { "_ZN2nn2os19InitializeSemaphoreEPNS0_13SemaphoreTypeEii", (void*)(uintptr_t)&os_InitializeSemaphore },
+    { "_ZN2nn2os19TimedWaitLightEventEPNS0_14LightEventTypeENS_8TimeSpanE", OS_TIMED_WAIT_LIGHT_EVENT_ENTRY },
+    { "_ZN2nn2os20InitializeLightEventEPNS0_14LightEventTypeEbNS0_14EventClearModeE", (void*)(uintptr_t)&os_InitializeLightEvent },
+    { "_ZN2nn2os9LockMutexEPNS0_9MutexTypeE", OS_LOCK_MUTEX_ENTRY },
+    { "_ZN2nn2os9WaitEventEPNS0_9EventTypeE", OS_WAIT_EVENT_ENTRY }
 };
 
 int botw_hle_os_register(botw_hle_table* hle, botw_hle_os_state* state) {

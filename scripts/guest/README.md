@@ -27,8 +27,9 @@ retail NSO  --rewrite_botw.py-->  patched.bin + fixups/gates/sites
 - [x] 页级保护计划（`guest_segments.c`）：真实四模块 5/5/5/4 段；rtld 在 16 KiB 页上 rwx 冲突，如实报告
 - [x] `guest_run`：独立客体栈 + 守卫页 + 入口/退出哨兵；合成客体在 macOS arm64 CI 真正执行
 - [x] 协作式客体线程（`guest_thread_test`）：独立栈、272 字节帧保存/恢复、轮转切换、线程退出；三线程在 arm64 CI 通过
-- [x] `nn::os` 线程表 / TLS / 虚拟时钟 / 内存块（33/78；CreateThread / StartThread / WaitThread / DestroyThread）
+- [x] `nn::os` 线程表 / TLS / 虚拟时钟 / 同步 / 内存块（55/78；CreateThread / StartThread / WaitThread / DestroyThread + Mutex / Event / LightEvent / Semaphore）
 - [x] `SleepThread` / `WaitThread` 阻塞与唤醒：汇编导入包装器保存完整客体帧，`BLOCKED` → READY；sleep 由虚拟时钟 deadline 唤醒，join 由线程退出唤醒（`guest_block_test`，macOS arm64 CI 通过）
+- [x] Mutex / Event / LightEvent / Semaphore 阻塞：解锁/释放/signal 先交接对象状态再唤醒；timed light event 超时由 run timeout hook 从 waiter 队列移除（`guest_sync_test`，AArch64 探针已加入 CI）
 - [ ] `nn::os` 同步原语（mutex / event / light event / semaphore / message queue / multi-wait）
 - [ ] HLE 服务层（init / fs / vi / nv / NVN bootstrap）
 - [ ] 把 NVN 调用桥到 `ios/nvn` 的 Metal 后端

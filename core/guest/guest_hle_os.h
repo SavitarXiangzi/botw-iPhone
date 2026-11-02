@@ -1,21 +1,21 @@
-/* nn::os HLE: threads, TLS, the virtual clock and the memory-block heap.
+/* nn::os HLE: threads, TLS, the virtual clock, synchronization and the
+ * memory-block heap.
  *
  * The 1.6.0 main image imports 78 nn::os names.  They are not a service: they
  * are the SDK's own operating-system layer, so a zero-return stub is not a
- * neutral answer.  This layer claims the 33 names the scheduler can answer
+ * neutral answer.  This layer claims the 55 names the scheduler can answer
  * today:
  *
  *   - the thread table (CreateThread / StartThread / WaitThread / DestroyThread,
  *     current-thread queries, names, priority and core masks);
  *   - per-thread TLS slots;
  *   - GetSystemTick / frequency / conversions;
+ *   - Mutex / Event / LightEvent / Semaphore, with real blocking and wake;
  *   - AllocateMemoryBlock / FreeMemoryBlock / SetMemoryHeapSize.
  *
- * SleepThread and WaitThread now block for real.  The other synchronization
- * objects (Mutex, Event, LightEvent, Semaphore, MessageQueue, SystemEvent,
- * MultiWait) stay on the shared stub until their ABI layouts and ownership
- * rules are implemented; a lock that reports success without excluding
- * anyone would be worse than an explicit stub.
+ * MessageQueue, SystemEvent and MultiWait stay on the shared stub until their
+ * object layouts and ordering rules are implemented; a lock that reports
+ * success without excluding anyone would be worse than an explicit stub.
  *
  * Scheduling contract, stated plainly because it is not the real kernel:
  *
@@ -27,10 +27,13 @@
  *     next host gate, not inside the import call.
  *   - YieldThread requests a switch at the next gate.  It cannot switch inside
  *     a host call because the guest's return point would be lost.
- *   - SleepThread and WaitThread use an AArch64 import wrapper that saves the
- *     complete register frame, parks the caller in BLOCKED, and restores
- *     another runnable frame.  Sleep is woken by the virtual run clock; a live
- *     WaitThread target wakes its joiners from the thread-exit trampoline.
+ *   - SleepThread, WaitThread, LockMutex, WaitEvent, WaitLightEvent,
+ *     TimedWaitLightEvent and AcquireSemaphore use AArch64 import wrappers
+ *     that save the complete register frame, park the caller in BLOCKED, and
+ *     restore another runnable frame.  Sleep and timed waits are woken by the
+ *     virtual run clock; a live WaitThread target wakes its joiners from the
+ *     thread-exit trampoline; a signal/release transfers the object exactly
+ *     once before making the chosen waiter READY.
  *   - DestroyThread reaps a DONE (or never-started CREATED) worker and returns
  *     its slot and stack to the run.
  *
@@ -55,7 +58,11 @@
 extern "C" {
 #endif
 
-#define BOTW_HLE_OS_COUNT 33u
+#define BOTW_HLE_OS_COUNT 55u
+#define BOTW_HLE_OS_MAX_MUTEX 128u
+#define BOTW_HLE_OS_MAX_EVENT 128u
+#define BOTW_HLE_OS_MAX_LIGHT_EVENT 128u
+#define BOTW_HLE_OS_MAX_SEMAPHORE 64u
 #define BOTW_HLE_OS_TLS_SLOTS 16u
 #define BOTW_HLE_OS_NAME_MAX 64u
 #define BOTW_HLE_OS_MAIN_ID 0x100u
@@ -70,7 +77,12 @@ extern "C" {
  * registers these instead of the plain C implementations on AArch64. */
 typedef enum {
     BOTW_HLE_OS_OP_SLEEP = 1,
-    BOTW_HLE_OS_OP_WAIT_THREAD = 2
+    BOTW_HLE_OS_OP_WAIT_THREAD = 2,
+    BOTW_HLE_OS_OP_LOCK_MUTEX = 3,
+    BOTW_HLE_OS_OP_WAIT_EVENT = 4,
+    BOTW_HLE_OS_OP_WAIT_LIGHT_EVENT = 5,
+    BOTW_HLE_OS_OP_TIMED_WAIT_LIGHT_EVENT = 6,
+    BOTW_HLE_OS_OP_ACQUIRE_SEMAPHORE = 7
 } botw_hle_os_block_op;
 
 enum {
@@ -93,10 +105,55 @@ typedef struct {
     char     name[BOTW_HLE_OS_NAME_MAX];
 } botw_hle_os_thread;
 
+/* Sync objects are keyed by the guest's own object pointer.  The HLE never
+ * writes into that memory: the pointer is only an identity token, exactly as
+ * ThreadType* is.  A fixed table with explicit "table full" errors is safer
+ * than silently aliasing objects after a wrap. */
+typedef struct {
+    int      used;
+    void*    type;
+    int      owner;             /* thread slot, -1 when unlocked */
+    int      depth;             /* recursion count for a recursive mutex */
+    int      recursive;
+    int      waiters[BOTW_GUEST_MAX_THREADS];
+    int      waiter_count;
+} botw_hle_os_mutex;
+
+typedef struct {
+    int      used;
+    void*    type;
+    int      signaled;
+    int      auto_clear;
+    int      waiters[BOTW_GUEST_MAX_THREADS];
+    int      waiter_count;
+} botw_hle_os_event;
+
+typedef struct {
+    int      used;
+    void*    type;
+    int      signaled;
+    int      auto_clear;
+    int      waiters[BOTW_GUEST_MAX_THREADS];
+    int      waiter_count;
+} botw_hle_os_light_event;
+
+typedef struct {
+    int      used;
+    void*    type;
+    int      count;
+    int      maximum;
+    int      waiters[BOTW_GUEST_MAX_THREADS];
+    int      waiter_count;
+} botw_hle_os_semaphore;
+
 typedef struct {
     botw_guest_run* run;
     int attached;
     botw_hle_os_thread threads[BOTW_GUEST_MAX_THREADS];
+    botw_hle_os_mutex mutexes[BOTW_HLE_OS_MAX_MUTEX];
+    botw_hle_os_event events[BOTW_HLE_OS_MAX_EVENT];
+    botw_hle_os_light_event light_events[BOTW_HLE_OS_MAX_LIGHT_EVENT];
+    botw_hle_os_semaphore semaphores[BOTW_HLE_OS_MAX_SEMAPHORE];
     uint8_t  main_type[BOTW_HLE_OS_MAIN_TYPE_BYTES];
     uint64_t next_thread_id;
     uint64_t tick;
@@ -118,6 +175,21 @@ typedef struct {
     unsigned long sleeps;
     unsigned long sleep_blocks;
     unsigned long wait_blocks;
+    unsigned long mutex_locks;
+    unsigned long mutex_try_locks;
+    unsigned long mutex_blocks;
+    unsigned long mutex_unlocks;
+    unsigned long event_waits;
+    unsigned long event_blocks;
+    unsigned long event_signals;
+    unsigned long event_clears;
+    unsigned long light_event_waits;
+    unsigned long light_event_blocks;
+    unsigned long light_event_signals;
+    unsigned long light_event_timeouts;
+    unsigned long semaphore_acquires;
+    unsigned long semaphore_blocks;
+    unsigned long semaphore_releases;
     unsigned long block_allocs;
     unsigned long block_frees;
     char     error[160];
@@ -131,14 +203,14 @@ void botw_hle_os_reset(botw_hle_os_state* state);
 /* The singleton used when register() is given NULL. */
 botw_hle_os_state* botw_hle_os_default(void);
 
-/* Registers the 33 nn::os implementations.  `state` may be NULL.  Returns 0,
+/* Registers the 55 nn::os implementations.  `state` may be NULL.  Returns 0,
  * or -1 with hle->error set. */
 int botw_hle_os_register(botw_hle_table* hle, botw_hle_os_state* state);
 
 /* Binds the state to the run whose thread table StartThread/GetCurrentThread
- * use.  Passing NULL detaches.  Worker mappings are cleared; the run itself is
- * never modified here.  Call after botw_guest_run_init() and before the guest
- * can reach an nn::os import. */
+ * use.  Passing NULL detaches.  Worker mappings, sync objects and the timed-
+ * wait hook are cleared; the run's saved frames are not.  Call after
+ * botw_guest_run_init() and before the guest can reach an nn::os import. */
 void botw_hle_os_attach_run(botw_hle_os_state* state, botw_guest_run* run);
 
 /* Adds to the deterministic virtual clock and wakes any attached SLEEP
