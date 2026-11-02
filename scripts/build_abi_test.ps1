@@ -83,8 +83,8 @@ try {
     & $py scripts\guest\probe_relocs.py --self-test
     if ($LASTEXITCODE -ne 0) { Write-Error "guest relocation probe: self-test failed"; exit 1 }
 
-    # Host-only tool; compiles everywhere, needs a real image to say anything.
-    $cmd = "call `"$VcVars`" >nul && cl $flags $inc /c scripts\guest\reloc_run.cpp /Fo:build\nvn\rel\"
+    # Host-only tool; links everywhere, needs a real image to say anything.
+    $cmd = "call `"$VcVars`" >nul && cl $flags $inc scripts\guest\reloc_run.cpp core\guest\guest_image.c core\guest\guest_slot.c core\guest\guest_segments.c /Fo:build\nvn\rel\ /Fe:build\nvn\reloc_run.exe"
     cmd /c $cmd 2>&1 | ForEach-Object { if ("$_".Trim()) { Write-Host "  $_" } }
     if ($LASTEXITCODE -ne 0) { Write-Error "reloc_run.cpp: build failed"; exit 1 }
 
