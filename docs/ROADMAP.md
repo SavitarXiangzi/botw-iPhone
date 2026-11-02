@@ -7396,3 +7396,75 @@ rtld 只有 0x1a00 字节 text、0x2000 处 rodata、0x3000 处 data，三者全
 2. 在 macOS / Linux runner 上做真实映射测试：映射后写 text 必须触发
    SIGSEGV，读 text 必须成功；
 3. rtld 的双映射（两个视图指向同一块匿名共享内存）。
+## M4 续四十：可执行映射，第一次跑自己映射出来的页
+
+### 1. 顺序就是全部
+
+`guest_map.c` 是唯一碰系统调用的文件，顺序是：
+
+```text
+1. parse(fixups 头)         只读头，不碰字节 → 页计划从布局就能算出来
+2. plan_conflict?           有页要同时 W+X 就拒绝，不伪造 W^X
+3. mmap 整块 RW + 拷贝      保持文件偏移，adrp 才不会错位
+4. attach(重定位)           此时整块仍可写
+5. 按计划 mprotect           text / patch → RX，data / key page → RW
+```
+
+第 4 步放在第 5 步之前是 **RELRO 的顺序**：所有写入都在可写期一次做完，
+之后 text 永久 RX。反过来先保护的话，将来某条落在 text 上的重定位会变成
+进程崩溃而不是一个能读的错误。1.6.0 的 text 没有重定位（续三十五实测
+0/262,837），所以这个顺序是无损的。
+
+### 2. loader 拆成 parse + attach
+
+`botw_guest_image_open()` 原来把“解析头”和“读 MOD0 + 重定位”揉在一起，
+而可执行映射必须**先拿到布局再决定分配**。现在：
+
+| 函数 | 做什么 |
+|---|---|
+| `botw_guest_image_parse()` | 只读 fixups 头：校验范围、填全部布局字段，不碰镜像字节 |
+| `botw_guest_image_attach()` | 接管调用者的 buffer，读 MOD0/dynamic，就地重定位 |
+| `botw_guest_image_open()` | parse + malloc 拷贝 + attach（老路径不变，owns_base=1） |
+
+所有权仍然是显式的：`attach()` 从不释放也不拷贝 buffer，谁设的 `owns_base`
+谁负责；映射路径里 `owns_base` 一直是 0，`botw_guest_map_close()` 关两者。
+
+### 3. 实测：两个系统、两种页大小
+
+`tests/guest_map_test.cpp` 用宿主真实页大小（`sysconf(_SC_PAGESIZE)`）映射
+一个合成镜像，然后**真的执行它**——patch 区里放两条指令
+（arm64 `mov w0,#0x1234; ret`，x86 `mov eax,0x1234; ret`），通过函数指针调用：
+
+| 主机 | 页大小 | 结果 |
+|---|---:|---|
+| Linux x86_64（portable job） | 4096 | `ok (page 4096, 68 KiB mapped, RX executes, RW writes, text write dies, conflict refused)` |
+| macOS arm64（ios job） | 16384 | `ok (page 16384, 80 KiB mapped, RX executes, RW writes, text write dies, conflict refused)` |
+
+四条断言各自的意义：
+
+* **RX executes**：patch 区真的能跑到，返回 0x1234；
+* **RW writes**：data 与 key page 在 mprotect 之后仍可写（key page 是客体唯一
+  会写的页）；
+* **text write dies**：fork 出来的子进程往 text / patch 写，必须死于保护信号
+  （接受 SIGSEGV 或 SIGBUS，两个系统的说法不一致）；
+* **conflict refused**：把 text/ro/data 挤进一页的布局必须被拒绝，error 里
+  写明 “writable and executable”。
+
+mprotect 只接受**宿主页**对齐的范围，所以测试用 4 KiB 的段去跑 macOS 的
+16 KiB 页会直接 EINVAL——这正是页大小做参数、测试问宿主的原因。
+
+### 4. 还没有证明
+
+* 用的是**合成镜像**（几十 KiB），不是真实的 46 MiB main：本机没有 mmap，
+  而 macOS runner 上没有游戏文件；
+* iOS 真机/模拟器上的 `PROT_EXEC` 需要 JIT 权限（`dynamic-codesigning`），
+  无签名 CI 验不了；代码在 `EPERM` 时会把这句话写进 error 而不是静默降级；
+* key page 还没接到 loader，第一条客体指令还没跑；
+* rtld 在 16 KiB 页上的 W^X 冲突仍未解决（需要双映射）。
+
+### 5. 下一步
+
+1. 把 `botw_guest_slot_publish()` 接在 map 之后、第一个 gate 之前；
+2. 在 macOS arm64 上用一份“接近真实布局”的合成镜像跑完整链路：
+   map → publish → 通过 KGATE 进 trampoline → 回到 gate 块；
+3. 之后才是真实模块和 HLE 表。

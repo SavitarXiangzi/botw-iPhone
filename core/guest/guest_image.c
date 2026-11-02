@@ -333,14 +333,12 @@ static int apply_table(botw_guest_image* img, const dyn_info* d, uint64_t off, u
     return 1;
 }
 
-int botw_guest_image_open(botw_guest_image* img, const void* file, size_t file_len,
-                          const char* fixups_text, botw_guest_resolve_fn resolve,
-                          void* user) {
+int botw_guest_image_parse(botw_guest_image* img, size_t file_len,
+                           const char* fixups_text) {
     int64_t patch_off, key_off, key_sz, text_end, ro_off, data_off;
-    dyn_info d;
     if (!img) return -1;
     memset(img, 0, sizeof *img);
-    if (!file || file_len == 0) {
+    if (file_len == 0) {
         set_error(img, "empty image");
         return -1;
     }
@@ -366,13 +364,6 @@ int botw_guest_image_open(botw_guest_image* img, const void* file, size_t file_l
         set_error(img, "fixups ranges are out of order or past the file");
         return -1;
     }
-    img->base = (uint8_t*)malloc(file_len);
-    if (!img->base) {
-        set_error(img, "out of memory (%zu bytes)", file_len);
-        return -1;
-    }
-    memcpy(img->base, file, file_len);
-    img->owns_base = 1;
     img->file_size = file_len;
     img->size = (size_t)key_off;
     img->text_end = (size_t)text_end;
@@ -384,7 +375,6 @@ int botw_guest_image_open(botw_guest_image* img, const void* file, size_t file_l
     img->patch_len = file_len - (size_t)patch_off;
     if (!parse_build_id(fixups_text, img->build_id)) {
         set_error(img, "fixups header has no BUILD_ID");
-        botw_guest_image_close(img);
         return -1;
     }
     /* The rewrite only puts *indices* into the gate/x18 blocks; the offsets
@@ -404,21 +394,52 @@ int botw_guest_image_open(botw_guest_image* img, const void* file, size_t file_l
                             strcmp(token, "abs") == 0;
         }
     }
-    if (!read_dynamic(img, &d)) {
-        botw_guest_image_close(img);
+    return 0;
+}
+
+int botw_guest_image_attach(botw_guest_image* img, void* buffer,
+                            botw_guest_resolve_fn resolve, void* user) {
+    dyn_info d;
+    if (!img || !buffer) return -1;
+    if (img->file_size == 0) {
+        set_error(img, "layout was not parsed before attach");
         return -1;
     }
+    img->base = (uint8_t*)buffer;
+    if (!read_dynamic(img, &d)) return -1;
     if (d.have_rela && d.rela_sz &&
         !apply_table(img, &d, d.rela_off, d.rela_sz, d.rela_ent, resolve, user)) {
-        botw_guest_image_close(img);
         return -1;
     }
     if (d.have_jmp && d.jmp_sz &&
         !apply_table(img, &d, d.jmp_off, d.jmp_sz, d.jmp_ent, resolve, user)) {
-        botw_guest_image_close(img);
         return -1;
     }
     img->error[0] = '\0';
+    return 0;
+}
+
+int botw_guest_image_open(botw_guest_image* img, const void* file, size_t file_len,
+                          const char* fixups_text, botw_guest_resolve_fn resolve,
+                          void* user) {
+    if (!img) return -1;
+    memset(img, 0, sizeof *img);
+    if (!file) {
+        set_error(img, "empty image");
+        return -1;
+    }
+    if (botw_guest_image_parse(img, file_len, fixups_text) != 0) return -1;
+    img->base = (uint8_t*)malloc(file_len);
+    if (!img->base) {
+        set_error(img, "out of memory (%zu bytes)", file_len);
+        return -1;
+    }
+    memcpy(img->base, file, file_len);
+    img->owns_base = 1;
+    if (botw_guest_image_attach(img, img->base, resolve, user) != 0) {
+        botw_guest_image_close(img);
+        return -1;
+    }
     return 0;
 }
 

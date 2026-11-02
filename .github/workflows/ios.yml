@@ -71,6 +71,7 @@ jobs:
           clang -std=c11 -Wall -Wextra -Werror $INC -c core/guest/guest_slot.c -o /tmp/guest_slot.o
           clang -std=c11 -Wall -Wextra -Werror $INC -c core/guest/guest_gate.c -o /tmp/guest_gate.o
           clang -std=c11 -Wall -Wextra -Werror $INC -c core/guest/guest_segments.c -o /tmp/guest_segments.o
+          clang -std=c11 -Wall -Wextra -Werror $INC -c core/guest/guest_map.c -o /tmp/guest_map.o
           LIB="/tmp/guest_image.o ios/nvn/src/nvn_dispatch.cpp ios/nvn/src/nvn_null.cpp core/src/botw_core.cpp /tmp/nvn_texture.o /tmp/nvn_shader.o /tmp/nvn_shader_key.o /tmp/nvn_shader_bundle.o /tmp/nvn_shader_blobs.o /tmp/nvn_vertex.o /tmp/nvn_sampler.o /tmp/nvn_pool.o /tmp/nvn_texlayout.o /tmp/nvn_bcn.o /tmp/nvn_pipeline.o /tmp/nvn_state.o"
           clang++ $FLAGS $INC tests/nvn_abi_test.cpp      $LIB -o /tmp/nvn_abi_test
           clang++ $FLAGS $INC tests/core_smoke_test.cpp   $LIB -o /tmp/core_smoke_test
@@ -102,6 +103,10 @@ jobs:
           # link and skip.  The macOS job runs it against a real core.
           clang++ $FLAGS $INC tests/guest_gate_test.cpp /tmp/guest_gate.o -o /tmp/guest_gate_test
           /tmp/guest_gate_test
+          # Real mmap/mprotect + a forked write to an RX page: the only place
+          # the page plan meets the OS.  Needs a POSIX host, so Windows skips.
+          clang++ $FLAGS $INC tests/guest_map_test.cpp /tmp/guest_image.o /tmp/guest_segments.o /tmp/guest_map.o -o /tmp/guest_map_test
+          /tmp/guest_map_test
           # Host-only loader probe: built everywhere, needs a real image to run.
           clang++ $FLAGS $INC scripts/guest/reloc_run.cpp /tmp/guest_image.o /tmp/guest_slot.o /tmp/guest_segments.o -o /tmp/reloc_run
           if /tmp/reloc_run; then
@@ -166,10 +171,10 @@ jobs:
       - name: Show Xcode version
         run: xcodebuild -version
 
-      # The only step that executes the trampoline: an x86 host cannot, and the
-      # simulator build would only link it.  This is the same compiler and the
-      # same -Werror the app uses, on a synthetic gate block.
-      - name: Guest gate trampoline (native arm64)
+      # The only steps that execute what the app links: an x86 host cannot run
+      # the trampoline, and the simulator build would only link it.  Same
+      # compiler, same -Werror, and a 16 KiB page size for the mapping.
+      - name: Guest core on arm64 (trampoline + executable mapping)
         run: |
           set -euo pipefail
           # guest_gate.c is C: clang++ would treat it as C++ and -Werror on
@@ -183,6 +188,17 @@ jobs:
             /tmp/guest_gate_entry.o \
             -o /tmp/guest_gate_test
           /tmp/guest_gate_test
+          xcrun clang -std=c11 -Wall -Wextra -Werror -O2 -I core/guest \
+            -c core/guest/guest_image.c -o /tmp/guest_image.o
+          xcrun clang -std=c11 -Wall -Wextra -Werror -O2 -I core/guest \
+            -c core/guest/guest_segments.c -o /tmp/guest_segments.o
+          xcrun clang -std=c11 -Wall -Wextra -Werror -O2 -I core/guest \
+            -c core/guest/guest_map.c -o /tmp/guest_map.o
+          xcrun clang++ -std=c++20 -Wall -Wextra -Werror -O2 -I core/guest \
+            tests/guest_map_test.cpp \
+            /tmp/guest_image.o /tmp/guest_segments.o /tmp/guest_map.o \
+            -o /tmp/guest_map_test
+          /tmp/guest_map_test
 
       - name: Verify generated project parses
         working-directory: ios

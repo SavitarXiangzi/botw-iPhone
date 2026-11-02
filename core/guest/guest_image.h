@@ -62,6 +62,21 @@ typedef struct {
 int botw_guest_image_open(botw_guest_image* img, const void* file, size_t file_len,
                           const char* fixups_text, botw_guest_resolve_fn resolve,
                           void* user);
+
+/* The two halves of open(), for callers that own the buffer.
+ *
+ * parse() reads only the fixups header: it validates the layout, fills every
+ * field in botw_guest_image except `base`, and never touches the bytes.  An
+ * executable mapping needs this first, because the page plan comes from the
+ * header alone.
+ *
+ * attach() adopts `buffer` (file_size bytes, already a copy of patched.bin),
+ * reads MOD0/dynamic from it, and applies the relocations in place.  It never
+ * frees or copies the buffer; whoever set owns_base keeps that duty. */
+int botw_guest_image_parse(botw_guest_image* img, size_t file_len,
+                           const char* fixups_text);
+int botw_guest_image_attach(botw_guest_image* img, void* buffer,
+                            botw_guest_resolve_fn resolve, void* user);
 void botw_guest_image_close(botw_guest_image* img);
 
 /* The MOD0 init entry (virtual offset), or 0 when the image has no init. */
