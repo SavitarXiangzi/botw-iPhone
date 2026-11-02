@@ -31,11 +31,7 @@ static int g_fail = 0;
     std::printf("guest_run_test: FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); \
     g_fail++; } } while (0)
 
-static const size_t kTextEnd = 0x400;
-static const size_t kRoOff = 0x400;
-static const size_t kDataOff = 0x4000;
 static const size_t kKeyOff = 0x8000;
-static const size_t kKeySize = 0x4000;
 static const size_t kPatchOff = 0x10000;
 static const size_t kBlockLen = 32;
 static const size_t kFileLen = kPatchOff + kBlockLen;
