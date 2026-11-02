@@ -164,6 +164,7 @@ int main() {
     }
     CHECK(map.span == span);
     CHECK(map.page == page);
+    CHECK(map.runs > 0 && map.runs <= BOTW_GUEST_MAP_MAX_SEGMENTS);
     CHECK(img.base == (uint8_t*)map.base);
     CHECK(img.owns_base == 0);
     CHECK(img.patch_off == kPatchOff && img.patch_len == kFileLen - kPatchOff);
@@ -217,15 +218,24 @@ int main() {
         keys[4] = 0xfeedfaceu;
         CHECK(keys[4] == 0xfeedfaceu);
 
-        /* A key page the plan did not make writable is refused before any
-         * write: the padding page at 0xc000 is read-only. */
+        /* A key page the mapping's recorded plan did not make writable is
+         * refused before any write: the padding page at 0xc000 is read-only. */
         {
             botw_guest_image saved = img;
+            uint64_t before = keys[0];
             img.key_page_off = 0xc000;
             img.key_page_size = 0x1000;
             CHECK(botw_guest_map_publish_slot(&map, &img, &slot) != 0);
             CHECK(std::strstr(map.error, "not writable") != nullptr);
+            CHECK(keys[0] == before);
             img = saved;
+        }
+        /* A closed mapping is refused for the same reason. */
+        {
+            botw_guest_mapping closed;
+            std::memset(&closed, 0, sizeof closed);
+            CHECK(botw_guest_map_publish_slot(&closed, &img, &slot) != 0);
+            CHECK(std::strstr(closed.error, "closed") != nullptr);
         }
     }
 

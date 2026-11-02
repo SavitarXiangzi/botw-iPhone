@@ -41,6 +41,8 @@ typedef struct {
     void*  base;
     size_t span;
     size_t page;
+    size_t runs;                 /* protection runs actually applied */
+    botw_guest_segment seg[BOTW_GUEST_MAP_MAX_SEGMENTS];
     char   error[192];
 } botw_guest_mapping;
 
