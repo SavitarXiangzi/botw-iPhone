@@ -139,6 +139,11 @@ jobs:
             /tmp/guest_run.o /tmp/guest_gate.o /tmp/guest_image.o \
             /tmp/guest_segments.o /tmp/guest_map.o /tmp/guest_slot.o $HLE_OS -o /tmp/guest_thread_test
           /tmp/guest_thread_test
+          # Blocking imports: WaitThread parks main until a worker exits, then
+          # SleepThread advances the virtual clock when nothing else can run.
+          # The real switch is AArch64-only; this host still compiles the test.
+          clang++ $FLAGS $INC tests/guest_block_test.cpp $HLE -o /tmp/guest_block_test
+          /tmp/guest_block_test
           # HLE registry: implementations, shared stubs, full-table refusal.
           clang++ $FLAGS $INC tests/guest_hle_test.cpp $HLE -o /tmp/guest_hle_test -lm
           /tmp/guest_hle_test
@@ -170,6 +175,10 @@ jobs:
             -c core/guest/guest_run_arm64.S -o /tmp/guest_run_arm64.o
           clang --target=aarch64-apple-ios17.0 -Wall -Wextra -Werror \
             -c tests/guest_thread_probe_arm64.S -o /tmp/guest_thread_probe_arm64.o
+          clang --target=aarch64-apple-ios17.0 -Wall -Wextra -Werror \
+            -c core/guest/guest_hle_os_arm64.S -o /tmp/guest_hle_os_arm64.o
+          clang --target=aarch64-apple-ios17.0 -Wall -Wextra -Werror \
+            -c tests/guest_block_probe_arm64.S -o /tmp/guest_block_probe_arm64.o
 
       # nvn_metal.mm is ObjC++; this parses it against tests/stubs/ so a type
       # error in the Metal backend is caught without a mac runner.
@@ -249,8 +258,10 @@ jobs:
             -c core/guest/guest_hle_fs.c -o /tmp/guest_hle_fs.o
           xcrun clang -std=c11 -Wall -Wextra -Werror -O2 -I core/guest \
             -c core/guest/guest_hle_os.c -o /tmp/guest_hle_os.o
-          HLE="/tmp/guest_hle.o /tmp/guest_hle_nn.o /tmp/guest_hle_fs.o /tmp/guest_hle_os.o /tmp/guest_run.o /tmp/guest_gate_entry.o core/guest/guest_run_arm64.S"
-          HLE_OS="/tmp/guest_hle.o /tmp/guest_hle_nn.o /tmp/guest_hle_fs.o /tmp/guest_hle_os.o"
+          xcrun clang -std=c11 -Wall -Wextra -Werror -O2 -I core/guest \
+            -c core/guest/guest_hle_os_arm64.S -o /tmp/guest_hle_os_arm64.o
+          HLE="/tmp/guest_hle.o /tmp/guest_hle_nn.o /tmp/guest_hle_fs.o /tmp/guest_hle_os.o /tmp/guest_hle_os_arm64.o /tmp/guest_run.o /tmp/guest_gate_entry.o core/guest/guest_run_arm64.S"
+          HLE_OS="/tmp/guest_hle.o /tmp/guest_hle_nn.o /tmp/guest_hle_fs.o /tmp/guest_hle_os.o /tmp/guest_hle_os_arm64.o"
           xcrun clang -std=c11 -Wall -Wextra -Werror -O2 -I core/guest \
             -c core/guest/guest_map.c -o /tmp/guest_map.o
           xcrun clang -std=c11 -Wall -Wextra -Werror -O2 -I core/guest \
@@ -288,6 +299,14 @@ jobs:
             /tmp/guest_run.o /tmp/guest_gate_entry.o /tmp/guest_image.o \
             /tmp/guest_segments.o /tmp/guest_map.o /tmp/guest_slot.o $HLE_OS -o /tmp/guest_thread_test
           /tmp/guest_thread_test
+          # WaitThread must park main before its worker has run; the worker's
+          # exit wakes main.  SleepThread then has no peer, so its deadline is
+          # the only way forward and the virtual clock must advance.
+          xcrun clang++ -std=c++20 -Wall -Wextra -Werror -O2 -I core/guest \
+            tests/guest_block_test.cpp \
+            core/guest/guest_run_arm64.S tests/guest_block_probe_arm64.S \
+            /tmp/guest_run.o /tmp/guest_gate_entry.o $HLE_OS -o /tmp/guest_block_test
+          /tmp/guest_block_test
           # The HLE stub returns 0 in x0 on the real arm64 target.
           xcrun clang++ -std=c++20 -Wall -Wextra -Werror -O2 -I core/guest \
             tests/guest_hle_test.cpp $HLE -o /tmp/guest_hle_test -lm

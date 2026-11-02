@@ -11,10 +11,11 @@
  *   - GetSystemTick / frequency / conversions;
  *   - AllocateMemoryBlock / FreeMemoryBlock / SetMemoryHeapSize.
  *
- * Synchronization objects (Mutex, Event, LightEvent, Semaphore, MessageQueue,
- * SystemEvent, MultiWait) stay on the shared stub for now.  Implementing them
- * before the scheduler can block and wake would produce a lock that reports
- * success without excluding anyone.
+ * SleepThread and WaitThread now block for real.  The other synchronization
+ * objects (Mutex, Event, LightEvent, Semaphore, MessageQueue, SystemEvent,
+ * MultiWait) stay on the shared stub until their ABI layouts and ownership
+ * rules are implemented; a lock that reports success without excluding
+ * anyone would be worse than an explicit stub.
  *
  * Scheduling contract, stated plainly because it is not the real kernel:
  *
@@ -24,13 +25,12 @@
  *     needs a guard page and ownership it can prove.
  *   - StartThread moves CREATED -> READY.  The first switch happens at the
  *     next host gate, not inside the import call.
- *   - YieldThread and SleepThread call botw_guest_run_yield().  The guest keeps
- *     executing until the next gate, where the trampoline restores another
- *     thread's frame.  SleepThread does not suspend the caller yet; it records
- *     the request and yields.
- *   - WaitThread returns immediately when the target is already DONE.  For a
- *     live target it records a wait and requests a yield; this is not a join
- *     until the scheduler can put the caller in BLOCKED and wake it on exit.
+ *   - YieldThread requests a switch at the next gate.  It cannot switch inside
+ *     a host call because the guest's return point would be lost.
+ *   - SleepThread and WaitThread use an AArch64 import wrapper that saves the
+ *     complete register frame, parks the caller in BLOCKED, and restores
+ *     another runnable frame.  Sleep is woken by the virtual run clock; a live
+ *     WaitThread target wakes its joiners from the thread-exit trampoline.
  *   - DestroyThread reaps a DONE (or never-started CREATED) worker and returns
  *     its slot and stack to the run.
  *
@@ -66,6 +66,19 @@ extern "C" {
  * Callers only test "zero or not"; this is not a Nintendo result code. */
 #define BOTW_HLE_OS_ERROR 0x804F0001u
 
+/* Blocking import entry points exported by guest_hle_os_arm64.S.  The table
+ * registers these instead of the plain C implementations on AArch64. */
+typedef enum {
+    BOTW_HLE_OS_OP_SLEEP = 1,
+    BOTW_HLE_OS_OP_WAIT_THREAD = 2
+} botw_hle_os_block_op;
+
+enum {
+    BOTW_HLE_OS_RETURN = 0,     /* resume the frame that made the call */
+    BOTW_HLE_OS_SWITCHED = 1,   /* next_frame holds another thread's frame */
+    BOTW_HLE_OS_STOPPED = 2     /* deadlock; finish the guest run */
+};
+
 typedef struct {
     unsigned used;
     void*    type;              /* guest ThreadType* (identity token) */
@@ -100,6 +113,8 @@ typedef struct {
     unsigned long thread_destroys;
     unsigned long yields;
     unsigned long sleeps;
+    unsigned long sleep_blocks;
+    unsigned long wait_blocks;
     unsigned long block_allocs;
     unsigned long block_frees;
     char     error[160];
@@ -123,9 +138,17 @@ int botw_hle_os_register(botw_hle_table* hle, botw_hle_os_state* state);
  * can reach an nn::os import. */
 void botw_hle_os_attach_run(botw_hle_os_state* state, botw_guest_run* run);
 
-/* Adds to the deterministic virtual clock.  GetSystemTick() also advances one
- * tick per call so a polling loop makes progress without a host clock. */
+/* Adds to the deterministic virtual clock and wakes any attached SLEEP
+ * waiters whose deadline has arrived.  GetSystemTick() also advances one tick
+ * per call so a polling loop makes progress without a host clock. */
 void botw_hle_os_advance(botw_hle_os_state* state, uint64_t ticks);
+
+/* Called by the AArch64 blocking wrapper, not by ordinary C code.  `frame`
+ * points at the wrapper's complete saved registers; the function performs the
+ * op, writes its return value into frame->x[0], and reports whether assembly
+ * must resume this frame, jump to next_resume, or finish the run. */
+int botw_hle_os_blocking_call(botw_guest_regs* frame, unsigned op,
+                              const botw_guest_resume** next_resume);
 
 #ifdef __cplusplus
 }

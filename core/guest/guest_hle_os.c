@@ -6,6 +6,14 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(__aarch64__)
+/* The blocking wrappers live in guest_hle_os_arm64.S.  They are entered with
+ * the guest's register file, not with a C signature, so their prototypes are
+ * intentionally just symbols here. */
+extern void botw_hle_os_guest_sleep(void);
+extern void botw_hle_os_guest_wait_thread(void);
+#endif
+
 /* The implementations are registered under their Itanium-mangled names,
  * because that is what the rewritten image imports.  The names are copied from
  * the 1.6.0 main image's undefined-symbol list; a wrong digit in a length
@@ -61,6 +69,10 @@ static int current_slot(const botw_hle_os_state* state) {
     return state->run->current;
 }
 
+static void sync_tick_from_run(botw_hle_os_state* state) {
+    if (state && state->run) state->tick = botw_guest_run_clock(state->run);
+}
+
 static void init_main_thread(botw_hle_os_state* state) {
     botw_hle_os_thread* t = &state->threads[0];
     memset(&state->threads[0], 0, sizeof state->threads[0]);
@@ -101,11 +113,18 @@ void botw_hle_os_attach_run(botw_hle_os_state* state, botw_guest_run* run) {
     memset(state->tls_used, 0, sizeof state->tls_used);
     memset(state->tls_dtor, 0, sizeof state->tls_dtor);
     state->tick = 0;
+    if (run) run->clock = 0;
     state->next_thread_id = BOTW_HLE_OS_MAIN_ID + 1u;
 }
 
 void botw_hle_os_advance(botw_hle_os_state* state, uint64_t ticks) {
-    if (state) state->tick += ticks;
+    if (!state) return;
+    if (state->run) {
+        state->tick = botw_guest_run_advance_clock(state->run, ticks);
+    } else {
+        if (UINT64_MAX - state->tick < ticks) state->tick = UINT64_MAX;
+        else state->tick += ticks;
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -255,14 +274,24 @@ static int64_t ticks_to_span(uint64_t tick) {
     return (int64_t)(sec * 1000000000ull + rem * 1000000000ull / BOTW_HLE_OS_TICK_FREQ);
 }
 
-static void os_SleepThread(int64_t ns) {
-    if (!g_os) return;
+static uint64_t sleep_prepare(int64_t ns) {
+    uint64_t deadline;
+    if (!g_os) return 0;
     g_os->calls++;
     g_os->sleeps++;
     g_os->last_sleep_ns = ns;
-    g_os->sleep_deadline = g_os->tick + span_to_ticks(ns);
-    /* Direct imports cannot switch inside the host call.  The request is
-     * honoured at the next gate; see the header for the exact contract. */
+    sync_tick_from_run(g_os);
+    deadline = g_os->tick + span_to_ticks(ns);
+    g_os->sleep_deadline = deadline;
+    return deadline;
+}
+
+/* Portable fallback used on hosts without the AArch64 blocking wrapper.  The
+ * wrapper takes the real path on Apple arm64; this one can only request a
+ * switch at the next gate. */
+static void os_SleepThread(int64_t ns) {
+    if (!g_os) return;
+    (void)sleep_prepare(ns);
     if (g_os->run) botw_guest_run_yield(g_os->run);
 }
 
@@ -329,20 +358,27 @@ static void os_StartThread(void* type) {
     g_os->thread_starts++;
 }
 
-static void os_WaitThread(void* type) {
+static int wait_prepare(void* type, int* out_slot) {
     botw_hle_os_thread* t;
     int cur;
-    if (!g_os) return;
+    if (!g_os) return 0;
     g_os->calls++;
     t = thread_by_type(g_os, type);
-    if (!t || !g_os->run) return;
+    if (!t || !g_os->run) return 0;
     cur = current_slot(g_os);
-    if (t->slot == cur) return;
+    if (t->slot == cur) return 0;
     if (t->slot >= 0 && t->slot < (int)BOTW_GUEST_MAX_THREADS &&
         g_os->run->threads[t->slot].state == BOTW_GUEST_THREAD_DONE) {
-        return;
+        return 0;
     }
     g_os->thread_waits++;
+    if (out_slot) *out_slot = t->slot;
+    return 1;
+}
+
+static void os_WaitThread(void* type) {
+    if (!g_os) return;
+    if (!wait_prepare(type, NULL)) return;
     botw_guest_run_yield(g_os->run);
 }
 
@@ -437,7 +473,8 @@ static uint64_t os_GetSystemTick(void) {
     g_os->calls++;
     /* One tick per query keeps a guest poll loop moving without a host clock;
      * the shell may also call botw_hle_os_advance() in bigger steps. */
-    g_os->tick++;
+    if (g_os->run) g_os->tick = botw_guest_run_advance_clock(g_os->run, 1);
+    else g_os->tick++;
     return g_os->tick;
 }
 
@@ -508,18 +545,84 @@ static void os_FreeMemoryBlock(size_t addr, size_t size) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Blocking imports                                                   */
+/* ------------------------------------------------------------------ */
+
+/* This is the C half of guest_hle_os_arm64.S.  The wrapper has already saved
+ * every guest register and reports the return address as frame->pc.  If a
+ * wait cannot block (no attached executing run, or the target is already
+ * done), it returns to the caller exactly like the portable C entry point. */
+int botw_hle_os_blocking_call(botw_guest_regs* frame, unsigned op,
+                              const botw_guest_resume** next_resume) {
+    botw_guest_run* run;
+    const botw_guest_resume* next;
+
+    if (!frame || !next_resume) return BOTW_HLE_OS_STOPPED;
+    *next_resume = NULL;
+    frame->x[0] = 0;
+    if (!g_os) return BOTW_HLE_OS_RETURN;
+    run = g_os->run;
+
+    switch (op) {
+    case BOTW_HLE_OS_OP_SLEEP: {
+        uint64_t deadline = sleep_prepare((int64_t)frame->x[0]);
+        if (run && botw_guest_run_is_executing(run)) {
+            next = botw_guest_run_block_and_switch(run, frame,
+                                                   BOTW_GUEST_WAIT_SLEEP,
+                                                   deadline);
+            if (!next) return BOTW_HLE_OS_STOPPED;
+            g_os->sleep_blocks++;
+            sync_tick_from_run(g_os);
+            *next_resume = next;
+            return BOTW_HLE_OS_SWITCHED;
+        }
+        if (run) botw_guest_run_yield(run);
+        return BOTW_HLE_OS_RETURN;
+    }
+    case BOTW_HLE_OS_OP_WAIT_THREAD: {
+        int target = -1;
+        if (!wait_prepare((void*)(uintptr_t)frame->x[0], &target) || !run) {
+            return BOTW_HLE_OS_RETURN;
+        }
+        if (botw_guest_run_is_executing(run)) {
+            next = botw_guest_run_block_and_switch(run, frame,
+                                                   BOTW_GUEST_WAIT_THREAD,
+                                                   (uint64_t)(unsigned)target);
+            if (!next) return BOTW_HLE_OS_STOPPED;
+            g_os->wait_blocks++;
+            *next_resume = next;
+            return BOTW_HLE_OS_SWITCHED;
+        }
+        botw_guest_run_yield(run);
+        return BOTW_HLE_OS_RETURN;
+    }
+    default:
+        (void)os_error(g_os, "blocking import %u is not implemented", op);
+        return BOTW_HLE_OS_STOPPED;
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* Registry                                                           */
 /* ------------------------------------------------------------------ */
 
+#if defined(__aarch64__)
+#  define OS_SLEEP_ENTRY ((void*)(uintptr_t)&botw_hle_os_guest_sleep)
+#  define OS_WAIT_THREAD_ENTRY ((void*)(uintptr_t)&botw_hle_os_guest_wait_thread)
+#else
+#  define OS_SLEEP_ENTRY ((void*)(uintptr_t)&os_SleepThread)
+#  define OS_WAIT_THREAD_ENTRY ((void*)(uintptr_t)&os_WaitThread)
+#endif
+
 static const os_entry g_os_entries[BOTW_HLE_OS_COUNT] = {
-    { "_ZN2nn2os10WaitThreadEPNS0_10ThreadTypeE", (void*)(uintptr_t)&os_WaitThread },
+    { "_ZN2nn2os10WaitThreadEPNS0_10ThreadTypeE", OS_WAIT_THREAD_ENTRY },
     { "_ZN2nn2os11FreeTlsSlotENS0_7TlsSlotE", (void*)(uintptr_t)&os_FreeTlsSlot },
     { "_ZN2nn2os11GetHostArgcEv", (void*)(uintptr_t)&os_GetHostArgc },
     { "_ZN2nn2os11GetHostArgvEv", (void*)(uintptr_t)&os_GetHostArgv },
     { "_ZN2nn2os11GetThreadIdEPKNS0_10ThreadTypeE", (void*)(uintptr_t)&os_GetThreadId },
     { "_ZN2nn2os11GetTlsValueENS0_7TlsSlotE", (void*)(uintptr_t)&os_GetTlsValue },
     { "_ZN2nn2os11SetTlsValueENS0_7TlsSlotEm", (void*)(uintptr_t)&os_SetTlsValue },
-    { "_ZN2nn2os11SleepThreadENS_8TimeSpanE", (void*)(uintptr_t)&os_SleepThread },
+    { "_ZN2nn2os11SleepThreadENS_8TimeSpanE", OS_SLEEP_ENTRY },
     { "_ZN2nn2os11StartThreadEPNS0_10ThreadTypeE", (void*)(uintptr_t)&os_StartThread },
     { "_ZN2nn2os11YieldThreadEv", (void*)(uintptr_t)&os_YieldThread },
     { "_ZN2nn2os12CreateThreadEPNS0_10ThreadTypeEPFvPvES3_S3_mi", (void*)(uintptr_t)&os_CreateThread6 },

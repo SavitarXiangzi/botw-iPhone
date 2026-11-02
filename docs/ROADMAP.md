@@ -8176,3 +8176,90 @@ wrapper，在 C 调用返回前保存客体帧。两者都还没有做。
 * 线程栈不使用游戏传入的栈；`ThreadType` 内部布局未被验证。
 * 仍无抢占：纯计算且没有 gate/自旋回边的长循环仍会饿死其他线程。
 * 仍无步数预算/信号处理：客体跳到未映射地址会带走整个进程。
+
+## M4 续四十九：阻塞导入与真正的 BLOCKED
+
+### 1. 为什么 `BLOCKED` 不能从 C 里切
+
+`nn::os::SleepThread` / `WaitThread` 是重定位到宿主 C 函数的直调导入：
+
+```
+guest: blr <WaitThread>      ; x30 = 返回点
+host:  os_WaitThread()       ; 宿主 C 帧仍在栈上
+```
+
+如果在这个 C 函数里直接恢复另一条客体线程，当前线程的返回点和活寄存器
+都还在被放弃的宿主帧里，恢复时无处可回。上一轮因此只置
+`switch_requested`，把阻塞推迟到下一个 gate；这能跑，但不是 join/sleep。
+
+### 2. 汇编导入包装器
+
+新增 `core/guest/guest_hle_os_arm64.S`：`botw_hle_os_guest_sleep` 和
+`botw_hle_os_guest_wait_thread` 先分配 288 字节栈块，保存
+`x0–x30`、进入时的 SP、返回地址（同时作为 PC）和 NZCV，再调用：
+
+```c
+int botw_hle_os_blocking_call(botw_guest_regs* frame, unsigned op,
+                              const botw_guest_resume** next_resume);
+```
+
+返回值：
+
+| 值 | 含义 |
+|---|---|
+| `BOTW_HLE_OS_RETURN` (0) | 不需要阻塞，恢复调用者自己的帧 |
+| `BOTW_HLE_OS_SWITCHED` (1) | C 侧已推进调度器，恢复 `next_resume` |
+| `BOTW_HLE_OS_STOPPED` (2) | 死锁，调用 `botw_guest_run_finish_asm` 结束 run |
+
+恢复路径必须区分两种帧：
+
+* gate 帧：保存于 gate 边界，恢复后要回到改写块末尾的
+  `ldp x29,x30,[sp],#16`，走 `botw_guest_resume_frame`；
+* import 帧：保存于导入包装器，恢复后直接回到 `blr` 的下一条指令，走
+  `botw_guest_resume_import_frame`。
+
+`botw_guest_resume` 因此带 `kind`；gate trampoline 用 NZCV bit63
+（`BOTW_GUEST_NZCV_IMPORT_FRAME`）标记 import 帧，避免把 import 帧误当成
+gate 帧恢复。线程退出 trampoline 也改成接收 `botw_guest_resume`。
+
+### 3. 调度语义
+
+* `SleepThread(ns)`：`deadline = run->clock + ns * freq / 1e9`，置
+  `BOTW_GUEST_WAIT_SLEEP` 后 `BLOCKED`；
+* `WaitThread(target)`：目标已 DONE 立即返回；目标还活着则置
+  `BOTW_GUEST_WAIT_THREAD` 并记录目标槽；
+* 线程退出时 `wake_joiners()` 把同一目标上的等待者全部置 READY；
+* clock 前进（`botw_hle_os_advance()` / `GetSystemTick`）时
+  `wake_expired()` 唤醒到期 sleeper；
+* 没有可运行线程时，调度器把 clock 直接推进到最早 sleep deadline；
+  若没有任何 deadline，报 `guest deadlock: all threads are blocked ...`
+  并结束 run，而不是静默返回成功；
+* `run->blocks` / `run->wakes` / `os.sleep_blocks` / `os.wait_blocks`
+  计入统计，测试可以验证真的发生了阻塞。
+
+`GetSystemTick` 仍然每次查询前进 1 tick，但现在与 `run->clock` 是同一个
+时钟，sleep deadline 与 guest 观察到的 tick 一致。
+
+### 4. 测试
+
+* `tests/guest_block_probe_arm64.S`：主线程在 worker 尚未运行时
+  `WaitThread`；worker 退出后主线程恢复并写计数；随后
+  `SleepThread(5ms)`，无其他可运行线程，虚拟时钟推进到 deadline。
+* `tests/guest_block_test.cpp`：真实 AArch64 客体执行，断言
+  `blocks == 2`、`wakes >= 2`、`switches == 2`、`thread_exits == 1`、
+  `wait_blocks == 1`、`sleep_blocks == 1`，且 sleep 前后 tick 差值 ≥ 5 ms。
+  Windows/x86 跳过；macOS arm64 CI 执行。
+* `.github/workflows/ios.yml`：portable job 编译并运行
+  `guest_block_test`（x86 跳过）；assembly job 编译新包装器与探针；
+  macOS arm64 job 链接 `guest_hle_os_arm64.S` 并执行。
+
+### 5. 仍然不成立
+
+* 45 个同步原语仍是共享 stub：mutex、event、light event、semaphore、
+  message queue、system event、multi-wait。没有做“返回成功但不互斥”的锁。
+* `SleepThread` 只有 deadline 唤醒，没有 `svcCancelSynchronization` /
+  `WakeThread` 之类的显式中断。
+* `YieldThread` 仍是“下一个 gate 让出”，不是立即切换。
+* 没有抢占、步数预算、信号处理；真实标题线程与 `main.patched.bin`
+  入口仍未调用。
+* `ThreadType` 内部布局仍未验证，线程栈仍不使用游戏传入的栈。

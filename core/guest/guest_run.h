@@ -47,7 +47,8 @@ extern "C" {
 typedef enum {
     BOTW_GUEST_EXIT_NONE = 0,   /* never entered, or still inside */
     BOTW_GUEST_EXIT_RETURNED,   /* the guest executed ret to the sentinel */
-    BOTW_GUEST_EXIT_REFUSED     /* enter() refused before executing anything */
+    BOTW_GUEST_EXIT_REFUSED,    /* enter() refused before executing anything */
+    BOTW_GUEST_EXIT_STOPPED     /* the scheduler had to stop a deadlocked run */
 } botw_guest_exit;
 
 /* Called from the gate trampoline while the guest is inside.  `user` is the
@@ -84,9 +85,30 @@ typedef enum {
     BOTW_GUEST_THREAD_CREATED,  /* stack and frame exist, not started */
     BOTW_GUEST_THREAD_READY,    /* runnable, waiting for a time slice */
     BOTW_GUEST_THREAD_RUNNING,
-    BOTW_GUEST_THREAD_BLOCKED,  /* reserved for a wait primitive */
+    BOTW_GUEST_THREAD_BLOCKED,  /* has a resumable frame, waiting for a wake */
     BOTW_GUEST_THREAD_DONE
 } botw_guest_thread_state;
+
+/* Why a BLOCKED thread is not runnable.  Thread exit wakes THREAD waiters;
+ * the scheduler's virtual clock wakes SLEEP waiters. */
+typedef enum {
+    BOTW_GUEST_WAIT_NONE = 0,
+    BOTW_GUEST_WAIT_THREAD,     /* wait_arg is the target thread slot */
+    BOTW_GUEST_WAIT_SLEEP       /* wait_arg is an absolute run-clock tick */
+} botw_guest_wait_kind;
+
+/* The two saved-frame shapes need different restore sequences.  A gate frame
+ * returns through the rewritten block's `ldp x29,x30,[sp],#16`; an import
+ * frame returns directly to the instruction after `blr`. */
+typedef enum {
+    BOTW_GUEST_FRAME_GATE = 0,
+    BOTW_GUEST_FRAME_IMPORT = 1
+} botw_guest_frame_kind;
+
+typedef struct {
+    botw_guest_regs* regs;
+    int              kind;      /* botw_guest_frame_kind */
+} botw_guest_resume;
 
 typedef struct {
     int      state;             /* botw_guest_thread_state */
@@ -98,6 +120,9 @@ typedef struct {
     size_t   guard_bytes;
     uint64_t stack_top;
     botw_guest_regs frame;      /* valid when has_frame is set */
+    int      frame_kind;        /* botw_guest_frame_kind for frame */
+    int      wait_kind;         /* botw_guest_wait_kind while BLOCKED */
+    uint64_t wait_arg;          /* target slot or wake tick */
     unsigned long yields;       /* explicit yields observed from this thread */
     unsigned long generation;   /* run generation that created this thread */
 } botw_guest_thread;
@@ -122,8 +147,12 @@ typedef struct {
     int      thread_count;       /* high-water mark, informational */
     int      current;            /* running thread, -1 when idle */
     int      switch_requested;   /* set by botw_guest_run_yield() */
+    botw_guest_resume resume;    /* consumed immediately after a switch */
     unsigned long switches;      /* context switches, self-yields excluded */
+    unsigned long blocks;        /* entries through block_and_switch() */
+    unsigned long wakes;         /* blocked threads made READY again */
     unsigned long thread_exits;  /* created threads that returned */
+    uint64_t clock;              /* virtual ticking clock shared with nn::os */
     unsigned long generation;    /* bumped after each completed run */
     char     error[160];
 } botw_guest_run;
@@ -167,13 +196,37 @@ int botw_guest_run_thread_reap(botw_guest_run* run, int id);
  * yield; a guest cannot observe it until the gate returns. */
 void botw_guest_run_yield(botw_guest_run* run);
 
+/* True only between enter_asm() and its return, not merely run->active.  The
+ * blocking HLE wrappers use this to refuse to abandon a synthetic test state
+ * that no assembly frame would resume. */
+int botw_guest_run_is_executing(const botw_guest_run* run);
+
+/* Runs the virtual clock forward and wakes every SLEEP waiter whose deadline
+ * has arrived.  Returns the new clock value.  Safe on a closed run. */
+uint64_t botw_guest_run_advance_clock(botw_guest_run* run, uint64_t ticks);
+
+/* The current thread's virtual-clock value. */
+uint64_t botw_guest_run_clock(const botw_guest_run* run);
+
+/* Parks the current RUNNING thread and returns the next runnable frame, or
+ * NULL when every thread is blocked and no future sleep deadline can make
+ * progress (a deadlock; run->error says so).  `frame` must be the complete
+ * register snapshot at the import boundary, including the return address.
+ *
+ * This is the context switch used by a blocking HLE import.  Unlike yield(),
+ * it happens immediately: the caller must restore the returned frame rather
+ * than return from the host call. */
+const botw_guest_resume* botw_guest_run_block_and_switch(
+    botw_guest_run* run, const botw_guest_regs* frame,
+    int wait_kind, uint64_t wait_arg);
+
 /* Index of the running thread, or -1. */
 int botw_guest_run_current(const botw_guest_run* run);
 
 /* Called by the thread-exit trampoline, not by normal host code.  Marks the
- * current thread DONE and returns the next frame to restore, or NULL when
- * the run has no runnable thread left. */
-botw_guest_regs* botw_guest_thread_exit_frame(void);
+ * current thread DONE and returns the next frame (with its restore kind), or
+ * NULL when the run has no runnable thread left. */
+const botw_guest_resume* botw_guest_thread_exit_frame(void);
 
 #ifdef __cplusplus
 }

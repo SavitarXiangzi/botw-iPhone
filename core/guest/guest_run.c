@@ -25,6 +25,10 @@ BOTW_STATIC_ASSERT(offsetof(botw_guest_run_ctx, exit_sp) == 344, ctx_exit_sp);
 BOTW_STATIC_ASSERT(offsetof(botw_guest_run_ctx, entry) == 352, ctx_entry);
 BOTW_STATIC_ASSERT(offsetof(botw_guest_run_ctx, stack_top) == 360, ctx_stack_top);
 BOTW_STATIC_ASSERT(sizeof(botw_guest_run_ctx) == 368, ctx_size);
+/* guest_run_arm64.S reads the resume descriptor as {regs, kind}. */
+BOTW_STATIC_ASSERT(offsetof(botw_guest_resume, regs) == 0, resume_regs);
+BOTW_STATIC_ASSERT(offsetof(botw_guest_resume, kind) == 8, resume_kind);
+BOTW_STATIC_ASSERT(sizeof(botw_guest_resume) == 16, resume_size);
 
 #if defined(__aarch64__)
 extern void botw_guest_run_enter_asm(botw_guest_run_ctx* ctx);
@@ -53,6 +57,73 @@ static int pick_next(botw_guest_run* run, int after) {
     return -1;
 }
 
+/* The trampoline consumes this descriptor immediately, so one slot in the run
+ * is enough and cannot be overwritten while an assembly restore is pending. */
+static const botw_guest_resume* set_resume(botw_guest_run* run, int next) {
+    run->resume.regs = &run->threads[next].frame;
+    run->resume.kind = run->threads[next].frame_kind;
+    return &run->resume;
+}
+
+/* A thread slot became DONE.  Any joiners waiting for it become runnable,
+ * but keep their saved frames: the scheduler restores one when it resumes. */
+static int wake_joiners(botw_guest_run* run, int target) {
+    int i, woke = 0;
+    for (i = 0; i < BOTW_GUEST_MAX_THREADS; i++) {
+        botw_guest_thread* t = &run->threads[i];
+        if (t->state == BOTW_GUEST_THREAD_BLOCKED &&
+            t->wait_kind == BOTW_GUEST_WAIT_THREAD &&
+            t->wait_arg == (uint64_t)(unsigned)target) {
+            t->state = BOTW_GUEST_THREAD_READY;
+            t->wait_kind = BOTW_GUEST_WAIT_NONE;
+            t->wait_arg = 0;
+            run->wakes++;
+            woke++;
+        }
+    }
+    return woke;
+}
+
+/* Wake every sleeper whose absolute deadline has arrived.  The clock is
+ * virtual and monotonic; this never consults the host wall clock. */
+static int wake_expired(botw_guest_run* run) {
+    int i, woke = 0;
+    for (i = 0; i < BOTW_GUEST_MAX_THREADS; i++) {
+        botw_guest_thread* t = &run->threads[i];
+        if (t->state == BOTW_GUEST_THREAD_BLOCKED &&
+            t->wait_kind == BOTW_GUEST_WAIT_SLEEP &&
+            t->wait_arg <= run->clock) {
+            t->state = BOTW_GUEST_THREAD_READY;
+            t->wait_kind = BOTW_GUEST_WAIT_NONE;
+            t->wait_arg = 0;
+            run->wakes++;
+            woke++;
+        }
+    }
+    return woke;
+}
+
+/* With nothing runnable, step the virtual clock to the earliest sleep
+ * deadline.  That gives the scheduler a way out of "every thread is asleep"
+ * without a host timer thread, while arbitrary event waits still deadlock
+ * loudly instead of pretending to succeed. */
+static int advance_to_earliest_sleeper(botw_guest_run* run) {
+    uint64_t earliest = UINT64_MAX;
+    int i;
+    for (i = 0; i < BOTW_GUEST_MAX_THREADS; i++) {
+        const botw_guest_thread* t = &run->threads[i];
+        if (t->state == BOTW_GUEST_THREAD_BLOCKED &&
+            t->wait_kind == BOTW_GUEST_WAIT_SLEEP &&
+            t->wait_arg < earliest) {
+            earliest = t->wait_arg;
+        }
+    }
+    if (earliest == UINT64_MAX) return 0;
+    if (earliest > run->clock) run->clock = earliest;
+    (void)wake_expired(run);
+    return 1;
+}
+
 #if defined(__aarch64__)
 /* The trampoline calls this through the single global handler slot, because
  * botw_guest_gate_dispatch_fn carries no user pointer. */
@@ -64,6 +135,10 @@ static void run_gate(botw_guest_regs* regs) {
     run->gates++;
     if (run->gate) run->gate(run->gate_user, regs);
 
+    /* A gate is a scheduling boundary too.  This does not force a switch;
+     * it only makes timed threads eligible for one. */
+    (void)wake_expired(run);
+
     if (!run->switch_requested) return;
     run->switch_requested = 0;
 
@@ -72,6 +147,7 @@ static void run_gate(botw_guest_regs* regs) {
     if (run->threads[cur].state == BOTW_GUEST_THREAD_RUNNING) {
         run->threads[cur].frame = *regs;
         run->threads[cur].has_frame = 1;
+        run->threads[cur].frame_kind = BOTW_GUEST_FRAME_GATE;
         run->threads[cur].state = BOTW_GUEST_THREAD_READY;
     }
 
@@ -89,13 +165,18 @@ static void run_gate(botw_guest_regs* regs) {
     run->current = next;
     run->threads[next].state = BOTW_GUEST_THREAD_RUNNING;
     *regs = run->threads[next].frame;
+    if (run->threads[next].frame_kind == BOTW_GUEST_FRAME_IMPORT) {
+        regs->nzcv |= BOTW_GUEST_NZCV_IMPORT_FRAME;
+    } else {
+        regs->nzcv &= ~BOTW_GUEST_NZCV_IMPORT_FRAME;
+    }
     run->switches++;
 }
 #endif
 
 /* Called by the thread-exit trampoline.  It runs on the exiting thread's
  * guest stack; the returned frame is restored by that same trampoline. */
-botw_guest_regs* botw_guest_thread_exit_frame(void) {
+const botw_guest_resume* botw_guest_thread_exit_frame(void) {
     botw_guest_run* run = g_active;
     int cur, next;
 
@@ -104,7 +185,10 @@ botw_guest_regs* botw_guest_thread_exit_frame(void) {
     if (cur >= 0 && cur < BOTW_GUEST_MAX_THREADS) {
         run->threads[cur].state = BOTW_GUEST_THREAD_DONE;
         run->threads[cur].has_frame = 0;
+        run->threads[cur].wait_kind = BOTW_GUEST_WAIT_NONE;
+        run->threads[cur].wait_arg = 0;
         run->thread_exits++;
+        (void)wake_joiners(run, cur);
     }
     run->switch_requested = 0;
     next = pick_next(run, cur);
@@ -112,7 +196,7 @@ botw_guest_regs* botw_guest_thread_exit_frame(void) {
     run->current = next;
     run->threads[next].state = BOTW_GUEST_THREAD_RUNNING;
     run->switches++;
-    return &run->threads[next].frame;
+    return set_resume(run, next);
 }
 
 static void run_error(botw_guest_run* run, const char* fmt, ...) {
@@ -287,6 +371,7 @@ int botw_guest_run_thread_create(botw_guest_run* run, const void* entry,
      * exit stub and branches to the entry.  The synthetic frame leaves the
      * usual 16 bytes above sp for the trampoline's x29/x30 store. */
     memset(&t->frame, 0, sizeof t->frame);
+    t->frame_kind = BOTW_GUEST_FRAME_IMPORT;
     t->frame.x[0] = arg;
     t->frame.x[19] = t->entry;
 #if defined(__aarch64__)
@@ -344,6 +429,78 @@ void botw_guest_run_yield(botw_guest_run* run) {
     run->threads[run->current].yields++;
 }
 
+int botw_guest_run_is_executing(const botw_guest_run* run) {
+    return run != NULL && g_active == run && run->active;
+}
+
+uint64_t botw_guest_run_clock(const botw_guest_run* run) {
+    return run ? run->clock : 0;
+}
+
+uint64_t botw_guest_run_advance_clock(botw_guest_run* run, uint64_t ticks) {
+    if (!run) return 0;
+    if (UINT64_MAX - run->clock < ticks) run->clock = UINT64_MAX;
+    else run->clock += ticks;
+    (void)wake_expired(run);
+    return run->clock;
+}
+
+const botw_guest_resume* botw_guest_run_block_and_switch(
+    botw_guest_run* run, const botw_guest_regs* frame,
+    int wait_kind, uint64_t wait_arg) {
+    botw_guest_thread* t;
+    int cur, next;
+
+    if (!run || !frame) return NULL;
+    if (!botw_guest_run_is_executing(run)) {
+        run_error(run, "block requested outside an executing guest run");
+        return NULL;
+    }
+    cur = run->current;
+    if (cur < 0 || cur >= BOTW_GUEST_MAX_THREADS) {
+        run_error(run, "block requested with no current thread");
+        return NULL;
+    }
+    if (wait_kind != BOTW_GUEST_WAIT_THREAD && wait_kind != BOTW_GUEST_WAIT_SLEEP) {
+        run_error(run, "block requested with unknown wait kind %d", wait_kind);
+        return NULL;
+    }
+    t = &run->threads[cur];
+    if (t->state != BOTW_GUEST_THREAD_RUNNING) {
+        run_error(run, "thread %d blocked from state %d", cur, t->state);
+        return NULL;
+    }
+    if (frame->pc == 0) {
+        run_error(run, "thread %d blocked without a return address", cur);
+        return NULL;
+    }
+
+    t->frame = *frame;
+    t->has_frame = 1;
+    t->frame_kind = BOTW_GUEST_FRAME_IMPORT;
+    t->state = BOTW_GUEST_THREAD_BLOCKED;
+    t->wait_kind = wait_kind;
+    t->wait_arg = wait_arg;
+    run->blocks++;
+    run->switch_requested = 0;
+
+    /* Sleep(0) and a deadline already reached must not strand the thread. */
+    (void)wake_expired(run);
+    next = pick_next(run, cur);
+    while (next < 0) {
+        if (!advance_to_earliest_sleeper(run)) break;
+        next = pick_next(run, cur);
+    }
+    if (next < 0) {
+        run_error(run, "guest deadlock: all threads are blocked and no sleep deadline can wake one");
+        return NULL;
+    }
+    run->current = next;
+    run->threads[next].state = BOTW_GUEST_THREAD_RUNNING;
+    if (next != cur) run->switches++;
+    return set_resume(run, next);
+}
+
 int botw_guest_run_current(const botw_guest_run* run) {
     return run ? run->current : -1;
 }
@@ -379,7 +536,8 @@ int botw_guest_run_enter_at(botw_guest_run* run, const void* entry) {
      * slice.  DONE threads are harmless and remain in the table. */
     for (i = 1; i < BOTW_GUEST_MAX_THREADS; i++) {
         if ((run->threads[i].state == BOTW_GUEST_THREAD_READY ||
-             run->threads[i].state == BOTW_GUEST_THREAD_RUNNING) &&
+             run->threads[i].state == BOTW_GUEST_THREAD_RUNNING ||
+             run->threads[i].state == BOTW_GUEST_THREAD_BLOCKED) &&
             run->threads[i].generation != run->generation) {
             run_error(run, "thread %d is still live from a previous run", i);
             run->reason = BOTW_GUEST_EXIT_REFUSED;
@@ -402,6 +560,8 @@ int botw_guest_run_enter_at(botw_guest_run* run, const void* entry) {
     run->current = 0;
     run->switch_requested = 0;
     run->switches = 0;
+    run->blocks = 0;
+    run->wakes = 0;
     run->thread_exits = 0;
 
     run->gates = 0;
@@ -422,11 +582,13 @@ int botw_guest_run_enter_at(botw_guest_run* run, const void* entry) {
     run->active = 0;
 
     run->threads[0].state = BOTW_GUEST_THREAD_DONE;
+    run->threads[0].wait_kind = BOTW_GUEST_WAIT_NONE;
+    run->threads[0].wait_arg = 0;
     run->current = -1;
     run->generation++;
     run->exit_x0 = run->ctx.exit_x0;
     run->exit_sp = run->ctx.exit_sp;
-    run->reason = BOTW_GUEST_EXIT_RETURNED;
+    run->reason = run->error[0] ? BOTW_GUEST_EXIT_STOPPED : BOTW_GUEST_EXIT_RETURNED;
     return 0;
 #endif
 }

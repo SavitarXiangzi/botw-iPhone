@@ -28,7 +28,8 @@ retail NSO  --rewrite_botw.py-->  patched.bin + fixups/gates/sites
 - [x] `guest_run`：独立客体栈 + 守卫页 + 入口/退出哨兵；合成客体在 macOS arm64 CI 真正执行
 - [x] 协作式客体线程（`guest_thread_test`）：独立栈、272 字节帧保存/恢复、轮转切换、线程退出；三线程在 arm64 CI 通过
 - [x] `nn::os` 线程表 / TLS / 虚拟时钟 / 内存块（33/78；CreateThread / StartThread / WaitThread / DestroyThread）
-- [ ] `nn::os` 同步原语（mutex / event / light event / semaphore / message queue / multi-wait）与真正的 BLOCKED 唤醒
+- [x] `SleepThread` / `WaitThread` 阻塞与唤醒：汇编导入包装器保存完整客体帧，`BLOCKED` → READY；sleep 由虚拟时钟 deadline 唤醒，join 由线程退出唤醒（`guest_block_test`，待 arm64 CI）
+- [ ] `nn::os` 同步原语（mutex / event / light event / semaphore / message queue / multi-wait）
 - [ ] HLE 服务层（init / fs / vi / nv / NVN bootstrap）
 - [ ] 把 NVN 调用桥到 `ios/nvn` 的 Metal 后端
 - [ ] 在 iOS 模拟器/真机执行第一条客体指令

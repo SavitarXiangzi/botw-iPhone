@@ -30,6 +30,9 @@
 #  define RUN_SYM(name) name
 #endif
 
+/* botw_guest_regs.pc */
+#define FRAME_PC 256
+
     .data
     .p2align 3
 /* The context pointer the sentinel loads.  Nothing in the guest can reach it:
@@ -94,6 +97,10 @@ RUN_SYM(botw_guest_run_enter_asm):
 /* Restore the host after either the sentinel or the last guest thread exits.
  * x0 is the guest's return value, sp is the guest's stack pointer. */
     .p2align 2
+.globl RUN_SYM(botw_guest_run_finish_asm)
+#if defined(__ELF__)
+    .type RUN_SYM(botw_guest_run_finish_asm), %function
+#endif
 RUN_SYM(botw_guest_run_finish_asm):
     adrp x9,  RUN_SYM(botw_guest_run_globals)@PAGE
     add  x9,  x9, RUN_SYM(botw_guest_run_globals)@PAGEOFF
@@ -141,7 +148,12 @@ RUN_SYM(botw_guest_thread_start_asm):
 RUN_SYM(botw_guest_thread_exit_asm):
     bl   RUN_SYM(botw_guest_thread_exit_frame)
     cbz  x0, 2f
+    mov  x9,  x0
+    ldr  w10, [x9, #8]                 /* botw_guest_resume.kind */
+    ldr  x0,  [x9, #0]                 /* botw_guest_resume.regs */
+    cbnz w10, 3f
     b    RUN_SYM(botw_guest_resume_frame)
+3:  b    RUN_SYM(botw_guest_resume_import_frame)
 2:  mov  x0, xzr
     b    RUN_SYM(botw_guest_run_finish_asm)
 #if defined(__ELF__)
@@ -152,6 +164,10 @@ RUN_SYM(botw_guest_thread_exit_asm):
  * lives in a thread struct, not on the stack being abandoned, so sp may move
  * before the remaining loads.  x18 is never loaded: it is reserved by Apple. */
     .p2align 2
+    .globl RUN_SYM(botw_guest_resume_frame)
+#if defined(__ELF__)
+    .type RUN_SYM(botw_guest_resume_frame), %function
+#endif
 RUN_SYM(botw_guest_resume_frame):
     mov  x9,  x0
     ldr  x16, [x9, #248]               /* frame->sp */
@@ -179,6 +195,43 @@ RUN_SYM(botw_guest_resume_frame):
     ret
 #if defined(__ELF__)
     .size RUN_SYM(botw_guest_resume_frame), . - RUN_SYM(botw_guest_resume_frame)
+#endif
+
+/* Restore a frame saved at a direct HLE import.  There is no gate block to
+ * reload x29/x30, so restore every register here, put the incoming sp back
+ * exactly where it was, and branch to the instruction after the import.
+ * x17 temporarily carries the new sp while the guest's own x17 is restored;
+ * x18 is not loaded (Apple reserves it). */
+    .p2align 2
+    .globl RUN_SYM(botw_guest_resume_import_frame)
+#if defined(__ELF__)
+    .type RUN_SYM(botw_guest_resume_import_frame), %function
+#endif
+RUN_SYM(botw_guest_resume_import_frame):
+    mov  x9,  x0
+    ldr  x17, [x9, #248]               /* frame->sp */
+    ldp  x0,  x1,  [x9, #0]
+    ldp  x2,  x3,  [x9, #16]
+    ldp  x4,  x5,  [x9, #32]
+    ldp  x6,  x7,  [x9, #48]
+    ldr  x8,       [x9, #64]
+    ldp  x10, x11, [x9, #80]
+    ldp  x12, x13, [x9, #96]
+    ldp  x14, x15, [x9, #112]
+    ldr  x16,      [x9, #128]
+    ldp  x19, x20, [x9, #152]
+    ldp  x21, x22, [x9, #168]
+    ldp  x23, x24, [x9, #184]
+    ldp  x25, x26, [x9, #200]
+    ldp  x27, x28, [x9, #216]
+    ldr  x29,      [x9, #232]
+    ldr  x30,      [x9, #FRAME_PC]
+    mov  sp,  x17
+    ldr  x17, [x9, #136]
+    ldr  x9,  [x9, #72]
+    br   x30
+#if defined(__ELF__)
+    .size RUN_SYM(botw_guest_resume_import_frame), . - RUN_SYM(botw_guest_resume_import_frame)
 #endif
 
 #endif /* __aarch64__ */

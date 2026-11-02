@@ -25,6 +25,12 @@ typedef struct {
     uint64_t nzcv;    /* offset 264 : condition flags (NZCV) */
 } botw_guest_regs;
 
+/* Bit 63 of nzcv is not an architectural condition flag.  The cooperative
+ * scheduler sets it when a gate dispatcher is handing control to a frame
+ * saved at a direct HLE import instead of a gate block.  The trampoline then
+ * takes the import restore path rather than the gate block's ldp path. */
+#define BOTW_GUEST_NZCV_IMPORT_FRAME (1ull << 63)
+
 typedef void (*botw_guest_gate_dispatch_fn)(botw_guest_regs* regs);
 
 /* One global dispatcher: the guest core is cooperative and runs on a single

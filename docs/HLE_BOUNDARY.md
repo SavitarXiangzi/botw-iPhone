@@ -39,17 +39,26 @@
 
 ## nn::os 直调 HLE 的调度边界
 
-`nn::os::YieldThread` / `SleepThread` / `WaitThread` 是**重定位到宿主 C 函数**
-的直调导入，不是 gate。宿主函数返回时，客体还在原来的指令流上；因此
-`guest_hle_os.c` 只能置 `botw_guest_run_yield()` 的 `switch_requested`，
-真正的帧切换发生在下一个 gate。`SleepThread` 目前记录 deadline 后同样只
-请求让出，`WaitThread` 对活目标也只请求让出一次；不要把这三者当成真正的
-阻塞/唤醒。
+`nn::os::YieldThread` 是**重定位到宿主 C 函数**的直调导入，不是 gate。
+宿主函数返回时，客体还在原来的指令流上；因此 `YieldThread` 只能置
+`botw_guest_run_yield()` 的 `switch_requested`，真正的帧切换发生在下一个
+gate。
 
-要越过这个边界，需要在 gate 分发处按 `gates.tsv` 的返回点识别等待原语，
-或在导入外包一层汇编入口，在 C 函数返回前保存客体帧并把当前线程置
-`BLOCKED`。在这之前，同步对象（mutex/event/semaphore/queue）不应假装
-自己已经互斥或已经唤醒。
+`SleepThread` / `WaitThread` 不能这样做：它们在语义上必须阻塞。为此
+`guest_hle_os_arm64.S` 给这两个导入加了汇编包装器：先在宿主栈上保存完整
+客体帧（`x0–x30` / SP / PC / NZCV），再调用
+`botw_hle_os_blocking_call()`；需要阻塞时由
+`botw_guest_run_block_and_switch()` 把线程置 `BLOCKED` 并立即恢复另一条
+客体帧。被放弃的宿主 C 帧不再展开，线程恢复时直接从 import 调用后的指令
+继续。睡眠 deadline 由确定性虚拟时钟推进，线程退出会唤醒 joiners。
+
+恢复路径有两种：gate 帧必须回到改写块末尾的 `ldp x29,x30,[sp],#16`，
+import 帧直接 `br x30`。`botw_guest_resume` 用 `kind` 区分，两条 trampoline
+不能混用。
+
+在这条包装器之外，同步对象（mutex / event / light event / semaphore /
+message queue / system event / multi-wait）仍不应假装自己已经互斥或已经
+唤醒——它们还在共享 stub 上。
 
 ## 已知技术债
 

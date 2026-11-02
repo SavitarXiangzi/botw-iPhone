@@ -93,6 +93,10 @@ GATE_SYM(botw_guest_gate_entry):
     bl   GATE_SYM(botw_guest_gate_dispatch)
 
     ldr  x9,  [sp, #FR_NZCV]
+    /* The cooperative scheduler uses bit 63 as 'this frame was saved at a
+     * direct HLE import, not at a gate block'.  That frame must branch
+     * straight back after the import rather than execute the block's ldp. */
+    tbnz x9,  #63, 9f
     msr  nzcv, x9                   /* nothing below sets the flags */
     ldr  x29, [sp, #FR_SP]          /* x29 is free now: the block reloads it */
     sub  x29, x29, #16              /* where the block will ldp from */
@@ -119,6 +123,11 @@ GATE_SYM(botw_guest_gate_entry):
 
     mov  sp,  x29
     ret                             /* x30 = the block's ldp */
+
+9:  /* Import frame: this trampoline's 272-byte frame is already the complete
+     * botw_guest_regs.  Restore it with the direct-import convention. */
+    mov  x0,  sp
+    b    GATE_SYM(botw_guest_resume_import_frame)
 #if defined(__ELF__)
     .size GATE_SYM(botw_guest_gate_entry), . - GATE_SYM(botw_guest_gate_entry)
 #endif
