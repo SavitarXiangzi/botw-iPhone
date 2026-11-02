@@ -56,6 +56,7 @@ static int map_fail(botw_guest_mapping* map, botw_guest_image* img,
     if (map->base) munmap(map->base, map->span);
     map->base = NULL;
     map->span = 0;
+    map->runs = 0;
     /* The image points into the mapping; it must not be left dangling. */
     if (img && !img->owns_base) img->base = NULL;
     return -1;
@@ -72,8 +73,7 @@ static int prot_to_native(unsigned prot) {
 int botw_guest_map_open(botw_guest_mapping* map, botw_guest_image* img,
                         const void* file, size_t file_len, const char* fixups_text,
                         botw_guest_resolve_fn resolve, void* user, size_t page_size) {
-    botw_guest_segment seg[BOTW_GUEST_MAP_MAX_SEGMENTS];
-    size_t runs, span, i;
+    size_t span, i;
     uint8_t* p;
 
     if (!map || !img) return -1;
@@ -92,8 +92,9 @@ int botw_guest_map_open(botw_guest_mapping* map, botw_guest_image* img,
                         "(text %#zx, data %#zx): refuse rather than fake W^X",
                         page_size, img->text_end, img->data_off);
     }
-    runs = botw_guest_image_plan(img, page_size, seg, BOTW_GUEST_MAP_MAX_SEGMENTS);
-    if (runs == 0 || runs > BOTW_GUEST_MAP_MAX_SEGMENTS) {
+    map->runs = botw_guest_image_plan(img, page_size, map->seg,
+                                      BOTW_GUEST_MAP_MAX_SEGMENTS);
+    if (map->runs == 0 || map->runs > BOTW_GUEST_MAP_MAX_SEGMENTS) {
         return map_fail(map, img, "plan: %s", img->error);
     }
 
@@ -111,11 +112,12 @@ int botw_guest_map_open(botw_guest_mapping* map, botw_guest_image* img,
         return map_fail(map, img, "load: %s", img->error);
     }
 
-    for (i = 0; i < runs; i++) {
-        if (mprotect(p + seg[i].off, seg[i].len, prot_to_native(seg[i].prot)) != 0) {
+    for (i = 0; i < map->runs; i++) {
+        if (mprotect(p + map->seg[i].off, map->seg[i].len,
+                     prot_to_native(map->seg[i].prot)) != 0) {
             return map_fail(map, img,
                             "mprotect(%#zx, %#zx, %u) failed: errno %d%s",
-                            seg[i].off, seg[i].len, seg[i].prot, errno,
+                            map->seg[i].off, map->seg[i].len, map->seg[i].prot, errno,
                             errno == EPERM ? " (executable anonymous memory needs the JIT entitlement)" : "");
         }
     }
@@ -124,11 +126,10 @@ int botw_guest_map_open(botw_guest_mapping* map, botw_guest_image* img,
 
 int botw_guest_map_publish_slot(botw_guest_mapping* map, botw_guest_image* img,
                                 botw_guest_slot* slot) {
-    botw_guest_segment seg[BOTW_GUEST_MAP_MAX_SEGMENTS];
-    size_t runs, i, begin, end;
+    size_t i, begin, end;
 
     if (!map || !img || !slot) return -1;
-    if (!map->base || map->span == 0) {
+    if (!map->base || map->span == 0 || map->runs == 0) {
         snprintf(map->error, sizeof map->error, "mapping is closed");
         return -1;
     }
@@ -147,21 +148,22 @@ int botw_guest_map_publish_slot(botw_guest_mapping* map, botw_guest_image* img,
     }
     begin = img->key_page_off;
     end = begin + img->key_page_size;
-    runs = botw_guest_image_plan(img, map->page, seg, BOTW_GUEST_MAP_MAX_SEGMENTS);
-    if (runs == 0 || runs > BOTW_GUEST_MAP_MAX_SEGMENTS) {
-        snprintf(map->error, sizeof map->error, "plan: %s", img->error);
+    if (begin >= map->span || end > map->span) {
+        snprintf(map->error, sizeof map->error,
+                 "key page [%#zx, %#zx) is outside the %#zx-byte mapping",
+                 begin, end, map->span);
         return -1;
     }
-    for (i = 0; i < runs; i++) {
-        if (seg[i].off <= begin && end <= seg[i].off + seg[i].len) break;
+    for (i = 0; i < map->runs; i++) {
+        if (map->seg[i].off <= begin && end <= map->seg[i].off + map->seg[i].len) break;
     }
-    if (i == runs) {
+    if (i == map->runs) {
         snprintf(map->error, sizeof map->error,
                  "key page [%#zx, %#zx) is not covered by one protection run",
                  begin, end);
         return -1;
     }
-    if ((seg[i].prot & BOTW_GUEST_PROT_WRITE) == 0) {
+    if ((map->seg[i].prot & BOTW_GUEST_PROT_WRITE) == 0) {
         snprintf(map->error, sizeof map->error,
                  "key page [%#zx, %#zx) is not writable in the page plan",
                  begin, end);
