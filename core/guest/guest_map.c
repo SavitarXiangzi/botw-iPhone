@@ -21,6 +21,17 @@ int botw_guest_map_open(botw_guest_mapping* map, botw_guest_image* img,
     return -1;
 }
 
+int botw_guest_map_publish_slot(botw_guest_mapping* map, botw_guest_image* img,
+                                botw_guest_slot* slot) {
+    (void)img;
+    (void)slot;
+    if (map) {
+        snprintf(map->error, sizeof map->error,
+                 "no mmap on this host; use botw_guest_slot_publish()");
+    }
+    return -1;
+}
+
 void botw_guest_map_close(botw_guest_mapping* map, botw_guest_image* img) {
     if (img) img->base = NULL;
     if (map) memset(map, 0, sizeof *map);
@@ -107,6 +118,59 @@ int botw_guest_map_open(botw_guest_mapping* map, botw_guest_image* img,
                             seg[i].off, seg[i].len, seg[i].prot, errno,
                             errno == EPERM ? " (executable anonymous memory needs the JIT entitlement)" : "");
         }
+    }
+    return 0;
+}
+
+int botw_guest_map_publish_slot(botw_guest_mapping* map, botw_guest_image* img,
+                                botw_guest_slot* slot) {
+    botw_guest_segment seg[BOTW_GUEST_MAP_MAX_SEGMENTS];
+    size_t runs, i, begin, end;
+
+    if (!map || !img || !slot) return -1;
+    if (!map->base || map->span == 0) {
+        snprintf(map->error, sizeof map->error, "mapping is closed");
+        return -1;
+    }
+    if (img->base != (uint8_t*)map->base) {
+        snprintf(map->error, sizeof map->error,
+                 "image does not live in this mapping");
+        return -1;
+    }
+    if (!slot->base) {
+        snprintf(map->error, sizeof map->error, "slot is not initialized");
+        return -1;
+    }
+    if (img->key_page_size == 0) {
+        snprintf(map->error, sizeof map->error, "image has no key page");
+        return -1;
+    }
+    begin = img->key_page_off;
+    end = begin + img->key_page_size;
+    runs = botw_guest_image_plan(img, map->page, seg, BOTW_GUEST_MAP_MAX_SEGMENTS);
+    if (runs == 0 || runs > BOTW_GUEST_MAP_MAX_SEGMENTS) {
+        snprintf(map->error, sizeof map->error, "plan: %s", img->error);
+        return -1;
+    }
+    for (i = 0; i < runs; i++) {
+        if (seg[i].off <= begin && end <= seg[i].off + seg[i].len) break;
+    }
+    if (i == runs) {
+        snprintf(map->error, sizeof map->error,
+                 "key page [%#zx, %#zx) is not covered by one protection run",
+                 begin, end);
+        return -1;
+    }
+    if ((seg[i].prot & BOTW_GUEST_PROT_WRITE) == 0) {
+        snprintf(map->error, sizeof map->error,
+                 "key page [%#zx, %#zx) is not writable in the page plan",
+                 begin, end);
+        return -1;
+    }
+    if (botw_guest_slot_publish(img, slot) != 0) {
+        snprintf(map->error, sizeof map->error, "slot: %s",
+                 slot->error[0] ? slot->error : "publish failed");
+        return -1;
     }
     return 0;
 }
