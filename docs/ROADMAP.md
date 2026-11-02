@@ -7533,12 +7533,24 @@ ret
 
 ### 4. 实测
 
+CI run `41371304577`，portable 与 ios 两个 job 均 success：
+
 | 主机 | 页大小 | 结果 |
 |---|---:|---|
-| Linux x86_64（portable job） | 4096 | 只编译链式测试并跳过；`guest_map_test` 覆盖 map + publish |
-| macOS arm64（ios job） | 16384 | 完整链路：map → publish → KGATE → trampoline → block |
+| Linux x86_64（portable job） | 4096 | `guest_map_test: ok (page 4096, 68 KiB mapped, RX executes, RW writes, text write dies, conflict refused)`；链式测试只编译并跳过 |
+| macOS arm64（ios job） | 16384 | `guest_map_test` 与 `guest_chain_test` 都返回 ok |
 
-（CI 结果在本节写入后补：`guest_chain_test: ok (...)`。）
+macOS 的三行输出：
+
+```text
+guest_gate_test: ok (frame, return, write-back, NZCV, no-handler)
+guest_map_test: ok (page 16384, 80 KiB mapped, RX executes, RW writes, text write dies, conflict refused)
+guest_chain_test: ok (page 16384, map -> slot -> KGATE -> trampoline -> block, registers round-trip)
+```
+
+portable 的 map 输出与上次相同（4 KiB），但这次多了 `publish` 断言；链式
+测试在 x86 上打印 `skipped (needs AArch64 + mmap)`，因为 trampoline 和
+gate 块都是 AArch64 指令。
 
 ### 5. 还没有证明
 
