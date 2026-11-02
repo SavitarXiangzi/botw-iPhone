@@ -366,11 +366,18 @@ static int wait_prepare(void* type, int* out_slot) {
     if (!g_os) return 0;
     g_os->calls++;
     t = thread_by_type(g_os, type);
-    if (!t || !g_os->run) return 0;
+    if (!t || !g_os->run) {
+        g_os->wait_unknown++;
+        return 0;
+    }
     cur = current_slot(g_os);
-    if (t->slot == cur) return 0;
+    if (t->slot == cur) {
+        g_os->wait_self++;
+        return 0;
+    }
     if (t->slot >= 0 && t->slot < (int)BOTW_GUEST_MAX_THREADS &&
         g_os->run->threads[t->slot].state == BOTW_GUEST_THREAD_DONE) {
+        g_os->wait_done++;
         return 0;
     }
     g_os->thread_waits++;

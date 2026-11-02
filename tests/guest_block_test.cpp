@@ -52,7 +52,7 @@ int main() {
     botw_hle_os_state os;
     botw_guest_run run;
     uint64_t worker_type[64] = {0};
-    uint64_t counter[5] = {0, 0, 0, 0, 0};
+    uint64_t counter[7] = {0, 0, 0, 0, 0, 0, 0};
     const int64_t sleep_ns = 5000000;
     block_probe_args args;
     os_create7_fn create;
@@ -135,6 +135,8 @@ int main() {
                     os.calls, os.thread_creates, os.thread_starts,
                     os.thread_waits, os.wait_blocks, os.sleeps,
                     os.sleep_blocks);
+        std::printf("  wait rejects: self=%lu done=%lu unknown=%lu\n",
+                    os.wait_self, os.wait_done, os.wait_unknown);
         std::printf("  counter=%llu,%llu,%llu,%llu,%llu states=%d,%d "
                     "waits=%d/%llu,%d/%llu error='%s'\n",
                     (unsigned long long)counter[0], (unsigned long long)counter[1],
@@ -152,6 +154,10 @@ int main() {
                     (unsigned long long)os.tick,
                     (void*)worker_type, os.threads[1].type,
                     (void*)os.main_type, run.current);
+        std::printf("  guest args: wait_ptr=%p sleep_ns=%lld "
+                    "host_sleep_ns=%lld\n",
+                    (void*)(uintptr_t)counter[5],
+                    (long long)(int64_t)counter[6], (long long)sleep_ns);
     }
 
     botw_hle_os_attach_run(&os, nullptr);

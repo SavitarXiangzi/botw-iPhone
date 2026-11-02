@@ -110,6 +110,9 @@ typedef struct {
     unsigned long thread_creates;
     unsigned long thread_starts;
     unsigned long thread_waits;
+    unsigned long wait_self;
+    unsigned long wait_done;
+    unsigned long wait_unknown;
     unsigned long thread_destroys;
     unsigned long yields;
     unsigned long sleeps;
