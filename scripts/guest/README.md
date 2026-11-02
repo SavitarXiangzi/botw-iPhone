@@ -18,7 +18,7 @@ retail NSO  --rewrite_botw.py-->  patched.bin + fixups/gates/sites
 - [x] 通用改写规则在 1.6.0 上跑通：main / sdk / subsdk0 / rtld
 - [x] 输出结构校验：无残留 `svc`、每个 gate/site 都跳进 patch 区
 - [x] 运行时 loader 的可移植部分（fixups 解析、私有复制、重定位、导入解析）
-- [ ] 可执行映射（text 按 RX、data 按 RW、patch 区单独映射）
+- [x] 可执行映射（`guest_map.c`）：整块 mmap → 重定位 → 按页 mprotect；Linux 4 KiB / macOS 16 KiB 实测
 - [x] 每线程槽布局 + key page 发布（`guest_slot.c`）
 - [x] 槽地址发布（`SLOT_BASE=abs`；`TPIDRRO_EL0` 在 EL0 只读，见 ROADMAP 续三十七）
 - [x] gate trampoline（`guest_gate_arm64.S`）：x0..x30 / sp / pc / nzcv 完整帧，CI 的 arm64 job 实测往返
