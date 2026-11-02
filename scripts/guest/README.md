@@ -40,7 +40,7 @@ python scripts/guest/rewrite_botw.py --nso-dir <ExeFS/update> --out build/guest
 python scripts/guest/verify_rewrite.py build/guest main
 python scripts/guest/probe_relocs.py build/guest/main.patched.bin --fixups build/guest/main.fixups.tsv
 # 有 MSVC 时：把真实镜像完整装载一遍（只读，不执行客体代码）
-cl /std:c++20 /I core\guest scripts/guest/reloc_run.cpp core/guest/guest_image.c core/guest/guest_slot.c core/guest/guest_segments.c core/guest/guest_hle.c core/guest/guest_hle_nn.c /Fe:build\reloc_run.exe
+cl /std:c++20 /I core\guest scripts/guest/reloc_run.cpp core/guest/guest_image.c core/guest/guest_slot.c core/guest/guest_segments.c core/guest/guest_hle.c core/guest/guest_hle_nn.c core/guest/guest_hle_fs.c /Fe:build\reloc_run.exe
 build\reloc_run.exe build/guest/main.patched.bin build/guest/main.fixups.tsv
 # --slot: 把合成槽发布进真实镜像的 key page 并核对四个索引（不执行客体代码）
 build\reloc_run.exe build/guest/main.patched.bin build/guest/main.fixups.tsv 0x4000 --slot

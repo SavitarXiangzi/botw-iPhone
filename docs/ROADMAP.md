@@ -7800,3 +7800,104 @@ reloc_run:      15  nn::hid
    需要一套宿主侧的句柄表，并且要明确“路径 → iOS 沙箱目录”的映射；
 2. 或者先做 rtld 双映射；
 3. 之后才接 `nn::vi` / NVN 与 `ios/nvn` 的 Metal 后端。
+
+## M4 续四十五：nn::fs 沙箱文件系统
+
+### 1. 为什么第二个做 nn::fs
+
+`nn::oe` 只是问答；`nn::fs` 是游戏**读取自己数据**的唯一通路。`main` 的
+23 个导入覆盖了整条链：
+
+```text
+QueryMountRomCacheSize -> MountRom -> OpenFile -> GetFileSize -> ReadFile
+                                   -> CloseFile / Unmount
+OpenDirectory -> ReadDirectory -> CloseDirectory -> GetEntryType
+MountSaveData / CommitSaveData / CreateFile / WriteFile / SetFileSize
+```
+
+只要把这条链接到一个宿主目录上，客体就不需要知道 romfs 长什么样。
+
+### 2. 路径规则（顺序即优先级）
+
+```text
+<root>/                      宿主数据根目录，必须显式配置
+<root>/<mount>/...           每个挂载点一个子目录
+```
+
+客体路径接受三种写法，统一归一化后再拼宿主路径：
+
+| 写法 | 例子 | 解析 |
+|---|---|---|
+| 挂载名 + 冒号 | `rom:/Pack/Boot.pack` | 挂 `rom`，余下 `Pack/Boot.pack` |
+| 斜杠 + 挂载名 | `/rom/Pack/Boot.pack` | 同上 |
+| 纯相对 | `Pack/Boot.pack` | 落在**第一个**挂载点 |
+
+拒绝规则（在碰宿主之前就返回失败）：
+
+* 空路径、`..` 分量、反斜杠；
+* 未配置 `root`；
+* `root` 本身是文件系统根（`/`、`C:`、`C:\`）——挂载会创建目录，
+  一个配错的根不能把 `DeleteFile` 变成“删任何地方”；
+* 归一化后超出 `BOTW_HLE_FS_PATH_MAX`。
+
+### 3. 句柄与目录项
+
+* 句柄是不透明 `u32`：文件 `0x1000|n`，目录 `0x2000|n`，slot 0 永不用。
+  所以 stub 的 0、已关闭的句柄、越界的句柄都会明确失败，不会别名到
+  slot 0。
+* `DirectoryEntry` 按 Horizon 布局写入：`name[0x300]`、`0x303` 类型
+  （0 目录 / 1 文件）、`0x308` 处的 64 位大小，`sizeof == 0x310`。
+  测试里用 `static_assert` 钉住这三个偏移。
+* `ReadOption` / `WriteOption` **只接指针，从不解引用**：结构体布局没有
+  证明，就不去读它。写入后一律 `fflush`，因为“要不要 flush”这个信息
+  我们不解析，而少刷一次比多刷一次危险。
+
+### 4. 实测
+
+```text
+guest_hle_test:    ok (89 built-in implementations, stubs shared, full table refused)
+guest_hle_nn_test: ok (20 nn::oe names, state-driven answers, clean misses)
+guest_hle_fs_test: ok (23 nn::fs names, sandboxed paths, handles, directories, explicit gap)
+```
+
+测试在系统临时目录里造一棵真树，通过注册表拿到的函数指针调用（和客体
+调用路径一致），覆盖：读偏移、两个 `ReadFile` 重载、写后在宿主侧读回、
+截断、目录枚举两种过滤、`.`/`..` 过滤、路径穿越拒绝、关闭后再用失败。
+
+真实 `main`（`reloc_run ... --hle --names`）：
+
+| 版本 | 命中实现 | 落到 stub | `nn::fs` 剩余 |
+|---|---:|---:|---:|
+| libc | 23 | 432 | 23 |
+| + `nn::oe` | 43 | 412 | 23 |
+| + `nn::fs` | 66 + 23 = 89 | 389 | **0** |
+
+`nn::fs` 的 23 条全部命中；`--names` 的命名空间汇总里已经不再出现
+`nn::fs`。
+
+### 5. 故意没做 / 仍然不成立
+
+* `DeleteDirectoryRecursively` **返回显式失败**并计入 `errors`：递归删除
+  需要 `lstat` + 重解析点检查才能保证不越界，而游戏只在“删除存档”菜单
+  里走到它。宁可红字，不做半对的删除。
+* `MountAddOnContent` 的 `index` 被忽略：挂载目录只用名字，DLC 的
+  目录结构没有验证。
+* `QueryMountRomCacheSize` / `QueryMountAddOnContentCacheSize` 返回
+  4 MiB / 1 MiB 的固定值。客体拿它只是分配缓存，而 `MountRom` 完全
+  忽略这块缓存（宿主不把 romfs 拷进客体内存），所以数值不影响正确性，
+  但也没有和真实 romfs 大小对齐。
+* `MountSaveData` 只按名字建目录，不读 `nn::account::Uid`；没有实现
+  多用户、存档元数据（`nn::fs::SaveDataInfo`）和提交日志。
+* 仍然**没有执行任何客体指令**：这些实现由宿主测试覆盖，真实调用要等
+  客体能跑起来。
+
+### 6. 下一步
+
+`--names` 剩下的头部是 `nn::os`（63）、`nn::audio`（50）、`nn::nfp`（17）、
+`nn::hid`（15）。建议顺序：
+
+1. `nn::hid`：手柄/触摸输入是“能不能操作”的最小闭环，语义窄；
+2. `nn::os`：不是服务而是 SDK 自己的线程/事件/计时层，必须配合客体调度
+   一起设计，不能一条条 HLE；
+3. `nn::audio` / `nn::nfp`：SoundSystem 与 amiibo，早期可以整段替身；
+4. rtld 双映射仍未做。
