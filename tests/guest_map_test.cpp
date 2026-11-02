@@ -15,7 +15,9 @@
  *     (a two-instruction stub that returns 0x1234);
  *   - writing to text or to the patch area kills the process;
  *   - writing to data and to the key page does not;
- *   - a layout that would need one page writable and executable is refused.
+ *   - a layout that would need one page writable and executable is refused;
+ *   - after mprotect, the loader can still publish a thread slot into the key
+ *     page, and the page holds absolute slot field addresses.
  */
 #include "guest_map.h"
 
@@ -194,6 +196,27 @@ int main() {
     volatile unsigned char* key = (volatile unsigned char*)((unsigned char*)map.base + kKeyOff);
     *key = 0x5a;
     CHECK(*key == 0x5a);
+
+    /* The loader step between mapping and the first gate: lay out the thread
+     * slot and publish its absolute field addresses into the key page. */
+    {
+        alignas(64) unsigned char slot_mem[BOTW_GUEST_SLOT_MIN * 2];
+        botw_guest_slot slot;
+        uint64_t handler = 0;
+        const uint64_t* keys = (const uint64_t*)((const unsigned char*)map.base + kKeyOff);
+        CHECK(botw_guest_slot_init(&slot, slot_mem, sizeof slot_mem,
+                                   (void*)(uintptr_t)0x12345678u) == 0);
+        CHECK(botw_guest_map_publish_slot(&map, &img, &slot) == 0);
+        CHECK(keys[0] == (uint64_t)(uintptr_t)(slot_mem + slot.x18_off));
+        CHECK(keys[1] == (uint64_t)(uintptr_t)(slot_mem + slot.tls_off));
+        CHECK(keys[2] == (uint64_t)(uintptr_t)(slot_mem + slot.tlr_off));
+        CHECK(keys[3] == (uint64_t)(uintptr_t)(slot_mem + slot.gate_off));
+        std::memcpy(&handler, slot_mem + slot.gate_off, sizeof handler);
+        CHECK(handler == 0x12345678u);
+        /* mprotect left the key page writable, not just writable before it. */
+        keys[4] = 0xfeedfaceu;
+        CHECK(keys[4] == 0xfeedfaceu);
+    }
 
     /* Text and the patch area are not. */
     CHECK(write_dies((volatile unsigned char*)map.base + 0x30, 0));

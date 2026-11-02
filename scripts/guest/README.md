@@ -19,9 +19,10 @@ retail NSO  --rewrite_botw.py-->  patched.bin + fixups/gates/sites
 - [x] 输出结构校验：无残留 `svc`、每个 gate/site 都跳进 patch 区
 - [x] 运行时 loader 的可移植部分（fixups 解析、私有复制、重定位、导入解析）
 - [x] 可执行映射（`guest_map.c`）：整块 mmap → 重定位 → 按页 mprotect；Linux 4 KiB / macOS 16 KiB 实测
-- [x] 每线程槽布局 + key page 发布（`guest_slot.c`）
+- [x] 每线程槽布局 + key page 发布（`guest_slot.c` + `botw_guest_map_publish_slot()`）
 - [x] 槽地址发布（`SLOT_BASE=abs`；`TPIDRRO_EL0` 在 EL0 只读，见 ROADMAP 续三十七）
 - [x] gate trampoline（`guest_gate_arm64.S`）：x0..x30 / sp / pc / nzcv 完整帧，CI 的 arm64 job 实测往返
+- [x] 链式测试（`guest_chain_test`）：真实映射 → key page 发布 → KGATE → trampoline → gate 块 → 寄存器往返
 - [x] 页级保护计划（`guest_segments.c`）：真实四模块 5/5/5/4 段；rtld 在 16 KiB 页上 rwx 冲突，如实报告
 - [ ] HLE 服务层（init / fs / vi / nv / NVN bootstrap）
 - [ ] 把 NVN 调用桥到 `ios/nvn` 的 Metal 后端

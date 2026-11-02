@@ -28,6 +28,7 @@
 #include <stddef.h>
 
 #include "guest_image.h"
+#include "guest_slot.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -50,6 +51,20 @@ typedef struct {
 int botw_guest_map_open(botw_guest_mapping* map, botw_guest_image* img,
                         const void* file, size_t file_len, const char* fixups_text,
                         botw_guest_resolve_fn resolve, void* user, size_t page_size);
+
+/* Publishes `slot` into the image's key page.  This is the loader step
+ * between mapping and the first gate: guest_slot_init() lays the thread slot
+ * out, and this call copies its absolute field addresses into the page the
+ * rewritten blocks read.  It checks that the page plan really made the whole
+ * key page writable before touching it, so a future plan change fails here
+ * with an error instead of faulting.
+ *
+ * The slot belongs to one host thread.  In SLOT_BASE=abs mode the key page
+ * holds that thread's addresses, so a thread switch has to publish again
+ * before the next gate; the current guest core is cooperative and single
+ * threaded.  Returns 0 or -1 with map->error set. */
+int botw_guest_map_publish_slot(botw_guest_mapping* map, botw_guest_image* img,
+                                botw_guest_slot* slot);
 
 /* Drops the image's pointer and unmaps.  Safe on a zeroed mapping. */
 void botw_guest_map_close(botw_guest_mapping* map, botw_guest_image* img);

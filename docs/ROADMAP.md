@@ -7468,3 +7468,87 @@ mprotect 只接受**宿主页**对齐的范围，所以测试用 4 KiB 的段去
 2. 在 macOS arm64 上用一份“接近真实布局”的合成镜像跑完整链路：
    map → publish → 通过 KGATE 进 trampoline → 回到 gate 块；
 3. 之后才是真实模块和 HLE 表。
+
+## M4 续四十一：key page 发布进 map 流程，第一次走完 KGATE 链路
+
+### 1. 发布为什么单独成一步
+
+`guest_map_open()` 结束时 text/patch 已经是 RX，data/key page 是 RW；但
+key page 里还只有零。`botw_guest_slot_init()` 只在本机内存里排好槽，
+真正让改写后的块能读到槽的是发布：
+
+```text
+botw_guest_map_open()          整块映射 + 重定位 + mprotect
+botw_guest_slot_init()         布局本线程的 x18 / tls / tlr / gate 字段
+botw_guest_map_publish_slot()  把字段的绝对地址写进 key page
+第一条 gate                    块用 adrp + ldr 从 key page 取 gate 指针
+```
+
+`botw_guest_map_publish_slot()` 在写之前会**重算页计划**，确认 key page
+整段落在同一个带 `PROT_WRITE` 的 run 里。这样如果将来页计划把 key page
+改成了只读，失败发生在发布这一步、error 里写明页范围，而不是在客体第一
+条 gate 上变成 SIGSEGV。它还会拒绝：mapping 已关闭、image 不属于这个
+mapping、slot 没有初始化。
+
+### 2. `SLOT_BASE=abs` 的线程前提
+
+key page 存的是**当前线程**槽字段的绝对地址，不是偏移。因此换线程必须在
+下一次 gate 之前重新发布；当前的客体核心是协作式、单宿主线程，这个前提
+成立。多线程执行器以后需要把“发布”挂到线程切换上，而不是只做一次。
+
+### 3. 链式测试：把所有层接起来
+
+`tests/guest_chain_test.cpp` 用一个接近真实布局的合成镜像（16 KiB 页下
+text/rodata、data、key page、padding、patch 各占独立页），在 patch 区放
+改写器生成的**同一条 8 指令 gate 块**：
+
+```text
+stp  x29, x30, [sp, #-16]!
+adrp x30, key_page
+ldr  x30, [x30, #KGATE*8]
+ldr  x30, [x30]
+ldr  x29, [sp]
+blr  x30
+ldp  x29, x30, [sp], #16
+ret
+```
+
+（真实块的最后一条是 `b site+4`；测试用 `ret`，因为探针是用 `blr` 调进来
+的，块的 `ldp` 正好恢复探针的链接寄存器。）
+
+测试按顺序断言：
+
+* key page 的四个索引都指向**这块槽**的字段地址，gate 字段里是
+  `botw_guest_gate_entry` 的地址；
+* dispatcher 看到 x0..x8、x19、x20、guest x29，`x30` 是块保存的 guest LR
+  而不是 `pc`，`pc` 是块的 `ldp`，`sp` 在块的 16 字节之上，NZCV 是进入时
+  的 0xa0000000；
+* dispatcher 写回的 x0/x2/x19 出现在返回后的寄存器里，其余寄存器原样恢复，
+  x29/x30 由块的 `ldp` 从槽里取回，sp 回到调用前；
+* 整个过程走的是**真实的 mprotect 页面**：key page 可写、patch 区可执行。
+
+这仍然不是客体代码：块是测试里手写的，HLE 也没有参与。但这是第一次把
+映射、key page、槽、KGATE 间接、trampoline、dispatcher 和块自身的
+`ldp` 串在同一条调用链上。
+
+### 4. 实测
+
+| 主机 | 页大小 | 结果 |
+|---|---:|---|
+| Linux x86_64（portable job） | 4096 | 只编译链式测试并跳过；`guest_map_test` 覆盖 map + publish |
+| macOS arm64（ios job） | 16384 | 完整链路：map → publish → KGATE → trampoline → block |
+
+（CI 结果在本节写入后补：`guest_chain_test: ok (...)`。）
+
+### 5. 还没有证明
+
+* 合成镜像只有几十 KiB，不是真实 main；
+* 没有执行过一条**客体**指令，也没有 HLE 表；
+* iOS 真机的 JIT 权限仍未验证；
+* rtld 的 16 KiB W^X 冲突仍需双映射。
+
+### 6. 下一步
+
+1. 用真实 main 做 map + publish（不执行），核对 key page 与段计划；
+2. 先做 rtld 的双映射，或从 main 的 HLE 表开始；
+3. 把 NVN 调用桥到 `ios/nvn` 的 Metal 后端。
