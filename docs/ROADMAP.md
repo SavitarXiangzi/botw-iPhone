@@ -7628,3 +7628,83 @@ macOS/iOS 上可以用同一份 `MAP_SHARED` 后备对象映射两次（或者
 1. 实现 rtld 的双映射（最小真实模块，19 个 HLE）；
 2. 或者先做 main 的 458 个 HLE 名字表；
 3. 把 NVN 调用桥到 `ios/nvn` 的 Metal 后端。
+
+## M4 续四十三：HLE 注册表与 libc 直通
+
+### 1. 为什么先做注册表
+
+`guest_image.c` 对每个未定义符号调用 `botw_guest_resolve_fn`。之前
+`reloc_run` 用一个“每个名字一块 16 字节哨兵”的解析器，只能证明重定位
+不会变成 NULL；真正的 HLE 需要三件事：
+
+1. 名字 → 宿主函数；
+2. 未实现的名字也要有稳定指针，不能写 NULL；
+3. 能数清楚“实现了多少、还缺多少”。
+
+`core/guest/guest_hle.c` 就是这三件事的最小实现：
+
+| 机制 | 做法 |
+|---|---|
+| 查找 | FNV-1a + 开放寻址，4096 槽 |
+| 已知名字 | `botw_hle_register()` 注册的实现优先 |
+| 未知名字 | 全部映射到同一个 `botw_hle_stub`（返回 0），按名字记账 |
+| 满表 | 先线性查找已有名字；新名字返回错误，不会在探测里死循环 |
+| 名字所有权 | 不复制；解析器给的是镜像 strtab 的指针，镜像活着它就在 |
+
+4096 槽是给 1.6.0 的 1,137 个唯一 HLE 名字留的余量；表本身约 72 KiB，
+放在静态/堆上，不要放线程栈。
+
+### 2. libc 直通表
+
+第一批实现是签名在 Switch 与 Apple AAPCS64 上一致的 libc 函数
+（44 个，macOS/Linux 多 `strcasecmp`/`strncasecmp` 共 46 个）：
+
+```text
+memcpy memmove memset memcmp memchr
+strlen strnlen strcmp strncmp strcpy strncpy strcat strncat
+strchr strrchr strstr strspn strcspn strpbrk
+atoi atol strtol strtoul strtoll strtoull strtod strtof
+sqrtf sinf cosf tanf atanf atan2f powf fmodf expf logf log10f
+floorf ceilf roundf truncf fabsf ldexpf
+```
+
+刻意**不**收：
+
+* 可变参数函数（`printf`、`vsnprintf` 等）：Switch 把可变参数放寄存器，
+  Apple ABI 放栈，C 的 `...` 不能直接对接；
+* 带结构体布局的函数（`struct tm` 等）：两边布局没有证明一致；
+* `malloc`/`free`：客体堆应由客体 allocator 管理，不能直接落到宿主堆。
+
+### 3. 实测
+
+`guest_hle_test`（Windows x86_64，MSVC `/W4 /WX`）：
+
+```text
+guest_hle_test: ok (44 libc implementations, stubs shared, full table refused)
+```
+
+真实模块（`reloc_run ... --hle`，1.6.0 ABS 产物）：
+
+| 模块 | 导入数 | 命中实现 | 落到 stub |
+|---|---:|---:|---:|
+| main | 455 | 22 | 433 |
+| rtld | 19 | 0 | 19 |
+
+注意“命中实现”是**该模块实际引用到的**名字数，不是表里的 44 个；
+`--hle` 打印的 `implementations=44` 是整张表的实现数。
+
+### 4. 这还不是可运行的 HLE
+
+* stub 只返回 0；对返回句柄/对象指针的 `nn::fs`/`nn::oe`/`nn::vi` 调用，
+  0 不是“成功”，后续使用会失败；
+* 共享 stub 不携带名字，运行时无法从 stub 本身知道是谁没实现；加载期
+  的 `stubs=` 计数和表内容才是诊断依据；
+* 浮点返回的未实现调用会得到 x0=0 而不是 s0=0，不能假装正确；
+* 没有执行任何客体指令。
+
+### 5. 下一步
+
+1. 按命名空间分类 main 的 433 个未知名字，先做 `nn::oe`（启动/焦点/语言）
+   和 `nn::fs`（挂载、打开、读文件）；
+2. 或者先做 rtld 双映射，让最小真实模块能进入入口；
+3. 之后再接 `nn::vi` / NVN 和 `ios/nvn` 的 Metal 后端。

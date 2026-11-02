@@ -23,6 +23,7 @@ retail NSO  --rewrite_botw.py-->  patched.bin + fixups/gates/sites
 - [x] 槽地址发布（`SLOT_BASE=abs`；`TPIDRRO_EL0` 在 EL0 只读，见 ROADMAP 续三十七）
 - [x] gate trampoline（`guest_gate_arm64.S`）：x0..x30 / sp / pc / nzcv 完整帧，CI 的 arm64 job 实测往返
 - [x] 链式测试（`guest_chain_test`）：真实映射 → key page 发布 → KGATE → trampoline → gate 块 → 寄存器往返
+- [x] HLE 注册表 + libc 直通（`guest_hle.c`）：未知名字共享零返回 stub，44/46 个 libc 实现
 - [x] 页级保护计划（`guest_segments.c`）：真实四模块 5/5/5/4 段；rtld 在 16 KiB 页上 rwx 冲突，如实报告
 - [ ] HLE 服务层（init / fs / vi / nv / NVN bootstrap）
 - [ ] 把 NVN 调用桥到 `ios/nvn` 的 Metal 后端
@@ -43,6 +44,8 @@ cl /std:c++20 /I core\guest scripts/guest/reloc_run.cpp core/guest/guest_image.c
 build\reloc_run.exe build/guest/main.patched.bin build/guest/main.fixups.tsv
 # --slot: 把合成槽发布进真实镜像的 key page 并核对四个索引（不执行客体代码）
 build\reloc_run.exe build/guest/main.patched.bin build/guest/main.fixups.tsv 0x4000 --slot
+# --hle: 用 HLE 注册表解析导入，并报告实现/未知名字数量
+build\reloc_run.exe build/guest/main.patched.bin build/guest/main.fixups.tsv 0x4000 --hle
 ```
 
 `rewrite_botw.py` 会先核对 0x20 字节 build ID，再调用 vendored 的
