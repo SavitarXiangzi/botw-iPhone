@@ -13,8 +13,11 @@
  * pass 0x1000 to see how the same module looks on a 4 KiB host.  `--slot`
  * publishes a synthetic thread slot into the image's key page and checks the
  * four entries; the image is malloc-backed here, so this validates the real
- * module's indices and addresses, not the mapping protections.
+ * module's indices and addresses, not the mapping protections.  `--hle` uses
+ * the HLE registry instead of the sentinel resolver and reports how many
+ * imports got a real implementation and how many got the zero-return stub.
  */
+#include "guest_hle.h"
 #include "guest_image.h"
 #include "guest_slot.h"
 
@@ -30,6 +33,7 @@
 
 static std::vector<char*> g_sentinel_blocks;
 static std::unordered_map<std::string, void*> g_sentinels;
+static botw_hle_table g_hle;
 
 static void* sentinel_resolve(void*, const char* name) {
     auto it = g_sentinels.find(name);
@@ -93,6 +97,7 @@ static int publish_slot(botw_guest_image* img) {
 int main(int argc, char** argv) {
     size_t page = 0x4000;
     int want_slot = 0;
+    int want_hle = 0;
     if (argc < 3) {
         std::printf("usage: reloc_run <module.patched.bin> <module.fixups.tsv> "
                     "[page_size] [--slot]\n");
@@ -101,6 +106,8 @@ int main(int argc, char** argv) {
     for (int i = 3; i < argc; i++) {
         if (std::strcmp(argv[i], "--slot") == 0) {
             want_slot = 1;
+        } else if (std::strcmp(argv[i], "--hle") == 0) {
+            want_hle = 1;
         } else {
             char* end = nullptr;
             unsigned long long v = std::strtoull(argv[i], &end, 0);
@@ -119,10 +126,12 @@ int main(int argc, char** argv) {
     }
     std::string header((const char*)fixups.data(), fixups.size());
 
+    if (want_hle) botw_hle_init(&g_hle);
     auto start = std::chrono::steady_clock::now();
     botw_guest_image img;
     int rc = botw_guest_image_open(&img, image.data(), image.size(), header.c_str(),
-                                   sentinel_resolve, nullptr);
+                                   want_hle ? botw_hle_resolve : sentinel_resolve,
+                                   want_hle ? (void*)&g_hle : nullptr);
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                   std::chrono::steady_clock::now() - start).count();
     if (rc != 0) {
@@ -134,6 +143,13 @@ int main(int argc, char** argv) {
                 argv[1], (double)image.size() / (1024.0 * 1024.0), img.relocs, img.symbols,
                 img.hle, img.imports, g_sentinels.size(), botw_guest_image_entry(&img),
                 (long long)ms);
+    if (want_hle) {
+        std::printf("reloc_run: hle implementations=%zu stubs=%zu%s%s\n",
+                    botw_hle_implementation_count(&g_hle),
+                    botw_hle_stub_count(&g_hle),
+                    g_hle.error[0] ? " error=" : "",
+                    g_hle.error[0] ? g_hle.error : "");
+    }
     {
         botw_guest_segment seg[16];
         size_t n = botw_guest_image_plan(&img, page, seg, 16);
