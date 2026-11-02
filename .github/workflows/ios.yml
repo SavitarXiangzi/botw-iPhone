@@ -79,7 +79,7 @@ jobs:
           clang -std=c11 -Wall -Wextra -Werror $INC -c core/guest/guest_hle_os.c -o /tmp/guest_hle_os.o
           HLE="/tmp/guest_hle.o /tmp/guest_hle_nn.o /tmp/guest_hle_fs.o /tmp/guest_hle_os.o /tmp/guest_run.o /tmp/guest_gate.o core/guest/guest_resume_arm64.S"
           HLE_OS="/tmp/guest_hle.o /tmp/guest_hle_nn.o /tmp/guest_hle_fs.o /tmp/guest_hle_os.o"
-          LIB="/tmp/guest_image.o ios/nvn/src/nvn_dispatch.cpp ios/nvn/src/nvn_null.cpp core/src/botw_core.cpp /tmp/nvn_texture.o /tmp/nvn_shader.o /tmp/nvn_shader_key.o /tmp/nvn_shader_bundle.o /tmp/nvn_shader_blobs.o /tmp/nvn_vertex.o /tmp/nvn_sampler.o /tmp/nvn_pool.o /tmp/nvn_texlayout.o /tmp/nvn_bcn.o /tmp/nvn_pipeline.o /tmp/nvn_state.o"
+          LIB="/tmp/guest_image.o ios/nvn/src/nvn_dispatch.cpp ios/nvn/src/nvn_null.cpp core/src/botw_core.cpp core/src/botw_guest_selftest.cpp /tmp/nvn_texture.o /tmp/nvn_shader.o /tmp/nvn_shader_key.o /tmp/nvn_shader_bundle.o /tmp/nvn_shader_blobs.o /tmp/nvn_vertex.o /tmp/nvn_sampler.o /tmp/nvn_pool.o /tmp/nvn_texlayout.o /tmp/nvn_bcn.o /tmp/nvn_pipeline.o /tmp/nvn_state.o"
           clang++ $FLAGS $INC tests/nvn_abi_test.cpp      $LIB -o /tmp/nvn_abi_test
           clang++ $FLAGS $INC tests/core_smoke_test.cpp   $LIB -o /tmp/core_smoke_test
           clang++ $FLAGS $INC tests/nvn_texture_test.cpp  $LIB -o /tmp/nvn_texture_test
@@ -209,6 +209,8 @@ jobs:
         run: |
           clang++ -std=c++20 -Wall -Wextra -Werror -I core/include -I ios/nvn/include \
             -fsyntax-only core/src/botw_core.cpp
+          clang++ -std=c++20 -Wall -Wextra -Werror -I core/include -I core/guest \
+            -fsyntax-only core/src/botw_guest_selftest.cpp
           clang -std=c11 -Wall -Wextra -Werror -I ios/nvn/include \
             -fsyntax-only ios/nvn/include/nvn_api.h
           clang -std=c11 -Wall -Wextra -Werror -I ios/nvn/include \
