@@ -7656,8 +7656,9 @@ macOS/iOS 上可以用同一份 `MAP_SHARED` 后备对象映射两次（或者
 
 ### 2. libc 直通表
 
-第一批实现是签名在 Switch 与 Apple AAPCS64 上一致的 libc 函数
-（44 个，macOS/Linux 多 `strcasecmp`/`strncasecmp` 共 46 个）：
+第一批实现是签名在 Switch 与 Apple AAPCS64 上一致的 libc 函数，共 46 个。
+其中 `strnlen` / `strcasecmp` / `strncasecmp` 用本地小包装，避免 Linux
+严格 C11 把 POSIX 声明藏起来：
 
 ```text
 memcpy memmove memset memcmp memchr
@@ -7680,18 +7681,18 @@ floorf ceilf roundf truncf fabsf ldexpf
 `guest_hle_test`（Windows x86_64，MSVC `/W4 /WX`）：
 
 ```text
-guest_hle_test: ok (44 libc implementations, stubs shared, full table refused)
+guest_hle_test: ok (46 libc implementations, stubs shared, full table refused)
 ```
 
 真实模块（`reloc_run ... --hle`，1.6.0 ABS 产物）：
 
 | 模块 | 导入数 | 命中实现 | 落到 stub |
 |---|---:|---:|---:|
-| main | 455 | 22 | 433 |
+| main | 455 | 23 | 432 |
 | rtld | 19 | 0 | 19 |
 
-注意“命中实现”是**该模块实际引用到的**名字数，不是表里的 44 个；
-`--hle` 打印的 `implementations=44` 是整张表的实现数。
+注意“命中实现”是**该模块实际引用到的**名字数，不是表里的 46 个；
+`--hle` 打印的 `implementations=46` 是整张表的实现数。
 
 ### 4. 这还不是可运行的 HLE
 
