@@ -7681,7 +7681,7 @@ floorf ceilf roundf truncf fabsf ldexpf
 `guest_hle_test`（Windows x86_64，MSVC `/W4 /WX`）：
 
 ```text
-guest_hle_test: ok (46 libc implementations, stubs shared, full table refused)
+guest_hle_test: ok (46 libc implementations, stubs shared, full table refused)   # 当时表里只有 libc；接上 nn::oe 后同一行显示 66 built-in
 ```
 
 真实模块（`reloc_run ... --hle`，1.6.0 ABS 产物）：
@@ -7709,3 +7709,94 @@ guest_hle_test: ok (46 libc implementations, stubs shared, full table refused)
    和 `nn::fs`（挂载、打开、读文件）；
 2. 或者先做 rtld 双映射，让最小真实模块能进入入口；
 3. 之后再接 `nn::vi` / NVN 和 `ios/nvn` 的 Metal 后端。
+
+## M4 续四十四：nn::oe 语义层
+
+### 1. 为什么 `return 0` 不够
+
+`nn::oe` 是“运行环境”查询：主机模式、性能模式、焦点、语言、音量平衡。
+它们大多返回 4 字节枚举，**0 是一个合法答案**，所以共享 stub 不会崩，
+只会静默地给出“掌机 / 美式英语 / 未获得焦点”。这类错误不会在日志里
+留下任何痕迹，却会让游戏的窗口模式、语言、帧率策略都走错分支。
+
+实测导入表里 `main` 正好有 20 个 `nn::oe`：
+
+```text
+GetOperationMode GetPerformanceMode GetCurrentFocusState GetDesiredLanguage
+Initialize FinishStartupLogo EnableRecording SetCpuBoostMode
+SetFocusHandlingMode SetPerformanceConfiguration
+TryPopLaunchParameter TryPopNotificationMessage
+GetExpectedVolumeBalance SetExpectedVolumeBalance
+SetResumeNotificationEnabled SetUserInactivityDetectionTimeExtended
+EnterExitRequestHandlingSection LeaveExitRequestHandlingSection
+SetOperationModeChangedNotificationEnabled
+SetPerformanceModeChangedNotificationEnabled
+```
+
+### 2. 做法
+
+`core/guest/guest_hle_nn.{h,c}` 持有一份 `botw_hle_nn_state`，20 个
+mangled name 全部指向读/写这份状态的宿主函数：
+
+| 类别 | 行为 |
+|---|---|
+| 查询 | 直接返回状态字段（枚举在 `w0`，`nn::Result` 也是 `w0=0`） |
+| 设置 | 存进状态，不产生副作用；手机没有 CPU boost / 开机 logo |
+| `TryPopLaunchParameter` | 返回 `false` 并写 `*out_size = 0`：干净地“没有参数” |
+| `TryPopNotificationMessage` | 返回 `false` 并写 `*out_message = 0` |
+| 音量平衡 | `float` 走 `s0/s1`，两边 ABI 一致，直接存取 |
+| 退出请求段 | 计数嵌套，`Leave` 不会下溢 |
+
+默认值：掌机、Boost、已获得焦点、美式英语、双声道 1.0。
+宿主（以后的 iOS 壳）通过 `botw_hle_nn_default()` 改这些字段，
+例如把语言改成 `BOTW_OE_LANG_SIMPLIFIED_CHINESE`。
+
+`botw_hle_init()` 现在注册 libc + `nn::oe`，所以调用方不需要记得第二个
+初始化步骤；`botw_hle_nn_register(hle, state)` 可以换成一份显式状态。
+
+### 3. 实测
+
+```text
+guest_hle_test:    ok (66 built-in implementations, stubs shared, full table refused)
+guest_hle_nn_test: ok (20 nn::oe names, state-driven answers, clean misses)
+```
+
+真实 `main`（`reloc_run ... --hle`，1.6.0 ABS 产物）：
+
+| 版本 | 命中实现 | 落到 stub |
+|---|---:|---:|
+| 只有 libc | 23 | 432 |
+| 加上 `nn::oe` | 43 | 412 |
+
+`--names` 是新增的排查开关：逐条打印 `impl|stub <mangled name>`，最后按
+命名空间汇总剩余 stub。这是从镜像测出来的待办清单，不是手写的表：
+
+```text
+reloc_run:     157  (other)
+reloc_run:      63  nn::os
+reloc_run:      50  nn::audio
+reloc_run:      22  nn::fs
+reloc_run:      17  nn::nfp
+reloc_run:      15  nn::hid
+```
+
+`(other)` 里主要是 C 符号（`glslc*`、`__cxa_*`、`sprintf`、`sin` 等）；
+`nn::fs` 那一行比导入表少 1，是命名空间解析对带替换的符号放弃归类的
+结果，逐条列表仍然是 23 条。
+
+### 4. 仍然不成立
+
+* 这 20 个实现**没有在客体代码里被执行过**：注册、查表、状态读写都由
+  宿主测试覆盖，真实调用要等客体指令能跑；
+* `TryPopLaunchParameter` 永远返回“没有参数”，DLC / 从主页菜单带参数
+  启动的路径没有验证；
+* 语言枚举值 0..16 取自公开头文件，未在 1.6.0 客体里逐条核对；
+* 状态是进程级单例，没有加锁：多个客体线程同时调用是良性竞争，但
+  `exit_request_sections` 这种计数在多线程下不精确。
+
+### 5. 下一步
+
+1. `nn::fs` 的 23 个导入：`MountRom` / `OpenFile` / `ReadFile` / 目录枚举，
+   需要一套宿主侧的句柄表，并且要明确“路径 → iOS 沙箱目录”的映射；
+2. 或者先做 rtld 双映射；
+3. 之后才接 `nn::vi` / NVN 与 `ios/nvn` 的 Metal 后端。

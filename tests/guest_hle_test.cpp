@@ -91,7 +91,7 @@ int main() {
         std::printf("guest_hle_test: %d failure(s)\n", g_fail);
         return 1;
     }
-    std::printf("guest_hle_test: ok (%zu libc implementations, stubs shared, full table refused)\n",
+    std::printf("guest_hle_test: ok (%zu built-in implementations, stubs shared, full table refused)\n",
                 libc);
     return 0;
 }

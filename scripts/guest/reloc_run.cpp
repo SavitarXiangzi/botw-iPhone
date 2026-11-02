@@ -16,17 +16,23 @@
  * module's indices and addresses, not the mapping protections.  `--hle` uses
  * the HLE registry instead of the sentinel resolver and reports how many
  * imports got a real implementation and how many got the zero-return stub.
+ * `--names` additionally lists every import the image asked for and, at the
+ * end, how many of them still land on a stub per C++ namespace.  That tally
+ * is the to-do list for the HLE layers: it is measured from the image, not
+ * from a hand-written table.
  */
 #include "guest_hle.h"
 #include "guest_image.h"
 #include "guest_slot.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <map>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -55,6 +61,62 @@ static bool slurp(const char* path, std::vector<unsigned char>& out) {
     out.resize((size_t)size);
     if (size > 0) in.read(reinterpret_cast<char*>(out.data()), (std::streamsize)size);
     return (bool)in;
+}
+
+/* "_ZN2nn2oe10InitializeEv" -> "nn::oe".  Itanium nested names only; anything
+ * with a substitution or a template parameter returns "" so the caller can
+ * bucket it as (global) instead of guessing. */
+static std::string mangled_namespace(const std::string& n) {
+    std::vector<std::string> parts;
+    size_t i;
+    if (n.rfind("_ZN", 0) == 0) {
+        i = 3;
+    } else if (n.rfind("_Z", 0) == 0) {
+        i = 2;
+    } else {
+        return std::string();
+    }
+    while (i < n.size() && n[i] >= '0' && n[i] <= '9') {
+        size_t len = 0;
+        while (i < n.size() && n[i] >= '0' && n[i] <= '9') {
+            len = len * 10u + (size_t)(n[i] - '0');
+            i++;
+        }
+        if (len == 0 || i + len > n.size()) return std::string();
+        std::string comp = n.substr(i, len);
+        i += len;
+        if (comp[0] == 'E') break;
+        if (comp.size() > 1 && (comp[0] == 'S' || comp[1] == 'I')) return std::string();
+        parts.push_back(comp);
+    }
+    if (parts.size() < 2) return std::string();
+    parts.pop_back(); /* last component is the function name */
+    std::string out;
+    for (size_t k = 0; k < parts.size(); k++) {
+        if (k) out += "::";
+        out += parts[k];
+    }
+    return out;
+}
+
+static void report_names(void) {
+    std::map<std::string, size_t> stubbed;
+    for (size_t i = 0; i < BOTW_HLE_SLOTS; i++) {
+        if (!g_hle.kind[i]) continue;
+        const bool impl = g_hle.kind[i] == 1;
+        std::printf("reloc_run: %s %s\n", impl ? "impl" : "stub", g_hle.name[i]);
+        if (!impl) {
+            std::string ns = mangled_namespace(g_hle.name[i]);
+            stubbed[ns.empty() ? "(other)" : ns]++;
+        }
+    }
+    std::vector<std::pair<size_t, std::string>> rows;
+    for (const auto& kv : stubbed) rows.emplace_back(kv.second, kv.first);
+    std::sort(rows.rbegin(), rows.rend());
+    std::printf("reloc_run: remaining stubs by namespace:\n");
+    for (const auto& r : rows) {
+        std::printf("reloc_run:   %5zu  %s\n", r.first, r.second.c_str());
+    }
 }
 
 /* Publishes a synthetic slot into the real image's key page.  The slot lives
@@ -98,6 +160,7 @@ int main(int argc, char** argv) {
     size_t page = 0x4000;
     int want_slot = 0;
     int want_hle = 0;
+    int want_names = 0;
     if (argc < 3) {
         std::printf("usage: reloc_run <module.patched.bin> <module.fixups.tsv> "
                     "[page_size] [--slot]\n");
@@ -108,6 +171,9 @@ int main(int argc, char** argv) {
             want_slot = 1;
         } else if (std::strcmp(argv[i], "--hle") == 0) {
             want_hle = 1;
+        } else if (std::strcmp(argv[i], "--names") == 0) {
+            want_hle = 1;
+            want_names = 1;
         } else {
             char* end = nullptr;
             unsigned long long v = std::strtoull(argv[i], &end, 0);
@@ -141,7 +207,8 @@ int main(int argc, char** argv) {
     std::printf("reloc_run: ok %s size=%.1f MiB relocs=%u symbols=%u hle=%u imports=%u "
                 "distinct=%zu entry=%#zx load=%lldms\n",
                 argv[1], (double)image.size() / (1024.0 * 1024.0), img.relocs, img.symbols,
-                img.hle, img.imports, g_sentinels.size(), botw_guest_image_entry(&img),
+                img.hle, img.imports, want_hle ? g_hle.used : g_sentinels.size(),
+                botw_guest_image_entry(&img),
                 (long long)ms);
     if (want_hle) {
         std::printf("reloc_run: hle implementations=%zu stubs=%zu%s%s\n",
@@ -149,6 +216,7 @@ int main(int argc, char** argv) {
                     botw_hle_stub_count(&g_hle),
                     g_hle.error[0] ? " error=" : "",
                     g_hle.error[0] ? g_hle.error : "");
+        if (want_names) report_names();
     }
     {
         botw_guest_segment seg[16];
