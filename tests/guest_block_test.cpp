@@ -124,8 +124,6 @@ int main() {
 
     unsigned long blocks = run.blocks;
     unsigned long wakes = run.wakes;
-    botw_hle_os_attach_run(&os, nullptr);
-    botw_guest_run_close(&run);
 
     if (g_fail) {
         std::printf("guest_block_test: %d failure(s)\n", g_fail);
@@ -137,13 +135,22 @@ int main() {
                     os.calls, os.thread_creates, os.thread_starts,
                     os.thread_waits, os.wait_blocks, os.sleeps,
                     os.sleep_blocks);
-        std::printf("  counter=%llu,%llu,%llu,%llu,%llu states=%d,%d error='%s'\n",
+        std::printf("  counter=%llu,%llu,%llu,%llu,%llu states=%d,%d "
+                    "waits=%d/%llu,%d/%llu error='%s'\n",
                     (unsigned long long)counter[0], (unsigned long long)counter[1],
                     (unsigned long long)counter[2], (unsigned long long)counter[3],
                     (unsigned long long)counter[4], run.threads[0].state,
-                    run.threads[worker].state, run.error);
-        return 1;
+                    run.threads[worker].state, run.threads[0].wait_kind,
+                    (unsigned long long)run.threads[0].wait_arg,
+                    run.threads[worker].wait_kind,
+                    (unsigned long long)run.threads[worker].wait_arg,
+                    run.error);
     }
+
+    botw_hle_os_attach_run(&os, nullptr);
+    botw_guest_run_close(&run);
+
+    if (g_fail) return 1;
     std::printf("guest_block_test: ok (wait join, timed wake, %lu blocks, %lu wakes)\n",
                 blocks, wakes);
     return 0;
