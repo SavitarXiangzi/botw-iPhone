@@ -286,6 +286,7 @@ static uint64_t sleep_prepare(int64_t ns) {
     return deadline;
 }
 
+#if !defined(__aarch64__)
 /* Portable fallback used on hosts without the AArch64 blocking wrapper.  The
  * wrapper takes the real path on Apple arm64; this one can only request a
  * switch at the next gate. */
@@ -294,6 +295,7 @@ static void os_SleepThread(int64_t ns) {
     (void)sleep_prepare(ns);
     if (g_os->run) botw_guest_run_yield(g_os->run);
 }
+#endif
 
 static uint32_t os_CreateThread_common(void* type, void (*entry)(void*), void* arg,
                                        void* stack, size_t stack_size,
@@ -376,11 +378,13 @@ static int wait_prepare(void* type, int* out_slot) {
     return 1;
 }
 
+#if !defined(__aarch64__)
 static void os_WaitThread(void* type) {
     if (!g_os) return;
     if (!wait_prepare(type, NULL)) return;
     botw_guest_run_yield(g_os->run);
 }
+#endif
 
 static void os_DestroyThread(void* type) {
     botw_hle_os_thread* t;
