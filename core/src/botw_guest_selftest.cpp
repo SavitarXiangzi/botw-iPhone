@@ -118,6 +118,10 @@ void put32(unsigned char* at, size_t off, uint32_t value) {
     std::memcpy(at + off, &value, sizeof value);
 }
 
+void put64(unsigned char* at, size_t off, uint64_t value) {
+    std::memcpy(at + off, &value, sizeof value);
+}
+
 /* ADRP encoding, matching the rewrite the gate block expects. */
 uint32_t adrp_word(unsigned rd, size_t pc, size_t target) {
     const int64_t imm = ((static_cast<int64_t>(target & ~static_cast<size_t>(0xFFFu)) -
@@ -133,6 +137,25 @@ void make_image(unsigned char* image) {
     put32(image, 4, 8);                    /* MOD0 header at image + 8 */
     std::memcpy(image + 8, "MOD0", 4);
     put32(image, 0x0c, 0x100 - 8);         /* dynamic table offset */
+
+    /* DT_INIT at 0x30: this is code that really lives in the mapped RX text
+     * page.  It writes a marker to the RW data page, branches into the patch
+     * area, stores the gate's answer, and returns through the exit sentinel. */
+    put32(image, 0x30, 0xA9800000u | (0x7Cu << 15) | (30u << 10) | (31u << 5) | 29u);
+    put32(image, 0x34, 0x910003FDu);                       /* mov x29, sp */
+    put32(image, 0x38, adrp_word(9, 0x38, kDataOff));      /* adrp x9, data */
+    put32(image, 0x3c, 0xD2800000u | (0x1234u << 5) | 10u);/* mov x10, #0x1234 */
+    put32(image, 0x40, 0xF9000000u | ((0x100u / 8u) << 10) | (9u << 5) | 10u);
+    put32(image, 0x44, 0xD2800000u | (0x55u << 5));        /* mov x0, #0x55 */
+    put32(image, 0x48, 0x94000000u |
+          (static_cast<uint32_t>((kPatchOff - 0x4C) / 4) & 0x03FFFFFFu));
+    put32(image, 0x4c, adrp_word(9, 0x4c, kDataOff));      /* adrp x9, data */
+    put32(image, 0x50, 0xF9000000u | ((0x108u / 8u) << 10) | (9u << 5) | 0u);
+    put32(image, 0x54, 0xA8C00000u | (4u << 15) | (30u << 10) | (31u << 5) | 29u);
+    put32(image, 0x58, 0xD65F03C0u);                       /* ret */
+    put64(image, 0x100, 12);                               /* DT_INIT */
+    put64(image, 0x108, 0x30);
+    put64(image, 0x110, 0);                                /* DT_NULL */
 
     w[0] = 0xA9800000u | (0x7Eu << 15) | (30u << 10) | (31u << 5) | 29u; /* stp x29,x30,[sp,#-16]! */
     w[1] = adrp_word(30, kPatchOff + 4, kKeyOff);
@@ -173,6 +196,7 @@ extern "C" int botw_core_guest_image_selftest(void) {
     uint64_t out[4] = {};
     const uint64_t value = 0x1234;
     size_t page;
+    size_t entry = 0;
     void* block = nullptr;
     int rc = 1;
 
@@ -270,8 +294,39 @@ extern "C" int botw_core_guest_image_selftest(void) {
     IMAGE_CHECK(run.exit_x0 == g_map_return, "exit x0");
     IMAGE_CHECK(run.exit_sp == run.stack_top, "exit sp");
 
-    set_image_report("ok (page=%zu span=%#zx runs=%zu gates=%lu exit_x0=%#llx)",
-                     page, map.span, map.runs, run.gates,
+    /* Now enter the image itself through its DT_INIT, not a host probe.  This
+     * proves the loader's entry offset and that text executes from the RX page
+     * while the data page stays writable. */
+    entry = botw_guest_image_entry(&img);
+    IMAGE_CHECK(entry == 0x30, "DT_INIT entry");
+    g_map_calls = 0;
+    std::memset(&g_map_seen, 0, sizeof g_map_seen);
+    run.args[0] = 0;
+    run.args[1] = 0;
+    run.args[2] = 0;
+    if (botw_guest_run_enter(&run, entry) != 0) {
+        set_image_report("FAIL image entry: %s", run.error);
+        rc = 2;
+        goto done;
+    }
+    IMAGE_CHECK(run.reason == BOTW_GUEST_EXIT_RETURNED, "image exit reason");
+    IMAGE_CHECK(run.gates == 1, "image gate count");
+    IMAGE_CHECK(g_map_calls == 1, "image dispatcher calls");
+    IMAGE_CHECK(g_map_seen.x[0] == 0x55u, "image gate x0");
+    IMAGE_CHECK(g_map_seen.pc == static_cast<uint64_t>(reinterpret_cast<uintptr_t>(block)) + 24u,
+                "image gate pc");
+    IMAGE_CHECK(g_map_seen.sp == run.stack_top - 32u, "image gate sp");
+    IMAGE_CHECK(*reinterpret_cast<const uint64_t*>(
+                    static_cast<const unsigned char*>(map.base) + kDataOff + 0x100) == 0x1234u,
+                "image data marker");
+    IMAGE_CHECK(*reinterpret_cast<const uint64_t*>(
+                    static_cast<const unsigned char*>(map.base) + kDataOff + 0x108) == g_map_return,
+                "image data result");
+    IMAGE_CHECK(run.exit_x0 == g_map_return, "image exit x0");
+    IMAGE_CHECK(run.exit_sp == run.stack_top, "image exit sp");
+
+    set_image_report("ok (page=%zu span=%#zx runs=%zu gates=%lu entry=%#zx exit_x0=%#llx)",
+                     page, map.span, map.runs, run.gates, entry,
                      static_cast<unsigned long long>(run.exit_x0));
     rc = 0;
 
