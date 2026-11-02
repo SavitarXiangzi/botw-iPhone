@@ -8258,7 +8258,8 @@ gate 帧恢复。线程退出 trampoline 也改成接收 `botw_guest_resume`。
 * `tests/guest_block_test.cpp`：真实 AArch64 客体执行，断言
   `blocks == 2`、`wakes >= 2`、`switches == 2`、`thread_exits == 1`、
   `wait_blocks == 1`、`sleep_blocks == 1`，且 sleep 前后 tick 差值 ≥ 5 ms。
-  Windows/x86 跳过；macOS arm64 CI 执行。
+  Windows/x86 跳过；macOS arm64 CI 已通过，输出
+  `guest_block_test: ok (wait join, timed wake, 2 blocks, 2 wakes)`。
 * `.github/workflows/ios.yml`：portable job 编译并运行
   `guest_block_test`（x86 跳过）；assembly job 编译新包装器与探针；
   macOS arm64 job 链接 `guest_hle_os_arm64.S` 并执行。
