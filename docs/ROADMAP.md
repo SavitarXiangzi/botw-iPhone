@@ -8504,7 +8504,12 @@ Horizon 多等待仲裁器。
     2/2/1/1，MultiWait waits/blocks/wakes/links = 2/1/1/2。
 * Windows x86 只编译 portable 路径并跳过 AArch64 执行；`guest_system_event_probe_arm64.S`
   和 `guest_hle_os_arm64.S` 已用 `--target=aarch64-apple-ios17.0` 交叉汇编通过。
-  macOS arm64 runner 的执行结果不在本机产生。
+* macOS arm64 CI run `41406048341` 已全绿，实际输出：
+  * `guest_system_event_test: ok (SystemEvent wait/timeout, WaitAny holder handoff)`；
+  * `guest_sync_test: ok (9 blocks, 9 wakes, mutex/event/light/semaphore)`；
+  * `guest_hle_os_test: ok (78 nn::os names, thread table, TLS, time, memory blocks, sync objects, message queues)`。
+* 顺带修正 `guest_sync_test` 的初始化错误：light event 之前误调 `InitializeEvent`，
+  在 macOS 上首次真正执行时导致 9 个断言失败；现已改为 `InitializeLightEvent`。
 
 ### 6. 仍然不成立
 

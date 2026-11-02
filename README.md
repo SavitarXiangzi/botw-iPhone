@@ -204,7 +204,9 @@ sender、空队列的 receiver 和阻塞 jam 都在消息真正写入后才恢�
 阻塞时保存 import 帧，超时 hook 从 waiter 表移除并把 false 写回 `x0`；MultiWait 保存
 holder 的 link 顺序，`WaitAny` 返回第一个有信号的 Event holder，且不消费 auto-clear
 信号，由 guest 随后的 `TryWaitEvent` 清除。`guest_system_event_test` 用两个 worker 覆盖
-阻塞等待、无 peer 的定时超时和已经置位时的立即 `WaitAny`；CI 已加入该 AArch64 探针，
+阻塞等待、无 peer 的定时超时和已经置位时的立即 `WaitAny`。macOS arm64 CI 已真实执行
+（run `41406048341`），输出 `guest_system_event_test: ok (SystemEvent wait/timeout, WaitAny holder handoff)`；
+同一次门禁还跑通 `guest_sync_test: ok (9 blocks, 9 wakes, mutex/event/light/semaphore)`。
 本机只能交叉汇编，执行结果以 macOS runner 为准。
 
 **仍然不成立**：`SetUserExceptionHandler` 只保存配置，用户异常不会回调；SystemEvent 的
