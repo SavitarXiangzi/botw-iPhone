@@ -8563,3 +8563,102 @@ BOTW_SELFTEST rc=0 (guest=0 replay=0)
 * 探针没有经过 HLE gate/import，也没有创建客体线程；
 * iOS 真机 arm64e 的函数指针签名（PAC）路径尚未验证；模拟器是 arm64；
 * 真实标题镜像装载、服务层和第一条 `main` 指令仍是后续工作。
+
+## M4 续五十四：四模块交叉链接与真实 HLE 面收口
+
+### 1. 问题
+
+单模块 `botw_guest_image_open()` 把每个 `st_shndx == 0` 的符号都交给 HLE。
+但 1.6.0 的四个模块是一个环：
+
+| 模块 | 未定义符号 | 其中由另一模块定义 |
+|---|---:|---:|
+| main | 459 | 446（430 sdk + 16 subsdk0） |
+| sdk | 14 | 8（malloc/free 等来自 main） |
+| subsdk0 | 648 | 643（640 sdk） |
+| rtld | 20 | 3（sdk 的 init、main 的 runtime object） |
+
+按单模块方式装载，main 的 1,414 次导入解析里只有约 12 次真正需要 HLE，
+其余 1,402 次会被错误地绑到零返回 stub。之前“1,137 个唯一 HLE 名字”的
+估计把跨模块导入也算进去了，不能当作 HLE 工作量。
+
+### 2. 这一轮接了什么
+
+* `guest_image.c` 拆出 `bind()` / `relocate()`：先只建立基址和动态表，
+  不写重定位；四个模块全部 bind 完才能建全局符号索引。
+* 新增 `botw_guest_image_symbol_count()` / `symbol_at()` /
+  `find_symbol()`；符号名仍指向镜像自己的字符串表，不复制。
+* 新增 `core/guest/guest_modules.{h,c}`：
+  * `botw_guest_modules_add()` 解析 fixups、私有复制、bind，不 relocate；
+  * `botw_guest_modules_link()` 先建开放寻址符号索引（FNV-1a，
+    容量为定义数的两倍），再逐模块 relocate；
+  * 解析顺序按加入顺序：先加入模块的定义优先，然后才调用 HLE；
+  * 未解析的符号是错误，不会静默写 NULL；
+  * `SHN_ABS` 直接返回符号值，其余返回 `base + st_value`；
+  * 一个符号恰好等于 `img->size`（ELF 的 `end`）是合法的 one-past-end，
+    不再被误判为越界。
+* `tests/guest_modules_test.cpp`：两个合成模块，provider 定义 `exported`、
+  consumer 导入它；断言 2 次跨模块解析、4 次 HLE、重复模块名与缺失导入
+  被拒绝。Windows `build_abi_test.ps1` 与 Linux/macOS CI 都执行。
+* `reloc_run --multi <dir>`：按 main、sdk、subsdk0、rtld 的顺序装载真实
+  模块，打印每模块的 resolver / cross / hle 计数和页保护计划。
+
+### 3. 1.6.0 实测
+
+```text
+reloc_run: module main    size=46.1 MiB relocs=211506 symbols=959  resolver=1414 cross=1402 hle=12 imports=455 entry=0x30
+reloc_run: module sdk     size=13.3 MiB relocs=22829  symbols=13453 resolver=16   cross=10   hle=6  imports=8838 entry=0x30
+reloc_run: module subsdk0 size=7.6 MiB  relocs=14371  symbols=12694 resolver=6545 cross=6541 hle=4  imports=4804 entry=0x30
+reloc_run: module rtld    size=0.1 MiB  relocs=15     symbols=0    resolver=19   cross=3    hle=16 imports=19   entry=0x100
+reloc_run: linked modules=4 symbols=35739 cross=7956 hle=38 load=53ms
+```
+
+`resolver` 是模块重定位时所有未定义符号的解析次数；`cross` 是其中由另一
+模块的定义回答的次数；`hle` 是剩余落到 HLE 的次数。7,956 次跨模块解析、
+38 次 HLE，最后只有 25 个不同的名字落到共享 stub（glslc* 与
+`__rel_dyn_*` / `__rel_plt_*` / `__EX_*` / `__got_*` / `__rela_*` /
+`__tbss_*` / `__tdata_*` 这些链接器标记）。这比按全部未定义符号估的
+1,137 小两个数量级。
+
+### 4. 证明了什么、还没有证明什么
+
+证明：
+
+* 同一份 portable 代码能把四个 1.6.0 模块的全部重定位应用完；
+* 交叉模块的 7,956 个引用绑到了真实模块的 `base + st_value`，而不是 stub；
+* 真实 HLE 面在链接后只剩 38 次引用 / 25 个名字，HLE 表不需要 1,137 项；
+* 合成测试覆盖了“一个模块定义、另一个模块导入”、重复名、缺失导入和
+  链接后继续添加模块的拒绝路径。
+
+没有证明：
+
+* **没有执行任何一条真实标题指令**：`reloc_run` 只写重定位，不执行；
+* iOS App 仍然只映射一个合成镜像，还没有把四模块映射计划接进
+  `botw_guest_map`；
+* rtld 在 16 KiB 页上仍是 RWX 冲突（`plan conflict=1`）；iOS 需要双映射，
+  或者干脆不运行 rtld（我们的 loader 已经替代它的职责）；
+* 25 个 stub 还没有实现；`glslc*` 目前返回 0，链接器标记也没有给出真实值；
+* 每个模块的 key page / 线程槽还没有在多个模块上发布。
+
+### 5. 下一步
+
+1. 给 `botw_guest_map` 增加多模块接口：每个模块独立 `mmap` + 按页
+   `mprotect`，但共享同一个 HLE 表和跨模块符号索引；
+2. 处理 rtld 的 16 KiB RWX 冲突：优先不加载 rtld，由宿主 loader 直接
+   承担重定位；若必须加载，则把 text 与 data 双映射到不同地址；
+3. 发布每个模块的 key page，先进入 `main` 的 `DT_INIT`（0x30），观察
+   第一条真实指令和第一个 HLE 调用；
+4. 把 `glslc*` 与链接器标记补成明确实现或明确拒绝，避免 stub 返回 0
+   被误当成成功。
+
+### 6. 门禁
+
+```text
+python scripts/verify_ios.py
+python scripts/guest/verify_rewrite.py --self-test
+python scripts/guest/probe_relocs.py --self-test
+powershell -ExecutionPolicy Bypass -File scripts/build_abi_test.ps1
+```
+
+最近一次本机结果：`guest_modules_test: ok (cross=2, hle=4, duplicate/missing refusals)`，
+`build_abi_test: all tests passed`。

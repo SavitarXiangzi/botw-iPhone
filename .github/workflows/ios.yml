@@ -68,6 +68,7 @@ jobs:
           clang -std=c11 -Wall -Wextra -Werror $INC -c ios/nvn/src/nvn_pipeline.c -o /tmp/nvn_pipeline.o
           clang -std=c11 -Wall -Wextra -Werror $INC -c ios/nvn/src/nvn_state.c -o /tmp/nvn_state.o
           clang -std=c11 -Wall -Wextra -Werror $INC -c core/guest/guest_image.c -o /tmp/guest_image.o
+          clang -std=c11 -Wall -Wextra -Werror $INC -c core/guest/guest_modules.c -o /tmp/guest_modules.o
           clang -std=c11 -Wall -Wextra -Werror $INC -c core/guest/guest_slot.c -o /tmp/guest_slot.o
           clang -std=c11 -Wall -Wextra -Werror $INC -c core/guest/guest_gate.c -o /tmp/guest_gate.o
           clang -std=c11 -Wall -Wextra -Werror $INC -c core/guest/guest_segments.c -o /tmp/guest_segments.o
@@ -106,6 +107,10 @@ jobs:
           /tmp/nvn_state_test
           clang++ $FLAGS $INC tests/guest_image_test.cpp /tmp/guest_image.o /tmp/guest_slot.o /tmp/guest_segments.o -o /tmp/guest_image_test
           /tmp/guest_image_test
+          # Two synthetic modules: one defines a symbol the other imports.
+          # This is the cycle a single-image loader cannot resolve.
+          clang++ $FLAGS $INC tests/guest_modules_test.cpp /tmp/guest_image.o /tmp/guest_modules.o -o /tmp/guest_modules_test
+          /tmp/guest_modules_test
           # The trampoline is AArch64 assembly: here it only has to compile,
           # link and skip.  The macOS job runs it against a real core.
           clang++ $FLAGS $INC tests/guest_gate_test.cpp /tmp/guest_gate.o -o /tmp/guest_gate_test
@@ -168,7 +173,7 @@ jobs:
           /tmp/guest_hle_fs_test
           /tmp/guest_hle_os_test
           # Host-only loader probe: built everywhere, needs a real image to run.
-          clang++ $FLAGS $INC scripts/guest/reloc_run.cpp /tmp/guest_image.o /tmp/guest_slot.o /tmp/guest_segments.o $HLE -o /tmp/reloc_run -lm
+          clang++ $FLAGS $INC scripts/guest/reloc_run.cpp /tmp/guest_image.o /tmp/guest_modules.o /tmp/guest_slot.o /tmp/guest_segments.o $HLE -o /tmp/reloc_run -lm
           if /tmp/reloc_run; then
             echo "::error::reloc_run should refuse to run without an image"
             exit 1
@@ -269,6 +274,8 @@ jobs:
           xcrun clang -std=c11 -Wall -Wextra -Werror -O2 -I core/guest \
             -c core/guest/guest_image.c -o /tmp/guest_image.o
           xcrun clang -std=c11 -Wall -Wextra -Werror -O2 -I core/guest \
+            -c core/guest/guest_modules.c -o /tmp/guest_modules.o
+          xcrun clang -std=c11 -Wall -Wextra -Werror -O2 -I core/guest \
             -c core/guest/guest_segments.c -o /tmp/guest_segments.o
           xcrun clang -std=c11 -Wall -Wextra -Werror -O2 -I core/guest \
             -c core/guest/guest_slot.c -o /tmp/guest_slot.o
@@ -288,6 +295,10 @@ jobs:
             -c core/guest/guest_map.c -o /tmp/guest_map.o
           xcrun clang -std=c11 -Wall -Wextra -Werror -O2 -I core/guest \
             -c core/guest/guest_run.c -o /tmp/guest_run.o
+          xcrun clang++ -std=c++20 -Wall -Wextra -Werror -O2 -I core/guest \
+            tests/guest_modules_test.cpp /tmp/guest_image.o /tmp/guest_modules.o \
+            -o /tmp/guest_modules_test
+          /tmp/guest_modules_test
           xcrun clang++ -std=c++20 -Wall -Wextra -Werror -O2 -I core/guest \
             tests/guest_map_test.cpp \
             /tmp/guest_image.o /tmp/guest_segments.o /tmp/guest_map.o /tmp/guest_slot.o \

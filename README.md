@@ -126,6 +126,33 @@ docs/           路线图、HLE 边界、NVN 覆盖表、iOS 移植手册、着�
 
 ## M4 进展（本轮）
 
+### 四模块交叉链接：HLE 面从 1,137 个名字缩到 25 个
+
+新增 `core/guest/guest_modules.{h,c}`，把 main / sdk / subsdk0 / rtld 先全部
+`bind`、再建一张全局符号索引、最后逐模块 `relocate`。原因是四个模块互相
+导入：main 从 sdk 取 430 个符号、从 subsdk0 取 16 个；sdk 从 main 取
+malloc/free 等 8 个；subsdk0 从 sdk 取 640 个；rtld 又从 sdk/main 取 3 个。
+单模块加载会把这些跨模块引用全部错误地交给 HLE。
+
+1.6.0 实测（`reloc_run --multi`，Windows x86）：
+
+```text
+module main    relocs=211506 resolver=1414 cross=1402 hle=12 entry=0x30
+module sdk     relocs=22829  resolver=16   cross=10   hle=6  entry=0x30
+module subsdk0 relocs=14371  resolver=6545 cross=6541 hle=4  entry=0x30
+module rtld    relocs=15     resolver=19   cross=3    hle=16 entry=0x100
+linked modules=4 symbols=35739 cross=7956 hle=38 load=53ms
+```
+
+只有 38 次引用真正落到 HLE，最后 25 个不同名字使用共享 stub（`glslc*`
+与 `__rel_dyn_*` / `__EX_*` / `__got_*` 等链接器标记）。这修正了此前
+“1,137 个 HLE 名字”的估算：那是在单模块视角下把跨模块导入也算进了 HLE。
+
+`tests/guest_modules_test.cpp` 用两个合成模块覆盖定义/导入、重复名、
+缺失导入和链接后继续添加；`reloc_run --multi <dir>` 可对真实四模块复跑。
+**仍未执行真实标题指令**：下一步是把多模块映射、每模块 key page 和
+`main` 的 `DT_INIT` 接进 iOS；rtld 在 16 KiB 页上的 RWX 冲突也还没解决。
+
 ### `nn::os` 线程层（74/74 个标题导入）
 
 新增 `core/guest/guest_hle_os.{h,c}`，把游戏自己的 `ThreadType*` 映射到

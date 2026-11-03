@@ -23,10 +23,10 @@ try {
     if (-not (Test-Path $VcVars)) {
         Write-Error "vcvars64.bat not found at '$VcVars'. Pass -VcVars <path>."
     }
-    New-Item -ItemType Directory -Force -Path build\nvn\abi, build\nvn\core, build\nvn\tex, build\nvn\shd, build\nvn\vtx, build\nvn\smp, build\nvn\pool, build\nvn\txl, build\nvn\bcn, build\nvn\pipe, build\nvn\state, build\nvn\bnd, build\nvn\gst, build\nvn\rel, build\nvn\gate | Out-Null
+    New-Item -ItemType Directory -Force -Path build\nvn\abi, build\nvn\core, build\nvn\tex, build\nvn\shd, build\nvn\vtx, build\nvn\smp, build\nvn\pool, build\nvn\txl, build\nvn\bcn, build\nvn\pipe, build\nvn\state, build\nvn\bnd, build\nvn\gst, build\nvn\mods, build\nvn\rel, build\nvn\gate | Out-Null
 
     $inc = "/I core\include /I core\guest /I ios\nvn\include"
-    $lib = "ios\nvn\src\nvn_dispatch.cpp ios\nvn\src\nvn_null.cpp ios\nvn\src\nvn_pool.c ios\nvn\src\nvn_sampler.c ios\nvn\src\nvn_texture.c ios\nvn\src\nvn_shader.c ios\nvn\src\nvn_shader_key.c ios\nvn\src\nvn_shader_bundle.c ios\nvn\src\nvn_shader_blobs.gen.c ios\nvn\src\nvn_texlayout.c ios\nvn\src\nvn_bcn.c ios\nvn\src\nvn_vertex.c ios\nvn\src\nvn_pipeline.c ios\nvn\src\nvn_state.c core\src\botw_core.cpp core\src\botw_guest_selftest.cpp core\guest\guest_image.c core\guest\guest_slot.c core\guest\guest_gate.c core\guest\guest_segments.c core\guest\guest_map.c core\guest\guest_run.c core\guest\guest_hle.c core\guest\guest_hle_nn.c core\guest\guest_hle_fs.c core\guest\guest_hle_os.c"
+    $lib = "ios\nvn\src\nvn_dispatch.cpp ios\nvn\src\nvn_null.cpp ios\nvn\src\nvn_pool.c ios\nvn\src\nvn_sampler.c ios\nvn\src\nvn_texture.c ios\nvn\src\nvn_shader.c ios\nvn\src\nvn_shader_key.c ios\nvn\src\nvn_shader_bundle.c ios\nvn\src\nvn_shader_blobs.gen.c ios\nvn\src\nvn_texlayout.c ios\nvn\src\nvn_bcn.c ios\nvn\src\nvn_vertex.c ios\nvn\src\nvn_pipeline.c ios\nvn\src\nvn_state.c core\src\botw_core.cpp core\src\botw_guest_selftest.cpp core\guest\guest_image.c core\guest\guest_modules.c core\guest\guest_slot.c core\guest\guest_gate.c core\guest\guest_segments.c core\guest\guest_map.c core\guest\guest_run.c core\guest\guest_hle.c core\guest\guest_hle_nn.c core\guest\guest_hle_fs.c core\guest\guest_hle_os.c"
     $flags = "/nologo /std:c++20 /EHsc /W4 /WX"
 
     $jobs = @(
@@ -43,6 +43,7 @@ try {
         @{ name = "nvn_state_test"; src = "tests\nvn_state_test.cpp"; obj = "build\nvn\state\" }
         @{ name = "nvn_shader_bundle_test"; src = "tests\nvn_shader_bundle_test.cpp"; obj = "build\nvn\bnd\" }
         @{ name = "guest_image_test"; src = "tests\guest_image_test.cpp"; obj = "build\nvn\gst\" }
+        @{ name = "guest_modules_test"; src = "tests\guest_modules_test.cpp"; obj = "build\nvn\mods\" }
         @{ name = "guest_gate_test"; src = "tests\guest_gate_test.cpp"; obj = "build\nvn\gate\" }
         @{ name = "guest_map_test"; src = "tests\guest_map_test.cpp"; obj = "build\nvn\gate\" }
         @{ name = "guest_chain_test"; src = "tests\guest_chain_test.cpp"; obj = "build\nvn\gate\" }
@@ -93,7 +94,7 @@ try {
     if ($LASTEXITCODE -ne 0) { Write-Error "guest relocation probe: self-test failed"; exit 1 }
 
     # Host-only tool; links everywhere, needs a real image to say anything.
-    $cmd = "call `"$VcVars`" >nul && cl $flags $inc scripts\guest\reloc_run.cpp core\guest\guest_image.c core\guest\guest_slot.c core\guest\guest_segments.c core\guest\guest_run.c core\guest\guest_hle.c core\guest\guest_hle_nn.c core\guest\guest_hle_fs.c core\guest\guest_hle_os.c /Fo:build\nvn\rel\ /Fe:build\nvn\reloc_run.exe"
+    $cmd = "call `"$VcVars`" >nul && cl $flags $inc scripts\guest\reloc_run.cpp core\guest\guest_image.c core\guest\guest_modules.c core\guest\guest_slot.c core\guest\guest_segments.c core\guest\guest_run.c core\guest\guest_hle.c core\guest\guest_hle_nn.c core\guest\guest_hle_fs.c core\guest\guest_hle_os.c /Fo:build\nvn\rel\ /Fe:build\nvn\reloc_run.exe"
     cmd /c $cmd 2>&1 | ForEach-Object { if ("$_".Trim()) { Write-Host "  $_" } }
     if ($LASTEXITCODE -ne 0) { Write-Error "reloc_run.cpp: build failed"; exit 1 }
 

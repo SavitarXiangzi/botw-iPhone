@@ -148,7 +148,7 @@ void make_image(unsigned char* image) {
     put32(image, 0x40, 0xF9000000u | ((0x100u / 8u) << 10) | (9u << 5) | 10u);
     put32(image, 0x44, 0xD2800000u | (0x55u << 5));        /* mov x0, #0x55 */
     put32(image, 0x48, 0x94000000u |
-          (static_cast<uint32_t>((kPatchOff - 0x4C) / 4) & 0x03FFFFFFu));
+          (static_cast<uint32_t>((kPatchOff - 0x48) / 4) & 0x03FFFFFFu));
     put32(image, 0x4c, adrp_word(9, 0x4c, kDataOff));      /* adrp x9, data */
     put32(image, 0x50, 0xF9000000u | ((0x108u / 8u) << 10) | (9u << 5) | 0u);
     put32(image, 0x54, 0xA8C00000u | (4u << 15) | (30u << 10) | (31u << 5) | 29u);
@@ -230,6 +230,17 @@ extern "C" int botw_core_guest_image_selftest(void) {
                 "patch range");
     IMAGE_CHECK(img.slot_abs == 1, "absolute slot mode");
     IMAGE_CHECK(img.kgate_idx == 3, "KGATE index");
+    {
+        /* A BL encodes its displacement from the instruction's own address,
+         * not from the next instruction.  An off-by-four here jumps into the
+         * read-only padding before the patch area and faults before the gate
+         * ever runs; decode the word back instead of trusting the encoder. */
+        uint32_t bl = 0;
+        std::memcpy(&bl, static_cast<const unsigned char*>(map.base) + 0x48, sizeof bl);
+        const int64_t disp = static_cast<int64_t>(static_cast<int32_t>(bl << 6) >> 6);
+        IMAGE_CHECK(0x48 + disp * 4 == static_cast<int64_t>(kPatchOff),
+                    "DT_INIT branch target");
+    }
 
     IMAGE_CHECK(botw_guest_slot_init(&slot, slot_mem, sizeof slot_mem,
                                      reinterpret_cast<void*>(&botw_guest_gate_entry)) == 0,

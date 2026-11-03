@@ -70,17 +70,45 @@ int botw_guest_image_open(botw_guest_image* img, const void* file, size_t file_l
  * executable mapping needs this first, because the page plan comes from the
  * header alone.
  *
- * attach() adopts `buffer` (file_size bytes, already a copy of patched.bin),
- * reads MOD0/dynamic from it, and applies the relocations in place.  It never
- * frees or copies the buffer; whoever set owns_base keeps that duty. */
+ * bind() takes the bytes and reads MOD0/dynamic from them, but applies no
+ * relocations.  relocate() then applies the two relocation tables.  Splitting
+ * these apart is what lets a multi-module loader bind every module first,
+ * build one symbol index, and only then relocate any of them: main, sdk,
+ * subsdk0 and rtld import each other in a cycle, so a one-module-at-a-time
+ * attach() cannot resolve them.
+ *
+ * attach() is bind() followed by relocate().  None of the three frees or
+ * copies the buffer; whoever set owns_base keeps that duty. */
 int botw_guest_image_parse(botw_guest_image* img, size_t file_len,
                            const char* fixups_text);
+int botw_guest_image_bind(botw_guest_image* img, void* buffer);
+int botw_guest_image_relocate(botw_guest_image* img,
+                              botw_guest_resolve_fn resolve, void* user);
 int botw_guest_image_attach(botw_guest_image* img, void* buffer,
                             botw_guest_resolve_fn resolve, void* user);
 void botw_guest_image_close(botw_guest_image* img);
 
 /* The MOD0 init entry (virtual offset), or 0 when the image has no init. */
 size_t botw_guest_image_entry(const botw_guest_image* img);
+
+/* Dynamic symbol iteration, for a multi-module symbol index.
+ *
+ * index 0 is the ELF null symbol.  symbol_at() returns 1 and fills every
+ * non-NULL output when the entry is well formed; `value` is st_value (a
+ * module-relative offset, or an absolute value for SHN_ABS), not a runtime
+ * address.  `bind` is the ELF binding (0 local, 1 global, 2 weak).
+ * symbol_count() is the size of the table implied by DT_SYMTAB/DT_STRTAB;
+ * symbol_at() may still return 0 for an individual damaged entry. */
+unsigned botw_guest_image_symbol_count(const botw_guest_image* img);
+int botw_guest_image_symbol_at(const botw_guest_image* img, unsigned index,
+                               const char** name, uint64_t* value,
+                               unsigned* shndx, unsigned* bind);
+
+/* First defined symbol with this name, as a runtime address.  Returns 1 on a
+ * hit, 0 when there is none (or the image is not bound).  SHN_ABS symbols are
+ * returned verbatim. */
+int botw_guest_image_find_symbol(const botw_guest_image* img, const char* name,
+                                 uint64_t* addr);
 
 /* The key page the rewritten code reads with `adrp/ldr`.  It sits between the
  * image proper and the patch area and is writable: guest_slot_publish() stores
