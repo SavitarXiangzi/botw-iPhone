@@ -383,10 +383,42 @@ C:\Python314\python.exe -m pip list
 - **不要传**：明文 `prod.keys` / `title.keys` / `prod_hactool.keys`；不要把密钥和公开分享链接放在一起。
 - 源码仓库 `E:\平台移植\botw-iPhone` 已在 GitHub，通常不需要再放进网盘；但本地 `.git` 和未推送分支要保留。
 
+### 9.1 `E:\平台移植` 的上传建议
+
+`E:\平台移植` 当前约 **78.92 MiB / 3,470 个文件**，不是游戏数据，上传成本很低。建议按下表处理：
+
+| 内容 | 是否上传 | 说明 |
+|---|---|---|
+| `botw-iPhone` | 建议上传一份 bundle | `main` 和 `m4/guest-run` 已在 GitHub；但本地分支 `m4/hle-registry` **没有推到远端** |
+| `d2r-mobile-analysis` | 可不上传 | 是 `jhaizhou-ops/d2r-mobile` 的干净 clone，`git status` 干净，可重新 clone |
+| `ProdKeys.NET-v22.5.0` | **必须上传，但只能加密私有** | 只有 `prod.keys` / `title.keys`，没有 exe；不能明文放公开链接 |
+| 根目录 `_patch_*.py` / `_analyze*.py` | 建议上传 | 24 个脚本共约 88 KiB，成本可忽略 |
+| 根目录 `README.md` | 可忽略 | 0 字节空文件 |
+| `E:\tools`、`E:\Program Files` | 不要算进 BOTW 备份 | Android 工具/MobaXterm 等，与本项目无关 |
+
+最省事的做法：
+
+```powershell
+cd E:\平台移植\botw-iPhone
+git bundle create ..\botw-iPhone-all-branches.bundle --all
+git bundle verify ..\botw-iPhone-all-branches.bundle
+```
+
+然后把 `botw-iPhone-all-branches.bundle`、根目录的 `_patch_*.py` / `_analyze*.py` 放到同一个“源码/脚本”压缩包；`ProdKeys.NET-v22.5.0` 单独用 WinRAR 加密压缩（勾选“加密文件名”），密码不要和压缩包放在一起，也不要写进文件名。当前机器没有 `7z` 命令，不要照搬 `7z` 命令。
+
+如果不想处理本地分支，也可以直接：
+
+```powershell
+cd E:\平台移植\botw-iPhone
+git push origin m4/hle-registry
+```
+
+推送后再把 GitHub 当作源码备份即可。
+
 ## 10. 变更记录
 
 | 日期 | 变更 |
 |---|---|
-| 2026-11-03 | 首次整理：核对 C/E 盘安装项、项目局部工具、Python 包、缺失工具和清理建议 |
+| 2026-11-03 | 首次整理：核对 C/E 盘安装项、项目局部工具、Python 包、缺失工具、清理建议和 E 盘上传建议 |
 
 > 维护规则：安装/卸载工具、改变 `.NET`/LLVM/Python 版本、移动 `C:\botw-work` 或更换机器后，更新本文件；不要只改 `HANDOFF_CURRENT.md` 而留下过时的软件清单。

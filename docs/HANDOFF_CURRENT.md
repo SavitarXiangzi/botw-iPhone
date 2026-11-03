@@ -469,7 +469,8 @@ build\vn\reloc_run.exe --multi build\guest 0x4000 --hle --names
 3. 视空间备份 `RomFS` 和 `DLC`；
 4. 密钥单独加密，绝不与公开链接放一起；
 5. 云端校验文件数和大小后，才考虑删除本地派生数据；
-6. `secure` 保留本地，直到至少有一个经过验证的云端副本。
+6. `secure` 保留本地，直到至少有一个经过验证的云端副本；
+7. `E:\平台移植` 约 79 MiB，可整体打包；密钥单独加密；`m4/hle-registry` 只在本地，先 push 或用 `git bundle --all` 备份。
 
 如果必须释放 C 盘空间，优先级：
 
