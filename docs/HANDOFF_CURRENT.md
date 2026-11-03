@@ -4,8 +4,8 @@
 > 适用仓库：`E:\平台移植\botw-iPhone`
 > 远端：<https://github.com/SavitarXiangzi/botw-iPhone.git>
 > 当前分支：`m4/guest-run`
-> 当前提交：`3d896b8`
-> 当前 CI：[run 41559631519](https://github.com/SavitarXiangzi/botw-iPhone/actions/runs/41559631519)（success）
+> 代码验证快照：`3d896b8`（CI run 41559631519 success）
+
 
 ## 0. 先看结论
 
@@ -29,7 +29,7 @@
 | 本地仓库 | `E:\平台移植\botw-iPhone` |
 | GitHub | <https://github.com/SavitarXiangzi/botw-iPhone> |
 | 当前分支 | `m4/guest-run` |
-| 当前提交 | `3d896b8fa1cffaa4eebb187c3badd68347a774ff` |
+| 代码验证快照 | `3d896b8fa1cffaa4eebb187c3badd68347a774ff` |
 | 上游跟踪 | `origin/m4/guest-run` |
 | 默认分支 | `main`（当前停在旧提交，未合并 M4） |
 | 标题 | BOTW 1.6.0，Title ID `01007EF00011E000`，version `v786432` |
