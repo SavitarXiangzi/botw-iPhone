@@ -26,7 +26,7 @@ docs/           路线图、HLE 边界、NVN 覆盖表、iOS 移植手册、着�
 .github/        GitHub Actions：无 Mac 也能编译验证
 ```
 
-**新会话续作：先读 [docs/HANDOFF_CURRENT.md](docs/HANDOFF_CURRENT.md)**，其中记录了 2026-11-03 的当前状态、数据位置、门禁命令和下一里程碑。docs/IOS_PORTING.md 继续作为 iOS 侧操作手册与缺口清单。
+**新会话续作：先读 [docs/HANDOFF_CURRENT.md](docs/HANDOFF_CURRENT.md)**，其中记录了 2026-11-03 的当前状态、数据位置、门禁命令和下一里程碑。本机 C/E 盘安装了什么、哪些能删、哪些要保留，见 [docs/SOFTWARE_INVENTORY.md](docs/SOFTWARE_INVENTORY.md)。docs/IOS_PORTING.md 继续作为 iOS 侧操作手册与缺口清单。
 
 ## 当前状态（里程碑）
 

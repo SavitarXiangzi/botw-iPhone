@@ -5,6 +5,7 @@
 > 远端：<https://github.com/SavitarXiangzi/botw-iPhone.git>
 > 当前分支：`m4/guest-run`
 > 代码验证快照：`3d896b8`（CI run 41559631519 success）
+> 文档 CI：`1050cf8` run 41561491109 success；`00de7f3` run 41561561180 success
 
 
 ## 0. 先看结论
@@ -35,6 +36,7 @@
 | 标题 | BOTW 1.6.0，Title ID `01007EF00011E000`，version `v786432` |
 | 本地平台 | Windows，无 Apple Silicon Mac / Xcode |
 | iOS 构建验证 | GitHub Actions 的 macOS runner |
+| 本机软件/工具链 | [SOFTWARE_INVENTORY.md](SOFTWARE_INVENTORY.md)（2026-11-03 核查） |
 
 当前工作区应保持干净。新会话开始先执行：
 
@@ -89,13 +91,13 @@ git pull --ff-only
 
 快照时：
 
-- C 盘剩余约 6.96 GiB。
+- C 盘剩余约 6.94 GiB。
 - E 盘剩余约 28.03 GiB。
 - `C:\botw-work` 约 46.49 GiB。
 
 不要在本地生成完整的 45 GB 级 ZIP；空间不足，而且 RomFS 已经有 8 万个小文件。优先用网盘客户端按目录上传。
 
-`C:\msys64` 约 0.30 GiB，当前项目不使用它；可用其自带 `uninstall.exe` 卸载。释放空间有限，不能解决主要问题。
+本机软件与工具链（C/E 盘安装项、项目局部 .NET 10、LLVM、WinLibs、Sideloadly 残留、Python 包）见 [SOFTWARE_INVENTORY.md](SOFTWARE_INVENTORY.md)。2026-11-03 核查：`C:\msys64` 已不存在，旧说明中的 0.30 GiB 卸载建议作废。
 
 ## 3. 仓库结构
 
@@ -188,7 +190,7 @@ linked modules=4 symbols=35739 cross=7956 hle=38
 4. 将结果写入 App 容器 `Documents/selftest.txt`，期望：
    `BOTW_SELFTEST rc=0 (guest=0 image=0 replay=0)`。
 
-最新 CI 运行 `41559631519` 已成功，但它是合成镜像/合成验证，不等于真实标题可运行。
+代码快照 `3d896b8` 的 CI 运行 `41559631519` 已成功；文档提交 `1050cf8`（run `41561491109`）和 `00de7f3`（run `41561561180`）的 CI 也已成功。它们都是合成镜像/合成验证，不等于真实标题可运行。
 
 ## 6. 明确未完成 / 不要误判
 
@@ -261,10 +263,11 @@ powershell -ExecutionPolicy Bypass -File scripts\build_abi_test.ps1
 
 要求：
 
-- Visual Studio 2022 Community；
+- Visual Studio 2022 Community（MSVC v143 + Windows SDK 10.0.26100）；
 - `vcvars64.bat` 默认路径存在；
 - Python 3.14 或 `python` 可用；
-- LLVM clang 可选，用于 `nvn_metal.mm` 语法检查。
+- LLVM clang 可选（`C:\Program Files\LLVM\bin\clang++.exe`；不在 PATH，脚本用绝对路径），用于 `nvn_metal.mm` 语法检查；
+- shader 链另需 `.NET 10`（`C:\botw-work\dotnet10`），系统 `dotnet` 9.x 不够。
 
 ### 8.2 仓库不变量
 
@@ -471,10 +474,10 @@ build\vn\reloc_run.exe --multi build\guest 0x4000 --hle --names
 如果必须释放 C 盘空间，优先级：
 
 ```text
-botw-iPhone\build               约 733 MiB（可重建）
-C:\botw-work\dotnet10           约 770 MiB（可重下）
-C:\botw-work\nxsrc              约 733 MiB（可重下）
-C:\msys64                       约 0.30 GiB（可卸载）
+botw-iPhone\build               约 20 MiB（可重建）
+C:\botw-work\dotnet10           约 0.75 GiB（可重下）
+C:\botw-work\nxsrc              约 0.72 GiB（可重下）
+C:\Program Files\Sideloadly     约 0（空目录，可删）
 ```
 
 不要优先删除 `secure`。
