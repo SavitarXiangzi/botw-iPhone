@@ -18,6 +18,7 @@ retail NSO  --rewrite_botw.py-->  patched.bin + fixups/gates/sites
 - [x] 通用改写规则在 1.6.0 上跑通：main / sdk / subsdk0 / rtld
 - [x] 输出结构校验：无残留 `svc`、每个 gate/site 都跳进 patch 区
 - [x] 运行时 loader 的可移植部分（fixups 解析、私有复制、重定位、导入解析）
+- [x] 多模块交叉链接（`guest_modules.c`）：先绑定 main/sdk/subsdk0/rtld，再建全局符号索引，最后逐模块重定位；1.6.0 实测 7,956 次跨模块解析、仅 38 次落到 HLE、25 个 stub 名字
 - [x] 可执行映射（`guest_map.c`）：整块 mmap → 重定位 → 按页 mprotect；Linux 4 KiB / macOS 16 KiB 实测
 - [x] 每线程槽布局 + key page 发布（`guest_slot.c` + `botw_guest_map_publish_slot()`）
 - [x] 槽地址发布（`SLOT_BASE=abs`；`TPIDRRO_EL0` 在 EL0 只读，见 ROADMAP 续三十七）
@@ -25,9 +26,15 @@ retail NSO  --rewrite_botw.py-->  patched.bin + fixups/gates/sites
 - [x] 链式测试（`guest_chain_test`）：真实映射 → key page 发布 → KGATE → trampoline → gate 块 → 寄存器往返
 - [x] HLE 注册表 + libc 直通（`guest_hle.c`）：未知名字共享零返回 stub，46 个 libc 实现（含 3 个本地小包装）
 - [x] 页级保护计划（`guest_segments.c`）：真实四模块 5/5/5/4 段；rtld 在 16 KiB 页上 rwx 冲突，如实报告
+- [x] `guest_run`：独立客体栈 + 守卫页 + 入口/退出哨兵；合成客体在 macOS arm64 CI 真正执行
+- [x] 协作式客体线程（`guest_thread_test`）：独立栈、272 字节帧保存/恢复、轮转切换、线程退出；三线程在 arm64 CI 通过
+- [x] `nn::os` 线程表 / TLS / 虚拟时钟 / 同步 / 内存块（74/74 个标题导入；78 个注册表项）
+- [x] `SleepThread` / `WaitThread` 阻塞与唤醒：汇编导入包装器保存完整客体帧，`BLOCKED` → READY；sleep 由虚拟时钟 deadline 唤醒，join 由线程退出唤醒（`guest_block_test`，macOS arm64 CI 通过）
+- [x] Mutex / Event / LightEvent / Semaphore 阻塞：解锁/释放/signal 先交接对象状态再唤醒；timed light event 超时由 run timeout hook 从 waiter 队列移除（`guest_sync_test`，AArch64 探针已加入 CI）
+- [x] `nn::os` 同步原语（mutex / event / light event / semaphore / message queue / system event / multi-wait）
 - [ ] HLE 服务层（init / fs / vi / nv / NVN bootstrap）
 - [ ] 把 NVN 调用桥到 `ios/nvn` 的 Metal 后端
-- [ ] 在 iOS 模拟器/真机执行第一条客体指令
+- [x] 在 iOS 模拟器执行第一条客体指令（内置探针，run 41409268996；真实标题入口仍未接）
 
 ## 用法
 
@@ -40,7 +47,7 @@ python scripts/guest/rewrite_botw.py --nso-dir <ExeFS/update> --out build/guest
 python scripts/guest/verify_rewrite.py build/guest main
 python scripts/guest/probe_relocs.py build/guest/main.patched.bin --fixups build/guest/main.fixups.tsv
 # 有 MSVC 时：把真实镜像完整装载一遍（只读，不执行客体代码）
-cl /std:c++20 /I core\guest scripts/guest/reloc_run.cpp core/guest/guest_image.c core/guest/guest_slot.c core/guest/guest_segments.c core/guest/guest_hle.c core/guest/guest_hle_nn.c core/guest/guest_hle_fs.c /Fe:build\reloc_run.exe
+cl /std:c++20 /I core\guest scripts/guest/reloc_run.cpp core/guest/guest_image.c core/guest/guest_slot.c core/guest/guest_segments.c core/guest/guest_run.c core/guest/guest_hle.c core/guest/guest_hle_nn.c core/guest/guest_hle_fs.c core/guest/guest_hle_os.c /Fe:build\reloc_run.exe
 build\reloc_run.exe build/guest/main.patched.bin build/guest/main.fixups.tsv
 # --slot: 把合成槽发布进真实镜像的 key page 并核对四个索引（不执行客体代码）
 build\reloc_run.exe build/guest/main.patched.bin build/guest/main.fixups.tsv 0x4000 --slot
@@ -52,6 +59,22 @@ build\reloc_run.exe build/guest/main.patched.bin build/guest/main.fixups.tsv 0x4
 
 `rewrite_botw.py` 会先核对 0x20 字节 build ID，再调用 vendored 的
 nxnative 改写器；任何版本不符都会在写文件前退出。
+
+## 2026-11-02 多模块链接实测（1.6.0，v786432）
+
+```text
+reloc_run: module main    relocs=211506 symbols=959  resolver=1414 cross=1402 hle=12 imports=455 entry=0x30
+reloc_run: module sdk     relocs=22829  symbols=13453 resolver=16   cross=10   hle=6  imports=8838 entry=0x30
+reloc_run: module subsdk0 relocs=14371  symbols=12694 resolver=6545 cross=6541 hle=4  imports=4804 entry=0x30
+reloc_run: module rtld    relocs=15     symbols=0    resolver=19   cross=3    hle=16 imports=19   entry=0x100
+reloc_run: linked modules=4 symbols=35739 cross=7956 hle=38 load=53ms
+```
+
+`resolver` 是模块重定位时所有未定义符号的解析次数，`cross` 是其中由另一个
+模块的定义回答的次数，`hle` 是剩余落到 HLE 的次数。没有交叉链接时，main 的
+430 个 sdk 导入、sdk 的 malloc/free 导入和 subsdk0 的 640 个 sdk 导入都会被
+错误地当成 HLE；单模块 `--hle` 报出的 315 个 stub 也不能直接当作 HLE 工作量。
+交叉链接后只剩 25 个不同的 stub 名字（glslc* 与链接器标记），38 次引用。
 
 ## 2026-10-31 的实测统计（1.6.0，v786432）
 

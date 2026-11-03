@@ -7901,3 +7901,764 @@ guest_hle_fs_test: ok (23 nn::fs names, sandboxed paths, handles, directories, e
    一起设计，不能一条条 HLE；
 3. `nn::audio` / `nn::nfp`：SoundSystem 与 amiibo，早期可以整段替身；
 4. rtld 双映射仍未做。
+
+## M4 续四十六：guest_run —— 真的进入客体
+
+### 1. 之前缺的是什么
+
+`guest_chain_test` 证明的是「一次 **调用** 能穿过门再回来」：它 `blr` 一个门块，
+门块把控制权交给蹦床。但它没有回答另外三个问题：
+
+1. 客体的 **sp** 在哪？用什么栈？
+2. 最外层函数 `ret` 的时候回到哪？
+3. 一个跨多条指令、会调用、会写内存的客体程序，能不能连续跑？
+
+`core/guest/guest_run.{h,c}` + `guest_run_arm64.S` 就是这三件事。
+
+### 2. 进入序列（x0 = 上下文）
+
+```text
+stp x29,x30,[sp,#-16]!  ; 压宿主 fp/lr
+stp x19..x28 -> ctx     ; 保存宿主被调用者保存寄存器
+ctx.host_sp = sp
+globals = ctx           ; 之后每个寄存器都属于客体了，只能靠全局找回上下文
+x0..x30 <- ctx.x[]      ; 初始寄存器（跳过 x18：Apple 保留它）
+sp = ctx.stack_top
+x30 = 哨兵              ; 客体最外层 ret 落到这里
+br  ctx.entry
+
+哨兵:
+   ctx.exit_x0 = x0; ctx.exit_sp = sp
+   x19..x28 <- ctx; sp = ctx.host_sp
+   ldp x29,x30,[sp],#16; ret
+```
+
+由此 `botw_guest_run_enter()` 对调用者就是一个普通 C 函数调用。
+
+### 3. 栈与守卫页
+
+`botw_guest_run_init()` 用 `mmap` 映射 `可用大小 + 1 页`，把 **最低那一页**
+`mprotect` 成 `PROT_NONE`。栈向下增长，所以溢出会立刻撞在守卫页上触发
+fault，而不是安静地吃掉宿主内存。默认可用 64 KiB；真机上一个客体线程
+需要多大栈由调用方决定。
+
+### 4. 门的分发
+
+`botw_guest_run_enter()` 在进入前安装一个计数用的 dispatcher，并把它之前
+的 handler 记下来，退出时原样恢复。用户回调拿到 `botw_guest_regs*`，
+写 `regs->x[]` 就是给这次调用作答。
+
+### 5. 实测
+
+`tests/guest_run_probe_arm64.S` 是一段 **真的会被执行的 AArch64 客体程序**：
+
+```asm
+stp x29,x30,[sp,#-48]!      ; 用宿主给的客体栈建帧
+mov x19,x0 / x20,x1 / x21,x2
+loop 3 次: ldr/add/str      ; 通过内存计数
+blr x20                     ; 穿过门块 -> 蹦床 -> dispatcher
+str x0,[x19,#8]             ; 存 dispatcher 写回的答案
+ldp x29,x30,[sp],#48
+ret                         ; 落到哨兵
+```
+
+macOS arm64 runner 上的断言：
+
+* `reason == RETURNED`、`exit_sp == stack_top`（帧平衡）、`exit_x0 == 0xdead0001`；
+* 计数器 = 3、`counter[1]` = dispatcher 的返回值；
+* `gates == 1`，且 dispatcher 看到的 `x0` 是入口设的 `0x1234`；
+* 同一个 run 再进一次：计数到 6、handler 计数归零后重新计 1；
+* 结束后全局 handler 被恢复成 `nullptr`；
+* 入口越界 `enter(…, file_len)` 在**一条指令都没跑**之前就被拒绝。
+
+x86 主机上整个测试跳过（入口序列是 AArch64 汇编），但 `guest_run.c`
+仍然编译、链接，`run_init()` 会明确报「needs POSIX mmap / AArch64」。
+
+### 6. 仍然不成立
+
+* **这仍然不是《旷野之息》在跑。** 被执行的是手写的客体程序 + 手写的门块；
+  真实 `main.patched.bin` 的入口从未被调用过。
+* 没有步数预算、没有信号处理：客体死循环或跳到未映射地址会带走整个进程。
+  需要诊断时应当在子进程里跑，把信号当结论。
+* 一次只能有一个 run（宿主寄存器存在单个全局里）；不支持嵌套。
+* `x9/x10/x11` 在入口是暂存寄存器（AAPCS64 临时寄存器），`ctx.x[9..11]`
+  不会生效。
+* 没有抢占式调度：客体线程切换还没接。
+
+### 7. 下一步
+
+1. 把 `nn::os` 的线程原语接到这个 run 上（栈、切上下文、时片）；
+2. 或者先做 `nn::hid`，让输入闭环；
+3. rtld 双映射仍未做。
+
+
+## M4 续四十七：客体线程与协作切换
+
+`guest_run` 已经能进入一个客体函数并回到宿主，但《旷野之息》启动时会创建
+14 个以上的线程；只跑一个线程不可能走到标题画面。这一轮把“一个 run”
+扩展成“一个 run 里有多条客体线程”，但仍然**不创建宿主线程**：
+
+* 所有客体线程共用宿主调用栈，轮流使用各自的客体栈；
+* 切换点只有 gate（重写器把 `svc` 和自旋回边都变成了 gate），
+  所以 HLE 回调返回后、trampoline 恢复寄存器之前，是唯一安全的切换窗口；
+* 没有 `ucontext`、没有 `setjmp`，也没有平台相关的线程 API。
+
+### 1. 线程对象与栈
+
+`core/guest/guest_run.h` 新增 `botw_guest_thread`：
+
+| 字段 | 含义 |
+|---|---|
+| `state` | `CREATED` / `READY` / `RUNNING` / `BLOCKED` / `DONE` |
+| `stack`, `stack_bytes`, `guard_bytes`, `stack_top` | 独立 `mmap` 的客体栈，底部一页 `PROT_NONE` |
+| `frame` | 该线程在 gate 处保存的 272 字节 `botw_guest_regs` |
+| `yields` | 显式让出次数，用于测试与观测 |
+| `generation` | 创建它的 run 代号，防止下一次 run 复活旧线程 |
+
+线程 0 是 `run_init()` 映射的主栈，由 `enter_at()` 启动；其余线程通过
+`botw_guest_run_thread_create()` 创建（`CREATED`），再由
+`botw_guest_run_thread_start()` 变成 `READY`。创建线程时**不会**执行客体代码，
+只准备一个合成帧。
+
+### 2. 切换：换的是 trampoline 手里的那张帧
+
+`run_gate()` 在调用 HLE 回调之后检查 `switch_requested`：
+
+1. 把当前 `regs` 整张帧拷进当前线程的 `frame`，状态改成 `READY`；
+2. 从当前线程之后开始轮转，找第一个 `READY`；
+3. 把目标线程的 `frame` 拷回 `regs`，状态改成 `RUNNING`。
+
+gate trampoline 接着按 `regs->sp` 把 `x29/x30` 写回目标线程的 gate 块，
+恢复 `x0..x28`、`sp`、`pc`，于是“返回”到另一条线程的 gate 块。整个过程
+只改寄存器帧，不碰宿主栈；被切走的线程的 C 栈帧（dispatcher 那一层）
+直接丢弃，等它下次被恢复时从 gate 块的 `ldp` 继续。
+
+`botw_guest_run_yield()` 只置一个标志，真正的切换发生在 gate 回调返回之后。
+这样 HLE 函数可以放心地改 `regs->x[0]` 作为返回值，改动会随帧一起保存。
+
+### 3. 新线程怎么开始
+
+新线程没有“原来的 gate 块”可返回，所以合成帧是：
+
+```text
+pc  = botw_guest_thread_start_asm
+sp  = stack_top
+x0  = arg
+x19 = guest entry
+x20 = botw_guest_thread_exit_asm
+```
+
+trampoline 会在 `stack_top - 16` 留出它惯用的 16 字节，然后跳到 start
+stub；start stub 做三件事：
+
+```asm
+mov x29, xzr
+mov x30, x20        ; 线程返回时落到 exit stub
+br  x19             ; 客体入口，x0 = arg
+```
+
+入口的 prologue 从 `stack_top - 16` 往下建帧，和普通 AAPCS64 函数一样。
+线程入口 `ret` 时落到 exit stub；exit stub 调
+`botw_guest_thread_exit_frame()` 把当前线程标成 `DONE` 并取下一个帧，
+没有可运行线程时跳到 `botw_guest_run_finish_asm` 恢复宿主。
+
+`botw_guest_resume_frame()` 与 gate trampoline 的恢复段是同一套寄存器语义，
+但它从一个线程结构体（而不是当前栈上的 272 字节）读帧；因此可以先把
+`sp` 切到目标栈，再继续加载其余寄存器。`x18` 仍然不加载/不写。
+
+### 4. 测试
+
+`tests/guest_thread_test.cpp` + `tests/guest_thread_probe_arm64.S` 在
+macOS arm64 runner 上跑三条**真实执行**的客体线程：
+
+| 线程 | 次数 | 行为 |
+|---|---:|---|
+| main（线程 0） | 4 | 每轮计数，调用 gate 块，gate 回调 `yield` |
+| worker A | 2 | 同上，独立栈 |
+| worker B | 2 | 同上，独立栈 |
+
+断言：
+
+* gate 看到的 id 序列是 `0,1,2,0,1,2,0,0`（8 次 gate）；
+* 三个计数器分别 4 / 2 / 2，且各自记录到的 `sp` 落在自己的栈区间内；
+* `switches == 9`（7 次 gate 轮转 + A/B 退出各一次），`thread_exits == 2`；
+* 结束后线程 0/A/B 都是 `DONE`，全局 gate handler 被恢复成 `nullptr`；
+* `run_close()` 释放三条栈。
+
+x86 的 portable job 仍会编译 C 调度器、汇编两份 `.S`（Apple 目标），
+但测试本身跳过；真正执行只在 `macos-15` arm64 job。
+
+### 5. 仍然不成立
+
+* **没有阻塞原语**：`BLOCKED` 只是预留状态，mutex / semaphore / event /
+  `svcWaitSynchronization` 还没有接到调度器；
+* **没有抢占**：线程只有走到 gate 才会让出。纯计算且没有自旋回边的长循环
+  仍会饿死其他线程；重写器覆盖了 `svc` 和自旋回边，但不覆盖所有长循环；
+* **没有 `nn::os` HLE**：`CreateThread` / `StartThread` / `ExitThread` /
+  `SleepThread` 还没有映射到这张表；当前只有测试和宿主 API 能建线程；
+* **没有真实标题线程**：执行的是合成 probe，不是 `main.patched.bin` 的
+  线程入口；
+* 线程不能 join/reap；槽位和栈保留到 `run_close()`；
+* 没有步数预算/信号处理；客体跳到未映射地址仍会带走进程。
+
+### 6. 下一步
+
+1. 把 `nn::os` 的线程/同步原语接到线程表：句柄 → 槽位，`StartThread` 置
+   `READY`，`ExitThread` 走 exit stub，`WaitSynchronization` 置 `BLOCKED`；
+2. 在 gate 上做时间片：连续运行超过 N 个 gate 或 N 次 tick 就强制
+   `switch_requested`，给“不主动 yield”的线程留出轮转机会；
+3. 之后才是 `nn::hid` 输入闭环与真实 `main` 的入口调用。
+
+## M4 续四十八：nn::os 线程层
+
+### 1. 这一轮接了什么
+
+`core/guest/guest_hle_os.{h,c}` 接管 1.6.0 `main` 的 33 个 `nn::os` 导入：
+
+| 组 | 入口 |
+|---|---|
+| 线程 | `CreateThread` ×2、`StartThread`、`WaitThread`、`DestroyThread` |
+| 查询 | `GetCurrentThread`、`GetThreadId`、名称两套、优先级、核掩码、栈信息、fiber、host argc/argv |
+| 调度 | `YieldThread`、`SleepThread` |
+| TLS | `AllocateTlsSlot`、`FreeTlsSlot`、`GetTlsValue`、`SetTlsValue` |
+| 时间 | `GetSystemTick`、`GetSystemTickFrequency`、`ConvertToTick`、`ConvertToTimeSpan` |
+| 内存 | `AllocateMemoryBlock`、`FreeMemoryBlock`、`SetMemoryHeapSize` |
+
+`ThreadType*` 只作为不透明的 guest 句柄；HLE 不往游戏自己的对象里写字段。
+主线程没有这样的对象，因此 `GetCurrentThread()` 返回 state 内一块 0x200
+字节的 identity token。
+
+`CreateThread` 用 `botw_guest_run_thread_create()` 分配私有客体栈（含
+`PROT_NONE` 守卫页）。游戏传入的 `stack` 指针和大小被记录在状态里，但
+**没有拿来当执行栈**：宿主需要自己拥有并证明守卫页，当前也不具备把任意
+guest 堆指针安全改成栈映射的页表。`DestroyThread` 走新增的
+`botw_guest_run_thread_reap()`，允许回收 DONE 或从未启动的 CREATED 线程。
+
+### 2. 调度语义仍然受“导入是直调”限制
+
+改写器把 `svc` 和自旋回边变成 gate，但 `nn::os::*` 是被重定位到宿主 C
+函数的**直调**导入。因此：
+
+```
+guest: blr <YieldThread>
+host:  os_YieldThread() -> botw_guest_run_yield(); return
+guest: 继续执行到下一个 gate
+gate:  run_gate() 保存当前帧，轮转，恢复另一个帧
+```
+
+`YieldThread` 的语义因此是“请求在下一个 gate 让出”，不是立刻切走。
+`SleepThread(ns)` 目前也只记录 `last_sleep_ns`/`sleep_deadline` 并发出同样
+的请求；活目标的 `WaitThread` 同样只请求一次 gate 切换。这样不会假装
+`BLOCKED` 已经可用，也不会在宿主 C 调用栈里强行恢复另一条客体帧。
+
+真正的阻塞需要下一步把 gate 回调改成按 `gates.tsv` 的返回点分派，并在
+那里把当前线程置 `BLOCKED`、唤醒等待者；或者给线程导入加一层汇编
+wrapper，在 C 调用返回前保存客体帧。两者都还没有做。
+
+### 3. 测试
+
+* `tests/guest_hle_os_test.cpp`：33 个名字逐个查表；ThreadType 到 run
+  槽位的映射、StartThread 状态、Yield/Sleep 的 switch request、活/已完成
+  目标的 WaitThread、DestroyThread 的回收、TLS、时间换算、页对齐内存块。
+  Windows 上跳过 run 段（无 POSIX mmap），Linux/macOS 上执行映射与回收。
+* `tests/guest_thread_test.cpp`：三条真实 AArch64 客体线程在 gate 前调用
+  `nn::os::YieldThread` HLE 导入；gate 回调不再主动 yield。预期仍是
+  `0,1,2,0,1,2,0,0` 八次 gate、九次切换、两次线程退出。
+* `tests/guest_thread_probe_arm64.S`：新增 `+32` 的 yield 函数指针参数，
+  `x23` 保存并在调用前后保持。
+
+### 4. 仍然不成立
+
+* 78 个 `nn::os` 里还有 45 个在共享 stub 上：mutex、event、light event、
+  semaphore、message queue、system event、multi-wait。
+* 没有 `BLOCKED` 唤醒路径，没有超时；`SleepThread` 不是睡眠。
+* 没有真实标题线程：`main.patched.bin` 的入口仍未调用。
+* 线程栈不使用游戏传入的栈；`ThreadType` 内部布局未被验证。
+* 仍无抢占：纯计算且没有 gate/自旋回边的长循环仍会饿死其他线程。
+* 仍无步数预算/信号处理：客体跳到未映射地址会带走整个进程。
+
+## M4 续四十九：阻塞导入与真正的 BLOCKED
+
+### 1. 为什么 `BLOCKED` 不能从 C 里切
+
+`nn::os::SleepThread` / `WaitThread` 是重定位到宿主 C 函数的直调导入：
+
+```
+guest: blr <WaitThread>      ; x30 = 返回点
+host:  os_WaitThread()       ; 宿主 C 帧仍在栈上
+```
+
+如果在这个 C 函数里直接恢复另一条客体线程，当前线程的返回点和活寄存器
+都还在被放弃的宿主帧里，恢复时无处可回。上一轮因此只置
+`switch_requested`，把阻塞推迟到下一个 gate；这能跑，但不是 join/sleep。
+
+### 2. 汇编导入包装器
+
+新增 `core/guest/guest_hle_os_arm64.S`：`botw_hle_os_guest_sleep` 和
+`botw_hle_os_guest_wait_thread` 先分配 288 字节栈块，保存
+`x0–x30`、进入时的 SP、返回地址（同时作为 PC）和 NZCV，再调用：
+
+```c
+int botw_hle_os_blocking_call(botw_guest_regs* frame, unsigned op,
+                              const botw_guest_resume** next_resume);
+```
+
+返回值：
+
+| 值 | 含义 |
+|---|---|
+| `BOTW_HLE_OS_RETURN` (0) | 不需要阻塞，恢复调用者自己的帧 |
+| `BOTW_HLE_OS_SWITCHED` (1) | C 侧已推进调度器，恢复 `next_resume` |
+| `BOTW_HLE_OS_STOPPED` (2) | 死锁，调用 `botw_guest_run_finish_asm` 结束 run |
+
+`x0` 同时是导入参数和返回值槽。C 侧必须先把参数复制出来，再写回零返回值；
+第一版先清零后分派，结果 `SleepThread` 永远收到 0 ns、`WaitThread` 永远
+收到空 `ThreadType*`，两条路径都退化成“立即返回”。`guest_block_test`
+的失败计数把这个错误直接暴露出来。
+
+恢复路径必须区分两种帧：
+
+* gate 帧：保存于 gate 边界，恢复后要回到改写块末尾的
+  `ldp x29,x30,[sp],#16`，走 `botw_guest_resume_frame`；
+* import 帧：保存于导入包装器，恢复后直接回到 `blr` 的下一条指令，走
+  `botw_guest_resume_import_frame`。
+
+`botw_guest_resume` 因此带 `kind`；gate trampoline 用 NZCV bit63
+（`BOTW_GUEST_NZCV_IMPORT_FRAME`）标记 import 帧，避免把 import 帧误当成
+gate 帧恢复。线程退出 trampoline 也改成接收 `botw_guest_resume`。
+
+两条恢复路径放在独立文件 `core/guest/guest_resume_arm64.S`，不引用任何 C
+符号。这样 `guest_gate_test` / `guest_chain_test` 只链接 gate 恢复所需，
+`guest_block_test` 只链接 import 恢复所需，不会因为另一条路径缺失而出现
+链接错误。
+
+### 3. 调度语义
+
+* `SleepThread(ns)`：`deadline = run->clock + ns * freq / 1e9`，置
+  `BOTW_GUEST_WAIT_SLEEP` 后 `BLOCKED`；
+* `WaitThread(target)`：目标已 DONE 立即返回；目标还活着则置
+  `BOTW_GUEST_WAIT_THREAD` 并记录目标槽；
+* 线程退出时 `wake_joiners()` 把同一目标上的等待者全部置 READY；
+* clock 前进（`botw_hle_os_advance()` / `GetSystemTick`）时
+  `wake_expired()` 唤醒到期 sleeper；
+* 没有可运行线程时，调度器把 clock 直接推进到最早 sleep deadline；
+  若没有任何 deadline，报 `guest deadlock: all threads are blocked ...`
+  并结束 run，而不是静默返回成功；
+* `run->blocks` / `run->wakes` / `os.sleep_blocks` / `os.wait_blocks`
+  计入统计，测试可以验证真的发生了阻塞。
+
+`GetSystemTick` 仍然每次查询前进 1 tick，但现在与 `run->clock` 是同一个
+时钟，sleep deadline 与 guest 观察到的 tick 一致。
+
+### 4. 测试
+
+* `tests/guest_block_probe_arm64.S`：主线程在 worker 尚未运行时
+  `WaitThread`；worker 退出后主线程恢复并写计数；随后
+  `SleepThread(5ms)`，无其他可运行线程，虚拟时钟推进到 deadline。
+* `tests/guest_block_test.cpp`：真实 AArch64 客体执行，断言
+  `blocks == 2`、`wakes >= 2`、`switches == 2`、`thread_exits == 1`、
+  `wait_blocks == 1`、`sleep_blocks == 1`，且 sleep 前后 tick 差值 ≥ 5 ms。
+  Windows/x86 跳过；macOS arm64 CI 已通过，输出
+  `guest_block_test: ok (wait join, timed wake, 2 blocks, 2 wakes)`。
+* `.github/workflows/ios.yml`：portable job 编译并运行
+  `guest_block_test`（x86 跳过）；assembly job 编译新包装器与探针；
+  macOS arm64 job 链接 `guest_hle_os_arm64.S` 并执行。
+
+### 5. 仍然不成立
+
+* 45 个同步原语仍是共享 stub：mutex、event、light event、semaphore、
+  message queue、system event、multi-wait。没有做“返回成功但不互斥”的锁。
+* `SleepThread` 只有 deadline 唤醒，没有 `svcCancelSynchronization` /
+  `WakeThread` 之类的显式中断。
+* `YieldThread` 仍是“下一个 gate 让出”，不是立即切换。
+* 没有抢占、步数预算、信号处理；真实标题线程与 `main.patched.bin`
+  入口仍未调用。
+* `ThreadType` 内部布局仍未验证，线程栈仍不使用游戏传入的栈。
+
+## M4 续五十：同步对象的真实阻塞与所有权移交
+
+### 1. 这一轮接了什么
+
+`core/guest/guest_hle_os.c` 的注册表从 33 个 `nn::os` 名字扩到 55 个，
+新增的 22 个是：
+
+| 组 | 入口 |
+|---|---|
+| Mutex | `InitializeMutex`、`FinalizeMutex`、`LockMutex`、`TryLockMutex`、`UnlockMutex` |
+| Event | `InitializeEvent`、`FinalizeEvent`、`WaitEvent`、`TryWaitEvent`、`SignalEvent`、`ClearEvent` |
+| LightEvent | `InitializeLightEvent`、`FinalizeLightEvent`、`WaitLightEvent`、`TimedWaitLightEvent`、`SignalLightEvent`、`ClearLightEvent` |
+| Semaphore | `InitializeSemaphore`、`FinalizeSemaphore`、`AcquireSemaphore`、两个 `ReleaseSemaphore` 重载 |
+
+对象内存仍只作为 identity token。宿主侧用固定表保存：
+
+* mutex：owner 线程槽、递归 depth、recursive 标志、waiter 队列；
+* event / light event：signaled、auto-clear 模式、waiter 队列；
+* semaphore：count、maximum、waiter 队列。
+
+固定表满、未初始化对象、非 owner 解锁、semaphore 超出 maximum 都会写入
+`state->error`，不会静默成功或把两个对象别名到同一个槽。
+
+### 2. 阻塞路径
+
+`guest_hle_os_arm64.S` 新增五个入口：
+`botw_hle_os_guest_lock_mutex`、`wait_event`、`wait_light_event`、
+`timed_wait_light_event`、`acquire_semaphore`。它们和已有的 sleep/wait-thread
+包装器共用同一段保存/恢复代码，操作号分别是 3–7。
+
+`botw_hle_os_blocking_call()` 的执行顺序是：
+
+1. 先从保存帧读出 `x0`（对象指针）和 `x1`（TimeSpan）；`x0` 随后被清零，
+   作为返回值槽；
+2. 能立即完成时直接返回：未占用的 mutex、signaled event/light event、
+   非空 semaphore；
+3. 否则把当前线程加入对象的 waiter 队列，置 `BLOCKED`，由
+   `botw_guest_run_block_and_switch()` 立即恢复另一条 import/gate 帧；
+4. 解锁、signal 或 release 时先从 waiter 队列取出一个/全部有效 waiter，
+   把对象状态交给它，再调用 `botw_guest_run_wake()` 置 READY。
+
+mutex 解锁不是“叫醒后再抢一次”：owner 在 `UnlockMutex` 里直接移交给
+下一个 waiter，depth 置 1。这样即使被唤醒的线程还没运行，其他线程也
+不能插队，避免丢唤醒和优先级反转式的重复阻塞。递归 mutex 的
+`TryLockMutex` 由同一 owner 增加 depth，非递归的第二次尝试返回 0。
+
+Event 的 manual-clear 在 signal 后保持 signaled 并唤醒全部 waiter；
+auto-clear 只唤醒一个 waiter 并立即清掉 signaled。LightEvent 使用相同
+规则。Semaphore 的 `ReleaseSemaphore(n)` 先把 count 加到 maximum 以内，
+再按 count 逐个把 permit 交给 waiter；每个被交接的 waiter 计入一次
+acquire，不要求它恢复后再执行一次 `TryAcquire`。
+
+### 3. 定时等待
+
+`TimedWaitLightEvent` 的 deadline 仍用 run 的确定性虚拟时钟：
+
+```
+deadline = run->clock + span_to_ticks(ns)
+```
+
+`sleep_prepare()` 之外新增了通用的 `wait_deadline` 字段，sleep、thread join
+和同步等待共用同一套 blocked 表。没有可运行线程时，调度器把 clock 推进到
+最早的 `wait_deadline`；`wake_expired()` 先调用 run 的 `timeout_fn`，让 HLE
+把该线程从 light-event 的 waiter 队列移除，并向保存帧写回 `x0 = 0`，然后
+才把线程置 READY。这样超时后对象表里不会留下“幽灵 waiter”，之后一次
+`SignalLightEvent` 也不会错误地唤醒已经超时的线程。
+
+`botw_guest_run_set_timeout()` 是新增的宿主 hook；`botw_hle_os_attach_run()`
+安装它，detach/reset 时清除。hook 只在 timeout 路径调用，不能切线程。
+
+### 4. 测试
+
+* `tests/guest_hle_os_test.cpp` 现在逐个检查 55 个 mangled name，并覆盖
+  mutex 的非递归/递归 `TryLock`、manual/auto event、timed light event
+  立即返回、semaphore count 与 finalize；Windows x86 上通过。
+* `tests/guest_sync_probe_arm64.S` + `tests/guest_sync_test.cpp` 用四个真实
+  AArch64 客体 worker：
+  * main 持有 mutex 后在 light event 上定时等待；worker-a 阻塞在 mutex；
+    main 超时后解锁并 join，验证 timed wake + mutex 所有权移交；
+  * worker-b 在 main 等待 event 时 signal，验证 auto-clear event 唤醒；
+  * worker-c 先 signal event 再阻塞在 semaphore，main 被唤醒后 release，
+    验证 permit 交接；
+  * worker-d signal 一个 untimed light event，main 再在同一对象上做一次
+    无 peer 的定时等待并超时。
+  预期计数：9 次 block、9 次 wake、12 次 switch、4 次线程退出；mutex
+  lock/unlock = 2/2，event block/signal = 2/2，light block/wait/signal/
+  timeout = 3/3/1/2，semaphore block/acquire/release = 1/1/1。
+* 本机（Windows x86）完整 `scripts/build_abi_test.ps1` 已通过；AArch64
+  探针只做了 cross-assemble 语法检查，macOS arm64 CI 已加入编译/执行步骤，
+  但本轮没有 Mac 可执行它。
+
+### 5. 仍然不成立
+
+* message queue、system event、multi-wait、`SetUserExceptionHandler` 仍在
+  共享 stub 上；
+* 没有抢占；纯计算且无 gate/自旋回边的长循环仍会饿死其他线程；
+* `YieldThread` 仍是“下一个 gate 让出”，不是立即切换；
+* 没有步数预算/信号处理；真实标题线程与 `main.patched.bin` 入口仍未调用；
+* `ThreadType`、`MutexType`、`EventType` 等对象内部布局仍未被验证；HLE
+  只把它们当不透明指针；
+* 定时等待只有虚拟时钟，没有 host timer / `svcCancelSynchronization`。
+
+## M4 续五十一：MessageQueue 的 FIFO/LIFO 与阻塞交接
+
+### 1. 这一轮接了什么
+
+`nn::os` 的 8 个 MessageQueue 导入已接入：
+
+| 操作 | 语义 |
+|---|---|
+| `InitializeMessageQueue` / `FinalizeMessageQueue` | 对象指针只作 identity token；ring 使用 guest 传入的真实缓冲区 |
+| `SendMessageQueue` | 队尾 FIFO 入队；队列满时阻塞 |
+| `JamMessageQueue` | `offset -= 1` 后写入，从队头插队；队列满时阻塞，不覆盖旧消息 |
+| `ReceiveMessageQueue` | 从队头取出；空队列时阻塞 |
+| `TrySendMessageQueue` | 队列满返回 false，不阻塞 |
+| `TryReceiveMessageQueue` | 队列空返回 false，不阻塞 |
+| `TryPeekMessageQueue` | 只读队头，不消费 |
+
+阻塞的 receiver 在变成 READY 前，消息已经写入它传给 guest 的输出地址；
+阻塞的 sender 在队列腾出空间后先完成入队，再被唤醒。这样 import 包装器
+恢复执行时不需要再次进入 C 函数重试。
+
+### 2. 与 Atmosphere 的语义核对
+
+对照 `libstratosphere/source/os/os_message_queue.cpp` 和
+`impl/os_message_queue_helper.hpp`，修正了两个容易误实现的地方：
+
+* `Jam` 是 LIFO 插队，不是覆盖最旧消息；
+* `TryPeek` 不改变 ring 的 `count` / `offset`。
+
+### 3. 测试与计数口径
+
+* `tests/guest_hle_os_test.cpp` 在 Windows 和 Apple arm64 上覆盖 FIFO、
+  `TryPeek`、`TrySend`、`TryReceive` 和 portable `Jam` 顺序。
+* 新增 `tests/guest_message_queue_probe_arm64.S` +
+  `tests/guest_message_queue_test.cpp`，在 AArch64 上验证：
+  * 阻塞 receiver 的直接消息交接；
+  * 队列满时阻塞 sender，receive 后按 FIFO 接纳；
+  * 阻塞 Jam 在空间释放后插到队头；
+  * 计数为 9 次 block、9 次 wake、3 次线程退出。
+* `BOTW_HLE_OS_COUNT` 是注册表条目数，不等于标题导入覆盖率。当前 63 个
+  条目中 62 个是 1.6.0 的 `nn::os` 导入，另有一个 `FreeMemoryBlock`；
+  标题实际导入 74 个，仍缺 12 个：SystemEvent 4、MultiWait 7、
+  `SetUserExceptionHandler` 1。
+
+### 4. 仍然不成立
+
+* 多个同时阻塞的 `Jam` sender 目前按 waiter 表顺序接纳，尚未证明与
+  Horizon 内核的先入先出/优先级顺序完全一致；
+* ring 缓冲区由宿主直接解引用，尚未改成显式 guest-memory 访问器；
+* 没有抢占；真实标题线程与 `main.patched.bin` 入口仍未调用。
+
+## M4 续五十二：SystemEvent、MultiWait 与 nn::os 导入表收口
+
+### 1. 导入覆盖
+
+这一轮把标题实际导入的 `nn::os` 剩余 12 个入口接完：
+
+| 类别 | 标题导入 | 说明 |
+|---|---:|---|
+| SystemEvent | 4 | `WaitSystemEvent`、`TryWaitSystemEvent`、`TimedWaitSystemEvent`、`DestroySystemEvent` |
+| MultiWait | 7 | MultiWait / holder 的 initialize、finalize、link / unlink 与 `WaitAny` |
+| 用户异常 | 1 | `SetUserExceptionHandler` |
+
+注册表现在有 **78 个表项**：74 个标题导入加上 4 个 helper（SystemEvent 的 initialize /
+signal / clear，以及原有的 `FreeMemoryBlock`）。`guest_hle_os_test` 会把每个 mangled
+name 单独 lookup 一次，漏一个名字就会失败。
+
+### 2. SystemEvent
+
+SystemEvent 使用和 Event 类似的宿主固定表，guest 的 `SystemEventType*` 只作 identity
+token。clear mode 按 Atmosphere 的定义解释，**不是按 C 布尔直觉**：
+
+```cpp
+enum EventClearMode {
+    EventClearMode_ManualClear = 0,
+    EventClearMode_AutoClear   = 1,
+};
+```
+
+因此 `clear_mode != 0` 才是 auto-clear。`TryWaitSystemEvent` 立即消费 auto-clear
+信号；manual-clear 会保持置位，直到 `ClearSystemEvent`。阻塞版
+`WaitSystemEvent` / `TimedWaitSystemEvent` 走新增的 AArch64 import 包装器：
+
+1. 保存完整客体帧；
+2. 无信号时把当前线程加入该 SystemEvent 的 waiter 表并置 `BLOCKED`；
+3. signal 按 clear mode 唤醒（auto-clear 一个，manual-clear 全部）；timed wait 的 deadline 到达时由 run 的 timeout hook
+   移除 waiter，并把 `false` 写进保存帧的 `x0`。
+
+`WaitSystemEvent` 的 C++ 返回类型是 `void`，所以 `x0` 不参与 ABI；timed wait 的
+`bool` 才需要恢复前写回。
+
+### 3. MultiWait / WaitAny
+
+标题只导入了 `InitializeMultiWaitHolder(MultiWaitHolderType*, EventType*)` 这个重载，
+所以当前 holder 表只接受 Event，不接受 SystemEvent。MultiWait 保存 holder 的 link
+顺序；`Unlink` 后重新 link 会排到队尾，`WaitAny` 选择这个顺序里第一个有信号的
+holder。
+
+`WaitAny` 返回的是 **holder 指针**，不是 Event 指针，也不消费 auto-clear 信号。
+所以测试在 `WaitAny` 返回后还要对对应 Event 调一次 `TryWaitEvent`。阻塞路径在
+signal 时把 holder 指针写进等待线程的保存帧，然后才把线程置 READY。
+
+当前有一个已知语义缺口：如果同一个 auto-clear Event 同时有直接 `WaitEvent`
+waiter 和 `WaitAny` waiter，`SignalEvent` 会先把信号交给直接 waiter，`WaitAny`
+不会被同一次 signal 唤醒。标题目前没有证明会构造这个组合；不要把它当成完整的
+Horizon 多等待仲裁器。
+
+### 4. SetUserExceptionHandler
+
+只保存 handler、arg、stack、stack size 和调用计数，**不会**在 fault / SVC 异常时
+调用 handler。也没有异常栈切换、异常上下文构造、`UserExceptionInfo` 打包或
+`ThrowUserException` 语义。这一项是“导入不再落到共享 stub”，不是“用户异常可用”。
+
+### 5. 测试
+
+* `tests/guest_hle_os_test.cpp` 覆盖 78 个名字、SystemEvent auto-clear 序列、
+  MultiWait link 顺序、`WaitAny` 不消费 Event，以及 `SetUserExceptionHandler`
+  配置回读。
+* 新增 `tests/guest_system_event_probe_arm64.S` + `tests/guest_system_event_test.cpp`：
+  * worker-sys 在主线程 `WaitSystemEvent` 阻塞后 signal；
+  * 无 peer 时 `TimedWaitSystemEvent(2ms)` 由虚拟时钟推进并返回 false；
+  * Event 1 先 link，worker-mw signal 后 `WaitAny` 必须返回 holder 1；
+  * Event 2 已置位时第二次 `WaitAny` 立即返回 holder 2；
+  * 断言 13 个 guest 计数，以及 `run.blocks=3`、`wakes=3`、`switches=4`、
+    `thread_exits=2`；HLE 计数为 SystemEvent waits/blocks/signals/timeouts =
+    2/2/1/1，MultiWait waits/blocks/wakes/links = 2/1/1/2。
+* Windows x86 只编译 portable 路径并跳过 AArch64 执行；`guest_system_event_probe_arm64.S`
+  和 `guest_hle_os_arm64.S` 已用 `--target=aarch64-apple-ios17.0` 交叉汇编通过。
+* macOS arm64 CI run `41406048341` 已全绿，实际输出：
+  * `guest_system_event_test: ok (SystemEvent wait/timeout, WaitAny holder handoff)`；
+  * `guest_sync_test: ok (9 blocks, 9 wakes, mutex/event/light/semaphore)`；
+  * `guest_hle_os_test: ok (78 nn::os names, thread table, TLS, time, memory blocks, sync objects, message queues)`。
+* 顺带修正 `guest_sync_test` 的初始化错误：light event 之前误调 `InitializeEvent`，
+  在 macOS 上首次真正执行时导致 9 个断言失败；现已改为 `InitializeLightEvent`。
+
+### 6. 仍然不成立
+
+* SystemEvent 的 inter-process / native-handle 模式未实现，也没有跨进程可读 / 可写
+  handle 的 attach / detach；
+* `WaitAny` 只支持 Event holder，不支持 SystemEvent / timer / interrupt holder；
+* 没有抢占、步数预算或宿主 timer；长计算循环仍可能饿死其他客体线程；
+* 用户异常只保存配置，不派发；
+* 真实标题线程和 `main.patched.bin` 入口仍未调用，以上结果全部来自合成客体探针。
+
+## M4 续五十三：iOS App 内执行第一条客体指令
+
+### 1. 这一轮接了什么
+
+`botw_core_guest_selftest()` 不再只检查注册表，而是真正调用
+`botw_guest_run_init()` / `botw_guest_run_enter_at()`：
+
+* `ios/BotW/guest_app_probe_arm64.S` 是一段随 App 一起编译的 AArch64 探针；
+* 探针压入自己的 x29/x30，读取 `x0` 传入的参数块，写入三个派生值；
+* 它把压栈后的 sp 写回参数块，证明执行发生在 `botw_guest_run` 的独立客体栈上；
+* 探针把 `"BOTW"` 魔数放进 x0 后 `ret`，落到 run 安装的退出哨兵；
+* 宿主检查 `reason == RETURNED`、三个内存字、sp == `stack_top - 16` 和 `exit_x0`。
+
+探针不是标题镜像，也不调用 HLE；它只验证 App→guest_run→AArch64→退出哨兵这条
+链路。HLE 调用仍由 `guest_system_event_test` / `guest_sync_test` 等独立测试覆盖。
+
+### 2. App 自检
+
+`BotWApp` 的 `BOTW_SELFTEST=1` 路径现在依次执行：
+
+1. `botw_core_guest_selftest()`；
+2. `botw_core_selftest()`（Metal 回放与像素回读）；
+3. 合并两个返回值，写 `BOTW_SELFTEST rc=0 (guest=0 replay=0)` 后退出。
+
+macOS arm64 CI run `41409268996` 的 `portable` 与 `ios` 两个 job 均 success，
+模拟器中的自检报告为：
+
+```text
+botw_guest_selftest: ok (reason=1 words=5457424f/54574350/11f sp=10077fff0 exit_x0=5457424f)
+BOTW_GUEST_SELFTEST rc=0
+BOTW_SELFTEST rc=0 (guest=0 replay=0)
+```
+
+`reason=1` 是 `BOTW_GUEST_EXIT_RETURNED`；三个参数块字分别是魔数 `0x5457424f`、
+派生值 `0x54574350`、异或值 `0x11f`，`sp=0x10077fff0` 等于 `stack_top - 16`，
+`exit_x0` 与魔数一致。
+
+### 3. 仍然不成立
+
+* 探针是编译进 App 的合成代码，不是 `main.patched.bin`；
+* 探针没有经过 HLE gate/import，也没有创建客体线程；
+* iOS 真机 arm64e 的函数指针签名（PAC）路径尚未验证；模拟器是 arm64；
+* 真实标题镜像装载、服务层和第一条 `main` 指令仍是后续工作。
+
+## M4 续五十四：四模块交叉链接与真实 HLE 面收口
+
+### 1. 问题
+
+单模块 `botw_guest_image_open()` 把每个 `st_shndx == 0` 的符号都交给 HLE。
+但 1.6.0 的四个模块是一个环：
+
+| 模块 | 未定义符号 | 其中由另一模块定义 |
+|---|---:|---:|
+| main | 459 | 446（430 sdk + 16 subsdk0） |
+| sdk | 14 | 8（malloc/free 等来自 main） |
+| subsdk0 | 648 | 643（640 sdk） |
+| rtld | 20 | 3（sdk 的 init、main 的 runtime object） |
+
+按单模块方式装载，main 的 1,414 次导入解析里只有约 12 次真正需要 HLE，
+其余 1,402 次会被错误地绑到零返回 stub。之前“1,137 个唯一 HLE 名字”的
+估计把跨模块导入也算进去了，不能当作 HLE 工作量。
+
+### 2. 这一轮接了什么
+
+* `guest_image.c` 拆出 `bind()` / `relocate()`：先只建立基址和动态表，
+  不写重定位；四个模块全部 bind 完才能建全局符号索引。
+* 新增 `botw_guest_image_symbol_count()` / `symbol_at()` /
+  `find_symbol()`；符号名仍指向镜像自己的字符串表，不复制。
+* 新增 `core/guest/guest_modules.{h,c}`：
+  * `botw_guest_modules_add()` 解析 fixups、私有复制、bind，不 relocate；
+  * `botw_guest_modules_link()` 先建开放寻址符号索引（FNV-1a，
+    容量为定义数的两倍），再逐模块 relocate；
+  * 解析顺序按加入顺序：先加入模块的定义优先，然后才调用 HLE；
+  * 未解析的符号是错误，不会静默写 NULL；
+  * `SHN_ABS` 直接返回符号值，其余返回 `base + st_value`；
+  * 一个符号恰好等于 `img->size`（ELF 的 `end`）是合法的 one-past-end，
+    不再被误判为越界。
+* `tests/guest_modules_test.cpp`：两个合成模块，provider 定义 `exported`、
+  consumer 导入它；断言 2 次跨模块解析、4 次 HLE、重复模块名与缺失导入
+  被拒绝。Windows `build_abi_test.ps1` 与 Linux/macOS CI 都执行。
+* `reloc_run --multi <dir>`：按 main、sdk、subsdk0、rtld 的顺序装载真实
+  模块，打印每模块的 resolver / cross / hle 计数和页保护计划。
+
+### 3. 1.6.0 实测
+
+```text
+reloc_run: module main    size=46.1 MiB relocs=211506 symbols=959  resolver=1414 cross=1402 hle=12 imports=455 entry=0x30
+reloc_run: module sdk     size=13.3 MiB relocs=22829  symbols=13453 resolver=16   cross=10   hle=6  imports=8838 entry=0x30
+reloc_run: module subsdk0 size=7.6 MiB  relocs=14371  symbols=12694 resolver=6545 cross=6541 hle=4  imports=4804 entry=0x30
+reloc_run: module rtld    size=0.1 MiB  relocs=15     symbols=0    resolver=19   cross=3    hle=16 imports=19   entry=0x100
+reloc_run: linked modules=4 symbols=35739 cross=7956 hle=38 load=53ms
+```
+
+`resolver` 是模块重定位时所有未定义符号的解析次数；`cross` 是其中由另一
+模块的定义回答的次数；`hle` 是剩余落到 HLE 的次数。7,956 次跨模块解析、
+38 次 HLE，最后只有 25 个不同的名字落到共享 stub（glslc* 与
+`__rel_dyn_*` / `__rel_plt_*` / `__EX_*` / `__got_*` / `__rela_*` /
+`__tbss_*` / `__tdata_*` 这些链接器标记）。这比按全部未定义符号估的
+1,137 小两个数量级。
+
+### 4. 证明了什么、还没有证明什么
+
+证明：
+
+* 同一份 portable 代码能把四个 1.6.0 模块的全部重定位应用完；
+* 交叉模块的 7,956 个引用绑到了真实模块的 `base + st_value`，而不是 stub；
+* 真实 HLE 面在链接后只剩 38 次引用 / 25 个名字，HLE 表不需要 1,137 项；
+* 合成测试覆盖了“一个模块定义、另一个模块导入”、重复名、缺失导入和
+  链接后继续添加模块的拒绝路径。
+
+没有证明：
+
+* **没有执行任何一条真实标题指令**：`reloc_run` 只写重定位，不执行；
+* iOS App 仍然只映射一个合成镜像，还没有把四模块映射计划接进
+  `botw_guest_map`；
+* rtld 在 16 KiB 页上仍是 RWX 冲突（`plan conflict=1`）；iOS 需要双映射，
+  或者干脆不运行 rtld（我们的 loader 已经替代它的职责）；
+* 25 个 stub 还没有实现；`glslc*` 目前返回 0，链接器标记也没有给出真实值；
+* 每个模块的 key page / 线程槽还没有在多个模块上发布。
+
+### 5. 下一步
+
+1. 给 `botw_guest_map` 增加多模块接口：每个模块独立 `mmap` + 按页
+   `mprotect`，但共享同一个 HLE 表和跨模块符号索引；
+2. 处理 rtld 的 16 KiB RWX 冲突：优先不加载 rtld，由宿主 loader 直接
+   承担重定位；若必须加载，则把 text 与 data 双映射到不同地址；
+3. 发布每个模块的 key page，先进入 `main` 的 `DT_INIT`（0x30），观察
+   第一条真实指令和第一个 HLE 调用；
+4. 把 `glslc*` 与链接器标记补成明确实现或明确拒绝，避免 stub 返回 0
+   被误当成成功。
+
+### 6. 门禁
+
+```text
+python scripts/verify_ios.py
+python scripts/guest/verify_rewrite.py --self-test
+python scripts/guest/probe_relocs.py --self-test
+powershell -ExecutionPolicy Bypass -File scripts/build_abi_test.ps1
+```
+
+最近一次本机结果：`guest_modules_test: ok (cross=2, hle=4, duplicate/missing refusals)`，
+`build_abi_test: all tests passed`。

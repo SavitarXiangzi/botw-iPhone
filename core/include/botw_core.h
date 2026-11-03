@@ -71,6 +71,25 @@ int botw_core_nvn_has(const botw_core* core, const char* proc_name);
  * instead of only compiling it. */
 int botw_core_selftest(void);
 
+/* Debug hook: enters a tiny built-in AArch64 probe through the real
+ * botw_guest_run path (private stack, exit sentinel, host return).  It
+ * proves that the iOS binary can execute native guest code; it does not
+ * load the title image yet.  Returns 0 on success, 1 when the probe
+ * result differs, 2 when run setup fails, or -1 on non-AArch64 hosts. */
+int botw_core_guest_selftest(void);
+
+/* Debug hook: maps a synthetic patched.bin into executable memory with
+ * botw_guest_map_open(), publishes a thread slot, enters a rewritten gate
+ * block on a real guest stack, and verifies the dispatcher plus the exit
+ * sentinel.  It exercises the app-side loader/mapping/gate chain without any
+ * title data.  Returns 0 on success, 1 on a loader/mapping/gate failure, 2
+ * when the guest run cannot be set up, or -1 on non-AArch64 hosts. */
+int botw_core_guest_image_selftest(void);
+
+/* Human-readable result of the last botw_core_guest_image_selftest(), for
+ * the debug report the Swift shell writes to selftest.txt. */
+const char* botw_core_guest_image_selftest_report(void);
+
 #ifdef __cplusplus
 }
 #endif

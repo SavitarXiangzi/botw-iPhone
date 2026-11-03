@@ -9,11 +9,18 @@
 > 里跑通了十八条合成 draw（模拟器实际执行十七条）与七阶段 instanced / base-vertex / indirect draw 回归，其中包括从 guest 内存池
 > 解块上传的纹理、从离线 MSL bundle 按 guest key 命中的 shader，以及
 > `WriteTexels` / `FlushTexels` 触发重传的连续纹理更新。
-> **但 iOS 侧还没有客体核心，draw 依然一条都不执行**：Windows Unicorn
-> 捕获已证明 1.6.0 标题会发真实 draw/present（两次 700 s 长跑为
-> 707 / 304 与 667 / 288 draws/presents），但那是宿主调用捕获，不是 iOS 上的客体执行；首要缺口
-> 仍是把 1.6.0 的 ARM64 客体核心接进 app（AOT 改写已跑通，loader/HLE 未接），以及 Maxwell SASS -> MSL 的
-> 翻译器；NVNtextureView 的 16 字节状态对象已可读写，但通用 view 的
+> **iOS app 已经能执行两类 AArch64 客体代码**：内置探针经
+> `botw_guest_run` 进入/返回；合成 `patched.bin` 经 `botw_guest_map_open`
+> 映射成 16 KiB 页上的 RX/RW 段，发布 key page slot 后从 patch 区 gate
+> block 进入（CI run 41414601410：`page=16384 span=0x14000 runs=4 gates=1
+> exit_x0=0x47415445`）。
+> **但真实标题镜像还没有接进 app**：1.6.0 的 rtld/main/sdk/subsdk0 装载、
+> MOD0 init、HLE bootstrap 和真实线程入口都还没接，所以 iOS 上的真实
+> draw/present 仍是 0。Windows Unicorn 捕获已证明 1.6.0 标题会发真实
+> draw/present（两次 700 s 长跑为 707 / 304 与 667 / 288
+> draws/presents），但那是宿主调用捕获，不是 iOS 上的客体执行。首要缺口
+> 仍是将真实模块入口接上 loader/HLE，以及 Maxwell SASS -> MSL 的翻译器；
+> NVNtextureView 的 16 字节状态对象已可读写，但通用 view 的
 > swizzle/depth-stencil mode 尚未应用到采样/渲染目标，多队列、跨队列同步与
 > present blit 等待仍不完整；任意 mapped write 的精确脏页跟踪、BC6H/BC7 也还没有闭环。
 
@@ -86,6 +93,31 @@ syntax_check_metal: ok (clang++.exe)
 verify_ios: ok (metal bindings: 484/514)
 build_abi_test: all tests passed
 ```
+
+### App 内客体 selftest
+
+设 `BOTW_SELFTEST=1` 后，`BotWApp` 会在模拟器里依次跑：
+
+- `botw_core_guest_selftest()`：静态链接的 AArch64 探针，验证独立 guest
+  栈、guard page、x30 退出哨兵和宿主返回；
+- `botw_core_guest_image_selftest()`：在进程内构造最小 `patched.bin`，
+  走 `botw_guest_map_open()` 的 mmap / 重定位 / 按页 `mprotect`，经
+  `botw_guest_map_publish_slot()` 发布 key page，再进入 patch 区的 gate
+  block，验证 trampoline、dispatcher、寄存器写回和退出路径。
+
+最近一次 CI（run 41414601410，macOS arm64 模拟器）的完整结果：
+
+```
+BOTW_GUEST_SELFTEST rc=0
+BOTW_GUEST_IMAGE_SELFTEST rc=0 ok (page=16384 span=0x14000 runs=4 gates=1 exit_x0=0x47415445)
+BOTW_SELFTEST rc=0 (guest=0 image=0 replay=0)
+in-app self-tests (guest, mapped image, replay): rc=0
+```
+
+这证明**这个未签名的模拟器进程**允许匿名 RW 内存经 `mprotect` 变成 RX，
+且 16 KiB 页的布局计划可用；它不证明真机 arm64e / PAC / code-signing
+策略也允许同样的映射，也不证明真实标题已经能跑。unsigned device build
+在同一 CI 中只验证编译和链接，没有在真机执行。
 
 ### `syntax_check_metal.py` 到底检查什么
 
@@ -733,12 +765,12 @@ constexpr int kEnumsVerified = 0;
 
 | 缺口 | 现状 | 影响 |
 |---|---|---|
-| 客体核心 | 1.6.0 四模块的 AOT 改写链路已在 `scripts/guest` 跑通（vendored nxnative，MIT）；iOS 工程仍未链接运行时 loader / HLE | 真实标题的 draw/present 仍只存在于 Windows Unicorn 捕获，iPhone 上不会执行 |
+| 客体核心 | 1.6.0 四模块的 AOT 改写链路已在 `scripts/guest` 跑通（vendored nxnative，MIT）；iOS app 已链接 loader / map / slot / gate，并在模拟器内执行合成 `patched.bin`（run 41414601410）；真实模块装载顺序、MOD0 init 与 HLE bootstrap 未接 | 真实标题的 draw/present 仍只存在于 Windows Unicorn 捕获，iOS 上不会执行 |
 | 渲染目标绑定 | 1–8 个颜色附件、深度/模板附件、纯深度 pass 与 MRT 已接；通用 texture view 仍只记录 | 通用 view 的绑定仍不完整 |
 | 命令句柄回放 | `CallCommands` / `CopyCommands`、嵌套展开、句柄释放与录制时输入快照已接；实现是宿主调用捕获，不是 guest 命令字节解释器 | 不能观察或原地修补客体的命令记录；持久对象（纹理/程序/池/事件）仍按回放时状态解析；单段 arena 上限 256 MiB |
 | 着色器翻译 | 只留了接口，没有实现 | 客体的 draw 全部停在 `noPipeline` |
 | 纹理创建 | 建 host `MTLTexture`；首次采样时从 guest pool 解块/上传，WriteTexels/FlushTexels 后标脏重传 | 2D/数组/cube/LINEAR 和 BC1–BC5 可采样；BC6H/BC7、通用 texture view 与任意 mapped write 的脏页跟踪仍不完整 |
-| draw 执行 | 有 pipeline 就真的编码 draw；没有就丢弃；实例化、base-vertex 与两种 indirect draw 已接 | iOS 客体仍是 0 条（未链接客体核心）；Windows 捕获侧已有 707 draws / 304 presents；自检十八条 draw（模拟器执行十七条）加七阶段 instanced / base-vertex / indirect 回归、sampler 状态与 compute dispatch 回归由 CI 执行 |
+| draw 执行 | 有 pipeline 就真的编码 draw；没有就丢弃；实例化、base-vertex 与两种 indirect draw 已接 | iOS 真实标题仍是 0 条（合成 gate 已执行，标题入口未接）；Windows 捕获侧已有 707 draws / 304 presents；自检十八条 draw（模拟器执行十七条）加七阶段 instanced / base-vertex / indirect 回归、sampler 状态与 compute dispatch 回归由 CI 执行 |
 | 顶点输入 | attrib/stream 已接，缓冲从 pool 零拷贝绑到 `MTLBuffer` | 自检的第二条 draw 就是这条路；客体尚未跑到 |
 | 浮点参数 | `nvngfx_args.f[8]` 已扩展，float 在低 32 位 | 本仓库外 guest 调用端仍需实现 s/d 寄存器桥 |
 | 采样器资源 | builder/object、sampler pool 与 `MTLSamplerState` 已建，句柄可解析 | `[[id(k)]]`、c1、packed slot、bindless 与顶点参数缓冲区已接；真实标题 shader 仍缺离线翻译链 |

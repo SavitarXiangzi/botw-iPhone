@@ -6,6 +6,7 @@
 #include "guest_hle.h"
 #include "guest_hle_nn.h"
 #include "guest_hle_fs.h"
+#include "guest_hle_os.h"
 
 #include <ctype.h>
 #include <math.h>
@@ -235,5 +236,8 @@ void botw_hle_init(botw_hle_table* hle) {
     /* nn::fs is registered but unconfigured: the iOS shell calls
      * botw_hle_fs_init() with the sandbox root before the guest runs. */
     (void)botw_hle_fs_register(hle, NULL);
+    /* nn::os owns the guest thread table.  It is registered unattached: the
+     * shell calls botw_hle_os_attach_run() after botw_guest_run_init(). */
+    (void)botw_hle_os_register(hle, NULL);
 }
 

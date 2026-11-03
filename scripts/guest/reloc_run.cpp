@@ -8,6 +8,13 @@
  *
  *   reloc_run <module.patched.bin> <module.fixups.tsv> [page_size] [--slot]
  *
+ *   reloc_run --multi <dir> [page_size] [--hle] [--names]
+ *
+ * --multi loads main/sdk/subsdk0/rtld from <dir>, binds them in that order,
+ * and lets the linker resolve cross-module symbols before falling back to HLE.
+ * That is the shape the real four-module set needs; the single-image mode
+ * cannot resolve the 430 sdk imports of main or the malloc/free imports of sdk.
+ *
  * It also prints the page protection plan the image would need, which is the
  * input to the executable mapping.  The page size defaults to 16 KiB (iOS);
  * pass 0x1000 to see how the same module looks on a 4 KiB host.  `--slot`
@@ -23,6 +30,7 @@
  */
 #include "guest_hle.h"
 #include "guest_image.h"
+#include "guest_modules.h"
 #include "guest_slot.h"
 
 #include <algorithm>
@@ -156,14 +164,129 @@ static int publish_slot(botw_guest_image* img) {
     return ok ? 0 : 1;
 }
 
+static void print_plan(botw_guest_image* img, size_t page) {
+    botw_guest_segment seg[16];
+    size_t n = botw_guest_image_plan(img, page, seg, 16);
+    size_t span = botw_guest_image_map_size(img, page);
+    if (n == 0) {
+        std::printf("reloc_run: plan page=%#zx FAIL: %s\n", page, img->error);
+        return;
+    }
+    size_t shown = n < 16 ? n : 16;
+    std::printf("reloc_run: plan page=%#zx span=%#zx runs=%zu conflict=%d\n",
+                page, span, n, botw_guest_image_plan_conflict(img, page));
+    for (size_t i = 0; i < shown; i++) {
+        char prot[4];
+        prot[0] = (seg[i].prot & BOTW_GUEST_PROT_READ) ? 'r' : '-';
+        prot[1] = (seg[i].prot & BOTW_GUEST_PROT_WRITE) ? 'w' : '-';
+        prot[2] = (seg[i].prot & BOTW_GUEST_PROT_EXEC) ? 'x' : '-';
+        prot[3] = '\0';
+        std::printf("  [%#zx, %#zx) %s\n", seg[i].off, seg[i].off + seg[i].len, prot);
+    }
+}
+
+static bool file_exists(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    return (bool)in;
+}
+
+static int run_multi(const char* dir, size_t page, int want_hle, int want_names) {
+    static const char* const kOrder[] = {"main", "sdk", "subsdk0", "rtld"};
+    botw_guest_modules set;
+    std::memset(&set, 0, sizeof set);
+    if (want_hle) botw_hle_init(&g_hle);
+    for (size_t i = 0; i < sizeof kOrder / sizeof kOrder[0]; ++i) {
+        std::string bin = std::string(dir) + "/" + kOrder[i] + ".patched.bin";
+        std::string fix = std::string(dir) + "/" + kOrder[i] + ".fixups.tsv";
+        if (!file_exists(bin)) {
+            if (i == 0) {
+                std::printf("reloc_run: cannot read %s\n", bin.c_str());
+                return 2;
+            }
+            continue;
+        }
+        std::vector<unsigned char> image, fixups;
+        if (!slurp(bin.c_str(), image) || !slurp(fix.c_str(), fixups)) {
+            std::printf("reloc_run: cannot read %s or %s\n", bin.c_str(), fix.c_str());
+            return 2;
+        }
+        std::string header((const char*)fixups.data(), fixups.size());
+        if (botw_guest_modules_add(&set, kOrder[i], image.data(), image.size(),
+                                   header.c_str()) != 0) {
+            std::printf("reloc_run: FAIL %s: %s\n", kOrder[i], set.error);
+            botw_guest_modules_close(&set);
+            return 1;
+        }
+    }
+    auto start = std::chrono::steady_clock::now();
+    int rc = botw_guest_modules_link(&set,
+                                     want_hle ? botw_hle_resolve : sentinel_resolve,
+                                     want_hle ? (void*)&g_hle : nullptr);
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - start).count();
+    if (rc != 0) {
+        std::printf("reloc_run: FAIL multi: %s\n", set.error);
+        botw_guest_modules_close(&set);
+        return 1;
+    }
+    for (unsigned i = 0; i < set.count; ++i) {
+        const botw_guest_image& img = set.mods[i].image;
+        unsigned fallthrough = img.hle > set.mods[i].cross ? img.hle - set.mods[i].cross : 0;
+        std::printf("reloc_run: module %-7s size=%.1f MiB relocs=%u symbols=%u "
+                    "resolver=%u cross=%u hle=%u imports=%u entry=%#zx\n",
+                    set.mods[i].name, (double)img.file_size / (1024.0 * 1024.0),
+                    img.relocs, img.symbols, img.hle, set.mods[i].cross, fallthrough,
+                    img.imports, botw_guest_image_entry(&img));
+    }
+    std::printf("reloc_run: linked modules=%u symbols=%u cross=%u hle=%u load=%lldms\n",
+                set.count, set.nsyms, set.cross, set.hle, (long long)ms);
+    if (want_hle) {
+        std::printf("reloc_run: hle implementations=%zu stubs=%zu%s%s\n",
+                    botw_hle_implementation_count(&g_hle),
+                    botw_hle_stub_count(&g_hle),
+                    g_hle.error[0] ? " error=" : "",
+                    g_hle.error[0] ? g_hle.error : "");
+        if (want_names) report_names();
+    }
+    for (unsigned i = 0; i < set.count; ++i) print_plan(&set.mods[i].image, page);
+    botw_guest_modules_close(&set);
+    for (char* block : g_sentinel_blocks) delete[] block;
+    g_sentinel_blocks.clear();
+    return 0;
+}
+
 int main(int argc, char** argv) {
     size_t page = 0x4000;
     int want_slot = 0;
     int want_hle = 0;
     int want_names = 0;
+    if (argc >= 2 && std::strcmp(argv[1], "--multi") == 0) {
+        if (argc < 3) {
+            std::printf("usage: reloc_run --multi <dir> [page_size] [--hle] [--names]\n");
+            return 2;
+        }
+        for (int i = 3; i < argc; i++) {
+            if (std::strcmp(argv[i], "--hle") == 0) {
+                want_hle = 1;
+            } else if (std::strcmp(argv[i], "--names") == 0) {
+                want_hle = 1;
+                want_names = 1;
+            } else {
+                char* end = nullptr;
+                unsigned long long v = std::strtoull(argv[i], &end, 0);
+                if (!end || *end != '\0' || v < 0x1000) {
+                    std::printf("reloc_run: bad page size '%s'\n", argv[i]);
+                    return 2;
+                }
+                page = (size_t)v;
+            }
+        }
+        return run_multi(argv[2], page, want_hle, want_names);
+    }
     if (argc < 3) {
         std::printf("usage: reloc_run <module.patched.bin> <module.fixups.tsv> "
-                    "[page_size] [--slot]\n");
+                    "[page_size] [--slot] [--hle] [--names]\n"
+                    "       reloc_run --multi <dir> [page_size] [--hle] [--names]\n");
         return 2;
     }
     for (int i = 3; i < argc; i++) {
@@ -218,26 +341,7 @@ int main(int argc, char** argv) {
                     g_hle.error[0] ? g_hle.error : "");
         if (want_names) report_names();
     }
-    {
-        botw_guest_segment seg[16];
-        size_t n = botw_guest_image_plan(&img, page, seg, 16);
-        size_t span = botw_guest_image_map_size(&img, page);
-        if (n == 0) {
-            std::printf("reloc_run: plan page=%#zx FAIL: %s\n", page, img.error);
-        } else {
-            size_t shown = n < 16 ? n : 16;
-            std::printf("reloc_run: plan page=%#zx span=%#zx runs=%zu conflict=%d\n",
-                        page, span, n, botw_guest_image_plan_conflict(&img, page));
-            for (size_t i = 0; i < shown; i++) {
-                char prot[4];
-                prot[0] = (seg[i].prot & BOTW_GUEST_PROT_READ) ? 'r' : '-';
-                prot[1] = (seg[i].prot & BOTW_GUEST_PROT_WRITE) ? 'w' : '-';
-                prot[2] = (seg[i].prot & BOTW_GUEST_PROT_EXEC) ? 'x' : '-';
-                prot[3] = '\0';
-                std::printf("  [%#zx, %#zx) %s\n", seg[i].off, seg[i].off + seg[i].len, prot);
-            }
-        }
-    }
+    print_plan(&img, page);
     if (want_slot && publish_slot(&img) != 0) {
         botw_guest_image_close(&img);
         for (char* block : g_sentinel_blocks) delete[] block;

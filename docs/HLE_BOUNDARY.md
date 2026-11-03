@@ -37,6 +37,34 @@
 | `nn::lm::Initialize` / `Finalize` | 日志库依赖 `lm` 服务，无 IPC 时构造失败 |
 | `OsResourceManager` 构造 | 依赖 `svcGetInfo(12/13)` 的地址空间基址/大小 |
 
+## nn::os 直调 HLE 的调度边界
+
+`nn::os::YieldThread` 是**重定位到宿主 C 函数**的直调导入，不是 gate。
+宿主函数返回时，客体还在原来的指令流上；因此 `YieldThread` 只能置
+`botw_guest_run_yield()` 的 `switch_requested`，真正的帧切换发生在下一个
+gate。
+
+所有语义上会阻塞的 `nn::os` 导入都走同一套汇编包装器：先在宿主栈上保存完整客体帧
+（`x0–x30` / SP / PC / NZCV），再调用 `botw_hle_os_blocking_call()`；需要阻塞时由
+`botw_guest_run_block_and_switch()` 把线程置 `BLOCKED` 并立即恢复另一条客体帧。
+被放弃的宿主 C 帧不再展开，线程恢复时直接从 import 调用后的指令继续。
+
+当前阻塞集合包括 `SleepThread`、活目标 `WaitThread`、`LockMutex`、`WaitEvent`、
+`WaitLightEvent`、`TimedWaitLightEvent`、`AcquireSemaphore`、阻塞式 MessageQueue
+（send / jam / receive）、`WaitSystemEvent`、`TimedWaitSystemEvent` 和 `WaitAny`。
+同步对象按 guest 指针索引宿主固定表，HLE 不读写游戏对象内部；解锁 / 释放 / signal
+先把对象状态交给确切的 waiter，再调用 `botw_guest_run_wake()`，避免“被唤醒但对象仍
+不可用”的丢唤醒。定时等待到期时由 `botw_guest_run` 的 timeout hook 通知 HLE 移除
+waiter 并向保存帧写回 false。
+
+恢复路径有两种：gate 帧必须回到改写块末尾的 `ldp x29,x30,[sp],#16`，import 帧直接
+`br x30`。`botw_guest_resume` 用 `kind` 区分，两条 trampoline 不能混用。
+
+`Try*` 路径（`TryLockMutex` / `TryWaitEvent` / `TrySendMessageQueue` 等）返回真实
+布尔值，不进入调度器。`SetUserExceptionHandler` 目前只保存 handler / arg / stack，
+不会派发用户异常；SystemEvent 的 inter-process 模式和 `WaitAny` 的非 Event holder
+也还没有实现。
+
 ## 已知技术债
 
 * **页别名**：Fiber 真正跑起来时需要（复制 + 回写，或自建页表）。当前是“假装成功”。
@@ -50,7 +78,6 @@
   `OP_PRESENT`，没有交换链。
 * **符号表两套地址**：`symbols.json` 里每个模块有两张重叠的表（shndx 1/2），
   查符号要和 `valid_entry()` 一起用，否则会落到 `udf` 填充上。
-
 
 ## 已踩过的第 4 个坑：`svcGetInfo` 的值也要放 x1
 
@@ -275,7 +302,6 @@ _ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvmRKNS0_10ReadOptionE
 窗口 `[0x100000000,0x180000000)` 整个包住，一次 64 MiB 的堆提交就会让后续
 64 KiB 的线程栈槽 `uc.mem_map` 失败（`UC_ERR_MAP`）。现在按四段互不重叠的窗口
 提交，并记录已映射区间。
-
 
 ## 实测补充：NVN 的"空实现"是静默陷阱（M3.6）
 

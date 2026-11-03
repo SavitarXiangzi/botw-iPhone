@@ -11,8 +11,10 @@
  * as long as the table entry is needed.
  *
  * The table is deliberately plain data: no allocation, no OS calls, and no
- * execution.  It is sized for the 1.6.0 rewrite (1,137 unique HLE names
- * across four modules) with room to spare.
+ * execution.  It has 4,096 slots.  After the 1.6.0 four modules are linked
+ * against each other, only 25 distinct names still fall through to this table
+ * (the glslc* group and the linker-provided __rel_dyn/__EX/__got markers), so
+ * the old 1,137-name estimate was counting cross-module imports as HLE.
  *
  * The built-in entries are libc passthroughs whose AAPCS64 signatures are
  * identical on the Switch and on Apple silicon.  Variadic functions are

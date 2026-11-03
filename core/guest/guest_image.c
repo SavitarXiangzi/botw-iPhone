@@ -182,12 +182,25 @@ static int read_dynamic(botw_guest_image* img, dyn_info* d) {
     return 1;
 }
 
+/* The dynamic symbol table ends where the string table starts in every
+ * 1.6.0 module (main: 480 entries, sdk: 25,091).  Keep that relation local:
+ * a malformed layout yields 0 instead of walking a bogus table. */
+static unsigned symbol_count_of(const dyn_info* d) {
+    uint64_t span;
+    if (!d->symtab || !d->strtab || d->strtab <= d->symtab) return 0;
+    if (d->syment < ELF_SYM_SIZE) return 0;
+    span = d->strtab - d->symtab;
+    if (span / d->syment > 0x7fffffffu) return 0;
+    return (unsigned)(span / d->syment);
+}
+
 /* Reads one dynamic symbol.  `name` may be NULL when only shndx/value matter;
  * when it is non-NULL the returned pointer aliases the image's own string
  * table (NUL-terminated, validated inside DT_STRSZ), so symbol names have no
  * copy limit.  The 1.6.0 sdk has names up to 767 bytes. */
 static int symbol_lookup(const botw_guest_image* img, const dyn_info* d, uint64_t sym_index,
-                         unsigned* shndx, uint64_t* value, const char** name) {
+                         unsigned* shndx, uint64_t* value, const char** name,
+                         unsigned* bind) {
     uint64_t at, name_off;
     size_t n;
 
@@ -197,6 +210,7 @@ static int symbol_lookup(const botw_guest_image* img, const dyn_info* d, uint64_
     if (at + ELF_SYM_SIZE > img->size) return 0;
     *shndx = rd16(img->base + at + 6);
     *value = rdu64(img->base + at + 8);
+    if (bind) *bind = (unsigned)(img->base[at + 4] >> 4);
     if (name == NULL) return 1;
 
     if (d->strtab == 0 || d->strsz == 0) return 0;
@@ -220,7 +234,7 @@ static int symbol_address(botw_guest_image* img, const dyn_info* d, uint64_t sym
     uint64_t st_value = 0;
     const char* name = NULL;
 
-    if (!symbol_lookup(img, d, sym, &shndx, &st_value, &name)) {
+    if (!symbol_lookup(img, d, sym, &shndx, &st_value, &name, NULL)) {
         set_error(img, "symbol %llu is not readable", (unsigned long long)sym);
         return 0;
     }
@@ -240,7 +254,7 @@ static int symbol_address(botw_guest_image* img, const dyn_info* d, uint64_t sym
     } else if (shndx == 0xfff1u) { /* SHN_ABS */
         *out = st_value;
     } else {
-        if (st_value >= (uint64_t)img->size) {
+        if (st_value > (uint64_t)img->size) {
             set_error(img, "symbol %s sits past the image (%#llx)",
                       name, (unsigned long long)st_value);
             return 0;
@@ -397,16 +411,31 @@ int botw_guest_image_parse(botw_guest_image* img, size_t file_len,
     return 0;
 }
 
-int botw_guest_image_attach(botw_guest_image* img, void* buffer,
-                            botw_guest_resolve_fn resolve, void* user) {
+int botw_guest_image_bind(botw_guest_image* img, void* buffer) {
     dyn_info d;
     if (!img || !buffer) return -1;
     if (img->file_size == 0) {
-        set_error(img, "layout was not parsed before attach");
+        set_error(img, "layout was not parsed before bind");
         return -1;
     }
     img->base = (uint8_t*)buffer;
     if (!read_dynamic(img, &d)) return -1;
+    img->error[0] = '\0';
+    return 0;
+}
+
+int botw_guest_image_relocate(botw_guest_image* img,
+                              botw_guest_resolve_fn resolve, void* user) {
+    dyn_info d;
+    if (!img || !img->base) {
+        if (img) set_error(img, "image is not bound");
+        return -1;
+    }
+    if (!read_dynamic(img, &d)) return -1;
+    img->relocs = 0;
+    img->symbols = 0;
+    img->hle = 0;
+    img->imports = 0;
     if (d.have_rela && d.rela_sz &&
         !apply_table(img, &d, d.rela_off, d.rela_sz, d.rela_ent, resolve, user)) {
         return -1;
@@ -417,6 +446,12 @@ int botw_guest_image_attach(botw_guest_image* img, void* buffer,
     }
     img->error[0] = '\0';
     return 0;
+}
+
+int botw_guest_image_attach(botw_guest_image* img, void* buffer,
+                            botw_guest_resolve_fn resolve, void* user) {
+    if (botw_guest_image_bind(img, buffer) != 0) return -1;
+    return botw_guest_image_relocate(img, resolve, user);
 }
 
 int botw_guest_image_open(botw_guest_image* img, const void* file, size_t file_len,
@@ -466,4 +501,64 @@ size_t botw_guest_image_entry(const botw_guest_image* img) {
     if (!img || !img->base) return 0;
     if (!read_dynamic((botw_guest_image*)img, &d)) return 0;
     return (size_t)d.init;
+}
+
+unsigned botw_guest_image_symbol_count(const botw_guest_image* img) {
+    dyn_info d;
+    if (!img || !img->base) return 0;
+    if (!read_dynamic((botw_guest_image*)img, &d)) return 0;
+    return symbol_count_of(&d);
+}
+
+int botw_guest_image_symbol_at(const botw_guest_image* img, unsigned index,
+                               const char** name, uint64_t* value,
+                               unsigned* shndx, unsigned* bind) {
+    dyn_info d;
+    unsigned n;
+    unsigned local_shndx = 0;
+    uint64_t local_value = 0;
+    const char* local_name = NULL;
+    unsigned local_bind = 0;
+    if (!img || !img->base) return 0;
+    if (!read_dynamic((botw_guest_image*)img, &d)) return 0;
+    n = symbol_count_of(&d);
+    if (index >= n) return 0;
+    if (!symbol_lookup(img, &d, index, &local_shndx, &local_value, &local_name,
+                       &local_bind)) {
+        return 0;
+    }
+    if (name) *name = local_name;
+    if (value) *value = local_value;
+    if (shndx) *shndx = local_shndx;
+    if (bind) *bind = local_bind;
+    return 1;
+}
+
+int botw_guest_image_find_symbol(const botw_guest_image* img, const char* name,
+                                 uint64_t* addr) {
+    dyn_info d;
+    unsigned i, n;
+    if (!img || !img->base || !name || !addr) return 0;
+    if (!read_dynamic((botw_guest_image*)img, &d)) return 0;
+    n = symbol_count_of(&d);
+    for (i = 1; i < n; ++i) {
+        unsigned shndx = 0;
+        uint64_t value = 0;
+        const char* sym_name = NULL;
+        if (!symbol_lookup(img, &d, i, &shndx, &value, &sym_name, NULL)) continue;
+        if (shndx == 0 || !sym_name || strcmp(sym_name, name) != 0) continue;
+        if (shndx == 0xfff1u) {
+            *addr = value;
+            return 1;
+        }
+        if (value > (uint64_t)img->size) {
+            set_error((botw_guest_image*)img,
+                      "symbol %s sits past the image (%#llx)",
+                      name, (unsigned long long)value);
+            return 0;
+        }
+        *addr = (uint64_t)(uintptr_t)img->base + value;
+        return 1;
+    }
+    return 0;
 }
